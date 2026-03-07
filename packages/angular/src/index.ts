@@ -1,9 +1,10 @@
 import {
   Directive,
   ElementRef,
+  EventEmitter,
   OnInit,
   OnDestroy,
-  output,
+  Output,
 } from "@angular/core";
 import { bind, isWcBindable } from "@wc-bindable/core";
 
@@ -12,7 +13,7 @@ import { bind, isWcBindable } from "@wc-bindable/core";
   standalone: true,
 })
 export class WcBindableDirective implements OnInit, OnDestroy {
-  wcBindableChange = output<{ name: string; value: unknown }>();
+  @Output() wcBindableChange = new EventEmitter<{ name: string; value: unknown }>();
 
   private unbind?: () => void;
 

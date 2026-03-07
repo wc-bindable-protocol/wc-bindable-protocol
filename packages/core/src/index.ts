@@ -41,6 +41,11 @@ export function bind(
     const handler = (event: Event) => onUpdate(prop.name, getter(event));
     element.addEventListener(prop.event, handler);
     cleanups.push(() => element.removeEventListener(prop.event, handler));
+
+    const current = (element as unknown as Record<string, unknown>)[prop.name];
+    if (current !== undefined) {
+      onUpdate(prop.name, current);
+    }
   }
 
   return () => cleanups.forEach((fn) => fn());

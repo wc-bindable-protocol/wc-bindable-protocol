@@ -47,6 +47,14 @@ A standalone directive applied via the `wcBindable` attribute selector.
 - Binds on `ngOnInit` and cleans up on `ngOnDestroy`.
 - If the element does not implement `wc-bindable`, the directive is a no-op.
 
+## Design Notes
+
+This directive uses `@Output()` with `EventEmitter` rather than the newer `output()` function API (Angular 17.3+). Reasons:
+
+- **Broader compatibility** — works with Angular 17+ (matching the `peerDependencies` requirement).
+- **Testability** — `@Output()` does not require an injection context, so the directive can be instantiated directly in unit tests.
+- **Stability** — `EventEmitter` is a long-established, stable Angular API with no deprecation planned.
+
 ## License
 
 MIT

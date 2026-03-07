@@ -4,6 +4,12 @@ A minimal, framework-agnostic protocol that enables any Web Component to declare
 
 No dependencies. Just `static` class fields and `CustomEvent`.
 
+## Why?
+
+- **Write once, use everywhere** — A Web Component that implements this protocol works with React, Vue, Svelte, Angular, Solid, and any future framework without modification.
+- **No more manual wrappers** — Framework adapters automatically discover bindable properties and wire up event listeners. No per-component glue code needed.
+- **Clear separation of concerns** — Component authors declare *what* is bindable; framework consumers decide *how* to bind. Neither side needs to know about the other.
+
 ## How it works
 
 A Web Component declares bindable properties via `static wcBindable`:
@@ -22,6 +28,17 @@ class MyInput extends HTMLElement {
 
 Any framework adapter can then automatically bind to those properties — no manual wiring needed.
 
+When the adapter binds to an element, it reads the current value of each declared property for initial synchronization, then listens for subsequent change events. This means your framework state is populated immediately, even if the component was initialized before binding.
+
+## Non-goals
+
+This protocol intentionally does **not** cover:
+
+- **Two-way binding** — The protocol is one-way (component to framework). Writing back to the component is left to the consumer via standard DOM property assignment.
+- **Form integration** — Integration with form libraries or `FormData` is outside the scope.
+- **SSR / hydration** — The protocol operates at the DOM level and does not address server-side rendering or hydration strategies.
+- **Validation or schema enforcement** — Property values are passed as-is. Type checking or validation is the consumer's responsibility.
+
 ## Packages
 
 | Package | Description |
@@ -31,7 +48,7 @@ Any framework adapter can then automatically bind to those properties — no man
 | [@wc-bindable/vue](packages/vue/) | Vue composable — `useWcBindable()` |
 | [@wc-bindable/svelte](packages/svelte/) | Svelte action — `use:wcBindable` |
 | [@wc-bindable/angular](packages/angular/) | Angular directive — `wcBindable` |
-| [@wc-bindable/solid](packages/solid/) | Solid primitive — `useWcBindable()` |
+| [@wc-bindable/solid](packages/solid/) | Solid primitive — `createWcBindable()` / `use:wcBindable` |
 
 ## Quick start
 
@@ -91,12 +108,11 @@ export class AppComponent {
 ### Solid
 
 ```tsx
-import { useWcBindable } from "@wc-bindable/solid";
+import { createWcBindable } from "@wc-bindable/solid";
 
 function App() {
-  let el!: HTMLElement;
-  const values = useWcBindable(el, { value: "" });
-  return <my-input ref={el} />;
+  const [values, directive] = createWcBindable();
+  return <my-input ref={directive} />;
 }
 ```
 

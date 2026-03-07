@@ -131,4 +131,44 @@ describe("bind", () => {
     unbind(); // should not throw
     expect(onUpdate).not.toHaveBeenCalled();
   });
+
+  it("synchronizes initial property values on bind", () => {
+    const el = createBindableElement(validDeclaration);
+    (el as unknown as Record<string, unknown>).value = "initial";
+    const onUpdate = vi.fn();
+
+    bind(el, onUpdate);
+
+    expect(onUpdate).toHaveBeenCalledWith("value", "initial");
+  });
+
+  it("does not call onUpdate for undefined initial values", () => {
+    const el = createBindableElement(validDeclaration);
+    // value is not set, so it should be undefined
+    const onUpdate = vi.fn();
+
+    bind(el, onUpdate);
+
+    expect(onUpdate).not.toHaveBeenCalled();
+  });
+
+  it("synchronizes multiple initial values", () => {
+    const el = createBindableElement({
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [
+        { name: "value", event: "test:value-changed" },
+        { name: "checked", event: "test:checked-changed" },
+      ],
+    });
+    (el as unknown as Record<string, unknown>).value = "hello";
+    (el as unknown as Record<string, unknown>).checked = true;
+    const onUpdate = vi.fn();
+
+    bind(el, onUpdate);
+
+    expect(onUpdate).toHaveBeenCalledTimes(2);
+    expect(onUpdate).toHaveBeenCalledWith("value", "hello");
+    expect(onUpdate).toHaveBeenCalledWith("checked", true);
+  });
 });

@@ -1,6 +1,6 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { createRoot } from "solid-js";
-import { useWcBindable } from "../src/index.js";
+import { wcBindable, createWcBindable } from "../src/index.js";
 import type { WcBindableDeclaration } from "@wc-bindable/core";
 
 const TAG = "solid-test-input";
@@ -20,23 +20,60 @@ if (!customElements.get(TAG)) {
   customElements.define(TAG, SolidTestInput);
 }
 
-describe("useWcBindable (Solid)", () => {
-  it("returns initial values before any event", () => {
+describe("wcBindable directive", () => {
+  it("calls onUpdate when a bindable event is dispatched", () => {
     createRoot((dispose) => {
       const el = document.createElement(TAG);
-      const values = useWcBindable(el, { value: "", checked: false });
+      const onUpdate = vi.fn();
 
-      expect(values().value).toBe("");
-      expect(values().checked).toBe(false);
+      wcBindable(el, () => onUpdate);
+
+      el.dispatchEvent(new CustomEvent("solid-test-input:value-changed", { detail: "hello" }));
+      expect(onUpdate).toHaveBeenCalledWith("value", "hello");
 
       dispose();
     });
   });
 
-  it("updates values when a bindable event is dispatched", () => {
+  it("stops listening after dispose", () => {
+    const el = document.createElement(TAG);
+    const onUpdate = vi.fn();
+
+    createRoot((dispose) => {
+      wcBindable(el, () => onUpdate);
+
+      el.dispatchEvent(new CustomEvent("solid-test-input:value-changed", { detail: "before" }));
+      expect(onUpdate).toHaveBeenCalledWith("value", "before");
+
+      dispose();
+    });
+
+    onUpdate.mockClear();
+    el.dispatchEvent(new CustomEvent("solid-test-input:value-changed", { detail: "after" }));
+    expect(onUpdate).not.toHaveBeenCalled();
+  });
+
+  it("handles non-bindable elements gracefully", () => {
+    createRoot((dispose) => {
+      const el = document.createElement("div");
+      const onUpdate = vi.fn();
+
+      wcBindable(el, () => onUpdate);
+
+      expect(onUpdate).not.toHaveBeenCalled();
+
+      dispose();
+    });
+  });
+});
+
+describe("createWcBindable", () => {
+  it("returns a signal and directive that track property values", () => {
     createRoot((dispose) => {
       const el = document.createElement(TAG);
-      const values = useWcBindable(el, { value: "" });
+      const [values, directive] = createWcBindable();
+
+      directive(el);
 
       el.dispatchEvent(new CustomEvent("solid-test-input:value-changed", { detail: "hello" }));
       expect(values().value).toBe("hello");
@@ -49,12 +86,13 @@ describe("useWcBindable (Solid)", () => {
   });
 
   it("stops listening after dispose", () => {
-    let el: HTMLElement;
+    const el = document.createElement(TAG);
     let values: () => Record<string, unknown>;
 
     createRoot((dispose) => {
-      el = document.createElement(TAG);
-      values = useWcBindable(el, { value: "" });
+      const [v, directive] = createWcBindable();
+      values = v;
+      directive(el);
 
       el.dispatchEvent(new CustomEvent("solid-test-input:value-changed", { detail: "before" }));
       expect(values().value).toBe("before");
@@ -62,18 +100,7 @@ describe("useWcBindable (Solid)", () => {
       dispose();
     });
 
-    el!.dispatchEvent(new CustomEvent("solid-test-input:value-changed", { detail: "after" }));
+    el.dispatchEvent(new CustomEvent("solid-test-input:value-changed", { detail: "after" }));
     expect(values!().value).toBe("before");
-  });
-
-  it("handles non-bindable elements gracefully", () => {
-    createRoot((dispose) => {
-      const el = document.createElement("div");
-      const values = useWcBindable(el);
-
-      expect(Object.keys(values())).toHaveLength(0);
-
-      dispose();
-    });
   });
 });

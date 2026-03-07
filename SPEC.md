@@ -119,7 +119,9 @@ A reactivity system that supports this protocol should:
 
 1. Read `element.constructor.wcBindable`
 2. Verify `protocol === "wc-bindable"` and `version === 1`
-3. For each property descriptor, attach an event listener:
+3. For each property descriptor:
+   a. Read the current value of `element[prop.name]` — if it is not `undefined`, deliver it to the consumer immediately (initial value synchronization)
+   b. Attach an event listener for subsequent changes
 
 ```javascript
 const DEFAULT_GETTER = (e) => e.detail;
@@ -134,9 +136,44 @@ function bind(element, onUpdate) {
     element.addEventListener(prop.event, (event) => {
       onUpdate(prop.name, getter(event));
     });
+
+    // Initial value synchronization
+    const current = element[prop.name];
+    if (current !== undefined) {
+      onUpdate(prop.name, current);
+    }
   }
 }
 ```
+
+### Initial Value Synchronization
+
+Initial value synchronization is a **required** part of the protocol (not merely an adapter implementation suggestion). Adapters **must** read `element[prop.name]` at bind time for each declared property. If the value is not `undefined`, the adapter delivers it to the consumer immediately — before any events fire.
+
+This ensures that components whose properties are set before the adapter binds (e.g., server-rendered attributes, programmatic initialization) are correctly reflected in the consuming framework's state from the start.
+
+Component authors **should** ensure that the property named in `name` is readable on the element instance and reflects the current state at any point in time.
+
+### Repeated Events for the Same Property
+
+When a component dispatches the same event multiple times, the adapter calls `onUpdate` for each occurrence. There is no batching, deduplication, or equality check — every event produces a callback. Consumers that need deduplication (e.g., skipping no-op re-renders) are responsible for implementing it on their side.
+
+### Getter Errors
+
+If a `getter` function throws during event handling, the adapter **must not** swallow the error silently. The error should propagate naturally (i.e., be thrown from the event listener). This preserves normal JavaScript error semantics and allows component authors to detect bugs in their getter implementations.
+
+Adapters **should not** wrap getter calls in try/catch unless they re-throw the error after performing cleanup.
+
+### Undeclared or Missing Properties
+
+The `name` field in a property descriptor serves two purposes:
+
+1. It is passed to `onUpdate` as the property identifier.
+2. It is used to read `element[name]` for initial value synchronization.
+
+If `element[name]` is `undefined` at bind time (including when the property does not exist on the element), the adapter simply skips the initial synchronization for that property. This is not an error — the adapter proceeds normally and will still listen for the declared event.
+
+Component authors **should** ensure that every `name` in the declaration corresponds to a readable property on the element instance. However, adapters **must not** throw or warn if the property is absent.
 
 ---
 

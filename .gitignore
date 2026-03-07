@@ -4,3 +4,4 @@ coverage/
 .tsc-out/
 .vscode/
 .npmrc
+*.tsbuildinfo

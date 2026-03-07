@@ -1,21 +1,29 @@
-import { createSignal, onCleanup } from "solid-js";
+import { createSignal, onCleanup, type Accessor } from "solid-js";
 import { bind, isWcBindable } from "@wc-bindable/core";
 
-export function useWcBindable(
+export type WcBindableDirective = (
   el: HTMLElement,
-  initialValues: Record<string, unknown> = {},
-) {
-  const [values, setValues] = createSignal<Record<string, unknown>>({ ...initialValues });
+  accessor: Accessor<(name: string, value: unknown) => void>,
+) => void;
 
-  let unbind: (() => void) | undefined;
+export const wcBindable: WcBindableDirective = (el, accessor) => {
+  if (!isWcBindable(el)) return;
 
-  if (isWcBindable(el)) {
-    unbind = bind(el, (name, value) => {
+  const unbind = bind(el, (name, value) => {
+    accessor()(name, value);
+  });
+
+  onCleanup(unbind);
+};
+
+export function createWcBindable() {
+  const [values, setValues] = createSignal<Record<string, unknown>>({});
+
+  const directive = (el: HTMLElement) => {
+    wcBindable(el, () => (name, value) => {
       setValues((prev) => ({ ...prev, [name]: value }));
     });
-  }
+  };
 
-  onCleanup(() => unbind?.());
-
-  return values;
+  return [values, directive] as const;
 }
