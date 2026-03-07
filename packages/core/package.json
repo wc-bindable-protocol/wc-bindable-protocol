@@ -1,0 +1,16 @@
+{
+  "name": "@wc-bindable/core",
+  "version": "0.0.0",
+  "description": "Core protocol definitions and bind utility for wc-bindable",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "license": "MIT"
+}
