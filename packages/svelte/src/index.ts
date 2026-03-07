@@ -11,9 +11,9 @@ export const wcBindable: Action<HTMLElement, WcBindableParams> = (
 ) => {
   let unbind: (() => void) | undefined;
 
-  function setup(p: WcBindableParams) {
+  function setup(p: WcBindableParams | undefined) {
     unbind?.();
-    if (!isWcBindable(node)) return;
+    if (!p || !isWcBindable(node)) return;
     unbind = bind(node, p.onUpdate);
   }
 

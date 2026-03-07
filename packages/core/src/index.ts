@@ -10,8 +10,12 @@ export interface WcBindableDeclaration {
   properties: WcBindableProperty[];
 }
 
+export type WcBindableConstructor = (new (...args: unknown[]) => HTMLElement) & {
+  wcBindable: WcBindableDeclaration;
+};
+
 export interface WcBindableElement extends HTMLElement {
-  constructor: { wcBindable: WcBindableDeclaration };
+  constructor: WcBindableConstructor;
 }
 
 const DEFAULT_GETTER = (e: Event): unknown => (e as CustomEvent).detail;
