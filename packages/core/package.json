@@ -1,6 +1,6 @@
 {
   "name": "@wc-bindable/core",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Core protocol definitions and bind utility for wc-bindable",
   "type": "module",
   "main": "dist/index.js",
@@ -12,11 +12,18 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "LICENSE",
+    "README.md"
   ],
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wc-bindable-protocol/wc-bindable-protocol.git",
+    "directory": "packages/core"
   },
   "license": "MIT"
 }

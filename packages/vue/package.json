@@ -1,6 +1,6 @@
 {
   "name": "@wc-bindable/vue",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Vue adapter for wc-bindable protocol",
   "type": "module",
   "main": "dist/index.js",
@@ -12,17 +12,24 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "LICENSE",
+    "README.md"
   ],
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch"
   },
   "dependencies": {
-    "@wc-bindable/core": "0.0.0"
+    "@wc-bindable/core": "^0.1.0"
   },
   "peerDependencies": {
     "vue": ">=3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wc-bindable-protocol/wc-bindable-protocol.git",
+    "directory": "packages/vue"
   },
   "license": "MIT"
 }
