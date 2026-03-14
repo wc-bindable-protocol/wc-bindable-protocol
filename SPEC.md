@@ -177,6 +177,58 @@ Component authors **should** ensure that every `name` in the declaration corresp
 
 ---
 
+## TypeScript Support
+
+### Value Type Declaration
+
+Component authors **should** export a TypeScript interface describing the shape of their bindable values:
+
+```typescript
+// my-counter/types.ts
+export interface MyCounterValues {
+  count: number;
+}
+```
+
+```typescript
+// my-fetch/types.ts
+export interface MyFetchValues {
+  value: unknown;
+  loading: boolean;
+  error: { status: number; statusText: string; body: string } | null;
+  status: number;
+}
+```
+
+This interface represents the compile-time contract that complements the runtime contract (`static wcBindable`).
+
+### Adapter Usage
+
+Framework adapters **should** accept an optional generic type parameter for the values object:
+
+```typescript
+// React
+const [ref, values] = useWcBindable<HTMLElement, MyCounterValues>();
+values.count   // number — type-checked
+
+// Vue
+const { ref, values } = useWcBindable<HTMLElement, MyFetchValues>();
+values.loading // boolean — type-checked
+```
+
+When the type parameter is omitted, the values type defaults to `Record<string, unknown>`, preserving backward compatibility.
+
+### Two-Layer Contract
+
+| Layer | Mechanism | Purpose |
+|-------|-----------|---------|
+| Runtime | `static wcBindable` + `CustomEvent` | Protocol detection, event binding |
+| Compile-time | `export interface ...Values` | Type-safe access to bound values |
+
+The type declaration is a **recommendation**, not a requirement. Components without type exports still work — consumers simply receive `unknown` values. The `import type` syntax ensures type declarations have zero runtime cost.
+
+---
+
 ## Versioning
 
 The protocol version is an integer. Breaking changes increment the version.  

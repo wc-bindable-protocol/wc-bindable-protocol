@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>wc-bindable — Fetch Example</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 700px;
+      margin: 40px auto;
+      padding: 0 20px;
+    }
+    h1 { font-size: 1.4rem; }
+    .section {
+      margin: 24px 0;
+      padding: 16px;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+    }
+    .label { font-weight: 600; margin-bottom: 8px; }
+    .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    input[type="text"] {
+      flex: 1;
+      min-width: 200px;
+      padding: 6px 10px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      font-size: 14px;
+    }
+    button {
+      padding: 6px 16px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      background: #f5f5f5;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    button:hover { background: #e0e0e0; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .status-bar {
+      display: flex;
+      gap: 16px;
+      font-size: 14px;
+      margin-top: 8px;
+    }
+    .status-bar span { padding: 2px 8px; border-radius: 4px; }
+    .loading-true { background: #fef3c7; color: #92400e; }
+    .loading-false { background: #d1fae5; color: #065f46; }
+    .error-box { background: #fee2e2; color: #991b1b; padding: 8px; border-radius: 4px; margin-top: 8px; }
+    pre.response {
+      background: #f5f5f5;
+      padding: 12px;
+      border-radius: 4px;
+      max-height: 300px;
+      overflow: auto;
+      font-size: 13px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    #log {
+      font-family: monospace;
+      font-size: 13px;
+      background: #f5f5f5;
+      padding: 12px;
+      border-radius: 4px;
+      max-height: 200px;
+      overflow-y: auto;
+    }
+    .log-entry { margin: 2px 0; }
+  </style>
+</head>
+<body>
+  <p><a href="/index.html">&larr; Examples</a></p>
+  <h1>wc-bindable: Vanilla — Fetch</h1>
+
+  <!-- Declarative fetch component (manual mode) -->
+  <my-fetch id="fetcher" manual></my-fetch>
+
+  <div class="section">
+    <div class="label">Request</div>
+    <div class="controls">
+      <input type="text" id="url-input" value="https://jsonplaceholder.typicode.com/posts/1" />
+      <button id="fetch-btn">Fetch</button>
+      <button id="abort-btn">Abort</button>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="label">Bound State (via core bind())</div>
+    <div class="status-bar">
+      <span>loading: <strong id="loading-val">false</strong></span>
+      <span>status: <strong id="status-val">—</strong></span>
+    </div>
+    <div id="error-box" class="error-box" hidden></div>
+    <pre id="response" class="response">— No response yet —</pre>
+  </div>
+
+  <div class="section">
+    <div class="label">Event Log</div>
+    <div id="log"></div>
+  </div>
+
+  <script type="module">
+    import "./my-fetch.js";
+    import { bind, isWcBindable } from "@wc-bindable/core";
+
+    const fetcher = document.getElementById("fetcher");
+    const urlInput = document.getElementById("url-input");
+    const fetchBtn = document.getElementById("fetch-btn");
+    const abortBtn = document.getElementById("abort-btn");
+    const loadingVal = document.getElementById("loading-val");
+    const statusVal = document.getElementById("status-val");
+    const errorBox = document.getElementById("error-box");
+    const response = document.getElementById("response");
+    const log = document.getElementById("log");
+
+    const appendLog = (msg) => {
+      const entry = document.createElement("div");
+      entry.className = "log-entry";
+      entry.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+      log.prepend(entry);
+    };
+
+    appendLog(`isWcBindable(fetcher) = ${isWcBindable(fetcher)}`);
+
+    // Bind using core bind()
+    bind(fetcher, (name, value) => {
+      appendLog(`onUpdate("${name}", ${JSON.stringify(value)?.slice(0, 80)})`);
+
+      switch (name) {
+        case "loading":
+          loadingVal.textContent = String(value);
+          loadingVal.parentElement.className = `loading-${value}`;
+          fetchBtn.disabled = value;
+          break;
+        case "status":
+          statusVal.textContent = value || "—";
+          break;
+        case "value":
+          errorBox.hidden = true;
+          response.textContent = JSON.stringify(value, null, 2);
+          break;
+        case "error":
+          if (value) {
+            errorBox.hidden = false;
+            errorBox.textContent = JSON.stringify(value, null, 2);
+          }
+          break;
+      }
+    });
+
+    appendLog("bind() called — listening for changes");
+
+    // Wire up buttons
+    fetchBtn.addEventListener("click", () => {
+      fetcher.url = urlInput.value;
+      fetcher.fetch();
+    });
+
+    abortBtn.addEventListener("click", () => {
+      fetcher.abort();
+      appendLog("abort() called");
+    });
+  </script>
+</body>
+</html>

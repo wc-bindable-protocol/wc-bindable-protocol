@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>wc-bindable — Vanilla Example</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 600px;
+      margin: 40px auto;
+      padding: 0 20px;
+    }
+    h1 { font-size: 1.4rem; }
+    .section {
+      margin: 24px 0;
+      padding: 16px;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+    }
+    .label { font-weight: 600; margin-bottom: 8px; }
+    #bound-value {
+      font-size: 1.2rem;
+      color: #2563eb;
+      font-weight: bold;
+    }
+    #log {
+      font-family: monospace;
+      font-size: 13px;
+      background: #f5f5f5;
+      padding: 12px;
+      border-radius: 4px;
+      max-height: 200px;
+      overflow-y: auto;
+    }
+    .log-entry { margin: 2px 0; }
+  </style>
+</head>
+<body>
+  <p><a href="/index.html">&larr; Examples</a></p>
+  <h1>wc-bindable: Vanilla — Counter</h1>
+
+  <div class="section">
+    <div class="label">Counter Component (my-counter)</div>
+    <my-counter id="counter"></my-counter>
+  </div>
+
+  <div class="section">
+    <div class="label">Bound Value (via core bind())</div>
+    <div id="bound-value">—</div>
+  </div>
+
+  <div class="section">
+    <div class="label">Event Log</div>
+    <div id="log"></div>
+  </div>
+
+  <script type="module">
+    import "./my-counter.js";
+    // Import core from source (ESM)
+    import { bind, isWcBindable } from "@wc-bindable/core";
+
+    const counter = document.getElementById("counter");
+    const boundValue = document.getElementById("bound-value");
+    const log = document.getElementById("log");
+
+    // Check protocol
+    const appendLog = (msg) => {
+      const entry = document.createElement("div");
+      entry.className = "log-entry";
+      entry.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+      log.prepend(entry);
+    };
+
+    appendLog(`isWcBindable(counter) = ${isWcBindable(counter)}`);
+
+    // Bind using core bind()
+    const unbind = bind(counter, (name, value) => {
+      boundValue.textContent = `${name} = ${value}`;
+      appendLog(`onUpdate("${name}", ${JSON.stringify(value)})`);
+    });
+
+    appendLog("bind() called — listening for changes");
+  </script>
+</body>
+</html>

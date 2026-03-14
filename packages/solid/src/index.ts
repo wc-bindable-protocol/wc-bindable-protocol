@@ -16,8 +16,10 @@ export const wcBindable: WcBindableDirective = (el, accessor) => {
   onCleanup(unbind);
 };
 
-export function createWcBindable() {
-  const [values, setValues] = createSignal<Record<string, unknown>>({});
+export function createWcBindable<
+  V extends Record<string, unknown> = Record<string, unknown>,
+>(initialValues: Partial<V> = {}) {
+  const [values, setValues] = createSignal<V>(initialValues as V);
 
   const directive = (el: HTMLElement) => {
     wcBindable(el, () => (name, value) => {
