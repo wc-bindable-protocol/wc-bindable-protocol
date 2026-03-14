@@ -116,6 +116,37 @@ function App() {
 }
 ```
 
+## Examples
+
+The `examples/` directory contains working demos that verify the protocol across environments:
+
+| Example | Description |
+|---|---|
+| [Vanilla — Counter](examples/vanilla/counter/) | Basic counter using `bind()` directly |
+| [Vanilla — Fetch](examples/vanilla/fetch/) | Headless `<my-fetch>` component with async state |
+| [React — Counter](examples/react-counter/) | Counter bound via `useWcBindable` hook |
+| [React — Fetch](examples/react-fetch/) | Fetch bound via `useWcBindable` hook |
+| [Vue — Counter](examples/vue-counter/) | Counter bound via `useWcBindable` composable |
+| [Vue — Fetch](examples/vue-fetch/) | Fetch bound via `useWcBindable` composable |
+
+### Running the examples
+
+```bash
+npm run examples
+```
+
+Open `http://localhost:5173` to see the example index.
+
+### Headless Web Components
+
+The `<my-fetch>` example demonstrates using Web Components as **invisible service layers** — not UI widgets. The component handles HTTP requests internally and exposes `value`, `loading`, `error`, and `status` via the protocol. Framework code contains zero async logic:
+
+```tsx
+// React — no fetch(), no async/await, no loading state management
+const [ref, values] = useWcBindable<MyFetchElement, MyFetchValues>();
+// values.loading, values.value, values.error — all reactive
+```
+
 ## Development
 
 ```bash
