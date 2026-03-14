@@ -21,7 +21,7 @@ class MyFetch extends HTMLElement {
     protocol: "wc-bindable",
     version: 1,
     properties: [
-      { name: "value", event: "my-fetch:response" },
+      { name: "value", event: "my-fetch:response", getter: (e) => e.detail.value },
       { name: "loading", event: "my-fetch:loading-changed" },
       { name: "error", event: "my-fetch:error" },
       {
@@ -94,6 +94,7 @@ class MyFetch extends HTMLElement {
 
   #setError(error) {
     this.#error = error;
+    if (error?.status) this.#status = error.status;
     this.dispatchEvent(
       new CustomEvent("my-fetch:error", {
         detail: error,
@@ -131,7 +132,7 @@ class MyFetch extends HTMLElement {
     const { signal } = this.#abortController;
 
     this.#setLoading(true);
-    this.#error = null;
+    this.#setError(null);
 
     try {
       const response = await globalThis.fetch(url, {

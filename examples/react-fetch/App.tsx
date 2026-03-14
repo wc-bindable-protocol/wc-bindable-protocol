@@ -1,23 +1,23 @@
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { useWcBindable } from "../../packages/react/src/index.ts";
-import type { MyFetchValues } from "../vanilla/fetch/types.ts";
+import type { MyFetchElement, MyFetchValues } from "../vanilla/fetch/types.ts";
 import "../vanilla/fetch/my-fetch.js";
 
 export function App() {
   const [url, setUrl] = useState("https://jsonplaceholder.typicode.com/posts/1");
-  const [ref, values] = useWcBindable<HTMLElement, MyFetchValues>();
+  const [ref, values] = useWcBindable<MyFetchElement, MyFetchValues>();
 
-  const handleFetch = () => {
-    const el = ref.current as any;
+  const handleFetch = useCallback(() => {
+    const el = ref.current;
     if (el) {
       el.url = url;
       el.fetch();
     }
-  };
+  }, [ref, url]);
 
-  const handleAbort = () => {
-    (ref.current as any)?.abort();
-  };
+  const handleAbort = useCallback(() => {
+    ref.current?.abort();
+  }, [ref]);
 
   const section = { margin: "24px 0", padding: 16, border: "1px solid #ddd", borderRadius: 8 } as const;
   const label = { fontWeight: 600, marginBottom: 8 } as const;

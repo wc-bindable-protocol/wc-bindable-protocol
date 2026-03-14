@@ -1,14 +1,14 @@
 <script setup lang="ts">
 import { ref as vueRef } from "vue";
 import { useWcBindable } from "../../packages/vue/src/index.ts";
-import type { MyFetchValues } from "../vanilla/fetch/types.ts";
+import type { MyFetchElement, MyFetchValues } from "../vanilla/fetch/types.ts";
 import "../vanilla/fetch/my-fetch.js";
 
 const url = vueRef("https://jsonplaceholder.typicode.com/posts/1");
-const { ref: fetcherRef, values } = useWcBindable<HTMLElement, MyFetchValues>();
+const { ref: fetcherRef, values } = useWcBindable<MyFetchElement, MyFetchValues>();
 
 function handleFetch() {
-  const el = fetcherRef.value as any;
+  const el = fetcherRef.value;
   if (el) {
     el.url = url.value;
     el.fetch();
@@ -16,8 +16,7 @@ function handleFetch() {
 }
 
 function handleAbort() {
-  const el = fetcherRef.value as any;
-  el?.abort();
+  fetcherRef.value?.abort();
 }
 </script>
 
