@@ -1,9 +1,9 @@
 import { useWcBindable } from "../../packages/react/src/index.ts";
-import type { MyCounterValues } from "../vanilla/counter/types.ts";
+import type { MyCounterElement, MyCounterValues } from "../vanilla/counter/types.ts";
 import "../vanilla/counter/my-counter.js";
 
 export function App() {
-  const [ref, values] = useWcBindable<HTMLElement, MyCounterValues>();
+  const [ref, values] = useWcBindable<MyCounterElement, MyCounterValues>();
 
   return (
     <div style={{ fontFamily: "system-ui, sans-serif", maxWidth: 600, margin: "40px auto", padding: "0 20px" }}>

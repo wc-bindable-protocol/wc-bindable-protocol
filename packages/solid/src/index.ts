@@ -17,7 +17,7 @@ export const wcBindable: WcBindableDirective = (el, accessor) => {
 };
 
 export function createWcBindable<
-  V extends Record<string, unknown> = Record<string, unknown>,
+  V extends object = Record<string, unknown>,
 >(initialValues: Partial<V> = {}) {
   const [values, setValues] = createSignal<V>(initialValues as V);
 

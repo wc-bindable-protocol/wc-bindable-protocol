@@ -3,7 +3,7 @@ import { bind, isWcBindable } from "@wc-bindable/core";
 
 export function useWcBindable<
   T extends HTMLElement,
-  V extends Record<string, unknown> = Record<string, unknown>,
+  V extends object = Record<string, unknown>,
 >(initialValues: Partial<V> = {}) {
   const ref = useRef<T>(null);
   const [values, setValues] = useState<V>(initialValues as V);

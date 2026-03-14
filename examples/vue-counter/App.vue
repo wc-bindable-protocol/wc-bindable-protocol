@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { useWcBindable } from "../../packages/vue/src/index.ts";
-import type { MyCounterValues } from "../vanilla/counter/types.ts";
+import type { MyCounterElement, MyCounterValues } from "../vanilla/counter/types.ts";
 import "../vanilla/counter/my-counter.js";
 
-const { ref: counterRef, values } = useWcBindable<HTMLElement, MyCounterValues>();
+const { ref: counterRef, values } = useWcBindable<MyCounterElement, MyCounterValues>();
 </script>
 
 <template>

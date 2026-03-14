@@ -4,7 +4,7 @@ import { bind, isWcBindable } from "@wc-bindable/core";
 
 export function useWcBindable<
   T extends HTMLElement,
-  V extends Record<string, unknown> = Record<string, unknown>,
+  V extends object = Record<string, unknown>,
 >(initialValues: Partial<V> = {}): { ref: Ref<T | null>; values: V } {
   const templateRef = ref<T | null>(null) as Ref<T | null>;
   const values = reactive<V>({ ...initialValues } as V);
