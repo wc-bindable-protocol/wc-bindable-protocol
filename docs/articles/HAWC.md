@@ -90,7 +90,7 @@ The moment the scope is expanded, complexity explodes. These limitations reflect
 
 ## The Thinness of the Adapter
 
-The core `bind()` function can be implemented in roughly 10 lines:
+The core `bind()` function can be implemented in roughly 20 lines:
 
 ```javascript
 const DEFAULT_GETTER = (e) => e.detail;
