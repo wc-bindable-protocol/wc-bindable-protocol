@@ -1,11 +1,11 @@
+import { MyFetchCore } from "./my-fetch-core.js";
+
 /**
- * Sample wc-bindable custom element: <my-fetch>
+ * Shell: <my-fetch> (HTMLElement)
  *
- * A declarative fetch component that implements the wc-bindable protocol.
- * - property: "value"   — response data (JSON or text)
- * - property: "loading" — whether a request is in progress
- * - property: "error"   — error info (null when no error)
- * - property: "status"  — HTTP status code
+ * Thin DOM wrapper around MyFetchCore.
+ * Provides attribute mapping and lifecycle hooks.
+ * Core dispatches events directly on this HTMLElement (passed as target).
  *
  * Attributes:
  *   url      — request URL (required)
@@ -17,47 +17,31 @@
  *   abort()  — cancel in-flight request
  */
 class MyFetch extends HTMLElement {
-  static wcBindable = {
-    protocol: "wc-bindable",
-    version: 1,
-    properties: [
-      { name: "value", event: "my-fetch:response", getter: (e) => e.detail.value },
-      { name: "loading", event: "my-fetch:loading-changed" },
-      { name: "error", event: "my-fetch:error" },
-      {
-        name: "status",
-        event: "my-fetch:response",
-        getter: (e) => e.detail.status,
-      },
-    ],
-  };
+  static wcBindable = MyFetchCore.wcBindable;
 
-  #value = null;
-  #loading = false;
-  #error = null;
-  #status = 0;
-  #abortController = null;
+  #core;
 
   constructor() {
     super();
+    this.#core = new MyFetchCore(this);
   }
 
-  // --- public getters ---
+  // --- proxy getters to core ---
 
   get value() {
-    return this.#value;
+    return this.#core.value;
   }
   get loading() {
-    return this.#loading;
+    return this.#core.loading;
   }
   get error() {
-    return this.#error;
+    return this.#core.error;
   }
   get status() {
-    return this.#status;
+    return this.#core.status;
   }
 
-  // --- attribute accessors ---
+  // --- attribute accessors (DOM-specific) ---
 
   get url() {
     return this.getAttribute("url") || "";
@@ -80,99 +64,19 @@ class MyFetch extends HTMLElement {
     v ? this.setAttribute("manual", "") : this.removeAttribute("manual");
   }
 
-  // --- internal helpers ---
-
-  #setLoading(loading) {
-    this.#loading = loading;
-    this.dispatchEvent(
-      new CustomEvent("my-fetch:loading-changed", {
-        detail: loading,
-        bubbles: true,
-      }),
-    );
-  }
-
-  #setError(error) {
-    this.#error = error;
-    if (error?.status) this.#status = error.status;
-    this.dispatchEvent(
-      new CustomEvent("my-fetch:error", {
-        detail: error,
-        bubbles: true,
-      }),
-    );
-  }
-
-  #setResponse(value, status) {
-    this.#value = value;
-    this.#status = status;
-    this.dispatchEvent(
-      new CustomEvent("my-fetch:response", {
-        detail: { value, status },
-        bubbles: true,
-      }),
-    );
-  }
-
-  // --- public methods ---
+  // --- public methods (delegate to core) ---
 
   abort() {
-    if (this.#abortController) {
-      this.#abortController.abort();
-      this.#abortController = null;
-    }
+    this.#core.abort();
   }
 
   async fetch() {
     const url = this.url;
     if (!url) throw new Error("<my-fetch>: url attribute is required");
-
-    this.abort();
-    this.#abortController = new AbortController();
-    const { signal } = this.#abortController;
-
-    this.#setLoading(true);
-    this.#setError(null);
-
-    try {
-      const response = await globalThis.fetch(url, {
-        method: this.method,
-        signal,
-      });
-
-      if (!response.ok) {
-        const body = await response.text().catch(() => "");
-        this.#setError({
-          status: response.status,
-          statusText: response.statusText,
-          body,
-        });
-        this.#setLoading(false);
-        return null;
-      }
-
-      const contentType = response.headers.get("Content-Type") || "";
-      const data = contentType.includes("application/json")
-        ? await response.json()
-        : await response.text();
-
-      this.#setResponse(data, response.status);
-      this.#setLoading(false);
-      return data;
-    } catch (e) {
-      if (e.name === "AbortError") {
-        this.#setLoading(false);
-        return null;
-      }
-      this.#setError(e);
-      this.#setLoading(false);
-      return null;
-    } finally {
-      this.#abortController = null;
-    }
+    return this.#core.fetch(url, { method: this.method });
   }
 
-  // --- lifecycle ---
+  // --- lifecycle (DOM-specific) ---
 
   connectedCallback() {
     this.style.display = "none";
