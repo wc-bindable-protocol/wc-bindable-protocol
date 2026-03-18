@@ -10,39 +10,39 @@ export interface WcBindableDeclaration {
   properties: WcBindableProperty[];
 }
 
-export type WcBindableConstructor = (new (...args: unknown[]) => HTMLElement) & {
+export type WcBindableConstructor = (new (...args: unknown[]) => EventTarget) & {
   wcBindable: WcBindableDeclaration;
 };
 
-export interface WcBindableElement extends HTMLElement {
+export interface WcBindableElement extends EventTarget {
   constructor: WcBindableConstructor;
 }
 
 const DEFAULT_GETTER = (e: Event): unknown => (e as CustomEvent).detail;
 
-export function isWcBindable(element: HTMLElement): element is WcBindableElement {
-  const decl = (element.constructor as { wcBindable?: WcBindableDeclaration }).wcBindable;
+export function isWcBindable(target: EventTarget): target is WcBindableElement {
+  const decl = (target.constructor as { wcBindable?: WcBindableDeclaration }).wcBindable;
   return decl?.protocol === "wc-bindable" && decl?.version === 1;
 }
 
 export type UnbindFn = () => void;
 
 export function bind(
-  element: HTMLElement,
+  target: EventTarget,
   onUpdate: (name: string, value: unknown) => void,
 ): UnbindFn {
-  if (!isWcBindable(element)) return () => {};
+  if (!isWcBindable(target)) return () => {};
 
-  const { properties } = element.constructor.wcBindable;
+  const { properties } = target.constructor.wcBindable;
   const cleanups: (() => void)[] = [];
 
   for (const prop of properties) {
     const getter = prop.getter ?? DEFAULT_GETTER;
     const handler = (event: Event) => onUpdate(prop.name, getter(event));
-    element.addEventListener(prop.event, handler);
-    cleanups.push(() => element.removeEventListener(prop.event, handler));
+    target.addEventListener(prop.event, handler);
+    cleanups.push(() => target.removeEventListener(prop.event, handler));
 
-    const current = (element as unknown as Record<string, unknown>)[prop.name];
+    const current = (target as unknown as Record<string, unknown>)[prop.name];
     if (current !== undefined) {
       onUpdate(prop.name, current);
     }

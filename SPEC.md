@@ -7,15 +7,17 @@
 
 ## Overview
 
-`wc-bindable-protocol` is a minimal, framework-agnostic protocol that enables any Web Component to declare its reactive properties so that any reactivity system (React, Vue, Svelte, etc.) can bind to them without framework-specific coupling.
+`wc-bindable-protocol` is a minimal, framework-agnostic protocol that enables any class extending `EventTarget` to declare its reactive properties so that any reactivity system (React, Vue, Svelte, etc.) can bind to them without framework-specific coupling.
 
-The protocol requires no dependencies and relies solely on browser-native APIs: `static` class fields and `CustomEvent`.
+The minimum requirement is `EventTarget` — any object that supports `addEventListener` and `dispatchEvent` can participate in the protocol. `HTMLElement` (a subclass of `EventTarget`) is the most common implementation target, as it enables DOM integration and framework binding via refs, but it is not required. This means the protocol works equally well in non-browser runtimes (Node.js, Deno, Cloudflare Workers, etc.) where `EventTarget` is available.
+
+The protocol requires no dependencies and relies solely on standard APIs: `static` class fields and `CustomEvent`.
 
 ---
 
 ## Goals
 
-- Allow Web Component authors to declare bindable properties once
+- Allow any EventTarget-based class to declare bindable properties once
 - Allow any reactivity system to consume those declarations without prior knowledge of the component
 - Remain zero-dependency and runtime-only
 - Be simple enough to implement in tens of lines of code
@@ -24,7 +26,26 @@ The protocol requires no dependencies and relies solely on browser-native APIs: 
 
 ## Protocol Declaration
 
-A Web Component declares its bindable properties by defining a `static wcBindable` field on the class.
+Any class extending `EventTarget` declares its bindable properties by defining a `static wcBindable` field on the class.
+
+### Headless (EventTarget only)
+
+```javascript
+class MyFetchCore extends EventTarget {
+  static wcBindable = {
+    protocol: "wc-bindable",
+    version: 1,
+    properties: [
+      { name: "value",   event: "my-fetch:value-changed" },
+      { name: "loading", event: "my-fetch:loading-changed" },
+    ],
+  };
+}
+```
+
+This form works in any runtime that provides `EventTarget` and `CustomEvent` (browsers, Node.js, Deno, Cloudflare Workers, etc.).
+
+### Web Component (HTMLElement)
 
 ```javascript
 class MyInput extends HTMLElement {
@@ -46,6 +67,8 @@ class MyInput extends HTMLElement {
 }
 ```
 
+`HTMLElement` extends `EventTarget`, so Web Components are fully compatible. This form is required when the component needs to be mounted in the DOM and accessed via framework refs.
+
 ---
 
 ## Schema
@@ -62,7 +85,7 @@ class MyInput extends HTMLElement {
 
 | Field    | Type       | Required | Description                                              |
 |----------|------------|----------|----------------------------------------------------------|
-| `name`   | `string`   | ✅       | The property name on the element                         |
+| `name`   | `string`   | ✅       | The property name on the target                          |
 | `event`  | `string`   | ✅       | The CustomEvent name dispatched when the property changes |
 | `getter` | `function` | ❌       | Extracts the new value from the event. Defaults to `e => e.detail` |
 
@@ -117,28 +140,30 @@ getter: (e) => e.target.value
 
 A reactivity system that supports this protocol should:
 
-1. Read `element.constructor.wcBindable`
+1. Read `target.constructor.wcBindable`
 2. Verify `protocol === "wc-bindable"` and `version === 1`
 3. For each property descriptor:
-   a. Read the current value of `element[prop.name]` — if it is not `undefined`, deliver it to the consumer immediately (initial value synchronization)
+   a. Read the current value of `target[prop.name]` — if it is not `undefined`, deliver it to the consumer immediately (initial value synchronization)
    b. Attach an event listener for subsequent changes
+
+The `target` parameter accepts any `EventTarget` — this includes `HTMLElement` instances as well as headless `EventTarget` subclasses.
 
 ```javascript
 const DEFAULT_GETTER = (e) => e.detail;
 
-function bind(element, onUpdate) {
-  const { protocol, version, properties } = element.constructor.wcBindable;
+function bind(target, onUpdate) {
+  const { protocol, version, properties } = target.constructor.wcBindable;
 
   if (protocol !== "wc-bindable" || version !== 1) return;
 
   for (const prop of properties) {
     const getter = prop.getter ?? DEFAULT_GETTER;
-    element.addEventListener(prop.event, (event) => {
+    target.addEventListener(prop.event, (event) => {
       onUpdate(prop.name, getter(event));
     });
 
     // Initial value synchronization
-    const current = element[prop.name];
+    const current = target[prop.name];
     if (current !== undefined) {
       onUpdate(prop.name, current);
     }
@@ -148,11 +173,11 @@ function bind(element, onUpdate) {
 
 ### Initial Value Synchronization
 
-Initial value synchronization is a **required** part of the protocol (not merely an adapter implementation suggestion). Adapters **must** read `element[prop.name]` at bind time for each declared property. If the value is not `undefined`, the adapter delivers it to the consumer immediately — before any events fire.
+Initial value synchronization is a **required** part of the protocol (not merely an adapter implementation suggestion). Adapters **must** read `target[prop.name]` at bind time for each declared property. If the value is not `undefined`, the adapter delivers it to the consumer immediately — before any events fire.
 
-This ensures that components whose properties are set before the adapter binds (e.g., server-rendered attributes, programmatic initialization) are correctly reflected in the consuming framework's state from the start.
+This ensures that targets whose properties are set before the adapter binds (e.g., server-rendered attributes, programmatic initialization) are correctly reflected in the consuming framework's state from the start.
 
-Component authors **should** ensure that the property named in `name` is readable on the element instance and reflects the current state at any point in time.
+Component authors **should** ensure that the property named in `name` is readable on the target instance and reflects the current state at any point in time.
 
 ### Repeated Events for the Same Property
 
@@ -169,11 +194,11 @@ Adapters **should not** wrap getter calls in try/catch unless they re-throw the 
 The `name` field in a property descriptor serves two purposes:
 
 1. It is passed to `onUpdate` as the property identifier.
-2. It is used to read `element[name]` for initial value synchronization.
+2. It is used to read `target[name]` for initial value synchronization.
 
-If `element[name]` is `undefined` at bind time (including when the property does not exist on the element), the adapter simply skips the initial synchronization for that property. This is not an error — the adapter proceeds normally and will still listen for the declared event.
+If `target[name]` is `undefined` at bind time (including when the property does not exist on the target), the adapter simply skips the initial synchronization for that property. This is not an error — the adapter proceeds normally and will still listen for the declared event.
 
-Component authors **should** ensure that every `name` in the declaration corresponds to a readable property on the element instance. However, adapters **must not** throw or warn if the property is absent.
+Component authors **should** ensure that every `name` in the declaration corresponds to a readable property on the target instance. However, adapters **must not** throw or warn if the property is absent.
 
 ---
 
@@ -204,16 +229,20 @@ This interface represents the compile-time contract that complements the runtime
 
 ### Adapter Usage
 
-Framework adapters **should** accept an optional generic type parameter for the values object:
+Framework adapters **should** accept an optional generic type parameter for the values object. The first type parameter constrains the target type — use `EventTarget` for headless targets or `HTMLElement` (default) for DOM-mounted components:
 
 ```typescript
-// React
+// React — DOM component
 const [ref, values] = useWcBindable<HTMLElement, MyCounterValues>();
 values.count   // number — type-checked
 
-// Vue
+// Vue — DOM component
 const { ref, values } = useWcBindable<HTMLElement, MyFetchValues>();
 values.loading // boolean — type-checked
+
+// Headless (non-DOM) — bind directly to an EventTarget
+const core = new MyFetchCore();
+bind(core, (name, value) => { /* ... */ });
 ```
 
 When the type parameter is omitted, the values type defaults to `Record<string, unknown>`, preserving backward compatibility.
@@ -222,7 +251,7 @@ When the type parameter is omitted, the values type defaults to `Record<string, 
 
 | Layer | Mechanism | Purpose |
 |-------|-----------|---------|
-| Runtime | `static wcBindable` + `CustomEvent` | Protocol detection, event binding |
+| Runtime | `static wcBindable` + `CustomEvent` on `EventTarget` | Protocol detection, event binding |
 | Compile-time | `export interface ...Values` | Type-safe access to bound values |
 
 The type declaration is a **recommendation**, not a requirement. Components without type exports still work — consumers simply receive `unknown` values. The `import type` syntax ensures type declarations have zero runtime cost.
@@ -248,8 +277,11 @@ Static fields are accessible without instantiation, allowing adapters to inspect
 **Why not JSON / custom attribute?**  
 Functions (getters) cannot be expressed in JSON. A `static` field keeps everything in one place with full JavaScript expressiveness.
 
-**Is this a W3C standard?**  
-No. This is a community protocol. Any Web Component or framework can adopt it independently.
+**Why EventTarget and not HTMLElement?**
+`EventTarget` is the minimal interface that provides `addEventListener` and `dispatchEvent`. By targeting `EventTarget`, the protocol works in non-browser runtimes (Node.js, Deno, Cloudflare Workers) and enables headless components that encapsulate business logic without any DOM dependency. `HTMLElement` is a subclass of `EventTarget`, so all Web Components are automatically compatible.
+
+**Is this a W3C standard?**
+No. This is a community protocol. Any EventTarget-based class or framework can adopt it independently.
 
 ---
 
