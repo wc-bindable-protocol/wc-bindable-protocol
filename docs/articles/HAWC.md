@@ -28,6 +28,79 @@ HAWC's architecture consists of three layers:
 
 ![architecure overview](./hawc_architecture_overview.svg)
 
+### Core/Shell Separation
+
+The Headless Web Component Layer can be further decomposed into two distinct parts: a **Core** and a **Shell**. Each crosses a different boundary.
+
+**Core (EventTarget)** — Contains all business logic: async processing, state management, and event dispatching. It extends `EventTarget`, not `HTMLElement`, and therefore has zero DOM dependency. This means the Core works in any JavaScript runtime that provides `EventTarget` and `CustomEvent` — browsers, Node.js, Deno, Cloudflare Workers, and others. The Core crosses the **runtime boundary**.
+
+**Shell (HTMLElement)** — A thin wrapper that extends `HTMLElement`. It holds a Core instance internally, maps HTML attributes to Core parameters, and manages DOM lifecycle (`connectedCallback` / `disconnectedCallback`). Because it is an `HTMLElement`, frameworks can reference it via `ref` and adapters can bind to it. The Shell crosses the **framework boundary**.
+
+```
+┌─────────────────────────────────────────────────┐
+│  Core (EventTarget)                             │
+│  - async logic, state, dispatchEvent            │
+│  - runs anywhere: browser, Node, Deno, Workers  │
+├─────────────────────────────────────────────────┤
+│  Shell (HTMLElement)                            │
+│  - attribute mapping, lifecycle                 │
+│  - enables framework binding via ref            │
+└─────────────────────────────────────────────────┘
+```
+
+The key design pattern enabling this separation is **target injection**: the Core's constructor accepts an optional `target` parameter (an `EventTarget`) to which it dispatches all events. When omitted, it defaults to `this` — the Core itself. When the Shell passes `this` (the `HTMLElement`) as the target, Core events fire directly on the DOM element, requiring no event re-dispatch.
+
+```javascript
+// Core — pure EventTarget, no DOM
+class MyFetchCore extends EventTarget {
+  static wcBindable = { /* ... */ };
+  #target;
+
+  constructor(target) {
+    super();
+    this.#target = target ?? this;
+  }
+
+  // Events dispatch on #target
+  #setLoading(loading) {
+    this.#target.dispatchEvent(
+      new CustomEvent("my-fetch:loading-changed", { detail: loading, bubbles: true }),
+    );
+  }
+
+  async fetch(url, options = {}) { /* ... */ }
+}
+```
+
+```javascript
+// Shell — thin HTMLElement wrapper
+class MyFetch extends HTMLElement {
+  static wcBindable = MyFetchCore.wcBindable;
+  #core;
+
+  constructor() {
+    super();
+    this.#core = new MyFetchCore(this); // events fire directly on this element
+  }
+
+  // Attribute mapping (DOM-specific)
+  get url() { return this.getAttribute("url") || ""; }
+
+  // Delegate to core
+  async fetch() { return this.#core.fetch(this.url, { method: this.method }); }
+
+  // Lifecycle (DOM-specific)
+  connectedCallback() { if (!this.manual && this.url) this.fetch(); }
+  disconnectedCallback() { this.#core.abort(); }
+}
+```
+
+This separation yields three practical benefits:
+
+1. **Testability** — The Core can be unit-tested in Node.js without jsdom or a browser. Instantiate it, call `fetch()`, and assert on events.
+2. **Reuse beyond the browser** — The same Core class can power a server-side process, a CLI tool, or a Cloudflare Worker, with `bind()` subscribing to its state just as a framework adapter would.
+3. **Shell minimality** — The Shell contains no business logic at all. It is purely a DOM integration surface, making it trivial to write and maintain.
+
 ### Conversion to a State Machine Subscription
 
 The core insight of this architecture is that async processing is converted into a subscription to a state machine. From the framework's perspective, properties like `values.loading` and `values.error` exposed by a component such as `<my-fetch>` are simply reactive values — there is no need to be aware that async processing is happening at all. Whether written in React or Vue, the code structure becomes nearly identical.
@@ -75,7 +148,7 @@ Each property descriptor requires only two fields: `name` (property name) and `e
 
 ### Zero Dependencies — Web Standards Only
 
-The protocol uses only two browser-native APIs: `static` class fields and `CustomEvent`. No build tools, no polyfills, no runtime libraries. Both are stable, long-standing Web standards, and a future in which `CustomEvent` is deprecated is difficult to imagine. This characteristic provides a strong answer to the question: "Will this still work in 10 years?"
+The protocol uses only standard APIs: `static` class fields, `EventTarget`, and `CustomEvent`. No build tools, no polyfills, no runtime libraries. All three are stable, long-standing Web standards available across browsers and server-side runtimes (Node.js, Deno, Cloudflare Workers). A future in which `EventTarget` or `CustomEvent` is deprecated is difficult to imagine. This characteristic provides a strong answer to the question: "Will this still work in 10 years?"
 
 ### Deliberate Scope Limitations
 
@@ -95,22 +168,24 @@ The core `bind()` function can be implemented in roughly 20 lines:
 ```javascript
 const DEFAULT_GETTER = (e) => e.detail;
 
-function bind(element, onUpdate) {
-  const { protocol, version, properties } = element.constructor.wcBindable;
+function bind(target, onUpdate) {
+  const { protocol, version, properties } = target.constructor.wcBindable;
   if (protocol !== "wc-bindable" || version !== 1) return;
 
   for (const prop of properties) {
     const getter = prop.getter ?? DEFAULT_GETTER;
-    element.addEventListener(prop.event, (event) => {
+    target.addEventListener(prop.event, (event) => {
       onUpdate(prop.name, getter(event));
     });
-    const current = element[prop.name];
+    const current = target[prop.name];
     if (current !== undefined) {
       onUpdate(prop.name, current);
     }
   }
 }
 ```
+
+Note that `bind()` accepts any `EventTarget` — it works with both the Shell (`HTMLElement`) via framework adapters and the Core (`EventTarget`) directly.
 
 Framework-specific adapters are also just a few dozen lines each. React's `useWcBindable`, Vue's `useWcBindable`, and Svelte's `use:wcBindable` are all thin wrappers around this core function.
 
@@ -148,7 +223,7 @@ By treating Web Components not as "visible UI parts" but as an "async service la
 
 What HAWC and wc-bindable-protocol provide is not a replacement for frameworks, but a structure that is free from framework dependency.
 
-A zero-dependency protocol design relying solely on Web standards, adapters that fit in a few dozen lines, and async processing encapsulated in headless Web Components — together, these form a practical and durable escape from frontend framework lock-in.
+A zero-dependency protocol design relying solely on Web standards, adapters that fit in a few dozen lines, and async processing encapsulated in headless Web Components — with the Core (EventTarget) crossing runtime boundaries and the Shell (HTMLElement) crossing framework boundaries — together, these form a practical and durable escape from frontend framework lock-in.
 
 ## Reference
 
