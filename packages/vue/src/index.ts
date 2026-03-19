@@ -16,7 +16,7 @@ export function useWcBindable<
     if (!el || !isWcBindable(el)) return;
 
     unbind = bind(el, (name, value) => {
-      values[name] = value;
+      (values as Record<string, unknown>)[name] = value;
     });
   });
 
@@ -24,5 +24,5 @@ export function useWcBindable<
     unbind?.();
   });
 
-  return { ref: templateRef, values };
+  return { ref: templateRef, values: values as V };
 }
