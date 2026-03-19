@@ -1,0 +1,35 @@
+{
+  "name": "@wc-bindable/preact",
+  "version": "0.2.0",
+  "description": "Preact adapter for wc-bindable protocol",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "@wc-bindable/core": "^0.2.0"
+  },
+  "peerDependencies": {
+    "preact": ">=10"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/user/wc-bindable-protocol.git",
+    "directory": "packages/preact"
+  },
+  "license": "MIT"
+}

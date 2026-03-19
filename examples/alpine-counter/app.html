@@ -1,0 +1,15 @@
+<!-- Setup -->
+<script type="module">
+  import Alpine from "alpinejs";
+  import wcBindable from "@wc-bindable/alpine";
+  import "./my-counter.js";
+
+  Alpine.plugin(wcBindable);
+  Alpine.start();
+</script>
+
+<!-- Usage: x-wc-bindable binds properties directly into x-data -->
+<div x-data="{ count: 0 }">
+  <my-counter x-wc-bindable></my-counter>
+  <pre x-text="JSON.stringify({ count }, null, 2)"></pre>
+</div>

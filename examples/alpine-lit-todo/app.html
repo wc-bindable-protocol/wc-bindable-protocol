@@ -1,0 +1,24 @@
+<!-- Setup -->
+<script type="module">
+  import Alpine from "alpinejs";
+  import wcBindable from "@wc-bindable/alpine";
+  import "./lit-todo.ts";
+
+  Alpine.plugin(wcBindable);
+  Alpine.start();
+</script>
+
+<!-- Usage: x-wc-bindable binds items/count directly into x-data -->
+<div x-data="{ items: [], count: null }">
+  <lit-todo x-wc-bindable></lit-todo>
+
+  <pre x-text="JSON.stringify({ items, count }, null, 2)"></pre>
+
+  <template x-if="items.length > 0">
+    <ul>
+      <template x-for="item in items">
+        <li x-text="item"></li>
+      </template>
+    </ul>
+  </template>
+</div>

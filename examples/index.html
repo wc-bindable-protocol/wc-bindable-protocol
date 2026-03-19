@@ -7,37 +7,112 @@
   <style>
     body {
       font-family: system-ui, sans-serif;
-      max-width: 600px;
+      max-width: 720px;
       margin: 60px auto;
       padding: 0 20px;
     }
     h1 { font-size: 1.6rem; }
-    ul { list-style: none; padding: 0; }
-    li { margin: 12px 0; }
-    a {
-      font-size: 1.1rem;
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 24px;
+    }
+    thead th {
+      text-align: left;
+      padding: 8px 12px;
+      border-bottom: 2px solid #e5e7eb;
+      color: #6b7280;
+      font-size: 0.85rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    tbody td {
+      padding: 0;
+      border-bottom: 1px solid #f3f4f6;
+    }
+    tbody td:first-child {
+      font-weight: 600;
+      padding: 10px 12px;
+      white-space: nowrap;
+      width: 1%;
+    }
+    tbody td a {
+      display: inline-block;
+      padding: 10px 12px;
       color: #2563eb;
       text-decoration: none;
-      padding: 8px 16px;
-      border: 1px solid #ddd;
-      border-radius: 8px;
-      display: inline-block;
+      border-radius: 4px;
     }
-    a:hover { background: #f0f7ff; }
+    tbody td a:hover {
+      background: #f0f7ff;
+    }
+    tbody tr:last-child td {
+      border-bottom: none;
+    }
   </style>
 </head>
 <body>
   <h1>wc-bindable Examples</h1>
-  <ul>
-    <li><a href="/vanilla/counter/index.html">Vanilla — Counter</a></li>
-    <li><a href="/vanilla/fetch/index.html">Vanilla — Fetch</a></li>
-    <li><a href="/react-counter/index.html">React — Counter</a></li>
-    <li><a href="/react-fetch/index.html">React — Fetch</a></li>
-    <li><a href="/vue-counter/index.html">Vue — Counter</a></li>
-    <li><a href="/vue-fetch/index.html">Vue — Fetch</a></li>
-    <li><a href="/vanilla/lit-todo/index.html">Vanilla — Lit Todo</a></li>
-    <li><a href="/react-lit-todo/index.html">React — Lit Todo</a></li>
-    <li><a href="/vue-lit-todo/index.html">Vue — Lit Todo</a></li>
-  </ul>
+  <table>
+    <thead>
+      <tr>
+        <th>Framework</th>
+        <th>Counter</th>
+        <th>Fetch</th>
+        <th>Lit Todo</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Vanilla JS</td>
+        <td><a href="/vanilla/counter/index.html">Counter</a></td>
+        <td><a href="/vanilla/fetch/index.html">Fetch</a></td>
+        <td><a href="/vanilla/lit-todo/index.html">Lit Todo</a></td>
+      </tr>
+      <tr>
+        <td>React</td>
+        <td><a href="/react-counter/index.html">Counter</a></td>
+        <td><a href="/react-fetch/index.html">Fetch</a></td>
+        <td><a href="/react-lit-todo/index.html">Lit Todo</a></td>
+      </tr>
+      <tr>
+        <td>Angular</td>
+        <td><a href="/angular-counter/index.html">Counter</a></td>
+        <td><a href="/angular-fetch/index.html">Fetch</a></td>
+        <td><a href="/angular-lit-todo/index.html">Lit Todo</a></td>
+      </tr>
+      <tr>
+        <td>Vue.js</td>
+        <td><a href="/vue-counter/index.html">Counter</a></td>
+        <td><a href="/vue-fetch/index.html">Fetch</a></td>
+        <td><a href="/vue-lit-todo/index.html">Lit Todo</a></td>
+      </tr>
+      <tr>
+        <td>Svelte</td>
+        <td><a href="/svelte-counter/index.html">Counter</a></td>
+        <td><a href="/svelte-fetch/index.html">Fetch</a></td>
+        <td><a href="/svelte-lit-todo/index.html">Lit Todo</a></td>
+      </tr>
+      <tr>
+        <td>Alpine.js</td>
+        <td><a href="/alpine-counter/index.html">Counter</a></td>
+        <td><a href="/alpine-fetch/index.html">Fetch</a></td>
+        <td><a href="/alpine-lit-todo/index.html">Lit Todo</a></td>
+      </tr>
+      <tr>
+        <td>Preact</td>
+        <td><a href="/preact-counter/index.html">Counter</a></td>
+        <td><a href="/preact-fetch/index.html">Fetch</a></td>
+        <td><a href="/preact-lit-todo/index.html">Lit Todo</a></td>
+      </tr>
+      <tr>
+        <td>SolidJS</td>
+        <td><a href="/solid-counter/index.html">Counter</a></td>
+        <td><a href="/solid-fetch/index.html">Fetch</a></td>
+        <td><a href="/solid-lit-todo/index.html">Lit Todo</a></td>
+      </tr>
+    </tbody>
+  </table>
 </body>
 </html>

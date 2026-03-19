@@ -3,6 +3,7 @@ import { ref as vueRef } from "vue";
 import { useWcBindable } from "../../packages/vue/src/index.ts";
 import type { MyFetchElement, MyFetchValues } from "../vanilla/fetch/types.ts";
 import "../vanilla/fetch/my-fetch.js";
+import appSource from "./App.vue?raw";
 
 const url = vueRef("https://jsonplaceholder.typicode.com/posts/1");
 const { ref: fetcherRef, values } = useWcBindable<MyFetchElement, MyFetchValues>();
@@ -66,5 +67,10 @@ function handleAbort() {
         values.value ? JSON.stringify(values.value, null, 2) : '— No response yet —'
       }}</pre>
     </div>
+
+    <details style="margin: 24px 0; padding: 16px; border: 1px solid #ddd; border-radius: 8px">
+      <summary style="font-weight: 600; margin-bottom: 8px; cursor: pointer">Source Code</summary>
+      <pre style="font-size: 13px; overflow: auto; margin: 8px 0 0; padding: 12px; background: #f8fafc; border-radius: 4px"><code>{{ appSource }}</code></pre>
+    </details>
   </div>
 </template>

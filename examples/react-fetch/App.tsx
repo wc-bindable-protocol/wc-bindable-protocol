@@ -1,26 +1,34 @@
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { useWcBindable } from "../../packages/react/src/index.ts";
 import type { MyFetchElement, MyFetchValues } from "../vanilla/fetch/types.ts";
 import "../vanilla/fetch/my-fetch.js";
+// @ts-expect-error vite raw import
+import appSource from "./App.tsx?raw";
+
+const section = { margin: "24px 0", padding: 16, border: "1px solid #ddd", borderRadius: 8 } as const;
+const label = { fontWeight: 600, marginBottom: 8 } as const;
 
 export function App() {
   const [url, setUrl] = useState("https://jsonplaceholder.typicode.com/posts/1");
-  const [ref, values] = useWcBindable<MyFetchElement, MyFetchValues>();
+  const [bindRef, values] = useWcBindable<MyFetchElement, MyFetchValues>();
+  const elRef = useRef<MyFetchElement | null>(null);
+
+  const ref = useCallback((node: MyFetchElement | null) => {
+    elRef.current = node;
+    bindRef(node);
+  }, [bindRef]);
 
   const handleFetch = useCallback(() => {
-    const el = ref.current;
+    const el = elRef.current;
     if (el) {
       el.url = url;
       el.fetch();
     }
-  }, [ref, url]);
+  }, [url]);
 
   const handleAbort = useCallback(() => {
-    ref.current?.abort();
-  }, [ref]);
-
-  const section = { margin: "24px 0", padding: 16, border: "1px solid #ddd", borderRadius: 8 } as const;
-  const label = { fontWeight: 600, marginBottom: 8 } as const;
+    elRef.current?.abort();
+  }, []);
 
   return (
     <div style={{ fontFamily: "system-ui, sans-serif", maxWidth: 700, margin: "40px auto", padding: "0 20px" }}>
@@ -71,6 +79,13 @@ export function App() {
           {values.value ? JSON.stringify(values.value, null, 2) : "— No response yet —"}
         </pre>
       </div>
+
+      <details style={section}>
+        <summary style={{ ...label, cursor: "pointer" }}>Source Code</summary>
+        <pre style={{ fontSize: 13, overflow: "auto", margin: "8px 0 0", padding: 12, background: "#f8fafc", borderRadius: 4 }}>
+          <code>{appSource}</code>
+        </pre>
+      </details>
     </div>
   );
 }

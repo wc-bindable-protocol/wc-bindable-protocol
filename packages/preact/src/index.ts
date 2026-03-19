@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback } from "preact/hooks";
 import { bind, isWcBindable } from "@wc-bindable/core";
 
 export function useWcBindable<

@@ -63,34 +63,11 @@
     <div id="log"></div>
   </div>
 
-  <script type="module">
-    import "./lit-todo.ts";
-    import { bind, isWcBindable } from "@wc-bindable/core";
+  <details class="section">
+    <summary class="label" style="cursor: pointer">Source Code (lit-todo.ts)</summary>
+    <pre style="font-size: 13px; overflow: auto; margin: 8px 0 0; padding: 12px; background: #f8fafc; border-radius: 4px"><code id="source-code"></code></pre>
+  </details>
 
-    const todo = document.getElementById("todo");
-    const boundValue = document.getElementById("bound-value");
-    const countBadge = document.getElementById("count-badge");
-    const log = document.getElementById("log");
-
-    const state = {};
-
-    const appendLog = (msg) => {
-      const entry = document.createElement("div");
-      entry.className = "log-entry";
-      entry.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
-      log.prepend(entry);
-    };
-
-    appendLog(`isWcBindable(todo) = ${isWcBindable(todo)}`);
-
-    const unbind = bind(todo, (name, value) => {
-      state[name] = value;
-      boundValue.textContent = JSON.stringify(state, null, 2);
-      if (name === "count") countBadge.textContent = String(value);
-      appendLog(`onUpdate("${name}", ${JSON.stringify(value)})`);
-    });
-
-    appendLog("bind() called — listening for changes");
-  </script>
+  <script type="module" src="./main.ts"></script>
 </body>
 </html>

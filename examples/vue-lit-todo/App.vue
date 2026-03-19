@@ -2,6 +2,7 @@
 import { useWcBindable } from "../../packages/vue/src/index.ts";
 import type { LitTodoElement, LitTodoValues } from "../vanilla/lit-todo/types.ts";
 import "../vanilla/lit-todo/lit-todo.ts";
+import appSource from "./App.vue?raw";
 
 const { ref: todoRef, values } = useWcBindable<LitTodoElement, LitTodoValues>();
 </script>
@@ -38,5 +39,10 @@ const { ref: todoRef, values } = useWcBindable<LitTodoElement, LitTodoValues>();
         <li v-for="(item, i) in values.items" :key="i">{{ item }}</li>
       </ul>
     </div>
+
+    <details style="margin: 24px 0; padding: 16px; border: 1px solid #ddd; border-radius: 8px">
+      <summary style="font-weight: 600; margin-bottom: 8px; cursor: pointer">Source Code</summary>
+      <pre style="font-size: 13px; overflow: auto; margin: 8px 0 0; padding: 12px; background: #f8fafc; border-radius: 4px"><code>{{ appSource }}</code></pre>
+    </details>
   </div>
 </template>
