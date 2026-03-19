@@ -12,7 +12,9 @@
       "Bash(npx vite:*)",
       "Bash(npm view:*)",
       "WebSearch",
-      "WebFetch(domain:alpinejs.dev)"
+      "WebFetch(domain:alpinejs.dev)",
+      "Bash(node --import tsx examples/node-fetch/main.mjs)",
+      "Bash(node examples/node-fetch/main.mjs)"
     ]
   }
 }
