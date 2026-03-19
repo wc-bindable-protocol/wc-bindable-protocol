@@ -9,7 +9,7 @@ export default defineConfig({
     vue({
       template: {
         compilerOptions: {
-          isCustomElement: (tag) => tag.startsWith("my-"),
+          isCustomElement: (tag) => tag.startsWith("my-") || tag.startsWith("lit-"),
         },
       },
     }),
@@ -32,6 +32,9 @@ export default defineConfig({
         reactFetch: path.resolve(__dirname, "react-fetch/index.html"),
         vueCounter: path.resolve(__dirname, "vue-counter/index.html"),
         vueFetch: path.resolve(__dirname, "vue-fetch/index.html"),
+        litTodo: path.resolve(__dirname, "vanilla/lit-todo/index.html"),
+        reactLitTodo: path.resolve(__dirname, "react-lit-todo/index.html"),
+        vueLitTodo: path.resolve(__dirname, "vue-lit-todo/index.html"),
       },
     },
   },

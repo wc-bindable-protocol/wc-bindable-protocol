@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /d/git/wc-bindable-protocol/wc-bindable-protocol -maxdepth 3 -type d ! -path */node_modules* ! -path */.git*)",
+      "Bash(npm install:*)",
+      "Bash(pkill -f \"vite --config examples/vite.config.ts\")",
+      "Bash(npx vitest:*)",
+      "Bash(xargs cat:*)"
+    ]
+  }
+}

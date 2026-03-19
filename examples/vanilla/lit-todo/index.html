@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>wc-bindable — Vanilla + Lit Todo</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 600px;
+      margin: 40px auto;
+      padding: 0 20px;
+    }
+    h1 { font-size: 1.4rem; }
+    .section {
+      margin: 24px 0;
+      padding: 16px;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+    }
+    .label { font-weight: 600; margin-bottom: 8px; }
+    #bound-value {
+      font-size: 14px;
+      color: #2563eb;
+    }
+    #log {
+      font-family: monospace;
+      font-size: 13px;
+      background: #f5f5f5;
+      padding: 12px;
+      border-radius: 4px;
+      max-height: 200px;
+      overflow-y: auto;
+    }
+    .log-entry { margin: 2px 0; }
+    .badge {
+      display: inline-block;
+      background: #2563eb;
+      color: white;
+      border-radius: 12px;
+      padding: 2px 10px;
+      font-size: 13px;
+      margin-left: 8px;
+    }
+  </style>
+</head>
+<body>
+  <p><a href="/index.html">&larr; Examples</a></p>
+  <h1>wc-bindable: Vanilla — Lit Todo</h1>
+
+  <div class="section">
+    <div class="label">Lit Todo Component <span class="badge" id="count-badge">0</span></div>
+    <lit-todo id="todo"></lit-todo>
+  </div>
+
+  <div class="section">
+    <div class="label">Bound Values (via core bind())</div>
+    <pre id="bound-value">—</pre>
+  </div>
+
+  <div class="section">
+    <div class="label">Event Log</div>
+    <div id="log"></div>
+  </div>
+
+  <script type="module">
+    import "./lit-todo.ts";
+    import { bind, isWcBindable } from "@wc-bindable/core";
+
+    const todo = document.getElementById("todo");
+    const boundValue = document.getElementById("bound-value");
+    const countBadge = document.getElementById("count-badge");
+    const log = document.getElementById("log");
+
+    const state = {};
+
+    const appendLog = (msg) => {
+      const entry = document.createElement("div");
+      entry.className = "log-entry";
+      entry.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+      log.prepend(entry);
+    };
+
+    appendLog(`isWcBindable(todo) = ${isWcBindable(todo)}`);
+
+    const unbind = bind(todo, (name, value) => {
+      state[name] = value;
+      boundValue.textContent = JSON.stringify(state, null, 2);
+      if (name === "count") countBadge.textContent = String(value);
+      appendLog(`onUpdate("${name}", ${JSON.stringify(value)})`);
+    });
+
+    appendLog("bind() called — listening for changes");
+  </script>
+</body>
+</html>
