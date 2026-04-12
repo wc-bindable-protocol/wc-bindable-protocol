@@ -1,0 +1,34 @@
+{
+  "name": "@wc-bindable/remote",
+  "version": "0.3.0",
+  "description": "Remote proxy for wc-bindable protocol — connect Core and Shell over a network",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test:coverage": "vitest run tests/index.test.ts --coverage --coverage.include=src/**/*.ts --coverage.exclude=src/types.ts --coverage.exclude=src/index.ts --coverage.exclude=src/transport/index.ts",
+    "test:integration": "playwright test"
+  },
+  "dependencies": {
+    "@wc-bindable/core": "^0.3.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wc-bindable-protocol/wc-bindable-protocol.git",
+    "directory": "packages/remote"
+  },
+  "license": "MIT"
+}

@@ -140,11 +140,19 @@ class MyFetch extends HTMLElement {
       { name: "error",   event: "my-fetch:error-changed" },
       { name: "status",  event: "my-fetch:status-changed" },
     ],
+    inputs: [
+      { name: "url", attribute: "url" },
+      { name: "method", attribute: "method" },
+    ],
+    commands: [
+      { name: "fetch", async: true },
+      { name: "abort" },
+    ],
   };
 }
 ```
 
-Each property descriptor requires only two fields: `name` (property name) and `event` (CustomEvent name). An optional `getter` function can customize how the event payload is extracted. Nothing more, nothing less.
+Each property descriptor requires only two fields: `name` (property name) and `event` (CustomEvent name). An optional `getter` function can customize how the event payload is extracted. Optionally, `inputs` and `commands` can declare the component's input interface — settable properties and callable methods. These declarations are purely descriptive and do not create automatic two-way synchronization; they exist to enable tooling, documentation generation, and remote proxying of components.
 
 ### Zero Dependencies — Web Standards Only
 
@@ -154,7 +162,7 @@ The protocol uses only standard APIs: `static` class fields, `EventTarget`, and 
 
 The protocol intentionally excludes the following from its scope:
 
-- Two-way binding (one-way only: component to framework)
+- Automatic two-way synchronization (the protocol can declare both outputs and inputs, but synchronization is always explicit — never implicit)
 - Form integration
 - SSR / hydration
 - Validation and schema enforcement
