@@ -7,7 +7,7 @@
 
 ## Overview
 
-`wc-bindable-protocol` is a minimal, framework-agnostic protocol that enables any class extending `EventTarget` to declare its reactive properties so that any reactivity system (React, Vue, Svelte, etc.) can bind to them without framework-specific coupling.
+`wc-bindable-protocol` is a minimal, framework-agnostic protocol that enables any class extending `EventTarget` to declare its reactive properties so that any reactivity system (React, Vue, Svelte, etc.) can bind to them without framework-specific coupling. Optionally, components can also declare their input properties and commands, providing a complete interface description that enables tooling, documentation generation, and remote proxying.
 
 The minimum requirement is `EventTarget` — any object that supports `addEventListener` and `dispatchEvent` can participate in the protocol. `HTMLElement` (a subclass of `EventTarget`) is the most common implementation target, as it enables DOM integration and framework binding via refs, but it is not required. This means the protocol works equally well in non-browser runtimes (Node.js, Deno, Cloudflare Workers, etc.) where `EventTarget` is available.
 
@@ -18,6 +18,7 @@ The protocol requires no dependencies and relies solely on standard APIs: `stati
 ## Goals
 
 - Allow any EventTarget-based class to declare bindable properties once
+- Optionally allow declaration of input properties and commands for a complete interface description
 - Allow any reactivity system to consume those declarations without prior knowledge of the component
 - Remain zero-dependency and runtime-only
 - Be simple enough to implement in tens of lines of code
@@ -39,11 +40,21 @@ class MyFetchCore extends EventTarget {
       { name: "value",   event: "my-fetch:value-changed" },
       { name: "loading", event: "my-fetch:loading-changed" },
     ],
+    inputs: [
+      { name: "url" },
+      { name: "method" },
+    ],
+    commands: [
+      { name: "fetch", async: true },
+      { name: "abort" },
+    ],
   };
 }
 ```
 
 This form works in any runtime that provides `EventTarget` and `CustomEvent` (browsers, Node.js, Deno, Cloudflare Workers, etc.).
+
+The `inputs` and `commands` fields are optional. When present, they declare the component's input interface — settable properties and callable methods — enabling tooling, documentation generation, and remote proxying. They do **not** create any implicit data flow; the consumer is responsible for explicitly setting properties and invoking methods.
 
 ### Web Component (HTMLElement)
 
@@ -63,11 +74,21 @@ class MyInput extends HTMLElement {
         getter: (e) => e.detail.checked,
       },
     ],
+    inputs: [
+      { name: "value", attribute: "value" },
+      { name: "placeholder", attribute: "placeholder" },
+    ],
+    commands: [
+      { name: "focus" },
+      { name: "clear" },
+    ],
   };
 }
 ```
 
 `HTMLElement` extends `EventTarget`, so Web Components are fully compatible. This form is required when the component needs to be mounted in the DOM and accessed via framework refs.
+
+When declaring inputs for a Shell (HTMLElement), the optional `attribute` field indicates the corresponding HTML attribute. This information can be used by tooling to map between property assignment and attribute reflection.
 
 ---
 
@@ -80,6 +101,8 @@ class MyInput extends HTMLElement {
 | `protocol`   | `string` | ✅       | Must be `"wc-bindable"`              |
 | `version`    | `number` | ✅       | Must be integer `1`                  |
 | `properties` | `array`  | ✅       | List of bindable property descriptors |
+| `inputs`     | `array`  | ❌       | List of input property descriptors    |
+| `commands`   | `array`  | ❌       | List of command descriptors           |
 
 ### Property Descriptor
 
@@ -88,6 +111,20 @@ class MyInput extends HTMLElement {
 | `name`   | `string`   | ✅       | The property name on the target                          |
 | `event`  | `string`   | ✅       | The CustomEvent name dispatched when the property changes |
 | `getter` | `function` | ❌       | Extracts the new value from the event. Defaults to `e => e.detail` |
+
+### Input Descriptor
+
+| Field       | Type     | Required | Description                                          |
+|-------------|----------|----------|------------------------------------------------------|
+| `name`      | `string` | ✅       | The settable property name on the target             |
+| `attribute` | `string` | ❌       | The corresponding HTML attribute name (Shell only)   |
+
+### Command Descriptor
+
+| Field   | Type      | Required | Description                                            |
+|---------|-----------|----------|--------------------------------------------------------|
+| `name`  | `string`  | ✅       | The method name on the target                          |
+| `async` | `boolean` | ❌       | Whether the method returns a Promise. Defaults to `false` |
 
 ---
 
@@ -251,7 +288,7 @@ When the type parameter is omitted, the values type defaults to `Record<string, 
 
 | Layer | Mechanism | Purpose |
 |-------|-----------|---------|
-| Runtime | `static wcBindable` + `CustomEvent` on `EventTarget` | Protocol detection, event binding |
+| Runtime | `static wcBindable` + `CustomEvent` on `EventTarget` | Protocol detection, event binding, input/command declaration |
 | Compile-time | `export interface ...Values` | Type-safe access to bound values |
 
 The type declaration is a **recommendation**, not a requirement. Components without type exports still work — consumers simply receive `unknown` values. The `import type` syntax ensures type declarations have zero runtime cost.
@@ -279,6 +316,9 @@ Functions (getters) cannot be expressed in JSON. A `static` field keeps everythi
 
 **Why EventTarget and not HTMLElement?**
 `EventTarget` is the minimal interface that provides `addEventListener` and `dispatchEvent`. By targeting `EventTarget`, the protocol works in non-browser runtimes (Node.js, Deno, Cloudflare Workers) and enables headless components that encapsulate business logic without any DOM dependency. `HTMLElement` is a subclass of `EventTarget`, so all Web Components are automatically compatible.
+
+**Why are `inputs` and `commands` optional?**
+The protocol's primary purpose is reactive property binding (`properties`). The `inputs` and `commands` fields are an opt-in extension for components that wish to declare their full interface — for example, to enable remote proxying, tooling, or documentation generation. Components that only need one-way state observation can omit them entirely. Importantly, these fields are purely declarative — they do not create any automatic two-way synchronization between the component and the framework.
 
 **Is this a W3C standard?**
 No. This is a community protocol. Any EventTarget-based class or framework can adopt it independently.

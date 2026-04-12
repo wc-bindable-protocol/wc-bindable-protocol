@@ -1,6 +1,6 @@
 # wc-bindable-protocol
 
-A minimal, framework-agnostic protocol that enables any Web Component to declare its reactive properties so that any reactivity system can bind to them without framework-specific coupling.
+A minimal, framework-agnostic protocol that enables any Web Component to declare its reactive properties — and optionally its input properties and commands — so that any reactivity system can bind to them without framework-specific coupling.
 
 No dependencies. Just `static` class fields and `CustomEvent`.
 
@@ -22,11 +22,17 @@ class MyInput extends HTMLElement {
     properties: [
       { name: "value", event: "my-input:value-changed" },
     ],
+    inputs: [
+      { name: "value", attribute: "value" },
+    ],
+    commands: [
+      { name: "focus" },
+    ],
   };
 }
 ```
 
-Any framework adapter can then automatically bind to those properties — no manual wiring needed.
+Any framework adapter can then automatically bind to those properties — no manual wiring needed. The optional `inputs` and `commands` fields declare the component's input interface for tooling, documentation, and remote proxying — they do not create automatic two-way synchronization.
 
 When the adapter binds to an element, it reads the current value of each declared property for initial synchronization, then listens for subsequent change events. This means your framework state is populated immediately, even if the component was initialized before binding.
 
@@ -34,7 +40,7 @@ When the adapter binds to an element, it reads the current value of each declare
 
 This protocol intentionally does **not** cover:
 
-- **Two-way binding** — The protocol is one-way (component to framework). Writing back to the component is left to the consumer via standard DOM property assignment.
+- **Automatic two-way synchronization** — The protocol can describe both outputs (`properties`) and inputs (`inputs`, `commands`), but it does not implement automatic synchronization between component and framework state. Setting input properties and invoking commands are always explicit actions by the consumer.
 - **Form integration** — Integration with form libraries or `FormData` is outside the scope.
 - **SSR / hydration** — The protocol operates at the DOM level and does not address server-side rendering or hydration strategies.
 - **Validation or schema enforcement** — Property values are passed as-is. Type checking or validation is the consumer's responsibility.

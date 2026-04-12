@@ -4,10 +4,22 @@ export interface WcBindableProperty {
   getter?: (event: Event) => unknown;
 }
 
+export interface WcBindableInput {
+  name: string;
+  attribute?: string;
+}
+
+export interface WcBindableCommand {
+  name: string;
+  async?: boolean;
+}
+
 export interface WcBindableDeclaration {
   protocol: "wc-bindable";
   version: 1;
   properties: WcBindableProperty[];
+  inputs?: WcBindableInput[];
+  commands?: WcBindableCommand[];
 }
 
 export type WcBindableConstructor = (new (...args: unknown[]) => EventTarget) & {
