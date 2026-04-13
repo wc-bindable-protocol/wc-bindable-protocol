@@ -55,7 +55,13 @@ function parseServerMessage(data: unknown): ServerMessage | null {
  */
 export class WebSocketClientTransport implements ClientTransport {
   private _ws: WebSocket;
-  private _buffer: ClientMessage[] | null;
+  // Buffer the already-serialized payload, not the raw message, so that a
+  // non-JSON-serializable value (BigInt, cyclic object, …) throws
+  // synchronously from send() and reaches the caller's try/catch. Buffering
+  // the raw message would defer JSON.stringify to the open handler, where
+  // the exception would escape as an unhandled event-listener error and the
+  // original send() call would already have returned successfully.
+  private _buffer: string[] | null;
   private _closed = false;
   private _disposed = false;
   private _warnedBinaryPayload = false;
@@ -83,8 +89,8 @@ export class WebSocketClientTransport implements ClientTransport {
         if (this._closed || this._buffer === null) return;
         const queued = this._buffer;
         this._buffer = null;
-        for (const msg of queued) {
-          ws.send(JSON.stringify(msg));
+        for (const payload of queued) {
+          ws.send(payload);
         }
       };
       ws.addEventListener("open", this._openListener, { once: true });
@@ -107,10 +113,11 @@ export class WebSocketClientTransport implements ClientTransport {
     if (this._closed) {
       throw new Error("WebSocketClientTransport: connection is closed");
     }
+    const payload = JSON.stringify(message);
     if (this._buffer !== null) {
-      this._buffer.push(message);
+      this._buffer.push(payload);
     } else {
-      this._ws.send(JSON.stringify(message));
+      this._ws.send(payload);
     }
   }
 

@@ -140,7 +140,11 @@ describe("WebSocketServerTransport", () => {
     warnSpy.mockRestore();
   });
 
-  it("ignores set messages that omit the value field", () => {
+  it("accepts set messages without a value field as an undefined assignment", () => {
+    // JSON.stringify drops `value: undefined`, so a client that calls
+    // `set(name, undefined)` emits a `set` message with no `value` key.
+    // The server must treat that as an undefined assignment rather than
+    // discarding the message.
     const listeners: Array<(data: unknown) => void> = [];
     const ws = {
       send: vi.fn(),
@@ -150,18 +154,11 @@ describe("WebSocketServerTransport", () => {
     };
     const transport = new WebSocketServerTransport(ws);
     const onMessage = vi.fn();
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
     transport.onMessage(onMessage);
     listeners[0](JSON.stringify({ type: "set", name: "url" }));
 
-    expect(onMessage).not.toHaveBeenCalled();
-    expect(warnSpy).toHaveBeenCalledWith(
-      "WebSocketServerTransport: ignoring invalid client message",
-      expect.any(Error),
-    );
-
-    warnSpy.mockRestore();
+    expect(onMessage).toHaveBeenCalledWith({ type: "set", name: "url" });
   });
 
   it("does nothing when no message subscription API is available", () => {

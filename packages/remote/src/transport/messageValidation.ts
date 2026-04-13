@@ -21,9 +21,12 @@ export function isClientMessage(value: unknown): value is ClientMessage {
     case "sync":
       return true;
     case "set":
+      // The `value` key is optional on the wire: JSON.stringify drops
+      // `value: undefined`, so an absent key is the only way to transport an
+      // undefined assignment. Reading `msg.value` yields `undefined` in that
+      // case, matching the sender's intent.
       return (
         typeof value.name === "string" &&
-        Object.prototype.hasOwnProperty.call(value, "value") &&
         (value.id === undefined || typeof value.id === "string")
       );
     case "cmd":
@@ -46,7 +49,9 @@ export function isServerMessage(value: unknown): value is ServerMessage {
     case "sync":
       return isServerSyncValues(value.values);
     case "update":
-      return typeof value.name === "string" && Object.prototype.hasOwnProperty.call(value, "value");
+      // See note on "set": an absent `value` key represents an undefined
+      // update, since JSON.stringify cannot transmit `value: undefined`.
+      return typeof value.name === "string";
     case "return":
     case "throw":
       return typeof value.id === "string";

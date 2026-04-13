@@ -20,6 +20,25 @@ describe("WebSocketClientTransport", () => {
     ]);
   });
 
+  it("throws synchronously from send() when the message is not JSON-serializable, even while buffering", () => {
+    // A non-JSON value (BigInt) must surface as a synchronous send() failure
+    // while the socket is still CONNECTING. Deferring JSON.stringify to the
+    // open flush would let the exception escape into an event listener and
+    // the caller's try/catch (and RemoteCoreProxy's pending reject) would be
+    // skipped.
+    const ws = new MockBrowserWebSocket(WebSocket.CONNECTING);
+    const transport = new WebSocketClientTransport(ws as unknown as WebSocket);
+
+    expect(() =>
+      transport.send({ type: "set", name: "value", value: 1n }),
+    ).toThrow(TypeError);
+
+    // The failed message must not be retained in the buffer — otherwise the
+    // same exception would re-throw during the open flush.
+    ws.emit("open");
+    expect(ws.sent).toEqual([]);
+  });
+
   it("sends immediately when the socket is already open", () => {
     const ws = new MockBrowserWebSocket(WebSocket.OPEN);
     const transport = new WebSocketClientTransport(ws as unknown as WebSocket);
@@ -108,22 +127,19 @@ describe("WebSocketClientTransport", () => {
     warnSpy.mockRestore();
   });
 
-  it("ignores update messages that omit the value field", () => {
+  it("accepts update messages without a value field as an undefined update", () => {
+    // JSON.stringify drops `value: undefined`, so the server emits an
+    // update with no `value` key when reverting a property to undefined.
+    // The client must treat that as an undefined update rather than
+    // discarding the message.
     const ws = new MockBrowserWebSocket(WebSocket.OPEN);
     const transport = new WebSocketClientTransport(ws as unknown as WebSocket);
     const onMessage = vi.fn();
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
     transport.onMessage(onMessage);
     ws.emit("message", { data: JSON.stringify({ type: "update", name: "value" }) });
 
-    expect(onMessage).not.toHaveBeenCalled();
-    expect(warnSpy).toHaveBeenCalledWith(
-      "WebSocketClientTransport: ignoring invalid server message",
-      expect.any(Error),
-    );
-
-    warnSpy.mockRestore();
+    expect(onMessage).toHaveBeenCalledWith({ type: "update", name: "value" });
   });
 
   it("warns once when binary payloads are received", () => {
