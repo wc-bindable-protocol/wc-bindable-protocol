@@ -19,7 +19,7 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "test:coverage": "vitest run tests/index.test.ts --coverage --coverage.include=src/**/*.ts --coverage.exclude=src/types.ts --coverage.exclude=src/index.ts --coverage.exclude=src/transport/index.ts",
+    "test:coverage": "vitest run tests --coverage --coverage.include=src/**/*.ts --coverage.exclude=src/types.ts --coverage.exclude=src/index.ts --coverage.exclude=src/transport/index.ts",
     "test:integration": "playwright test"
   },
   "dependencies": {
