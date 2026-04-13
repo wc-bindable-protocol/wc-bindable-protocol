@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>hawc-ai Remote E2E Test</title>
+  <script type="importmap">
+    {
+      "imports": {
+        "@wc-bindable/core": "/packages/core/dist/index.js",
+        "@wc-bindable/remote": "/packages/remote/dist/index.js",
+        "./RemoteCoreProxy.js": "/packages/remote/dist/RemoteCoreProxy.js",
+        "./RemoteShellProxy.js": "/packages/remote/dist/RemoteShellProxy.js",
+        "./types.js": "/packages/remote/dist/types.js",
+        "./transport/index.js": "/packages/remote/dist/transport/index.js",
+        "./transport/WebSocketClientTransport.js": "/packages/remote/dist/transport/WebSocketClientTransport.js",
+        "./transport/WebSocketServerTransport.js": "/packages/remote/dist/transport/WebSocketServerTransport.js",
+        "./transport/messageValidation.js": "/packages/remote/dist/transport/messageValidation.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="status">connecting</div>
+  <div id="results"></div>
+
+  <script type="module">
+    import { bind } from "@wc-bindable/core";
+    import { createRemoteCoreProxy, WebSocketClientTransport } from "@wc-bindable/remote";
+
+    // AiCore's wcBindable declaration (must match server-side AiCore)
+    const declaration = {
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [
+        { name: "content",   event: "hawc-ai:content-changed" },
+        { name: "messages",  event: "hawc-ai:messages-changed" },
+        { name: "usage",     event: "hawc-ai:usage-changed" },
+        { name: "loading",   event: "hawc-ai:loading-changed" },
+        { name: "streaming", event: "hawc-ai:streaming-changed" },
+        { name: "error",     event: "hawc-ai:error" },
+      ],
+      inputs: [
+        { name: "provider" },
+        { name: "messages" },
+      ],
+      commands: [
+        { name: "send", async: true },
+        { name: "abort" },
+      ],
+    };
+
+    const results = {};
+    const log = (key, value) => {
+      results[key] = value;
+      document.getElementById("results").textContent = JSON.stringify(results);
+    };
+
+    try {
+      const ws = new WebSocket(`ws://${location.host}`);
+      const transport = new WebSocketClientTransport(ws);
+      const proxy = createRemoteCoreProxy(declaration, transport);
+
+      // Collect all bind() updates
+      const updates = [];
+      bind(proxy, (name, value) => {
+        updates.push({ name, value: JSON.parse(JSON.stringify(value ?? null)) });
+        log("updates", updates);
+      });
+
+      // Wait for sync
+      await new Promise((r) => setTimeout(r, 300));
+      log("syncReceived", updates.length > 0);
+
+      // --- Test 1: Non-streaming send ---
+      const nonStreamResult = await proxy.invoke("send", "Hello", {
+        model: "gpt-4o",
+        stream: false,
+        baseUrl: `http://${location.host}/api/ai`,
+      });
+      log("nonStreamResult", nonStreamResult);
+      log("contentAfterNonStream", proxy.content);
+      log("messagesAfterNonStream", proxy.messages);
+      log("usageAfterNonStream", proxy.usage);
+      log("loadingAfterNonStream", proxy.loading);
+
+      // --- Test 2: Streaming send ---
+      const streamResult = await proxy.invoke("send", "World", {
+        model: "gpt-4o",
+        stream: true,
+        baseUrl: `http://${location.host}/api/ai`,
+      });
+      log("streamResult", streamResult);
+      log("contentAfterStream", proxy.content);
+
+      // --- Test 3: History accumulation ---
+      log("messagesCount", proxy.messages?.length ?? 0);
+
+      // --- Test 4: History reset ---
+      proxy.set("messages", []);
+      await new Promise((r) => setTimeout(r, 200));
+      log("messagesAfterReset", proxy.messages);
+
+      // --- Test 5: Error handling ---
+      const errorResult = await proxy.invoke("send", "Fail", {
+        model: "gpt-4o",
+        stream: false,
+        baseUrl: `http://${location.host}/api/ai/error`,
+      });
+      log("errorResult", errorResult);
+      log("errorState", proxy.error);
+
+      document.getElementById("status").textContent = "done";
+    } catch (err) {
+      log("error", err.message);
+      document.getElementById("status").textContent = "error";
+    }
+  </script>
+</body>
+</html>
