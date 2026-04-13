@@ -36,6 +36,7 @@ export class RemoteCoreProxy extends EventTarget {
   private _transport: ClientTransport | null = null;
   private _eventsByName: Map<string, string>;
   private _inputs: Set<string>;
+  private _commands: Set<string>;
   private _values: Record<string, unknown> = {};
   private _pending: Map<string, {
     resolve: (v: unknown) => void;
@@ -51,6 +52,7 @@ export class RemoteCoreProxy extends EventTarget {
     super();
     this._eventsByName = new Map(declaration.properties.map((prop) => [prop.name, prop.event]));
     this._inputs = new Set((declaration.inputs ?? []).map((input) => input.name));
+    this._commands = new Set((declaration.commands ?? []).map((command) => command.name));
 
     this._attachTransport(transport);
   }
@@ -107,6 +109,11 @@ export class RemoteCoreProxy extends EventTarget {
   }
 
   private _invoke(name: string, args: unknown[], options?: RemoteInvokeOptions): Promise<unknown> {
+    if (!this._commands.has(name)) {
+      return Promise.reject(
+        new Error(`RemoteCoreProxy: command "${name}" is not declared in wcBindable.commands`),
+      );
+    }
     const transport = this._transport;
     if (this._disposedError) {
       return Promise.reject(this._disposedError);
@@ -405,6 +412,23 @@ const handler: ProxyHandler<RemoteCoreProxy> = {
 /** Synthetic event-name prefix used by proxy declarations. */
 const PROXY_EVENT_PREFIX = "@wc-bindable/remote:";
 
+// Names that, if used as a declared property, would be shadowed by the cache
+// before the get trap falls through to the real target member — breaking the
+// EventTarget contract (addEventListener/dispatchEvent) or the protocol entry
+// point (constructor.wcBindable read by isWcBindable/bind).
+const RESERVED_PROPERTY_NAMES: ReadonlySet<string> = (() => {
+  const names = new Set<string>(["constructor"]);
+  let proto: object | null = RemoteCoreProxy.prototype;
+  while (proto && proto !== Object.prototype) {
+    for (const name of Object.getOwnPropertyNames(proto)) {
+      if (name === "constructor" || name.startsWith("_")) continue;
+      names.add(name);
+    }
+    proto = Object.getPrototypeOf(proto);
+  }
+  return names;
+})();
+
 /**
  * Create a RemoteCoreProxy with an isolated `constructor.wcBindable`.
  *
@@ -427,6 +451,14 @@ export function createRemoteCoreProxy(
   declaration: WcBindableDeclaration,
   transport: ClientTransport,
 ): RemoteCoreProxy {
+  for (const p of declaration.properties) {
+    if (RESERVED_PROPERTY_NAMES.has(p.name)) {
+      throw new Error(
+        `RemoteCoreProxy: property name "${p.name}" collides with a reserved EventTarget/proxy member and would break bind()/isWcBindable()`,
+      );
+    }
+  }
+
   // Create a unique subclass per declaration so that
   // constructor.wcBindable is isolated per proxy instance.
   const proxyProperties = declaration.properties.map((p) => ({

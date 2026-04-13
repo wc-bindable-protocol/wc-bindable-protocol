@@ -228,6 +228,47 @@ describe("RemoteCoreProxy", () => {
     );
   });
 
+  it("validates command name on invoke() and rejects without sending", async () => {
+    const send = vi.fn();
+    const client: ClientTransport = {
+      send,
+      onMessage: () => {},
+    };
+
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+
+    await expect(proxy.invoke("missingCommand")).rejects.toThrow(
+      'RemoteCoreProxy: command "missingCommand" is not declared in wcBindable.commands',
+    );
+    // the only send() that happened is the initial "sync"
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0][0]).toEqual({ type: "sync" });
+  });
+
+  it("validates command name on invoke() even after transport close or dispose", async () => {
+    let closeHandler: (() => void) | null = null;
+    const client: ClientTransport = {
+      send: () => {},
+      onMessage: () => {},
+      onClose: (h) => { closeHandler = h; },
+    };
+
+    const closedProxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+    closeHandler!();
+    await expect(closedProxy.invoke("typo")).rejects.toThrow(
+      'RemoteCoreProxy: command "typo" is not declared in wcBindable.commands',
+    );
+
+    const disposedProxy = createRemoteCoreProxy(TestCore.wcBindable, {
+      send: () => {},
+      onMessage: () => {},
+    });
+    disposedProxy.dispose();
+    await expect(disposedProxy.invoke("typo")).rejects.toThrow(
+      'RemoteCoreProxy: command "typo" is not declared in wcBindable.commands',
+    );
+  });
+
   it("forwards direct assignment for declared inputs as a set message", () => {
     const send = vi.fn();
     const client: ClientTransport = {
@@ -794,6 +835,21 @@ describe("RemoteCoreProxy", () => {
     );
 
     warnSpy.mockRestore();
+  });
+
+  it("rejects declarations whose property names collide with EventTarget/proxy members", () => {
+    const { client } = createSyncTransportPair();
+    const makeDecl = (name: string): WcBindableDeclaration => ({
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [{ name, event: "t:x" }],
+    });
+
+    for (const reserved of ["addEventListener", "removeEventListener", "dispatchEvent", "constructor"]) {
+      expect(() => createRemoteCoreProxy(makeDecl(reserved), client)).toThrow(
+        /collides with a reserved/,
+      );
+    }
   });
 
   it("binds native EventTarget methods to the real target", () => {
