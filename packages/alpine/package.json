@@ -1,6 +1,6 @@
 {
   "name": "@wc-bindable/alpine",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Alpine.js plugin adapter for wc-bindable protocol",
   "type": "module",
   "main": "dist/index.js",
@@ -21,7 +21,7 @@
     "dev": "tsc --watch"
   },
   "dependencies": {
-    "@wc-bindable/core": "^0.3.0"
+    "@wc-bindable/core": "^0.4.0"
   },
   "peerDependencies": {
     "alpinejs": ">=3"

@@ -1,6 +1,6 @@
 {
   "name": "@wc-bindable/react",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "React adapter for wc-bindable protocol",
   "type": "module",
   "main": "dist/index.js",
@@ -21,7 +21,7 @@
     "dev": "tsc --watch"
   },
   "dependencies": {
-    "@wc-bindable/core": "^0.3.0"
+    "@wc-bindable/core": "^0.4.0"
   },
   "peerDependencies": {
     "react": ">=18"

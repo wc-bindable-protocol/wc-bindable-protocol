@@ -1,6 +1,6 @@
 {
   "name": "@wc-bindable/remote",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Remote proxy for wc-bindable protocol — connect Core and Shell over a network",
   "type": "module",
   "main": "dist/index.js",
@@ -23,7 +23,7 @@
     "test:integration": "playwright test"
   },
   "dependencies": {
-    "@wc-bindable/core": "^0.3.0"
+    "@wc-bindable/core": "^0.4.0"
   },
   "repository": {
     "type": "git",
