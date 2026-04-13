@@ -1,5 +1,39 @@
-import { bind, type WcBindableDeclaration, type UnbindFn } from "@wc-bindable/core";
-import type { ServerTransport, ClientMessage } from "./types.js";
+import type { WcBindableDeclaration, UnbindFn } from "@wc-bindable/core";
+import type { ServerTransport, ClientMessage, ServerMessage, RemoteSerializedError } from "./types.js";
+
+const DEFAULT_GETTER = (event: Event): unknown => (event as CustomEvent).detail;
+
+function createRemoteShellProxyError(message: string): RemoteSerializedError {
+  return {
+    name: "RemoteShellProxyError",
+    message,
+  };
+}
+
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+  return (
+    value !== null &&
+    (typeof value === "object" || typeof value === "function") &&
+    typeof (value as { then?: unknown }).then === "function"
+  );
+}
+
+function serializeThrownError(error: unknown): unknown {
+  if (!(error instanceof Error)) {
+    return error;
+  }
+
+  const serialized: RemoteSerializedError = {
+    name: error.name,
+    message: error.message,
+  };
+
+  if (typeof error.stack === "string") {
+    serialized.stack = error.stack;
+  }
+
+  return serialized;
+}
 
 /**
  * Server-side proxy that sits between the real Core and the network.
@@ -13,7 +47,7 @@ import type { ServerTransport, ClientMessage } from "./types.js";
  *   const core = new MyFetchCore();
  *   const shell = new RemoteShellProxy(core, transport);
  *   // Now the client's RemoteCoreProxy can interact with this Core.
- *   // Call shell.dispose() to clean up when the connection closes.
+ *   // If the transport exposes onClose(), cleanup is automatic.
  */
 export class RemoteShellProxy {
   private _core: EventTarget;
@@ -23,6 +57,8 @@ export class RemoteShellProxy {
   private _allowedCommands: Set<string>;
   private _unbind: UnbindFn;
   private _disposed = false;
+  private _isBuildingSyncSnapshot = false;
+  private _queuedSyncUpdates: Array<{ message: ServerMessage; context: string }> = [];
 
   constructor(core: EventTarget, transport: ServerTransport) {
     this._core = core;
@@ -36,27 +72,15 @@ export class RemoteShellProxy {
     this._allowedInputs = new Set((this._declaration.inputs ?? []).map((i) => i.name));
     this._allowedCommands = new Set((this._declaration.commands ?? []).map((c) => c.name));
 
-    // Subscribe to Core events via bind().
-    // Skip initial values here — they are sent on "sync" request instead.
-    // bind() fires initial values synchronously, so we flag them to ignore.
-    // If bind() synchronously triggers real Core events through some side
-    // effect, they are intentionally suppressed here as well: the following
-    // sync response reads the latest property values and becomes the single
-    // source of truth for that initialization window.
-    // Forwarding is property-centric (not event-centric): when two properties
-    // share an event and differ only by getter (e.g. value/status on the same
-    // response event), bind() invokes this callback once per property with
-    // its getter-applied value. Sending { name, value } preserves that
-    // distinction — sending by event would collapse them.
-    let initializing = true;
-    this._unbind = bind(core, (name, value) => {
-      if (initializing) return;
-      transport.send({ type: "update", name, value });
-    });
-    initializing = false;
+    // Subscribe directly to Core events.
+    // Unlike bind(), this does not read current property values during
+    // construction, so sync remains the single source of initial state and
+    // throwing getters cannot break proxy construction.
+    this._unbind = this._subscribeToCoreEvents();
 
     // Listen for client messages.
     transport.onMessage((msg) => this._handleMessage(msg));
+    transport.onClose?.(() => this.dispose());
   }
 
   /** Read current values of all declared properties from the Core. */
@@ -64,12 +88,85 @@ export class RemoteShellProxy {
     const values: Record<string, unknown> = {};
     const coreRecord = this._core as unknown as Record<string, unknown>;
     for (const prop of this._declaration.properties) {
-      const v = coreRecord[prop.name];
-      if (v !== undefined) {
-        values[prop.name] = v;
+      try {
+        const v = coreRecord[prop.name];
+        if (v !== undefined) {
+          values[prop.name] = v;
+        }
+      } catch (err) {
+        console.error(
+          `RemoteShellProxy: getter for "${prop.name}" threw during sync:`,
+          err,
+        );
       }
     }
     return values;
+  }
+
+  private _subscribeToCoreEvents(): UnbindFn {
+    const cleanups: Array<() => void> = [];
+
+    for (const prop of this._declaration.properties) {
+      const getter = prop.getter ?? DEFAULT_GETTER;
+      const handler = (event: Event) => {
+        try {
+          const value = getter(event);
+          const message: ServerMessage = { type: "update", name: prop.name, value };
+          if (this._isBuildingSyncSnapshot) {
+            this._queuedSyncUpdates.push({
+              message,
+              context: `update for "${prop.name}"`,
+            });
+            return;
+          }
+
+          this._safeSend(message, `update for "${prop.name}"`);
+        } catch (err) {
+          console.error(
+            `RemoteShellProxy: getter for "${prop.name}" threw during update:`,
+            err,
+          );
+        }
+      };
+
+      this._core.addEventListener(prop.event, handler);
+      cleanups.push(() => this._core.removeEventListener(prop.event, handler));
+    }
+
+    return () => cleanups.forEach((cleanup) => cleanup());
+  }
+
+  private _safeSend(message: ServerMessage, context: string): boolean {
+    if (this._disposed) return false;
+    try {
+      this._transport.send(message);
+      return true;
+    } catch (err) {
+      console.error(`RemoteShellProxy: failed to send ${context}:`, err);
+      return false;
+    }
+  }
+
+  private _sendSyncResponse(): void {
+    this._isBuildingSyncSnapshot = true;
+
+    try {
+      const values = this._readCurrentValues();
+      const sent = this._safeSend({ type: "sync", values }, "sync response");
+      if (!sent) {
+        this._queuedSyncUpdates = [];
+        return;
+      }
+
+      const queuedUpdates = this._queuedSyncUpdates;
+      this._queuedSyncUpdates = [];
+      for (const queued of queuedUpdates) {
+        this._safeSend(queued.message, queued.context);
+      }
+    } finally {
+      this._isBuildingSyncSnapshot = false;
+      this._queuedSyncUpdates = [];
+    }
   }
 
   private _handleMessage(msg: ClientMessage): void {
@@ -80,20 +177,42 @@ export class RemoteShellProxy {
     if (this._disposed) return;
     switch (msg.type) {
       case "sync": {
-        this._transport.send({ type: "sync", values: this._readCurrentValues() });
+        this._sendSyncResponse();
         break;
       }
       case "set": {
-        if (!this._allowedInputs.has(msg.name)) return;
-        // Isolate setter exceptions so a throwing setter (validation,
-        // read-only property, type-conversion failure, etc.) does not
-        // escape the transport's message handler and kill the connection.
-        // `set` is fire-and-forget — there is no response id to surface
-        // the error to the client. Applications that need feedback should
-        // model the mutation as a command instead.
+        if (!this._allowedInputs.has(msg.name)) {
+          if (msg.id) {
+            this._safeSend({
+              type: "throw",
+              id: msg.id,
+              error: createRemoteShellProxyError(
+                `Input "${msg.name}" is not declared in wcBindable.inputs`,
+              ),
+            }, `throw response for input "${msg.name}"`);
+            return;
+          }
+
+          console.warn(
+            `RemoteShellProxy: ignored set for undeclared input "${msg.name}"`,
+          );
+          return;
+        }
         try {
           (this._core as unknown as Record<string, unknown>)[msg.name] = msg.value;
+          if (msg.id) {
+            this._safeSend({ type: "return", id: msg.id, value: undefined }, `return response for input "${msg.name}"`);
+          }
         } catch (err) {
+          if (msg.id) {
+            this._safeSend({
+              type: "throw",
+              id: msg.id,
+              error: serializeThrownError(err),
+            }, `throw response for input "${msg.name}"`);
+            return;
+          }
+
           console.error(
             `RemoteShellProxy: setter for "${msg.name}" threw:`,
             err,
@@ -103,47 +222,53 @@ export class RemoteShellProxy {
       }
       case "cmd": {
         if (!this._allowedCommands.has(msg.name)) {
-          this._transport.send({
+          this._safeSend({
             type: "throw",
             id: msg.id,
-            error: `Command "${msg.name}" is not declared in wcBindable.commands`,
-          });
+            error: createRemoteShellProxyError(
+              `Command "${msg.name}" is not declared in wcBindable.commands`,
+            ),
+          }, `throw response for command "${msg.name}"`);
           return;
         }
         const method = (this._core as unknown as Record<string, (...args: unknown[]) => unknown>)[msg.name];
         if (typeof method !== "function") {
-          this._transport.send({
+          this._safeSend({
             type: "throw",
             id: msg.id,
-            error: `Method "${msg.name}" not found on Core`,
-          });
+            error: createRemoteShellProxyError(`Method "${msg.name}" not found on Core`),
+          }, `throw response for command "${msg.name}"`);
           return;
         }
         try {
           const result = method.call(this._core, ...msg.args);
-          if (result instanceof Promise) {
-            result
+          // Use thenable detection instead of `instanceof Promise` so
+          // cross-realm Promises and user-land thenables are awaited
+          // correctly. Promise.resolve adopts the thenable's state and
+          // yields a well-behaved native Promise for the continuation.
+          if (isThenable(result)) {
+            Promise.resolve(result)
               .then((value) => {
                 if (this._disposed) return;
-                this._transport.send({ type: "return", id: msg.id, value });
+                this._safeSend({ type: "return", id: msg.id, value }, `return response for command "${msg.name}"`);
               })
               .catch((err) => {
                 if (this._disposed) return;
-                this._transport.send({
+                this._safeSend({
                   type: "throw",
                   id: msg.id,
-                  error: err instanceof Error ? err.message : err,
-                });
+                  error: serializeThrownError(err),
+                }, `throw response for command "${msg.name}"`);
               });
           } else {
-            this._transport.send({ type: "return", id: msg.id, value: result });
+            this._safeSend({ type: "return", id: msg.id, value: result }, `return response for command "${msg.name}"`);
           }
         } catch (err) {
-          this._transport.send({
+          this._safeSend({
             type: "throw",
             id: msg.id,
-            error: err instanceof Error ? err.message : err,
-          });
+            error: serializeThrownError(err),
+          }, `throw response for command "${msg.name}"`);
         }
         break;
       }

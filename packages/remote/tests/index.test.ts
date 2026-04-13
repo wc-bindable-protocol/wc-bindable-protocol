@@ -147,6 +147,21 @@ class MockBrowserWebSocket {
     this._listeners.set(type, entries);
   }
 
+  removeEventListener(type: string, listener: (event?: unknown) => void): void {
+    const entries = this._listeners.get(type) ?? [];
+    const kept = entries.filter((entry) => entry.listener !== listener);
+
+    if (kept.length > 0) {
+      this._listeners.set(type, kept);
+    } else {
+      this._listeners.delete(type);
+    }
+  }
+
+  listenerCount(type: string): number {
+    return (this._listeners.get(type) ?? []).length;
+  }
+
   emit(type: string, event?: unknown): void {
     const entries = [...(this._listeners.get(type) ?? [])];
     const kept: Array<{ listener: (event?: unknown) => void; once: boolean }> = [];
@@ -297,6 +312,135 @@ describe("RemoteCoreProxy", () => {
     expect(send).toHaveBeenCalledWith({ type: "set", name: "url", value: "/api/data" });
   });
 
+  it("setWithAck() sends a set message with an id and resolves on return", async () => {
+    const send = vi.fn();
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const client: ClientTransport = {
+      send,
+      onMessage: (h) => { handler = h; },
+    };
+
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+    const pending = proxy.setWithAck("url", "/api/ack");
+
+    expect(send).toHaveBeenLastCalledWith({
+      type: "set",
+      name: "url",
+      value: "/api/ack",
+      id: expect.any(String),
+    });
+
+    const requestId = send.mock.calls.at(-1)?.[0]?.id as string;
+    handler!({ type: "return", id: requestId, value: undefined });
+
+    await expect(pending).resolves.toBeUndefined();
+  });
+
+  it("setWithAck() rejects on throw response", async () => {
+    const send = vi.fn();
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const client: ClientTransport = {
+      send,
+      onMessage: (h) => { handler = h; },
+    };
+
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+    const pending = proxy.setWithAck("url", 123);
+    const requestId = send.mock.calls.at(-1)?.[0]?.id as string;
+
+    handler!({
+      type: "throw",
+      id: requestId,
+      error: { name: "TypeError", message: "invalid url" },
+    });
+
+    await expect(pending).rejects.toEqual({ name: "TypeError", message: "invalid url" });
+  });
+
+  it("throws on set() for undeclared inputs without sending", () => {
+    const send = vi.fn();
+    const client: ClientTransport = {
+      send,
+      onMessage: () => {},
+    };
+
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+
+    expect(() => proxy.set("value", "nope")).toThrow(
+      'RemoteCoreProxy: input "value" is not declared in wcBindable.inputs',
+    );
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it("validates input name on set() even after transport close or dispose", () => {
+    let closeHandler: (() => void) | null = null;
+    const client: ClientTransport = {
+      send: () => {},
+      onMessage: () => {},
+      onClose: (h) => { closeHandler = h; },
+    };
+
+    const closedProxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+    closeHandler!();
+    expect(() => closedProxy.set("typo", "nope")).toThrow(
+      'RemoteCoreProxy: input "typo" is not declared in wcBindable.inputs',
+    );
+
+    const disposedProxy = createRemoteCoreProxy(TestCore.wcBindable, {
+      send: () => {},
+      onMessage: () => {},
+    });
+    disposedProxy.dispose();
+    expect(() => disposedProxy.set("typo", "nope")).toThrow(
+      'RemoteCoreProxy: input "typo" is not declared in wcBindable.inputs',
+    );
+  });
+
+  it("forwards direct assignment for declared inputs as a set message", () => {
+    const send = vi.fn();
+    const client: ClientTransport = {
+      send,
+      onMessage: () => {},
+    };
+
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client) as RemoteCoreProxy & { url: string };
+    proxy.url = "/api/direct";
+
+    expect(send).toHaveBeenCalledWith({ type: "set", name: "url", value: "/api/direct" });
+  });
+
+  it("throws on direct assignment to undeclared properties", () => {
+    const client: ClientTransport = {
+      send: () => {},
+      onMessage: () => {},
+    };
+
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client) as RemoteCoreProxy & { value: unknown };
+
+    expect(() => {
+      proxy.value = "local";
+    }).toThrow('RemoteCoreProxy: cannot assign to undeclared property "value"');
+  });
+
+  it("rejects assignment to declared properties that collide with inherited members", () => {
+    const declWithCollision: WcBindableDeclaration = {
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [{ name: "toString", event: "test:to-string" }],
+    };
+
+    const client: ClientTransport = {
+      send: () => {},
+      onMessage: () => {},
+    };
+
+    const proxy = createRemoteCoreProxy(declWithCollision, client) as RemoteCoreProxy & { toString: unknown };
+
+    expect(() => {
+      proxy.toString = "local";
+    }).toThrow('RemoteCoreProxy: cannot assign to undeclared property "toString"');
+  });
+
   it("forwards invoke() as a cmd message and resolves on return", async () => {
     let handler: ((msg: ServerMessage) => void) | null = null;
     const send = vi.fn();
@@ -317,6 +461,29 @@ describe("RemoteCoreProxy", () => {
     expect(send).toHaveBeenCalledWith(
       expect.objectContaining({ type: "cmd", name: "doFetch", args: [] }),
     );
+  });
+
+  it("uses crypto.randomUUID() for command ids when available", async () => {
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const send = vi.fn();
+    const client: ClientTransport = {
+      send: (msg) => {
+        send(msg);
+        if (msg.type === "cmd") {
+          handler!({ type: "return", id: msg.id, value: "uuid-result" });
+        }
+      },
+      onMessage: (h) => { handler = h; },
+    };
+
+    const randomUuidSpy = vi.spyOn(globalThis.crypto, "randomUUID").mockReturnValue("cmd-uuid");
+
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+
+    await expect(proxy.invoke("doFetch")).resolves.toBe("uuid-result");
+    expect(send).toHaveBeenCalledWith({ type: "cmd", name: "doFetch", id: "cmd-uuid", args: [] });
+
+    randomUuidSpy.mockRestore();
   });
 
   it("rejects invoke() on throw message", async () => {
@@ -390,12 +557,41 @@ describe("RemoteCoreProxy", () => {
 
     const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
     const onUpdate = vi.fn();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     bind(proxy, onUpdate);
 
     handler!({ type: "sync", values: { unknown: 123 } });
 
     expect(onUpdate).not.toHaveBeenCalled();
-    expect((proxy as unknown as Record<string, unknown>).unknown).toBe(123);
+    expect((proxy as unknown as Record<string, unknown>).unknown).toBeUndefined();
+    expect(warnSpy).toHaveBeenCalledWith(
+      'RemoteCoreProxy: ignored sync value for undeclared property "unknown"',
+    );
+
+    warnSpy.mockRestore();
+  });
+
+  it("ignores update messages for undeclared properties", () => {
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const client: ClientTransport = {
+      send: () => {},
+      onMessage: (h) => { handler = h; },
+    };
+
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+    const onUpdate = vi.fn();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    bind(proxy, onUpdate);
+
+    handler!({ type: "update", name: "unknown", value: 123 });
+
+    expect(onUpdate).not.toHaveBeenCalled();
+    expect((proxy as unknown as Record<string, unknown>).unknown).toBeUndefined();
+    expect(warnSpy).toHaveBeenCalledWith(
+      'RemoteCoreProxy: ignored update for undeclared property "unknown"',
+    );
+
+    warnSpy.mockRestore();
   });
 
   it("updates cache on update messages so property access works", () => {
@@ -410,6 +606,35 @@ describe("RemoteCoreProxy", () => {
 
     // Property access via Proxy should return cached value.
     expect((proxy as unknown as Record<string, unknown>).value).toBe("cached");
+  });
+
+  it("prefers declared property values over inherited prototype members", () => {
+    const declWithCollision: WcBindableDeclaration = {
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [{ name: "toString", event: "test:to-string" }],
+    };
+
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const client: ClientTransport = {
+      send: () => {},
+      onMessage: (h) => { handler = h; },
+    };
+
+    const proxy = createRemoteCoreProxy(declWithCollision, client) as RemoteCoreProxy & { toString: unknown };
+    handler!({ type: "update", name: "toString", value: "remote-value" });
+
+    expect(proxy.toString).toBe("remote-value");
+  });
+
+  it("does not expose internal cache fields through the proxy", () => {
+    const { client } = createSyncTransportPair();
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client) as RemoteCoreProxy & { _values?: unknown };
+
+    expect(proxy._values).toBeUndefined();
+    expect(() => {
+      (proxy as RemoteCoreProxy & { _values: unknown })._values = {};
+    }).toThrow('RemoteCoreProxy: cannot assign to internal property "_values"');
   });
 
   it("passes invoke arguments to the server", async () => {
@@ -430,6 +655,43 @@ describe("RemoteCoreProxy", () => {
     expect(send).toHaveBeenCalledWith(
       expect.objectContaining({ type: "cmd", name: "doFetch", args: ["arg1", 2] }),
     );
+  });
+
+  it("rejects invokeWithOptions() immediately when the signal is already aborted", async () => {
+    const send = vi.fn();
+    const client: ClientTransport = {
+      send,
+      onMessage: () => {},
+    };
+    const controller = new AbortController();
+    controller.abort();
+
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+
+    await expect(proxy.invokeWithOptions("doFetch", { signal: controller.signal })).rejects.toMatchObject({
+      name: "AbortError",
+    });
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects invokeWithOptions() when aborted in flight and clears pending state", async () => {
+    const send = vi.fn();
+    const client: ClientTransport = {
+      send,
+      onMessage: () => {},
+    };
+    const controller = new AbortController();
+
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+    const pendingInvoke = proxy.invokeWithOptions("doFetch", { signal: controller.signal });
+
+    controller.abort();
+
+    await expect(pendingInvoke).rejects.toMatchObject({ name: "AbortError" });
+
+    const pending = Reflect.getOwnPropertyDescriptor(proxy, "_pending")?.value as Map<string, unknown>;
+    expect(pending.size).toBe(0);
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ type: "cmd", name: "doFetch" }));
   });
 
   it("rejects all pending invocations when transport closes", async () => {
@@ -468,6 +730,149 @@ describe("RemoteCoreProxy", () => {
     await expect(p).rejects.toThrow("Transport closed");
   });
 
+  it("can reconnect after transport close without losing subscribers", async () => {
+    let firstHandler: ((msg: ServerMessage) => void) | null = null;
+    let firstCloseHandler: (() => void) | null = null;
+    const firstSend = vi.fn();
+    const firstClient: ClientTransport = {
+      send: firstSend,
+      onMessage: (handler) => { firstHandler = handler; },
+      onClose: (handler) => { firstCloseHandler = handler; },
+    };
+
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, firstClient);
+    const onUpdate = vi.fn();
+    bind(proxy, onUpdate);
+
+    firstCloseHandler!();
+
+    expect(() => proxy.set("url", "/disconnected")).toThrow("Transport closed");
+
+    let secondHandler: ((msg: ServerMessage) => void) | null = null;
+    let secondCloseHandler: (() => void) | null = null;
+    const secondSend = vi.fn();
+    const secondClient: ClientTransport = {
+      send: secondSend,
+      onMessage: (handler) => { secondHandler = handler; },
+      onClose: (handler) => { secondCloseHandler = handler; },
+    };
+
+    proxy.reconnect(secondClient);
+    expect(secondSend).toHaveBeenCalledWith({ type: "sync" });
+
+    firstHandler!({ type: "update", name: "value", value: "stale" });
+    expect((proxy as unknown as Record<string, unknown>).value).not.toBe("stale");
+
+    secondHandler!({ type: "sync", values: { value: "fresh", loading: false } });
+    expect((proxy as unknown as Record<string, unknown>).value).toBe("fresh");
+    expect(onUpdate).toHaveBeenCalledWith("value", "fresh");
+
+    secondCloseHandler!();
+    await expect(proxy.invoke("doFetch")).rejects.toThrow("Transport closed");
+  });
+
+  it("clears cached properties omitted from a sync payload", () => {
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const client: ClientTransport = {
+      send: () => {},
+      onMessage: (h) => { handler = h; },
+    };
+
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+    const onUpdate = vi.fn();
+    bind(proxy, onUpdate);
+
+    // Server initially has a value cached on the client.
+    handler!({ type: "sync", values: { value: "hello", loading: true } });
+    expect((proxy as unknown as Record<string, unknown>).value).toBe("hello");
+    expect((proxy as unknown as Record<string, unknown>).loading).toBe(true);
+
+    onUpdate.mockClear();
+
+    // Server reverts `value` to undefined and omits it from the next sync
+    // (per protocol). Cached value must be cleared and subscribers notified.
+    // Note: CustomEvent normalizes `detail: undefined` to `null`, so the
+    // bind() callback observes null while the cache reads back as undefined.
+    handler!({ type: "sync", values: { loading: false } });
+    expect((proxy as unknown as Record<string, unknown>).value).toBeUndefined();
+    expect((proxy as unknown as Record<string, unknown>).loading).toBe(false);
+    expect(onUpdate).toHaveBeenCalledWith("value", null);
+    expect(onUpdate).toHaveBeenCalledWith("loading", false);
+  });
+
+  it("rejects reconnect() while connected or after dispose()", () => {
+    const activeClient: ClientTransport = {
+      send: () => {},
+      onMessage: () => {},
+      onClose: () => {},
+    };
+
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, activeClient);
+
+    expect(() => proxy.reconnect(activeClient)).toThrow("RemoteCoreProxy: transport is already connected");
+
+    proxy.dispose();
+
+    expect(() => proxy.reconnect(activeClient)).toThrow("RemoteCoreProxy disposed");
+  });
+
+  it("dispose() rejects all pending invocations and is idempotent", async () => {
+    const dispose = vi.fn();
+    const client: ClientTransport = {
+      send: () => {},
+      onMessage: () => {},
+      dispose,
+    };
+
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+    const p1 = proxy.invoke("doFetch");
+    const p2 = proxy.invoke("abort");
+
+    proxy.dispose();
+    proxy.dispose();
+
+    await expect(p1).rejects.toThrow("RemoteCoreProxy disposed");
+    await expect(p2).rejects.toThrow("RemoteCoreProxy disposed");
+    expect(dispose).toHaveBeenCalledTimes(1);
+
+    const pending = Reflect.getOwnPropertyDescriptor(proxy, "_pending")?.value as Map<string, unknown>;
+    expect(pending.size).toBe(0);
+  });
+
+  it("disposes the owned transport when the transport closes", async () => {
+    let closeHandler: (() => void) | null = null;
+    const dispose = vi.fn();
+    const client: ClientTransport = {
+      send: () => {},
+      onMessage: () => {},
+      onClose: (handler) => { closeHandler = handler; },
+      dispose,
+    };
+
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+    const pendingInvoke = proxy.invoke("doFetch");
+
+    closeHandler!();
+
+    await expect(pendingInvoke).rejects.toThrow("Transport closed");
+    expect(dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects further set() and invoke() calls after dispose()", async () => {
+    const send = vi.fn();
+    const client: ClientTransport = {
+      send,
+      onMessage: () => {},
+    };
+
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+    proxy.dispose();
+
+    expect(() => proxy.set("url", "/after-dispose")).toThrow("RemoteCoreProxy disposed");
+    await expect(proxy.invoke("doFetch")).rejects.toThrow("RemoteCoreProxy disposed");
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
   it("invoke() on a closed transport rejects without leaking pending entries", async () => {
     let closed = false;
     const client: ClientTransport = {
@@ -486,16 +891,18 @@ describe("RemoteCoreProxy", () => {
     await expect(p).rejects.toThrow("connection is closed");
 
     // Verify no pending entries leaked.
-    const pending = (proxy as unknown as { _pending: Map<string, unknown> })._pending;
+    const pending = Reflect.getOwnPropertyDescriptor(proxy, "_pending")?.value as Map<string, unknown>;
     expect(pending.size).toBe(0);
   });
 
-  it("ignores return and throw messages for unknown command ids", () => {
+  it("ignores return and throw messages for unknown request ids", () => {
     let handler: ((msg: ServerMessage) => void) | null = null;
     const client: ClientTransport = {
       send: () => {},
       onMessage: (h) => { handler = h; },
     };
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
     createRemoteCoreProxy(TestCore.wcBindable, client);
 
@@ -503,6 +910,17 @@ describe("RemoteCoreProxy", () => {
       handler!({ type: "return", id: "missing", value: 1 });
       handler!({ type: "throw", id: "missing", error: "boom" });
     }).not.toThrow();
+
+    expect(warnSpy).toHaveBeenNthCalledWith(
+      1,
+      'RemoteCoreProxy: received return for unknown request id "missing"',
+    );
+    expect(warnSpy).toHaveBeenNthCalledWith(
+      2,
+      'RemoteCoreProxy: received throw for unknown request id "missing"',
+    );
+
+    warnSpy.mockRestore();
   });
 
   it("binds native EventTarget methods to the real target", () => {
@@ -591,8 +1009,113 @@ describe("WebSocketClientTransport", () => {
     expect(onMessage).toHaveBeenCalledWith({ type: "sync", values: { value: 2 } });
   });
 
+  it("replaces the previous onMessage handler when called again", () => {
+    const ws = new MockBrowserWebSocket(WebSocket.OPEN);
+    const transport = new WebSocketClientTransport(ws as unknown as WebSocket);
+    const first = vi.fn();
+    const second = vi.fn();
+
+    transport.onMessage(first);
+    transport.onMessage(second);
+
+    expect(ws.listenerCount("message")).toBe(1);
+
+    ws.emit("message", { data: JSON.stringify({ type: "sync", values: { value: 1 } }) });
+
+    expect(first).not.toHaveBeenCalled();
+    expect(second).toHaveBeenCalledWith({ type: "sync", values: { value: 1 } });
+  });
+
+  it("ignores parsed server messages with invalid shape", () => {
+    const ws = new MockBrowserWebSocket(WebSocket.OPEN);
+    const transport = new WebSocketClientTransport(ws as unknown as WebSocket);
+    const onMessage = vi.fn();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    transport.onMessage(onMessage);
+    ws.emit("message", { data: JSON.stringify({ type: "update", value: 2 }) });
+
+    expect(onMessage).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledWith(
+      "WebSocketClientTransport: ignoring invalid server message",
+      expect.any(Error),
+    );
+
+    warnSpy.mockRestore();
+  });
+
+  it("dispose() removes WebSocket listeners", () => {
+    const ws = new MockBrowserWebSocket(WebSocket.CONNECTING);
+    const transport = new WebSocketClientTransport(ws as unknown as WebSocket);
+    const onMessage = vi.fn();
+    const onClose = vi.fn();
+
+    transport.onMessage(onMessage);
+    transport.onClose(onClose);
+
+    expect(ws.listenerCount("message")).toBe(1);
+    expect(ws.listenerCount("close")).toBe(2);
+    expect(ws.listenerCount("error")).toBe(2);
+
+    transport.dispose();
+
+    expect(ws.listenerCount("message")).toBe(0);
+    expect(ws.listenerCount("close")).toBe(0);
+    expect(ws.listenerCount("error")).toBe(0);
+
+    ws.emit("message", { data: JSON.stringify({ type: "sync", values: { value: 1 } }) });
+    ws.emit("close");
+
+    expect(onMessage).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("replaces the previous onClose handler when called again", () => {
+    const ws = new MockBrowserWebSocket(WebSocket.OPEN);
+    const transport = new WebSocketClientTransport(ws as unknown as WebSocket);
+    const first = vi.fn();
+    const second = vi.fn();
+
+    transport.onClose(first);
+    transport.onClose(second);
+
+    expect(ws.listenerCount("close")).toBe(2);
+    expect(ws.listenerCount("error")).toBe(2);
+
+    ws.emit("close");
+
+    expect(first).not.toHaveBeenCalled();
+    expect(second).toHaveBeenCalledTimes(1);
+  });
+
   it("marks a connecting socket as closed when it fails before opening", () => {
     const ws = new MockBrowserWebSocket(WebSocket.CONNECTING);
+    const transport = new WebSocketClientTransport(ws as unknown as WebSocket);
+
+    ws.emit("error");
+
+    expect(() => transport.send({ type: "sync" })).toThrow("connection is closed");
+  });
+
+  it("marks an initially-open socket as closed when it later closes", () => {
+    const ws = new MockBrowserWebSocket(WebSocket.OPEN);
+    const transport = new WebSocketClientTransport(ws as unknown as WebSocket);
+
+    // Send works while open.
+    transport.send({ type: "sync" });
+    expect(ws.sent).toEqual([JSON.stringify({ type: "sync" })]);
+
+    // Socket closes after transport construction — subsequent sends must
+    // surface a consistent "connection is closed" error rather than
+    // attempting ws.send on a dead socket.
+    ws.emit("close");
+
+    expect(() => transport.send({ type: "set", name: "url", value: "/api" }))
+      .toThrow("connection is closed");
+  });
+
+  it("marks an initially-open socket as closed when it later errors", () => {
+    const ws = new MockBrowserWebSocket(WebSocket.OPEN);
     const transport = new WebSocketClientTransport(ws as unknown as WebSocket);
 
     ws.emit("error");
@@ -668,11 +1191,85 @@ describe("WebSocketServerTransport", () => {
     expect(onMessage).toHaveBeenCalledWith({ type: "sync" });
   });
 
+  it("parses Buffer payloads from EventEmitter-style sockets", () => {
+    const listeners: Array<(data: unknown) => void> = [];
+    const ws = {
+      send: vi.fn(),
+      on: (_type: "message", listener: (data: unknown) => void) => {
+        listeners.push(listener);
+      },
+    };
+    const transport = new WebSocketServerTransport(ws);
+    const onMessage = vi.fn();
+
+    transport.onMessage(onMessage);
+    listeners[0](Buffer.from(JSON.stringify({ type: "set", name: "url", value: "/buffer" }), "utf8"));
+
+    expect(onMessage).toHaveBeenCalledWith({ type: "set", name: "url", value: "/buffer" });
+  });
+
+  it("ignores parsed client messages with invalid shape", () => {
+    const listeners: Array<(data: unknown) => void> = [];
+    const ws = {
+      send: vi.fn(),
+      on: (_type: "message", listener: (data: unknown) => void) => {
+        listeners.push(listener);
+      },
+    };
+    const transport = new WebSocketServerTransport(ws);
+    const onMessage = vi.fn();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    transport.onMessage(onMessage);
+    listeners[0](JSON.stringify({ type: "cmd", name: "doFetch", args: [] }));
+
+    expect(onMessage).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledWith(
+      "WebSocketServerTransport: ignoring invalid client message",
+      expect.any(Error),
+    );
+
+    warnSpy.mockRestore();
+  });
+
   it("does nothing when no message subscription API is available", () => {
     const ws = { send: vi.fn() };
     const transport = new WebSocketServerTransport(ws);
 
     expect(() => transport.onMessage(() => {})).not.toThrow();
+  });
+
+  it("notifies close handlers when using addEventListener", () => {
+    const ws = new MockBrowserWebSocket(WebSocket.OPEN);
+    const transport = new WebSocketServerTransport(ws as unknown as Parameters<typeof WebSocketServerTransport>[0]);
+    const onClose = vi.fn();
+
+    transport.onClose(onClose);
+    ws.emit("error");
+    ws.emit("close");
+    ws.emit("close");
+
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("notifies close handlers when falling back to EventEmitter style", () => {
+    const closeListeners: Array<() => void> = [];
+    const ws = {
+      send: vi.fn(),
+      on: (type: "message" | "close" | "error", listener: ((data: unknown) => void) | (() => void)) => {
+        if (type === "close" || type === "error") {
+          closeListeners.push(listener as () => void);
+        }
+      },
+    };
+    const transport = new WebSocketServerTransport(ws);
+    const onClose = vi.fn();
+
+    transport.onClose(onClose);
+    closeListeners[0]();
+    closeListeners[1]();
+
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -719,6 +1316,29 @@ describe("RemoteShellProxy", () => {
     });
   });
 
+  it("logs and swallows sync send failures", () => {
+    const core = new TestCore();
+    let handler: ((msg: ClientMessage) => void) | null = null;
+    const server: ServerTransport = {
+      send: () => {
+        throw new TypeError("Converting circular structure to JSON");
+      },
+      onMessage: (h) => { handler = h; },
+    };
+
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    new RemoteShellProxy(core, server);
+
+    expect(() => handler!({ type: "sync" })).not.toThrow();
+    expect(errorSpy).toHaveBeenCalledWith(
+      "RemoteShellProxy: failed to send sync response:",
+      expect.any(TypeError),
+    );
+
+    errorSpy.mockRestore();
+  });
+
   it("handles declarations without inputs or commands and omits undefined current values", () => {
     class MinimalCore extends EventTarget {
       static wcBindable: WcBindableDeclaration = {
@@ -746,6 +1366,91 @@ describe("RemoteShellProxy", () => {
     expect(send).toHaveBeenCalledWith({ type: "sync", values: {} });
   });
 
+  it("logs and skips properties whose getters throw during sync", () => {
+    class ThrowingGetterCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [
+          { name: "ok", event: "throwing:ok" },
+          { name: "bad", event: "throwing:bad" },
+        ],
+      };
+
+      get ok(): string {
+        return "value";
+      }
+
+      get bad(): never {
+        throw new Error("broken getter");
+      }
+    }
+
+    const core = new ThrowingGetterCore();
+    const send = vi.fn();
+    let handler: ((msg: ClientMessage) => void) | null = null;
+    const server: ServerTransport = {
+      send,
+      onMessage: (h) => { handler = h; },
+    };
+
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    new RemoteShellProxy(core, server);
+
+    expect(() => handler!({ type: "sync" })).not.toThrow();
+    expect(send).toHaveBeenCalledWith({ type: "sync", values: { ok: "value" } });
+    expect(errorSpy).toHaveBeenCalledWith(
+      'RemoteShellProxy: getter for "bad" threw during sync:',
+      expect.any(Error),
+    );
+
+    errorSpy.mockRestore();
+  });
+
+  it("queues updates emitted while building a sync snapshot until after sync", () => {
+    class SyncSideEffectCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [
+          { name: "value", event: "sync-side-effect:value" },
+          { name: "status", event: "sync-side-effect:status" },
+        ],
+      };
+
+      get value(): string {
+        this.dispatchEvent(new CustomEvent("sync-side-effect:status", { detail: "queued" }));
+        return "snapshot";
+      }
+
+      get status(): string {
+        return "current";
+      }
+    }
+
+    const core = new SyncSideEffectCore();
+    const send = vi.fn();
+    let handler: ((msg: ClientMessage) => void) | null = null;
+    const server: ServerTransport = {
+      send,
+      onMessage: (h) => { handler = h; },
+    };
+
+    new RemoteShellProxy(core, server);
+    handler!({ type: "sync" });
+
+    expect(send).toHaveBeenNthCalledWith(1, {
+      type: "sync",
+      values: { value: "snapshot", status: "current" },
+    });
+    expect(send).toHaveBeenNthCalledWith(2, {
+      type: "update",
+      name: "status",
+      value: "queued",
+    });
+  });
+
   it("forwards Core events to transport as property updates", () => {
     const core = new TestCore();
     const send = vi.fn();
@@ -763,6 +1468,30 @@ describe("RemoteShellProxy", () => {
       name: "value",
       value: "hello",
     });
+  });
+
+  it("logs and swallows update send failures", () => {
+    const core = new TestCore();
+    const server: ServerTransport = {
+      send: () => {
+        throw new TypeError("Do not know how to serialize a BigInt");
+      },
+      onMessage: () => {},
+    };
+
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    expect(() => {
+      new RemoteShellProxy(core, server);
+      core.dispatchEvent(new CustomEvent("test:value-changed", { detail: 1n }));
+    }).not.toThrow();
+
+    expect(errorSpy).toHaveBeenCalledWith(
+      'RemoteShellProxy: failed to send update for "value":',
+      expect.any(TypeError),
+    );
+
+    errorSpy.mockRestore();
   });
 
   it("forwards shared-event properties as separate updates with getter-applied values", () => {
@@ -808,6 +1537,22 @@ describe("RemoteShellProxy", () => {
     expect(core.url).toBe("/api/users");
   });
 
+  it("acknowledges setWithAck messages after applying the input", () => {
+    const core = new TestCore();
+    const send = vi.fn();
+    let handler: ((msg: ClientMessage) => void) | null = null;
+    const server: ServerTransport = {
+      send,
+      onMessage: (h) => { handler = h; },
+    };
+
+    new RemoteShellProxy(core, server);
+    handler!({ type: "set", name: "url", value: "/api/ack", id: "set-1" });
+
+    expect(core.url).toBe("/api/ack");
+    expect(send).toHaveBeenCalledWith({ type: "return", id: "set-1", value: undefined });
+  });
+
   it("handles sync cmd and returns result", async () => {
     const core = new TestCore();
     core.url = "/api/data";
@@ -846,6 +1591,85 @@ describe("RemoteShellProxy", () => {
     });
   });
 
+  it("awaits thenable return values (not just native Promise instances)", async () => {
+    class ThenableCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+        commands: [{ name: "thenable", async: true }],
+      };
+      thenable(): PromiseLike<string> {
+        return {
+          then(onFulfilled) {
+            return Promise.resolve(onFulfilled ? onFulfilled("resolved-via-thenable") : "resolved-via-thenable");
+          },
+        } as PromiseLike<string>;
+      }
+    }
+
+    const core = new ThenableCore();
+    const send = vi.fn();
+    let handler: ((msg: ClientMessage) => void) | null = null;
+    const server: ServerTransport = {
+      send,
+      onMessage: (h) => { handler = h; },
+    };
+
+    new RemoteShellProxy(core, server);
+    handler!({ type: "cmd", name: "thenable", id: "thenable-1", args: [] });
+
+    await flush();
+    await flush();
+
+    expect(send).toHaveBeenCalledWith({
+      type: "return",
+      id: "thenable-1",
+      value: "resolved-via-thenable",
+    });
+  });
+
+  it("propagates rejections from thenable return values as throw messages", async () => {
+    class RejectingThenableCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+        commands: [{ name: "fail", async: true }],
+      };
+      fail(): PromiseLike<never> {
+        return {
+          then(_onFulfilled, onRejected) {
+            return Promise.resolve(onRejected ? onRejected(new Error("thenable boom")) : undefined);
+          },
+        } as PromiseLike<never>;
+      }
+    }
+
+    const core = new RejectingThenableCore();
+    const send = vi.fn();
+    let handler: ((msg: ClientMessage) => void) | null = null;
+    const server: ServerTransport = {
+      send,
+      onMessage: (h) => { handler = h; },
+    };
+
+    new RemoteShellProxy(core, server);
+    handler!({ type: "cmd", name: "fail", id: "thenable-fail", args: [] });
+
+    await flush();
+    await flush();
+
+    expect(send).toHaveBeenCalledWith({
+      type: "throw",
+      id: "thenable-fail",
+      error: expect.objectContaining({
+        name: "Error",
+        message: "thenable boom",
+      }),
+    });
+  });
+
   it("rejects cmd not declared in commands", () => {
     const core = new TestCore();
     const send = vi.fn();
@@ -861,7 +1685,10 @@ describe("RemoteShellProxy", () => {
     expect(send).toHaveBeenCalledWith({
       type: "throw",
       id: "3",
-      error: 'Command "nonExistent" is not declared in wcBindable.commands',
+      error: {
+        name: "RemoteShellProxyError",
+        message: 'Command "nonExistent" is not declared in wcBindable.commands',
+      },
     });
   });
 
@@ -890,7 +1717,10 @@ describe("RemoteShellProxy", () => {
     expect(send).toHaveBeenCalledWith({
       type: "throw",
       id: "invalid",
-      error: 'Method "boom" not found on Core',
+      error: {
+        name: "RemoteShellProxyError",
+        message: 'Method "boom" not found on Core',
+      },
     });
   });
 
@@ -905,13 +1735,42 @@ describe("RemoteShellProxy", () => {
 
     new RemoteShellProxy(core, server);
 
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
     // _value is a private field, not declared in inputs
     handler!({ type: "set", name: "_value", value: "hacked" });
     expect((core as unknown as Record<string, unknown>)._value).not.toBe("hacked");
+    expect(warnSpy).toHaveBeenCalledWith(
+      'RemoteShellProxy: ignored set for undeclared input "_value"',
+    );
 
     // url IS declared in inputs — should work
     handler!({ type: "set", name: "url", value: "/allowed" });
     expect(core.url).toBe("/allowed");
+
+    warnSpy.mockRestore();
+  });
+
+  it("rejects acknowledged sets for undeclared inputs", () => {
+    const core = new TestCore();
+    const send = vi.fn();
+    let handler: ((msg: ClientMessage) => void) | null = null;
+    const server: ServerTransport = {
+      send,
+      onMessage: (h) => { handler = h; },
+    };
+
+    new RemoteShellProxy(core, server);
+    handler!({ type: "set", name: "missing", value: 1, id: "bad-set" });
+
+    expect(send).toHaveBeenCalledWith({
+      type: "throw",
+      id: "bad-set",
+      error: {
+        name: "RemoteShellProxyError",
+        message: 'Input "missing" is not declared in wcBindable.inputs',
+      },
+    });
   });
 
   it("isolates setter exceptions so the message handler survives", () => {
@@ -958,6 +1817,43 @@ describe("RemoteShellProxy", () => {
     errorSpy.mockRestore();
   });
 
+  it("returns throw for acknowledged sets whose setters throw", () => {
+    class ThrowingSetterCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+        inputs: [{ name: "value" }],
+      };
+      set value(_v: unknown) {
+        throw new TypeError("invalid");
+      }
+      get value(): unknown {
+        return undefined;
+      }
+    }
+
+    const core = new ThrowingSetterCore();
+    const send = vi.fn();
+    let handler: ((msg: ClientMessage) => void) | null = null;
+    const server: ServerTransport = {
+      send,
+      onMessage: (h) => { handler = h; },
+    };
+
+    new RemoteShellProxy(core, server);
+    handler!({ type: "set", name: "value", value: "bad", id: "set-throw" });
+
+    expect(send).toHaveBeenCalledWith({
+      type: "throw",
+      id: "set-throw",
+      error: expect.objectContaining({
+        name: "TypeError",
+        message: "invalid",
+      }),
+    });
+  });
+
   it("sends throw message when async cmd rejects", async () => {
     class FailCore extends EventTarget {
       static wcBindable: WcBindableDeclaration = {
@@ -987,7 +1883,10 @@ describe("RemoteShellProxy", () => {
     expect(send).toHaveBeenCalledWith({
       type: "throw",
       id: "4",
-      error: "something went wrong",
+      error: expect.objectContaining({
+        name: "Error",
+        message: "something went wrong",
+      }),
     });
   });
 
@@ -1052,7 +1951,52 @@ describe("RemoteShellProxy", () => {
     expect(send).toHaveBeenCalledWith({
       type: "throw",
       id: "5",
-      error: "sync error",
+      error: expect.objectContaining({
+        name: "Error",
+        message: "sync error",
+      }),
+    });
+  });
+
+  it("serializes thrown Error objects with name, message, and stack", () => {
+    class CustomRemoteError extends Error {
+      constructor(message: string) {
+        super(message);
+        this.name = "CustomRemoteError";
+      }
+    }
+
+    class ThrowCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+        commands: [{ name: "boom" }],
+      };
+      boom(): never {
+        throw new CustomRemoteError("structured failure");
+      }
+    }
+
+    const core = new ThrowCore();
+    const send = vi.fn();
+    let handler: ((msg: ClientMessage) => void) | null = null;
+    const server: ServerTransport = {
+      send,
+      onMessage: (h) => { handler = h; },
+    };
+
+    new RemoteShellProxy(core, server);
+    handler!({ type: "cmd", name: "boom", id: "structured", args: [] });
+
+    expect(send).toHaveBeenCalledWith({
+      type: "throw",
+      id: "structured",
+      error: expect.objectContaining({
+        name: "CustomRemoteError",
+        message: "structured failure",
+        stack: expect.any(String),
+      }),
     });
   });
 
@@ -1177,6 +2121,24 @@ describe("RemoteShellProxy", () => {
       shell.dispose();
       shell.dispose();
     }).not.toThrow();
+  });
+
+  it("auto-disposes when the server transport closes", () => {
+    const core = new TestCore();
+    const send = vi.fn();
+    let closeHandler: (() => void) | null = null;
+    const server: ServerTransport = {
+      send,
+      onMessage: () => {},
+      onClose: (handler) => { closeHandler = handler; },
+    };
+
+    new RemoteShellProxy(core, server);
+    closeHandler!();
+
+    core.dispatchEvent(new CustomEvent("test:value-changed", { detail: "ignored" }));
+
+    expect(send).not.toHaveBeenCalled();
   });
 });
 

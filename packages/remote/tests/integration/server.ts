@@ -141,8 +141,7 @@ export function startServer(port: number): Promise<{ close: () => Promise<void>;
     wss.on("connection", (ws) => {
       const core = new TestCore();
       const transport = createWsServerTransport(ws);
-      const shell = new RemoteShellProxy(core, transport);
-      ws.on("close", () => shell.dispose());
+      new RemoteShellProxy(core, transport);
     });
 
     server.listen(port, () => {

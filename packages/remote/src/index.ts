@@ -7,4 +7,6 @@ export type {
   ServerTransport,
   ClientMessage,
   ServerMessage,
+  RemoteSerializedError,
+  RemoteInvokeOptions,
 } from "./types.js";

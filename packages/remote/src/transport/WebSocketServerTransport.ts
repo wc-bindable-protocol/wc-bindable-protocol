@@ -1,8 +1,19 @@
 import type { ServerTransport, ServerMessage, ClientMessage } from "../types.js";
+import { isClientMessage } from "./messageValidation.js";
 
 function parseClientMessage(data: unknown): ClientMessage | null {
   try {
-    return JSON.parse(typeof data === "string" ? data : String(data)) as ClientMessage;
+    const message = typeof data === "string"
+      ? JSON.parse(data)
+      : typeof Buffer !== "undefined" && Buffer.isBuffer(data)
+        ? JSON.parse(data.toString("utf8"))
+        : JSON.parse(String(data));
+
+    if (!isClientMessage(message)) {
+      throw new Error("invalid client message shape");
+    }
+
+    return message;
   } catch (error) {
     console.warn("WebSocketServerTransport: ignoring invalid client message", error);
     return null;
@@ -23,7 +34,11 @@ function parseClientMessage(data: unknown): ClientMessage | null {
 export interface WebSocketLike {
   send(data: string): void;
   addEventListener?(type: "message", listener: (event: { data: unknown }) => void): void;
+  addEventListener?(type: "close", listener: () => void): void;
+  addEventListener?(type: "error", listener: () => void): void;
   on?(type: "message", listener: (data: unknown) => void): void;
+  on?(type: "close", listener: () => void): void;
+  on?(type: "error", listener: () => void): void;
 }
 
 /**
@@ -69,6 +84,23 @@ export class WebSocketServerTransport implements ServerTransport {
         if (!msg) return;
         handler(msg);
       });
+    }
+  }
+
+  onClose(handler: () => void): void {
+    let called = false;
+    const guard = () => {
+      if (called) return;
+      called = true;
+      handler();
+    };
+
+    if (this._ws.addEventListener) {
+      this._ws.addEventListener("close", guard);
+      this._ws.addEventListener("error", guard);
+    } else if (this._ws.on) {
+      this._ws.on("close", guard);
+      this._ws.on("error", guard);
     }
   }
 }
