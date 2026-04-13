@@ -6,13 +6,13 @@ export type ClientMessage =
   | { type: "set"; name: string; value: unknown; id?: string }
   | { type: "cmd"; name: string; id: string; args: unknown[] };
 
-/**
- * Messages sent from server (Core side) to client (Shell side).
- */
 export interface RemoteCapabilities {
   setAck?: boolean;
 }
 
+/**
+ * Messages sent from server (Core side) to client (Shell side).
+ */
 export type ServerMessage =
   | { type: "sync"; values: Record<string, unknown>; capabilities?: RemoteCapabilities; getterFailures?: string[] }
   | { type: "update"; name: string; value: unknown }
@@ -26,10 +26,13 @@ export interface RemoteSerializedError {
   cause?: unknown;
 }
 
-export interface RemoteInvokeOptions {
+export interface RemoteRequestOptions {
   signal?: AbortSignal;
   timeoutMs?: number;
 }
+
+/** @deprecated Use RemoteRequestOptions. */
+export type RemoteInvokeOptions = RemoteRequestOptions;
 
 /**
  * Transport interface for the client (Shell) side.

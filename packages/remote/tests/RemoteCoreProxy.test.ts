@@ -322,6 +322,23 @@ describe("RemoteCoreProxy", () => {
     expect(send).toHaveBeenCalledTimes(1);
   });
 
+  it("rejects setWithAckOptions() for undeclared inputs without sending", async () => {
+    const send = vi.fn();
+    const client: ClientTransport = {
+      send,
+      onMessage: () => {},
+    };
+
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+    const pending = proxy.setWithAckOptions("value", "nope", {});
+
+    expect(pending).toBeInstanceOf(Promise);
+    await expect(pending).rejects.toThrow(
+      'RemoteCoreProxy: input "value" is not declared in wcBindable.inputs',
+    );
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
   it("validates input name on set() even after transport close or dispose", () => {
     let closeHandler: (() => void) | null = null;
     const client: ClientTransport = {
@@ -692,6 +709,27 @@ describe("RemoteCoreProxy", () => {
     expect(send).toHaveBeenCalledTimes(1);
   });
 
+  it("supports invokeWithOptions(name, args, options) to avoid options/args ambiguity", async () => {
+    const send = vi.fn();
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const client: ClientTransport = {
+      send,
+      onMessage: (next) => { handler = next; },
+    };
+
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+    const pending = proxy.invokeWithOptions("doFetch", ["arg1", 2], { timeoutMs: 25 });
+
+    expect(send).toHaveBeenLastCalledWith(
+      expect.objectContaining({ type: "cmd", name: "doFetch", args: ["arg1", 2] }),
+    );
+
+    const requestId = send.mock.calls.at(-1)?.[0]?.id as string;
+    handler!({ type: "return", id: requestId, value: { ok: true } });
+
+    await expect(pending).resolves.toEqual({ ok: true });
+  });
+
   it("rejects invokeWithOptions() when aborted in flight and clears pending state", async () => {
     const send = vi.fn();
     const client: ClientTransport = {
@@ -756,6 +794,62 @@ describe("RemoteCoreProxy", () => {
     const setPromise = proxy.setWithAckOptions("url", "x", { timeoutMs: Number.NaN });
     expect(setPromise).toBeInstanceOf(Promise);
     await expect(setPromise).rejects.toBeInstanceOf(RangeError);
+  });
+
+  it("rejects only the pending setWithAck() when send() fails on a non-serializable payload", async () => {
+    const send = vi.fn((msg: ClientMessage) => {
+      JSON.stringify(msg);
+    });
+    const dispose = vi.fn();
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const client: ClientTransport = {
+      send,
+      onMessage: (next) => { handler = next; },
+      dispose,
+    };
+
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+
+    const badPending = proxy.setWithAck("url", 1n);
+    await expect(badPending).rejects.toBeInstanceOf(TypeError);
+
+    const pending = Reflect.getOwnPropertyDescriptor(proxy, "_pending")?.value as Map<string, unknown>;
+    expect(pending.size).toBe(0);
+    expect(dispose).not.toHaveBeenCalled();
+
+    const goodPending = proxy.setWithAck("url", "/ok");
+    const requestId = send.mock.calls.at(-1)?.[0]?.id as string;
+    handler!({ type: "return", id: requestId, value: undefined });
+
+    await expect(goodPending).resolves.toBeUndefined();
+  });
+
+  it("rejects only the pending invoke() when send() fails on a non-serializable payload", async () => {
+    const send = vi.fn((msg: ClientMessage) => {
+      JSON.stringify(msg);
+    });
+    const dispose = vi.fn();
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const client: ClientTransport = {
+      send,
+      onMessage: (next) => { handler = next; },
+      dispose,
+    };
+
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+
+    const badPending = proxy.invoke("doFetch", 1n);
+    await expect(badPending).rejects.toBeInstanceOf(TypeError);
+
+    const pending = Reflect.getOwnPropertyDescriptor(proxy, "_pending")?.value as Map<string, unknown>;
+    expect(pending.size).toBe(0);
+    expect(dispose).not.toHaveBeenCalled();
+
+    const goodPending = proxy.invoke("doFetch", "/ok");
+    const requestId = send.mock.calls.at(-1)?.[0]?.id as string;
+    handler!({ type: "return", id: requestId, value: { ok: true } });
+
+    await expect(goodPending).resolves.toEqual({ ok: true });
   });
 
   it("rejects all pending invocations when transport closes", async () => {
@@ -1130,6 +1224,30 @@ describe("RemoteCoreProxy", () => {
     expect(warnSpy).toHaveBeenNthCalledWith(
       2,
       'RemoteCoreProxy: received throw for unknown request id "missing"',
+    );
+
+    warnSpy.mockRestore();
+  });
+
+  it("warns when a setWithAck() reply unexpectedly includes a return payload", async () => {
+    const send = vi.fn();
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const client: ClientTransport = {
+      send,
+      onMessage: (next) => { handler = next; },
+    };
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+    const pending = proxy.setWithAck("url", "/api/ack");
+    const requestId = send.mock.calls.at(-1)?.[0]?.id as string;
+
+    handler!({ type: "return", id: requestId, value: { unexpected: true } });
+
+    await expect(pending).resolves.toBeUndefined();
+    expect(warnSpy).toHaveBeenCalledWith(
+      `RemoteCoreProxy: received return payload for setWithAck request id "${requestId}"; ignoring unexpected value`,
     );
 
     warnSpy.mockRestore();

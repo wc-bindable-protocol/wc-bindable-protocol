@@ -34,7 +34,7 @@ Client (Browser)                        Server (Node / Deno / etc.)
 1. The server creates a `RemoteShellProxy`, which subscribes to the Core's declared events and starts forwarding updates.
 2. The client creates a `RemoteCoreProxy`, which immediately sends a `sync` request.
 3. The server responds with the Core's current property values.
-  Properties whose current value is `undefined` are omitted, matching local `bind()` initial synchronization.
+  Properties whose current value is `undefined` are omitted, matching local `bind()` initial synchronization. This means the initial `sync` cannot distinguish between "currently `undefined`" and "not present / never initialized" for a declared property; both appear as an omitted key.
 4. The client populates its cache and dispatches events for each value — `bind()` on the client side picks these up as if they were normal state changes.
 5. From this point, all Core events are forwarded in real time.
 
@@ -87,6 +87,8 @@ const core = new MyFetchCore();
 const transport = new WebSocketServerTransport(socket);
 const shell = new RemoteShellProxy(core, transport);
 ```
+
+`RemoteShellProxy` reads the declaration from `core.constructor.wcBindable` at runtime. That means the object you pass in must expose the declared `static wcBindable` on its effective constructor. If you wrap a Core in a `Proxy`, decorator, or mixin that changes the constructor chain, preserve or re-expose that static property on the final constructor before passing it to `RemoteShellProxy`.
 
 `WebSocketServerTransport` expects incoming client messages to arrive either as text JSON frames or as UTF-8 binary bytes such as Node `Buffer`, `Uint8Array`, or `ArrayBuffer`. If your runtime surfaces `Blob` payloads for message events, prefer text frames or adapt the socket before passing it in, because the transport API is synchronous and does not await `Blob.text()`.
 
@@ -169,7 +171,7 @@ This package does **not** implement built-in back-pressure or queue limits. In p
 | `setWithAck(name, value)` | Set an input property and wait for the server to acknowledge or reject it. |
 | `setWithAckOptions(name, value, options)` | Set an input property with lifecycle options such as `AbortSignal` and `timeoutMs`, without changing the wire payload sent to the server. |
 | `invoke(name, ...args)` | Invoke a command on the remote Core. Returns a Promise that settles when the server replies, the send fails, the transport closes, or the default 30s timeout expires. |
-| `invokeWithOptions(name, options, ...args)` | Invoke a command with lifecycle options such as `AbortSignal` and `timeoutMs`, without changing the wire arguments sent to the server. |
+| `invokeWithOptions(name, args, options)` | Invoke a command with explicit wire arguments and lifecycle options such as `AbortSignal` and `timeoutMs`. The legacy `invokeWithOptions(name, options, ...args)` form remains supported for compatibility. |
 | `reconnect(transport)` | Attach a fresh client transport after the previous one closed. Existing `bind()` subscribers stay attached and a new `sync` request is sent immediately. |
 | `dispose()` | Reject pending invocations and stop processing future transport messages for this proxy instance. |
 
@@ -177,7 +179,7 @@ This package does **not** implement built-in back-pressure or queue limits. In p
 
 - **`invoke()`** errors on the server are serialized and delivered as `throw` messages, which reject the returned Promise. When the server throws an `Error`, the payload preserves at least `name` and `message`, and includes `stack` when available. If the thrown value itself is not JSON-serializable, `RemoteShellProxy` falls back to a serializable `RemoteShellProxyError` payload instead of leaving the client request pending.
 - **`setWithAckOptions()`** supports `AbortSignal` and `timeoutMs`. Aborting rejects the client-side Promise and forgets the pending response; it does not send a cancellation message to the server. Timeouts reject with `TimeoutError` and also clear the pending entry. `setWithAck()` uses the same behavior with a default 30s timeout.
-- **`invokeWithOptions()`** supports `AbortSignal` and `timeoutMs`. Aborting rejects the client-side Promise and forgets the pending response; it does not send a cancellation message to the server. Timeouts reject with `TimeoutError` and also clear the pending entry. `invoke()` uses the same behavior with a default 30s timeout.
+- **`invokeWithOptions()`** supports `AbortSignal` and `timeoutMs`. Prefer `invokeWithOptions(name, args, options)` so the wire arguments stay explicit and are harder to confuse with the options object. The legacy `invokeWithOptions(name, options, ...args)` form is still accepted for backward compatibility. Aborting rejects the client-side Promise and forgets the pending response; it does not send a cancellation message to the server. Timeouts reject with `TimeoutError` and also clear the pending entry. `invoke()` uses the same behavior with a default 30s timeout.
 - **Timeout configuration**: pass `timeoutMs` to override the default 30s deadline, or `timeoutMs: 0` to disable the built-in timeout for an individual call. If the initial `sync` response does not advertise `capabilities.setAck`, `setWithAck()` and `setWithAckOptions()` reject instead of waiting forever against a legacy server.
 - **Back-pressure** is not built in. Pending acknowledgements, pre-open WebSocket sends, and `sync`-time queued updates are all unbounded in-memory queues. If a peer can stall or flood the connection, enforce your own limits above this package.
 - **Transport close** rejects all pending `invoke()` calls with `Transport closed` and leaves the proxy disconnected until you call `reconnect()` with a new transport.
@@ -218,7 +220,7 @@ The server subscribes to future Core events, but it does not push initial values
 **Why no sequence numbers?**
 WebSocket guarantees FIFO message ordering, and JavaScript's single-threaded execution ensures that `sync` responses and `event` messages are enqueued in a consistent order. A `sync` response always reflects the Core's state at the time the request was processed; any events dispatched after that point are sent after the `sync` response. To preserve that guarantee even when a getter emits a synchronous side-effect event while the server is building the `sync` snapshot, `RemoteShellProxy` buffers those `update` messages and flushes them only after the `sync` response is sent. This makes sequence numbers unnecessary under these constraints.
 
-If a declared getter throws while building `sync`, the server logs the failure and includes that property name in `getterFailures`. The client preserves its previous cached value for those names on re-sync; only properties omitted without a getter failure are treated as having reverted to `undefined`.
+If a declared getter throws while building `sync`, the server logs the failure and includes that property name in `getterFailures`. The client preserves its previous cached value for those names on re-sync; only properties omitted without a getter failure are treated as having reverted to `undefined`. On the very first `sync`, however, there is no prior cached value to restore, so an omitted property is simply absent on the client until a later update or re-sync provides a concrete value.
 
 **Why is the wire protocol property-centric, not event-centric?**
 A Core may declare multiple properties that share the same event and differ only by `getter` — for example, `value` and `status` both driven by `my-fetch:response` with `detail.value` and `detail.status`. Sending the raw event name and detail would collapse those properties on the client side. Instead, `RemoteShellProxy` registers one listener per declared property, applies that property's getter on the server, and sends a distinct `{ type: "update", name, value }` message for each property. The client updates its cache by `name` and dispatches a synthetic per-property event so local `bind()` can discriminate.

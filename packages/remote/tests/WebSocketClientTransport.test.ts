@@ -104,6 +104,28 @@ describe("WebSocketClientTransport", () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
+  it("replaces the previous onClose handler without accumulating socket listeners", () => {
+    const ws = new MockBrowserWebSocket(WebSocket.OPEN);
+    const transport = new WebSocketClientTransport(ws as unknown as WebSocket);
+    const first = vi.fn();
+    const second = vi.fn();
+
+    transport.onClose(first);
+    expect(ws.listenerCount("close")).toBe(2);
+    expect(ws.listenerCount("error")).toBe(2);
+
+    transport.onClose(second);
+    expect(ws.listenerCount("close")).toBe(2);
+    expect(ws.listenerCount("error")).toBe(2);
+
+    ws.emit("close");
+
+    expect(first).not.toHaveBeenCalled();
+    expect(second).toHaveBeenCalledTimes(1);
+    expect(ws.listenerCount("close")).toBe(1);
+    expect(ws.listenerCount("error")).toBe(1);
+  });
+
   it("parses non-string message payloads via String(data)", () => {
     const ws = new MockBrowserWebSocket(WebSocket.OPEN);
     const transport = new WebSocketClientTransport(ws as unknown as WebSocket);

@@ -77,6 +77,7 @@ export class WebSocketClientTransport implements ClientTransport {
   private _failListener: (() => void) | null = null;
   private _messageListener: ((event: MessageEvent) => void) | null = null;
   private _closeListener: (() => void) | null = null;
+  private _errorListener: (() => void) | null = null;
 
   constructor(ws: WebSocket) {
     this._ws = ws;
@@ -151,26 +152,42 @@ export class WebSocketClientTransport implements ClientTransport {
   }
 
   onClose(handler: () => void): void {
-    if (this._closeListener) {
+    if (this._closeListener && this._errorListener) {
       this._ws.removeEventListener("close", this._closeListener);
-      this._ws.removeEventListener("error", this._closeListener);
+      this._ws.removeEventListener("error", this._errorListener);
     }
 
-    const once = { once: true } as const;
     // Fire on whichever comes first — close or error.
     // Guard against double invocation when both fire.
     let called = false;
+    let closeListener: (() => void) | null = null;
+    let errorListener: (() => void) | null = null;
+    const cleanup = () => {
+      if (closeListener) {
+        this._ws.removeEventListener("close", closeListener);
+      }
+      if (errorListener) {
+        this._ws.removeEventListener("error", errorListener);
+      }
+      if (this._closeListener === closeListener) {
+        this._closeListener = null;
+      }
+      if (this._errorListener === errorListener) {
+        this._errorListener = null;
+      }
+    };
     const guard = () => {
       if (called) return;
       called = true;
+      cleanup();
       handler();
-      if (this._closeListener === guard) {
-        this._closeListener = null;
-      }
     };
-    this._closeListener = guard;
-    this._ws.addEventListener("close", guard, once);
-    this._ws.addEventListener("error", guard, once);
+    closeListener = guard;
+    errorListener = guard;
+    this._closeListener = closeListener;
+    this._errorListener = errorListener;
+    this._ws.addEventListener("close", closeListener);
+    this._ws.addEventListener("error", errorListener);
   }
 
   dispose(): void {
@@ -195,10 +212,11 @@ export class WebSocketClientTransport implements ClientTransport {
       this._messageListener = null;
     }
 
-    if (this._closeListener) {
+    if (this._closeListener && this._errorListener) {
       this._ws.removeEventListener("close", this._closeListener);
-      this._ws.removeEventListener("error", this._closeListener);
+      this._ws.removeEventListener("error", this._errorListener);
       this._closeListener = null;
+      this._errorListener = null;
     }
   }
 }

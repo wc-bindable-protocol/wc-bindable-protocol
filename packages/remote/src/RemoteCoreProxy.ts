@@ -1,8 +1,9 @@
 import type { WcBindableDeclaration } from "@wc-bindable/core";
 import type {
+  ClientMessage,
   ClientTransport,
   ServerMessage,
-  RemoteInvokeOptions,
+  RemoteRequestOptions,
   RemoteSerializedError,
 } from "./types.js";
 import { isReservedRemoteName } from "./transport/messageValidation.js";
@@ -27,7 +28,7 @@ function createTimeoutError(operation: string, timeoutMs: number): Error {
   return error;
 }
 
-function normalizeTimeoutMs(options?: RemoteInvokeOptions): number | null {
+function normalizeTimeoutMs(options?: RemoteRequestOptions): number | null {
   const timeoutMs = options?.timeoutMs;
   if (timeoutMs === undefined) {
     return DEFAULT_PENDING_TIMEOUT_MS;
@@ -41,6 +42,15 @@ function normalizeTimeoutMs(options?: RemoteInvokeOptions): number | null {
     );
   }
   return timeoutMs;
+}
+
+function canSerializeClientMessage(message: ClientMessage): boolean {
+  try {
+    JSON.stringify(message);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function createCommandId(getFallbackId: () => number): string {
@@ -144,8 +154,12 @@ export class RemoteCoreProxy extends EventTarget {
   }
 
   /** Set an input property and wait for the server reply with lifecycle options such as AbortSignal. */
-  setWithAckOptions(name: string, value: unknown, options: RemoteInvokeOptions): Promise<void> {
-    this._validateInputName(name);
+  setWithAckOptions(name: string, value: unknown, options: RemoteRequestOptions): Promise<void> {
+    try {
+      this._validateInputName(name);
+    } catch (err) {
+      return Promise.reject(err);
+    }
     if (this._setAckSupported === false) {
       return Promise.reject(
         new Error("RemoteCoreProxy: remote server does not support setWithAck(); use set() or upgrade the server"),
@@ -169,9 +183,14 @@ export class RemoteCoreProxy extends EventTarget {
       options,
       `setWithAck(\"${name}\")`,
       (id) => {
+        const message: ClientMessage = { type: "set", name, value, id };
         try {
-          transport.send({ type: "set", name, value, id });
+          transport.send(message);
         } catch (err) {
+          if (!canSerializeClientMessage(message)) {
+            this._rejectPendingRequest(id, err);
+            return;
+          }
           // _handleSendFailure rejects all pending (including this id) and
           // clears the transport so reconnect() can attach a new one.
           this._handleSendFailure(transport, err);
@@ -185,12 +204,25 @@ export class RemoteCoreProxy extends EventTarget {
     return this._invoke(name, args);
   }
 
-  /** Invoke a command on the remote Core with lifecycle options such as AbortSignal. */
-  invokeWithOptions(name: string, options: RemoteInvokeOptions, ...args: unknown[]): Promise<unknown> {
-    return this._invoke(name, args, options);
+  /** Invoke a command on the remote Core with explicit wire arguments and lifecycle options. */
+  invokeWithOptions(name: string, args: unknown[], options?: RemoteRequestOptions): Promise<unknown>;
+
+  /** @deprecated Prefer invokeWithOptions(name, args, options) to avoid options/args ambiguity. */
+  invokeWithOptions(name: string, options: RemoteRequestOptions, ...args: unknown[]): Promise<unknown>;
+
+  invokeWithOptions(
+    name: string,
+    optionsOrArgs: RemoteRequestOptions | unknown[],
+    ...argsOrOptions: unknown[]
+  ): Promise<unknown> {
+    if (Array.isArray(optionsOrArgs)) {
+      return this._invoke(name, optionsOrArgs, argsOrOptions[0] as RemoteRequestOptions | undefined);
+    }
+
+    return this._invoke(name, argsOrOptions, optionsOrArgs);
   }
 
-  private _invoke(name: string, args: unknown[], options?: RemoteInvokeOptions): Promise<unknown> {
+  private _invoke(name: string, args: unknown[], options?: RemoteRequestOptions): Promise<unknown> {
     if (!this._commands.has(name)) {
       return Promise.reject(
         new Error(`RemoteCoreProxy: command "${name}" is not declared in wcBindable.commands`),
@@ -213,9 +245,14 @@ export class RemoteCoreProxy extends EventTarget {
       options,
       `invoke(\"${name}\")`,
       (id) => {
+        const message: ClientMessage = { type: "cmd", name, id, args };
         try {
-          transport.send({ type: "cmd", name, id, args });
+          transport.send(message);
         } catch (err) {
+          if (!canSerializeClientMessage(message)) {
+            this._rejectPendingRequest(id, err);
+            return;
+          }
           // _handleSendFailure rejects all pending (including this id) and
           // clears the transport so reconnect() can attach a new one.
           this._handleSendFailure(transport, err);
@@ -226,7 +263,7 @@ export class RemoteCoreProxy extends EventTarget {
 
   private _createPendingRequest<T>(
     kind: "set-ack" | "invoke",
-    options: RemoteInvokeOptions | undefined,
+    options: RemoteRequestOptions | undefined,
     timeoutContext: string,
     dispatch: (id: string) => void,
   ): Promise<T> {
@@ -358,6 +395,14 @@ export class RemoteCoreProxy extends EventTarget {
     this._pending.clear();
   }
 
+  private _rejectPendingRequest(id: string, error: unknown): void {
+    const pending = this._pending.get(id);
+    if (!pending) return;
+    this._pending.delete(id);
+    pending.cleanup();
+    pending.reject(error);
+  }
+
   private _validateInputName(name: string): void {
     // Validate the input name before checking transport state so that typos
     // surface as a declaration error even when the proxy is disconnected or
@@ -474,9 +519,14 @@ export class RemoteCoreProxy extends EventTarget {
       case "return": {
         const pending = this._pending.get(msg.id);
         if (pending) {
+          if (pending.kind === "set-ack" && msg.value !== undefined) {
+            console.warn(
+              `RemoteCoreProxy: received return payload for setWithAck request id "${msg.id}"; ignoring unexpected value`,
+            );
+          }
           this._pending.delete(msg.id);
           pending.cleanup();
-          pending.resolve(msg.value);
+          pending.resolve(pending.kind === "set-ack" ? undefined : msg.value);
         } else {
           console.warn(`RemoteCoreProxy: received return for unknown request id "${msg.id}"`);
         }
