@@ -43,6 +43,7 @@ describe("RemoteShellProxy", () => {
     expect(send).toHaveBeenCalledWith({
       type: "sync",
       values: { value: null, loading: false },
+      capabilities: { setAck: true },
     });
   });
 
@@ -93,7 +94,7 @@ describe("RemoteShellProxy", () => {
     new RemoteShellProxy(core, server);
     handler!({ type: "sync" });
 
-    expect(send).toHaveBeenCalledWith({ type: "sync", values: {} });
+    expect(send).toHaveBeenCalledWith({ type: "sync", values: {}, capabilities: { setAck: true } });
   });
 
   it("logs and skips properties whose getters throw during sync", () => {
@@ -129,7 +130,12 @@ describe("RemoteShellProxy", () => {
     new RemoteShellProxy(core, server);
 
     expect(() => handler!({ type: "sync" })).not.toThrow();
-    expect(send).toHaveBeenCalledWith({ type: "sync", values: { ok: "value" } });
+    expect(send).toHaveBeenCalledWith({
+      type: "sync",
+      values: { ok: "value" },
+      capabilities: { setAck: true },
+      getterFailures: ["bad"],
+    });
     expect(errorSpy).toHaveBeenCalledWith(
       'RemoteShellProxy: getter for "bad" threw during sync:',
       expect.any(Error),
@@ -173,6 +179,7 @@ describe("RemoteShellProxy", () => {
     expect(send).toHaveBeenNthCalledWith(1, {
       type: "sync",
       values: { value: "snapshot", status: "current" },
+      capabilities: { setAck: true },
     });
     expect(send).toHaveBeenNthCalledWith(2, {
       type: "update",
@@ -226,7 +233,7 @@ describe("RemoteShellProxy", () => {
     handler!({ type: "sync" });
 
     expect(sent).toEqual([
-      { type: "sync", values: { value: "snapshot", status: "current" } },
+      { type: "sync", values: { value: "snapshot", status: "current" }, capabilities: { setAck: true } },
       { type: "update", name: "status", value: "queued" },
       { type: "update", name: "status", value: "after-flush" },
     ]);
@@ -608,7 +615,7 @@ describe("RemoteShellProxy", () => {
 
     // Handler still alive — subsequent sync request is processed.
     handler!({ type: "sync" });
-    expect(send).toHaveBeenCalledWith({ type: "sync", values: {} });
+    expect(send).toHaveBeenCalledWith({ type: "sync", values: {}, capabilities: { setAck: true } });
 
     errorSpy.mockRestore();
   });
@@ -869,6 +876,41 @@ describe("RemoteShellProxy", () => {
         name: "CustomRemoteError",
         message: "structured failure",
         stack: expect.any(String),
+      }),
+    });
+  });
+
+  it("serializes a JSON-safe Error cause", () => {
+    class ThrowCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+        commands: [{ name: "boom" }],
+      };
+      boom(): never {
+        throw new Error("sync error", { cause: { status: 503, retryable: true } });
+      }
+    }
+
+    const core = new ThrowCore();
+    const send = vi.fn();
+    let handler: ((msg: ClientMessage) => void) | null = null;
+    const server: ServerTransport = {
+      send,
+      onMessage: (h) => { handler = h; },
+    };
+
+    new RemoteShellProxy(core, server);
+    handler!({ type: "cmd", name: "boom", id: "structured-cause", args: [] });
+
+    expect(send).toHaveBeenCalledWith({
+      type: "throw",
+      id: "structured-cause",
+      error: expect.objectContaining({
+        name: "Error",
+        message: "sync error",
+        cause: { status: 503, retryable: true },
       }),
     });
   });

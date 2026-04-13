@@ -160,6 +160,24 @@ describe("WebSocketClientTransport", () => {
     warnSpy.mockRestore();
   });
 
+  it("rejects Blob payloads with a clearer diagnostic before parse fallback", () => {
+    const ws = new MockBrowserWebSocket(WebSocket.OPEN);
+    const transport = new WebSocketClientTransport(ws as unknown as WebSocket);
+    const onMessage = vi.fn();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    transport.onMessage(onMessage);
+    ws.emit("message", { data: new Blob([JSON.stringify({ type: "sync", values: { value: 1 } })]) });
+
+    expect(onMessage).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledWith(
+      "WebSocketClientTransport: ignoring invalid server message",
+      expect.objectContaining({ message: "Blob payloads are not supported; expected a text JSON frame" }),
+    );
+
+    warnSpy.mockRestore();
+  });
+
   it("dispose() removes WebSocket listeners", () => {
     const ws = new MockBrowserWebSocket(WebSocket.CONNECTING);
     const transport = new WebSocketClientTransport(ws as unknown as WebSocket);

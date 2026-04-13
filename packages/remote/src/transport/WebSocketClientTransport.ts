@@ -25,6 +25,14 @@ function isBinaryMessagePayload(data: unknown): boolean {
 }
 
 function parseServerMessage(data: unknown): ServerMessage | null {
+  if (typeof Blob !== "undefined" && data instanceof Blob) {
+    console.warn(
+      "WebSocketClientTransport: ignoring invalid server message",
+      new Error("Blob payloads are not supported; expected a text JSON frame"),
+    );
+    return null;
+  }
+
   try {
     const message = JSON.parse(typeof data === "string" ? data : String(data));
     if (!isServerMessage(message)) {

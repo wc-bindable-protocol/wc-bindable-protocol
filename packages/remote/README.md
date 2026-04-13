@@ -178,12 +178,12 @@ This package does **not** implement built-in back-pressure or queue limits. In p
 - **`invoke()`** errors on the server are serialized and delivered as `throw` messages, which reject the returned Promise. When the server throws an `Error`, the payload preserves at least `name` and `message`, and includes `stack` when available. If the thrown value itself is not JSON-serializable, `RemoteShellProxy` falls back to a serializable `RemoteShellProxyError` payload instead of leaving the client request pending.
 - **`setWithAckOptions()`** supports `AbortSignal`. Aborting rejects the client-side Promise and forgets the pending response; it does not send a cancellation message to the server.
 - **`invokeWithOptions()`** supports `AbortSignal`. Aborting rejects the client-side Promise and forgets the pending response; it does not send a cancellation message to the server.
-- **Timeouts** are still not built in. If the server never replies, the Promise remains pending until it resolves, rejects, the transport closes, or you abort via `setWithAckOptions()` or `invokeWithOptions()`. If you need deadlines, wrap the call at the application layer with `AbortController`.
+- **Timeouts** are still not built in. If the server never replies, the Promise remains pending until it resolves, rejects, the transport closes, or you abort via `setWithAckOptions()` or `invokeWithOptions()`. If the initial `sync` response does not advertise `capabilities.setAck`, `setWithAck()` and `setWithAckOptions()` reject instead of waiting forever against a legacy server. For all other deadline needs, wrap the call at the application layer with `AbortController`.
 - **Back-pressure** is not built in. Pending acknowledgements, pre-open WebSocket sends, and `sync`-time queued updates are all unbounded in-memory queues. If a peer can stall or flood the connection, enforce your own limits above this package.
 - **Transport close** rejects all pending `invoke()` calls with `Transport closed` and leaves the proxy disconnected until you call `reconnect()` with a new transport.
 - **`dispose()`** is terminal: it rejects all pending requests with `RemoteCoreProxy disposed` and causes subsequent `set()`, `invoke()`, and `reconnect()` calls to fail immediately.
 - **`set()`** validates the input name on the client before sending, so undeclared names fail immediately. It also throws synchronously if the proxy is already disconnected or if the transport send fails while trying to enqueue the message. For declared inputs on a healthy transport, it remains fire-and-forget: there is no response id and no server-side success/error is delivered back to the client. If a buggy or stale client still sends an undeclared input, `RemoteShellProxy` drops it and logs `console.warn`.
-- **`setWithAck()`** sends the same mutation with a request id and waits for a `return`/`throw` response. Use it when the caller needs server-side validation feedback such as type mismatches, read-only assignments, or conversion failures. Use `setWithAckOptions()` when you also need client-side cancellation.
+- **`setWithAck()`** sends the same mutation with a request id and waits for a `return`/`throw` response. Use it when the caller needs server-side validation feedback such as type mismatches, read-only assignments, or conversion failures. It requires the server to advertise `capabilities.setAck` in the initial `sync` response; legacy servers that omit that capability are rejected once detected. Use `setWithAckOptions()` when you also need client-side cancellation.
 - **Fire-and-forget setter failures** on plain `set()` are still caught and logged via `console.error` on the server so they do not escape the transport's message handler or terminate the connection.
 - **Server send failures** while forwarding `sync`, `update`, `return`, or `throw` messages are caught and logged via `console.error`. The failing message is dropped; the connection is not closed automatically.
 - **Server transport teardown**: if the `ServerTransport` implements `onClose()`, `RemoteShellProxy` disposes itself automatically. If the transport also implements `dispose()`, `RemoteShellProxy.dispose()` calls it so message/close listeners can be released. `WebSocketServerTransport` does both for standard WebSocket and Node `ws` close events.
@@ -204,7 +204,7 @@ Client → Server:
   { type: "cmd", name: string, id: string, args: unknown[] }
 
 Server → Client:
-  { type: "sync", values: Record<string, unknown> }
+  { type: "sync", values: Record<string, unknown>, capabilities?: { setAck?: boolean }, getterFailures?: string[] }
   { type: "update", name: string, value: unknown }
   { type: "return", id: string, value: unknown }
   { type: "throw", id: string, error: unknown }
@@ -217,6 +217,8 @@ The server subscribes to future Core events, but it does not push initial values
 
 **Why no sequence numbers?**
 WebSocket guarantees FIFO message ordering, and JavaScript's single-threaded execution ensures that `sync` responses and `event` messages are enqueued in a consistent order. A `sync` response always reflects the Core's state at the time the request was processed; any events dispatched after that point are sent after the `sync` response. To preserve that guarantee even when a getter emits a synchronous side-effect event while the server is building the `sync` snapshot, `RemoteShellProxy` buffers those `update` messages and flushes them only after the `sync` response is sent. This makes sequence numbers unnecessary under these constraints.
+
+If a declared getter throws while building `sync`, the server logs the failure and includes that property name in `getterFailures`. The client preserves its previous cached value for those names on re-sync; only properties omitted without a getter failure are treated as having reverted to `undefined`.
 
 **Why is the wire protocol property-centric, not event-centric?**
 A Core may declare multiple properties that share the same event and differ only by `getter` — for example, `value` and `status` both driven by `my-fetch:response` with `detail.value` and `detail.status`. Sending the raw event name and detail would collapse those properties on the client side. Instead, `RemoteShellProxy` registers one listener per declared property, applies that property's getter on the server, and sends a distinct `{ type: "update", name, value }` message for each property. The client updates its cache by `name` and dispatches a synthetic per-property event so local `bind()` can discriminate.

@@ -9,8 +9,12 @@ export type ClientMessage =
 /**
  * Messages sent from server (Core side) to client (Shell side).
  */
+export interface RemoteCapabilities {
+  setAck?: boolean;
+}
+
 export type ServerMessage =
-  | { type: "sync"; values: Record<string, unknown> }
+  | { type: "sync"; values: Record<string, unknown>; capabilities?: RemoteCapabilities; getterFailures?: string[] }
   | { type: "update"; name: string; value: unknown }
   | { type: "return"; id: string; value: unknown }
   | { type: "throw"; id: string; error: unknown };
@@ -19,6 +23,7 @@ export interface RemoteSerializedError {
   name: string;
   message: string;
   stack?: string;
+  cause?: unknown;
 }
 
 export interface RemoteInvokeOptions {

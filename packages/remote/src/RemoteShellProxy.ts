@@ -1,5 +1,15 @@
 import type { WcBindableDeclaration, UnbindFn } from "@wc-bindable/core";
-import type { ServerTransport, ClientMessage, ServerMessage, RemoteSerializedError } from "./types.js";
+import type {
+  ServerTransport,
+  ClientMessage,
+  ServerMessage,
+  RemoteCapabilities,
+  RemoteSerializedError,
+} from "./types.js";
+
+const REMOTE_CAPABILITIES: RemoteCapabilities = {
+  setAck: true,
+};
 
 const DEFAULT_GETTER = (event: Event): unknown => (event as CustomEvent).detail;
 
@@ -29,9 +39,25 @@ function isSerializableAsThrowPayload(value: unknown): boolean {
   }
 }
 
+function getSerializableErrorCause(error: Error): unknown {
+  if (!("cause" in error)) {
+    return undefined;
+  }
+
+  const cause = (error as Error & { cause?: unknown }).cause;
+  if (cause === undefined) {
+    return undefined;
+  }
+
+  return isSerializableAsThrowPayload(cause) ? cause : undefined;
+}
+
 function serializeThrownError(error: unknown): unknown {
   const serialized = error instanceof Error
     ? (() => {
+      // Preserve standard Error fields plus a JSON-safe cause. Other
+      // subclass-specific fields remain intentionally excluded until the
+      // wire format defines a broader error metadata contract.
       const value: RemoteSerializedError = {
         name: error.name,
         message: error.message,
@@ -39,6 +65,11 @@ function serializeThrownError(error: unknown): unknown {
 
       if (typeof error.stack === "string") {
         value.stack = error.stack;
+      }
+
+      const cause = getSerializableErrorCause(error);
+      if (cause !== undefined) {
+        value.cause = cause;
       }
 
       return value;
@@ -101,8 +132,9 @@ export class RemoteShellProxy {
   }
 
   /** Read current values of all declared properties from the Core. */
-  private _readCurrentValues(): Record<string, unknown> {
+  private _readCurrentValues(): { values: Record<string, unknown>; getterFailures: string[] } {
     const values: Record<string, unknown> = {};
+    const getterFailures: string[] = [];
     const coreRecord = this._core as unknown as Record<string, unknown>;
     for (const prop of this._declaration.properties) {
       try {
@@ -111,13 +143,14 @@ export class RemoteShellProxy {
           values[prop.name] = v;
         }
       } catch (err) {
+        getterFailures.push(prop.name);
         console.error(
           `RemoteShellProxy: getter for "${prop.name}" threw during sync:`,
           err,
         );
       }
     }
-    return values;
+    return { values, getterFailures };
   }
 
   private _subscribeToCoreEvents(): UnbindFn {
@@ -169,8 +202,13 @@ export class RemoteShellProxy {
     let sent = false;
 
     try {
-      const values = this._readCurrentValues();
-      sent = this._safeSend({ type: "sync", values }, "sync response");
+      const { values, getterFailures } = this._readCurrentValues();
+      sent = this._safeSend({
+        type: "sync",
+        values,
+        capabilities: REMOTE_CAPABILITIES,
+        ...(getterFailures.length > 0 ? { getterFailures } : {}),
+      }, "sync response");
     } finally {
       this._isBuildingSyncSnapshot = false;
     }

@@ -135,7 +135,7 @@ describe("RemoteCoreProxy", () => {
     // Set up: server responds to sync.
     serverHandler = (msg) => {
       if (msg.type === "sync") {
-        serverSend({ type: "sync", values: { value: "hello", loading: false } });
+        serverSend({ type: "sync", values: { value: "hello", loading: false }, capabilities: { setAck: true } });
       }
     };
 
@@ -181,6 +181,40 @@ describe("RemoteCoreProxy", () => {
     handler!({ type: "return", id: requestId, value: undefined });
 
     await expect(pending).resolves.toBeUndefined();
+  });
+
+  it("rejects pending setWithAck() once sync reveals a legacy server without ack capability", async () => {
+    const send = vi.fn();
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const client: ClientTransport = {
+      send,
+      onMessage: (h) => { handler = h; },
+    };
+
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+    const pending = proxy.setWithAck("url", "/api/legacy");
+
+    handler!({ type: "sync", values: { value: "snapshot" } });
+
+    await expect(pending).rejects.toThrow(/does not support setWithAck/);
+
+    const pendingMap = Reflect.getOwnPropertyDescriptor(proxy, "_pending")?.value as Map<string, unknown>;
+    expect(pendingMap.size).toBe(0);
+  });
+
+  it("rejects setWithAck() immediately after sync established no ack capability", async () => {
+    const send = vi.fn();
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const client: ClientTransport = {
+      send,
+      onMessage: (h) => { handler = h; },
+    };
+
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+    handler!({ type: "sync", values: {}, capabilities: {} });
+
+    await expect(proxy.setWithAck("url", "/api/legacy")).rejects.toThrow(/does not support setWithAck/);
+    expect(send).toHaveBeenCalledTimes(1);
   });
 
   it("setWithAck() rejects on throw response", async () => {
@@ -438,6 +472,7 @@ describe("RemoteCoreProxy", () => {
       name: "CustomRemoteError",
       message: "structured failure",
       stack: "CustomRemoteError: structured failure\n    at remote:1:1",
+      cause: { status: 422, field: "url" },
     };
     const client: ClientTransport = {
       send: (msg) => {
@@ -757,6 +792,35 @@ describe("RemoteCoreProxy", () => {
     expect(onUpdate).toHaveBeenCalledWith("loading", false);
   });
 
+  it("preserves cached properties omitted from sync because the server getter failed", () => {
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const client: ClientTransport = {
+      send: () => {},
+      onMessage: (h) => { handler = h; },
+    };
+
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+    const onUpdate = vi.fn();
+    bind(proxy, onUpdate);
+
+    handler!({ type: "sync", values: { value: "hello", loading: true } });
+    expect((proxy as unknown as Record<string, unknown>).value).toBe("hello");
+    expect((proxy as unknown as Record<string, unknown>).loading).toBe(true);
+
+    onUpdate.mockClear();
+
+    handler!({
+      type: "sync",
+      values: { loading: false },
+      getterFailures: ["value"],
+    });
+
+    expect((proxy as unknown as Record<string, unknown>).value).toBe("hello");
+    expect((proxy as unknown as Record<string, unknown>).loading).toBe(false);
+    expect(onUpdate).not.toHaveBeenCalledWith("value", null);
+    expect(onUpdate).toHaveBeenCalledWith("loading", false);
+  });
+
   it("rejects reconnect() while connected or after dispose()", () => {
     const activeClient: ClientTransport = {
       send: () => {},
@@ -930,6 +994,38 @@ describe("RemoteCoreProxy", () => {
     });
 
     for (const reserved of ["addEventListener", "removeEventListener", "dispatchEvent", "constructor"]) {
+      expect(() => createRemoteCoreProxy(makeDecl(reserved), client)).toThrow(
+        /collides with a reserved/,
+      );
+    }
+  });
+
+  it("rejects declarations whose input names collide with EventTarget/proxy members", () => {
+    const { client } = createSyncTransportPair();
+    const makeDecl = (name: string): WcBindableDeclaration => ({
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [{ name: "value", event: "t:x" }],
+      inputs: [{ name }],
+    });
+
+    for (const reserved of ["set", "reconnect", "dispose", "constructor"]) {
+      expect(() => createRemoteCoreProxy(makeDecl(reserved), client)).toThrow(
+        /collides with a reserved/,
+      );
+    }
+  });
+
+  it("rejects declarations whose command names collide with EventTarget/proxy members", () => {
+    const { client } = createSyncTransportPair();
+    const makeDecl = (name: string): WcBindableDeclaration => ({
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [{ name: "value", event: "t:x" }],
+      commands: [{ name }],
+    });
+
+    for (const reserved of ["invoke", "set", "reconnect", "dispose"]) {
       expect(() => createRemoteCoreProxy(makeDecl(reserved), client)).toThrow(
         /collides with a reserved/,
       );

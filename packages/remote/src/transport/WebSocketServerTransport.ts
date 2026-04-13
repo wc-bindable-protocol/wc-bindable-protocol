@@ -111,11 +111,25 @@ export class WebSocketServerTransport implements ServerTransport {
   private _messageDataListener: ((data: unknown) => void) | null = null;
   private _closeHandler: (() => void) | null = null;
   private _closeFired = false;
-  private _closeListenerAttached = false;
   private _closeListener: (() => void) | null = null;
 
   constructor(ws: WebSocketLike) {
     this._ws = ws;
+
+    const guard = () => {
+      if (this._closeFired) return;
+      this._closeFired = true;
+      this._closeHandler?.();
+    };
+    this._closeListener = guard;
+
+    if (this._ws.addEventListener) {
+      this._ws.addEventListener("close", this._closeListener);
+      this._ws.addEventListener("error", this._closeListener);
+    } else if (this._ws.on) {
+      this._ws.on("close", this._closeListener);
+      this._ws.on("error", this._closeListener);
+    }
   }
 
   send(message: ServerMessage): void {
@@ -152,25 +166,6 @@ export class WebSocketServerTransport implements ServerTransport {
     this._closeHandler = handler;
     if (this._closeFired) {
       handler();
-      return;
-    }
-    if (this._closeListenerAttached) return;
-
-    const guard = () => {
-      if (this._closeFired) return;
-      this._closeFired = true;
-      this._closeHandler?.();
-    };
-    this._closeListener = guard;
-
-    if (this._ws.addEventListener) {
-      this._ws.addEventListener("close", this._closeListener);
-      this._ws.addEventListener("error", this._closeListener);
-      this._closeListenerAttached = true;
-    } else if (this._ws.on) {
-      this._ws.on("close", this._closeListener);
-      this._ws.on("error", this._closeListener);
-      this._closeListenerAttached = true;
     }
   }
 
@@ -195,7 +190,6 @@ export class WebSocketServerTransport implements ServerTransport {
     this._messageEventListener = null;
     this._messageDataListener = null;
     this._closeHandler = null;
-    this._closeListenerAttached = false;
     this._closeListener = null;
   }
 }

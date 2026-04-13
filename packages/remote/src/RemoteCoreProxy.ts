@@ -82,6 +82,7 @@ export class RemoteCoreProxy extends EventTarget {
   private _commands: Set<string>;
   private _values: Record<string, unknown> = {};
   private _pending: Map<string, {
+    kind: "set-ack" | "invoke";
     resolve: (v: unknown) => void;
     reject: (e: unknown) => void;
     cleanup: () => void;
@@ -90,6 +91,7 @@ export class RemoteCoreProxy extends EventTarget {
   private _connectionError: Error | null = null;
   private _disposedError: Error | null = null;
   private _transportGeneration = 0;
+  private _setAckSupported: boolean | null = null;
 
   constructor(declaration: WcBindableDeclaration, transport: ClientTransport) {
     super();
@@ -119,6 +121,11 @@ export class RemoteCoreProxy extends EventTarget {
   /** Set an input property and wait for the server reply with lifecycle options such as AbortSignal. */
   setWithAckOptions(name: string, value: unknown, options: RemoteInvokeOptions): Promise<void> {
     this._validateInputName(name);
+    if (this._setAckSupported === false) {
+      return Promise.reject(
+        new Error("RemoteCoreProxy: remote server does not support setWithAck(); use set() or upgrade the server"),
+      );
+    }
 
     const transport = this._transport;
     if (this._disposedError) {
@@ -149,6 +156,7 @@ export class RemoteCoreProxy extends EventTarget {
       };
 
       this._pending.set(id, {
+        kind: "set-ack",
         resolve: () => resolve(),
         reject,
         cleanup,
@@ -212,7 +220,7 @@ export class RemoteCoreProxy extends EventTarget {
         pending.reject(createAbortError(signal));
       };
 
-      this._pending.set(id, { resolve, reject, cleanup });
+      this._pending.set(id, { kind: "invoke", resolve, reject, cleanup });
 
       if (signal) {
         signal.addEventListener("abort", onAbort, { once: true });
@@ -322,10 +330,24 @@ export class RemoteCoreProxy extends EventTarget {
     transport.dispose();
   }
 
+  private _rejectUnsupportedSetAckPending(): void {
+    const error = new Error(
+      "RemoteCoreProxy: remote server does not support setWithAck(); use set() or upgrade the server",
+    );
+
+    for (const [id, pending] of this._pending) {
+      if (pending.kind !== "set-ack") continue;
+      this._pending.delete(id);
+      pending.cleanup();
+      pending.reject(error);
+    }
+  }
+
   private _attachTransport(transport: ClientTransport): void {
     const generation = ++this._transportGeneration;
     this._transport = transport;
     this._connectionError = null;
+    this._setAckSupported = null;
 
     transport.onMessage((msg) => {
       if (generation !== this._transportGeneration) return;
@@ -347,6 +369,11 @@ export class RemoteCoreProxy extends EventTarget {
     if (this._disposedError) return;
     switch (msg.type) {
       case "sync": {
+        this._setAckSupported = msg.capabilities?.setAck === true;
+        if (!this._setAckSupported) {
+          this._rejectUnsupportedSetAckPending();
+        }
+        const getterFailures = new Set(msg.getterFailures ?? []);
         // Populate cache and dispatch events for each initial value.
         for (const [name, value] of Object.entries(msg.values)) {
           const eventName = this._eventsByName.get(name);
@@ -366,6 +393,7 @@ export class RemoteCoreProxy extends EventTarget {
         // would never observe the reset.
         for (const name of this._eventsByName.keys()) {
           if (Object.prototype.hasOwnProperty.call(msg.values, name)) continue;
+          if (getterFailures.has(name)) continue;
           if (this._values[name] === undefined) continue;
           this._values[name] = undefined;
           const eventName = this._eventsByName.get(name);
@@ -478,11 +506,10 @@ const handler: ProxyHandler<RemoteCoreProxy> = {
 /** Synthetic event-name prefix used by proxy declarations. */
 const PROXY_EVENT_PREFIX = "@wc-bindable/remote:";
 
-// Names that, if used as a declared property, would be shadowed by the cache
-// before the get trap falls through to the real target member — breaking the
-// EventTarget contract (addEventListener/dispatchEvent) or the protocol entry
-// point (constructor.wcBindable read by isWcBindable/bind).
-const RESERVED_PROPERTY_NAMES: ReadonlySet<string> = (() => {
+// Names that, if used anywhere in the declared remote surface, would be
+// shadowed by the real target before the Proxy can route them to cached
+// properties, input setters, or command helpers.
+const RESERVED_PROXY_MEMBER_NAMES: ReadonlySet<string> = (() => {
   const names = new Set<string>(["constructor"]);
   let proto: object | null = RemoteCoreProxy.prototype;
   while (proto && proto !== Object.prototype) {
@@ -518,9 +545,25 @@ export function createRemoteCoreProxy(
   transport: ClientTransport,
 ): RemoteCoreProxy {
   for (const p of declaration.properties) {
-    if (RESERVED_PROPERTY_NAMES.has(p.name)) {
+    if (RESERVED_PROXY_MEMBER_NAMES.has(p.name)) {
       throw new Error(
         `RemoteCoreProxy: property name "${p.name}" collides with a reserved EventTarget/proxy member and would break bind()/isWcBindable()`,
+      );
+    }
+  }
+
+  for (const input of declaration.inputs ?? []) {
+    if (RESERVED_PROXY_MEMBER_NAMES.has(input.name)) {
+      throw new Error(
+        `RemoteCoreProxy: input name "${input.name}" collides with a reserved EventTarget/proxy member and would break proxy input access`,
+      );
+    }
+  }
+
+  for (const command of declaration.commands ?? []) {
+    if (RESERVED_PROXY_MEMBER_NAMES.has(command.name)) {
+      throw new Error(
+        `RemoteCoreProxy: command name "${command.name}" collides with a reserved EventTarget/proxy member and would break proxy command access`,
       );
     }
   }
