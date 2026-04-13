@@ -281,6 +281,32 @@ describe("RemoteCoreProxy", () => {
     expect(send).toHaveBeenCalledWith(expect.objectContaining({ type: "set", name: "url", value: "/api/ack" }));
   });
 
+  it("times out pending setWithAck() requests by default and clears pending state", async () => {
+    vi.useFakeTimers();
+    try {
+      const send = vi.fn();
+      const client: ClientTransport = {
+        send,
+        onMessage: () => {},
+      };
+
+      const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+      const pendingSet = expect(proxy.setWithAck("url", "/api/ack")).rejects.toMatchObject({
+        name: "TimeoutError",
+        message: 'RemoteCoreProxy: setWithAck("url") timed out after 30000ms',
+      });
+
+      await vi.advanceTimersByTimeAsync(30_000);
+
+      await pendingSet;
+
+      const pending = Reflect.getOwnPropertyDescriptor(proxy, "_pending")?.value as Map<string, unknown>;
+      expect(pending.size).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("throws on set() for undeclared inputs without sending", () => {
     const send = vi.fn();
     const client: ClientTransport = {
@@ -686,6 +712,52 @@ describe("RemoteCoreProxy", () => {
     expect(send).toHaveBeenCalledWith(expect.objectContaining({ type: "cmd", name: "doFetch" }));
   });
 
+  it("uses timeoutMs from invokeWithOptions() and clears pending state on timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const send = vi.fn();
+      const client: ClientTransport = {
+        send,
+        onMessage: () => {},
+      };
+
+      const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+      const pendingInvoke = expect(proxy.invokeWithOptions("doFetch", { timeoutMs: 25 })).rejects.toMatchObject({
+        name: "TimeoutError",
+        message: 'RemoteCoreProxy: invoke("doFetch") timed out after 25ms',
+      });
+
+      await vi.advanceTimersByTimeAsync(25);
+
+      await pendingInvoke;
+
+      const pending = Reflect.getOwnPropertyDescriptor(proxy, "_pending")?.value as Map<string, unknown>;
+      expect(pending.size).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("rejects (not throws) when timeoutMs is invalid", async () => {
+    const client: ClientTransport = {
+      send: vi.fn(),
+      onMessage: () => {},
+    };
+
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+
+    // invokeWithOptions and setWithAckOptions must surface invalid timeoutMs
+    // as an async rejection — callers chain .catch() on the returned Promise
+    // and would miss a synchronous throw.
+    const invokePromise = proxy.invokeWithOptions("doFetch", { timeoutMs: -1 });
+    expect(invokePromise).toBeInstanceOf(Promise);
+    await expect(invokePromise).rejects.toBeInstanceOf(RangeError);
+
+    const setPromise = proxy.setWithAckOptions("url", "x", { timeoutMs: Number.NaN });
+    expect(setPromise).toBeInstanceOf(Promise);
+    await expect(setPromise).rejects.toBeInstanceOf(RangeError);
+  });
+
   it("rejects all pending invocations when transport closes", async () => {
     let closeHandler: (() => void) | null = null;
     const client: ClientTransport = {
@@ -761,6 +833,84 @@ describe("RemoteCoreProxy", () => {
 
     secondCloseHandler!();
     await expect(proxy.invoke("doFetch")).rejects.toThrow("Transport closed");
+  });
+
+  it("keeps a late return from a closed transport from reviving a pre-reconnect invoke", async () => {
+    let firstHandler: ((msg: ServerMessage) => void) | null = null;
+    let firstCloseHandler: (() => void) | null = null;
+    const firstSend = vi.fn();
+    const firstClient: ClientTransport = {
+      send: firstSend,
+      onMessage: (handler) => { firstHandler = handler; },
+      onClose: (handler) => { firstCloseHandler = handler; },
+    };
+
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, firstClient);
+    const staleInvoke = proxy.invoke("doFetch");
+    const staleRequestId = firstSend.mock.calls.at(-1)?.[0]?.id as string;
+
+    firstCloseHandler!();
+    await expect(staleInvoke).rejects.toThrow("Transport closed");
+
+    let secondHandler: ((msg: ServerMessage) => void) | null = null;
+    const secondSend = vi.fn();
+    const secondClient: ClientTransport = {
+      send: secondSend,
+      onMessage: (handler) => { secondHandler = handler; },
+    };
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    proxy.reconnect(secondClient);
+
+    // Late return from the first transport must be ignored after reconnect.
+    firstHandler!({ type: "return", id: staleRequestId, value: "stale" });
+
+    const freshInvoke = proxy.invoke("doFetch");
+    const requestId = secondSend.mock.calls.at(-1)?.[0]?.id as string;
+    secondHandler!({ type: "return", id: requestId, value: "fresh" });
+
+    await expect(freshInvoke).resolves.toBe("fresh");
+    expect(warnSpy).not.toHaveBeenCalled();
+
+    warnSpy.mockRestore();
+  });
+
+  it("ignores stale sync capabilities from a previous transport after reconnect", async () => {
+    let firstHandler: ((msg: ServerMessage) => void) | null = null;
+    let firstCloseHandler: (() => void) | null = null;
+    const firstClient: ClientTransport = {
+      send: () => {},
+      onMessage: (handler) => { firstHandler = handler; },
+      onClose: (handler) => { firstCloseHandler = handler; },
+    };
+
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, firstClient);
+    firstCloseHandler!();
+
+    let secondHandler: ((msg: ServerMessage) => void) | null = null;
+    const secondSend = vi.fn();
+    const secondClient: ClientTransport = {
+      send: secondSend,
+      onMessage: (handler) => { secondHandler = handler; },
+    };
+
+    proxy.reconnect(secondClient);
+
+    // Late sync from the previous transport must be ignored completely.
+    firstHandler!({ type: "sync", values: {}, capabilities: {} });
+
+    const pending = proxy.setWithAck("url", "/after-reconnect");
+    const requestId = secondSend.mock.calls.at(-1)?.[0]?.id as string;
+
+    secondHandler!({
+      type: "sync",
+      values: { value: null, loading: false },
+      capabilities: { setAck: true },
+    });
+    secondHandler!({ type: "return", id: requestId, value: undefined });
+
+    await expect(pending).resolves.toBeUndefined();
   });
 
   it("clears cached properties omitted from a sync payload", () => {
@@ -1028,6 +1178,43 @@ describe("RemoteCoreProxy", () => {
     for (const reserved of ["invoke", "set", "reconnect", "dispose"]) {
       expect(() => createRemoteCoreProxy(makeDecl(reserved), client)).toThrow(
         /collides with a reserved/,
+      );
+    }
+  });
+
+  it("rejects declarations whose names are reserved on the wire protocol", () => {
+    const { client } = createSyncTransportPair();
+
+    const propDecl = (name: string): WcBindableDeclaration => ({
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [{ name, event: "t:x" }],
+    });
+    const inputDecl = (name: string): WcBindableDeclaration => ({
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [{ name: "value", event: "t:x" }],
+      inputs: [{ name }],
+    });
+    const cmdDecl = (name: string): WcBindableDeclaration => ({
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [{ name: "value", event: "t:x" }],
+      commands: [{ name }],
+    });
+
+    // Wire-reserved names ("__proto__", "prototype") aren't caught by the
+    // EventTarget/proxy-member check but are dropped by messageValidation,
+    // so they must fail fast at declaration time instead.
+    for (const reserved of ["__proto__", "prototype"]) {
+      expect(() => createRemoteCoreProxy(propDecl(reserved), client)).toThrow(
+        /reserved on the wire protocol/,
+      );
+      expect(() => createRemoteCoreProxy(inputDecl(reserved), client)).toThrow(
+        /reserved on the wire protocol/,
+      );
+      expect(() => createRemoteCoreProxy(cmdDecl(reserved), client)).toThrow(
+        /reserved on the wire protocol/,
       );
     }
   });

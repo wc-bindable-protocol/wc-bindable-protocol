@@ -28,6 +28,7 @@ export interface RemoteSerializedError {
 
 export interface RemoteInvokeOptions {
   signal?: AbortSignal;
+  timeoutMs?: number;
 }
 
 /**

@@ -150,6 +150,43 @@ describe("WebSocketClientTransport", () => {
     warn.mockRestore();
   });
 
+  it("rejects server update messages with empty or reserved names", () => {
+    const { ws, fire } = createMockWebSocket(1);
+    const transport = new WebSocketClientTransport(ws);
+    const handler = vi.fn();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    transport.onMessage(handler);
+
+    fire("message", JSON.stringify({ type: "update", name: "" }));
+    fire("message", JSON.stringify({ type: "update", name: "__proto__" }));
+    fire(
+      "message",
+      '{"type":"sync","values":{"__proto__":{"polluted":true}}}',
+    );
+
+    expect(handler).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledTimes(3);
+    expect(warn).toHaveBeenNthCalledWith(
+      1,
+      "WebSocketClientTransport: ignoring invalid server message",
+      expect.any(Error),
+    );
+    expect(warn).toHaveBeenNthCalledWith(
+      2,
+      "WebSocketClientTransport: ignoring invalid server message",
+      expect.any(Error),
+    );
+    expect(warn).toHaveBeenNthCalledWith(
+      3,
+      "WebSocketClientTransport: ignoring invalid server message",
+      expect.any(Error),
+    );
+    expect(({} as { polluted?: unknown }).polluted).toBeUndefined();
+
+    warn.mockRestore();
+  });
+
   it("onClose fires on close event", () => {
     const { ws, fire } = createMockWebSocket(1);
     const transport = new WebSocketClientTransport(ws);
@@ -240,6 +277,39 @@ describe("WebSocketServerTransport", () => {
     expect(warn).toHaveBeenCalledWith(
       "WebSocketServerTransport: ignoring invalid client message",
       expect.any(SyntaxError),
+    );
+
+    warn.mockRestore();
+  });
+
+  it("rejects addEventListener client messages with empty or reserved names", () => {
+    let listener: ((event: { data: unknown }) => void) | null = null;
+    const ws: WebSocketLike = {
+      send: vi.fn(),
+      addEventListener: vi.fn((_type: string, fn: (event: { data: unknown }) => void) => {
+        listener = fn;
+      }),
+    };
+    const transport = new WebSocketServerTransport(ws);
+    const handler = vi.fn();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    transport.onMessage(handler);
+
+    listener!({ data: JSON.stringify({ type: "set", name: "", value: 1 }) });
+    listener!({ data: JSON.stringify({ type: "cmd", name: "constructor", id: "1", args: [] }) });
+
+    expect(handler).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn).toHaveBeenNthCalledWith(
+      1,
+      "WebSocketServerTransport: ignoring invalid client message",
+      expect.any(Error),
+    );
+    expect(warn).toHaveBeenNthCalledWith(
+      2,
+      "WebSocketServerTransport: ignoring invalid client message",
+      expect.any(Error),
     );
 
     warn.mockRestore();

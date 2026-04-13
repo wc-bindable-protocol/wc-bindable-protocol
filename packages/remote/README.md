@@ -149,7 +149,7 @@ class MyCustomTransport implements ClientTransport {
 
 Custom transport implementations **must guarantee message ordering** (FIFO). The protocol relies on this to ensure consistency between `sync` responses and subsequent `event` messages without sequence numbers.
 
-This package does **not** implement built-in back-pressure or queue limits. In particular, `WebSocketClientTransport` buffers pre-open outbound messages without a cap, `RemoteCoreProxy` keeps pending acknowledged requests in memory until they settle, and `RemoteShellProxy` buffers synchronous `update` messages while a `sync` snapshot is being built. In production, bound these at a higher layer with admission control, timeouts, cancellation, connection quotas, reverse-proxy limits, or per-client rate limiting if untrusted or slow peers are possible.
+This package does **not** implement built-in back-pressure or queue limits. In particular, `WebSocketClientTransport` buffers pre-open outbound messages without a cap, `RemoteCoreProxy` still keeps pending acknowledged requests in memory until they settle or hit their timeout, and `RemoteShellProxy` buffers synchronous `update` messages while a `sync` snapshot is being built. In production, bound these at a higher layer with admission control, connection quotas, reverse-proxy limits, or per-client rate limiting if untrusted or slow peers are possible.
 
 ## API
 
@@ -167,18 +167,18 @@ This package does **not** implement built-in back-pressure or queue limits. In p
 |---|---|
 | `set(name, value)` | Set an input property on the remote Core. Fire-and-forget — see "Error handling" below. |
 | `setWithAck(name, value)` | Set an input property and wait for the server to acknowledge or reject it. |
-| `setWithAckOptions(name, value, options)` | Set an input property with lifecycle options such as `AbortSignal`, without changing the wire payload sent to the server. |
-| `invoke(name, ...args)` | Invoke a command on the remote Core. Returns a Promise that settles when the server replies, the send fails, or the transport closes; there is no built-in timeout or cancellation. |
-| `invokeWithOptions(name, options, ...args)` | Invoke a command with lifecycle options such as `AbortSignal`, without changing the wire arguments sent to the server. |
+| `setWithAckOptions(name, value, options)` | Set an input property with lifecycle options such as `AbortSignal` and `timeoutMs`, without changing the wire payload sent to the server. |
+| `invoke(name, ...args)` | Invoke a command on the remote Core. Returns a Promise that settles when the server replies, the send fails, the transport closes, or the default 30s timeout expires. |
+| `invokeWithOptions(name, options, ...args)` | Invoke a command with lifecycle options such as `AbortSignal` and `timeoutMs`, without changing the wire arguments sent to the server. |
 | `reconnect(transport)` | Attach a fresh client transport after the previous one closed. Existing `bind()` subscribers stay attached and a new `sync` request is sent immediately. |
 | `dispose()` | Reject pending invocations and stop processing future transport messages for this proxy instance. |
 
 #### Error handling
 
 - **`invoke()`** errors on the server are serialized and delivered as `throw` messages, which reject the returned Promise. When the server throws an `Error`, the payload preserves at least `name` and `message`, and includes `stack` when available. If the thrown value itself is not JSON-serializable, `RemoteShellProxy` falls back to a serializable `RemoteShellProxyError` payload instead of leaving the client request pending.
-- **`setWithAckOptions()`** supports `AbortSignal`. Aborting rejects the client-side Promise and forgets the pending response; it does not send a cancellation message to the server.
-- **`invokeWithOptions()`** supports `AbortSignal`. Aborting rejects the client-side Promise and forgets the pending response; it does not send a cancellation message to the server.
-- **Timeouts** are still not built in. If the server never replies, the Promise remains pending until it resolves, rejects, the transport closes, or you abort via `setWithAckOptions()` or `invokeWithOptions()`. If the initial `sync` response does not advertise `capabilities.setAck`, `setWithAck()` and `setWithAckOptions()` reject instead of waiting forever against a legacy server. For all other deadline needs, wrap the call at the application layer with `AbortController`.
+- **`setWithAckOptions()`** supports `AbortSignal` and `timeoutMs`. Aborting rejects the client-side Promise and forgets the pending response; it does not send a cancellation message to the server. Timeouts reject with `TimeoutError` and also clear the pending entry. `setWithAck()` uses the same behavior with a default 30s timeout.
+- **`invokeWithOptions()`** supports `AbortSignal` and `timeoutMs`. Aborting rejects the client-side Promise and forgets the pending response; it does not send a cancellation message to the server. Timeouts reject with `TimeoutError` and also clear the pending entry. `invoke()` uses the same behavior with a default 30s timeout.
+- **Timeout configuration**: pass `timeoutMs` to override the default 30s deadline, or `timeoutMs: 0` to disable the built-in timeout for an individual call. If the initial `sync` response does not advertise `capabilities.setAck`, `setWithAck()` and `setWithAckOptions()` reject instead of waiting forever against a legacy server.
 - **Back-pressure** is not built in. Pending acknowledgements, pre-open WebSocket sends, and `sync`-time queued updates are all unbounded in-memory queues. If a peer can stall or flood the connection, enforce your own limits above this package.
 - **Transport close** rejects all pending `invoke()` calls with `Transport closed` and leaves the proxy disconnected until you call `reconnect()` with a new transport.
 - **`dispose()`** is terminal: it rejects all pending requests with `RemoteCoreProxy disposed` and causes subsequent `set()`, `invoke()`, and `reconnect()` calls to fail immediately.

@@ -6,6 +6,7 @@ import type {
   RemoteCapabilities,
   RemoteSerializedError,
 } from "./types.js";
+import { isReservedRemoteName } from "./transport/messageValidation.js";
 
 const REMOTE_CAPABILITIES: RemoteCapabilities = {
   setAck: true,
@@ -39,41 +40,59 @@ function isSerializableAsThrowPayload(value: unknown): boolean {
   }
 }
 
-function getSerializableErrorCause(error: Error): unknown {
+function getErrorCause(error: Error): unknown {
   if (!("cause" in error)) {
     return undefined;
   }
 
-  const cause = (error as Error & { cause?: unknown }).cause;
-  if (cause === undefined) {
-    return undefined;
+  return (error as Error & { cause?: unknown }).cause;
+}
+
+function serializeErrorCause(cause: unknown, seen: Set<Error>): unknown {
+  if (cause instanceof Error) {
+    return serializeErrorObject(cause, seen);
   }
 
-  return isSerializableAsThrowPayload(cause) ? cause : undefined;
+  if (isSerializableAsThrowPayload(cause)) {
+    return cause;
+  }
+
+  return createRemoteShellProxyError("Error cause is not JSON-serializable");
+}
+
+function serializeErrorObject(error: Error, seen: Set<Error>): RemoteSerializedError {
+  if (seen.has(error)) {
+    return createRemoteShellProxyError("Error cause chain contains a cycle");
+  }
+
+  seen.add(error);
+  try {
+    // Preserve standard Error fields plus a JSON-safe cause. Other
+    // subclass-specific fields remain intentionally excluded until the
+    // wire format defines a broader error metadata contract.
+    const value: RemoteSerializedError = {
+      name: error.name,
+      message: error.message,
+    };
+
+    if (typeof error.stack === "string") {
+      value.stack = error.stack;
+    }
+
+    const cause = getErrorCause(error);
+    if (cause !== undefined) {
+      value.cause = serializeErrorCause(cause, seen);
+    }
+
+    return value;
+  } finally {
+    seen.delete(error);
+  }
 }
 
 function serializeThrownError(error: unknown): unknown {
   const serialized = error instanceof Error
-    ? (() => {
-      // Preserve standard Error fields plus a JSON-safe cause. Other
-      // subclass-specific fields remain intentionally excluded until the
-      // wire format defines a broader error metadata contract.
-      const value: RemoteSerializedError = {
-        name: error.name,
-        message: error.message,
-      };
-
-      if (typeof error.stack === "string") {
-        value.stack = error.stack;
-      }
-
-      const cause = getSerializableErrorCause(error);
-      if (cause !== undefined) {
-        value.cause = cause;
-      }
-
-      return value;
-    })()
+    ? serializeErrorObject(error, new Set())
     : error;
 
   if (isSerializableAsThrowPayload(serialized)) {
@@ -117,6 +136,32 @@ export class RemoteShellProxy {
       throw new Error("RemoteShellProxy: target must have static wcBindable declaration");
     }
     this._declaration = ctor.wcBindable;
+    // Reject any declared name that the wire validator reserves. Traffic for
+    // such names is dropped by messageValidation.ts (sync values, set, cmd,
+    // update), so letting a Shell come up with them would mean sync emits
+    // that never reach clients and set/cmd frames that silently fail. Fail
+    // fast at construction instead.
+    for (const input of this._declaration.inputs ?? []) {
+      if (isReservedRemoteName(input.name)) {
+        throw new Error(
+          `RemoteShellProxy: input name "${input.name}" is reserved and cannot be assigned remotely`,
+        );
+      }
+    }
+    for (const property of this._declaration.properties) {
+      if (isReservedRemoteName(property.name)) {
+        throw new Error(
+          `RemoteShellProxy: property name "${property.name}" is reserved on the wire protocol and its sync/update messages would be dropped`,
+        );
+      }
+    }
+    for (const command of this._declaration.commands ?? []) {
+      if (isReservedRemoteName(command.name)) {
+        throw new Error(
+          `RemoteShellProxy: command name "${command.name}" is reserved on the wire protocol and its cmd messages would be dropped`,
+        );
+      }
+    }
     this._allowedInputs = new Set((this._declaration.inputs ?? []).map((i) => i.name));
     this._allowedCommands = new Set((this._declaration.commands ?? []).map((c) => c.name));
 
@@ -250,6 +295,23 @@ export class RemoteShellProxy {
 
           console.warn(
             `RemoteShellProxy: ignored set for undeclared input "${msg.name}"`,
+          );
+          return;
+        }
+        if (isReservedRemoteName(msg.name)) {
+          if (msg.id != null) {
+            this._safeSend({
+              type: "throw",
+              id: msg.id,
+              error: createRemoteShellProxyError(
+                `Input "${msg.name}" is reserved and cannot be assigned remotely`,
+              ),
+            }, `throw response for input "${msg.name}"`);
+            return;
+          }
+
+          console.warn(
+            `RemoteShellProxy: ignored set for reserved input "${msg.name}"`,
           );
           return;
         }

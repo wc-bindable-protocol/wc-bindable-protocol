@@ -98,6 +98,7 @@ export class WebSocketClientTransport implements ClientTransport {
         const queued = this._buffer;
         this._buffer = null;
         for (const payload of queued) {
+          if (this._closed) break;
           ws.send(payload);
         }
       };

@@ -20,6 +20,33 @@ describe("WebSocketClientTransport", () => {
     ]);
   });
 
+  it("stops flushing buffered messages if the socket closes during the open flush", () => {
+    class ClosingOnFirstSendWebSocket extends MockBrowserWebSocket {
+      private _sendCount = 0;
+
+      override send(data: string): void {
+        this._sendCount += 1;
+        super.send(data);
+        if (this._sendCount === 1) {
+          this.emit("close");
+        }
+      }
+    }
+
+    const ws = new ClosingOnFirstSendWebSocket(WebSocket.CONNECTING);
+    const transport = new WebSocketClientTransport(ws as unknown as WebSocket);
+
+    transport.send({ type: "sync" });
+    transport.send({ type: "set", name: "url", value: "/api" });
+
+    ws.emit("open");
+
+    expect(ws.sent).toEqual([
+      JSON.stringify({ type: "sync" }),
+    ]);
+    expect(() => transport.send({ type: "sync" })).toThrow("connection is closed");
+  });
+
   it("throws synchronously from send() when the message is not JSON-serializable, even while buffering", () => {
     // A non-JSON value (BigInt) must surface as a synchronous send() failure
     // while the socket is still CONNECTING. Deferring JSON.stringify to the
@@ -142,12 +169,13 @@ describe("WebSocketClientTransport", () => {
     expect(onMessage).toHaveBeenCalledWith({ type: "update", name: "value" });
   });
 
-  it("warns once when binary payloads are received", () => {
+  it("deduplicates the specialized binary warning but still warns for each dropped binary payload", () => {
     const ws = new MockBrowserWebSocket(WebSocket.OPEN);
     const transport = new WebSocketClientTransport(ws as unknown as WebSocket);
     const onMessage = vi.fn();
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const binaryWarning = "WebSocketClientTransport: received a binary message payload; this transport expects text JSON frames from the server. Check the server framing or browser binaryType.";
+    const invalidMessageWarning = "WebSocketClientTransport: ignoring invalid server message";
 
     transport.onMessage(onMessage);
     ws.emit("message", { data: new Uint8Array([123, 125]) });
@@ -156,6 +184,7 @@ describe("WebSocketClientTransport", () => {
     expect(onMessage).not.toHaveBeenCalled();
     expect(warnSpy).toHaveBeenCalledWith(binaryWarning);
     expect(warnSpy.mock.calls.filter(([message]) => message === binaryWarning)).toHaveLength(1);
+    expect(warnSpy.mock.calls.filter(([message]) => message === invalidMessageWarning)).toHaveLength(2);
 
     warnSpy.mockRestore();
   });

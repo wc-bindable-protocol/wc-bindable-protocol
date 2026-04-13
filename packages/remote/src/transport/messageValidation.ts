@@ -16,8 +16,30 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
 }
 
+export const RESERVED_REMOTE_NAMES: ReadonlySet<string> = new Set([
+  "__proto__",
+  "prototype",
+  "constructor",
+]);
+
+export function isReservedRemoteName(name: string): boolean {
+  return RESERVED_REMOTE_NAMES.has(name);
+}
+
+function isValidRemoteName(value: unknown): value is string {
+  return isNonEmptyString(value) && !RESERVED_REMOTE_NAMES.has(value);
+}
+
 function isServerSyncValues(value: unknown): value is Record<string, unknown> {
-  return isRecord(value);
+  if (!isRecord(value)) return false;
+  // Per-key check: object keys travel over the wire just like `set.name` /
+  // `cmd.name`, and assigning `values["__proto__"] = x` into the cache object
+  // mutates its prototype. Reject reserved names here so the whole sync frame
+  // is dropped before it reaches the proxy's cache writes.
+  for (const key of Object.keys(value)) {
+    if (RESERVED_REMOTE_NAMES.has(key)) return false;
+  }
+  return true;
 }
 
 function isRemoteCapabilities(value: unknown): value is RemoteCapabilities {
@@ -41,12 +63,12 @@ export function isClientMessage(value: unknown): value is ClientMessage {
       // undefined assignment. Reading `msg.value` yields `undefined` in that
       // case, matching the sender's intent.
       return (
-        typeof value.name === "string" &&
+        isValidRemoteName(value.name) &&
         (value.id === undefined || typeof value.id === "string")
       );
     case "cmd":
       return (
-        typeof value.name === "string" &&
+        isValidRemoteName(value.name) &&
         isNonEmptyString(value.id) &&
         isUnknownArray(value.args)
       );
@@ -70,7 +92,7 @@ export function isServerMessage(value: unknown): value is ServerMessage {
     case "update":
       // See note on "set": an absent `value` key represents an undefined
       // update, since JSON.stringify cannot transmit `value: undefined`.
-      return typeof value.name === "string";
+      return isValidRemoteName(value.name);
     case "return":
     case "throw":
       return typeof value.id === "string";

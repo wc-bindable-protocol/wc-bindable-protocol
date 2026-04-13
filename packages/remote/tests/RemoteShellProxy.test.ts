@@ -15,6 +15,65 @@ describe("RemoteShellProxy", () => {
     );
   });
 
+  it("rejects declarations whose input names are reserved for object mutation", () => {
+    class ReservedInputCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [{ name: "value", event: "reserved:value" }],
+        inputs: [{ name: "__proto__" }],
+      };
+
+      get value(): string {
+        return "ok";
+      }
+    }
+
+    const { server } = createSyncTransportPair();
+    expect(() => new RemoteShellProxy(new ReservedInputCore(), server)).toThrow(
+      'RemoteShellProxy: input name "__proto__" is reserved and cannot be assigned remotely',
+    );
+  });
+
+  it("rejects declarations whose property names are reserved on the wire", () => {
+    class ReservedPropCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [{ name: "prototype", event: "reserved:prototype" }],
+      };
+
+      get prototype(): string {
+        return "ok";
+      }
+    }
+
+    const { server } = createSyncTransportPair();
+    expect(() => new RemoteShellProxy(new ReservedPropCore(), server)).toThrow(
+      /property name "prototype" is reserved on the wire protocol/,
+    );
+  });
+
+  it("rejects declarations whose command names are reserved on the wire", () => {
+    class ReservedCmdCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [{ name: "value", event: "reserved:value" }],
+        commands: [{ name: "constructor" }],
+      };
+
+      get value(): string {
+        return "ok";
+      }
+    }
+
+    const { server } = createSyncTransportPair();
+    expect(() => new RemoteShellProxy(new ReservedCmdCore(), server)).toThrow(
+      /command name "constructor" is reserved on the wire protocol/,
+    );
+  });
+
   it("does not send initial values on construction", () => {
     const core = new TestCore();
     (core as unknown as Record<string, unknown>)._value = "initial";
@@ -561,6 +620,31 @@ describe("RemoteShellProxy", () => {
     });
   });
 
+  it("rejects reserved input names at set time even if allowed inputs are corrupted", () => {
+    const core = new TestCore();
+    const send = vi.fn();
+    let handler: ((msg: ClientMessage) => void) | null = null;
+    const server: ServerTransport = {
+      send,
+      onMessage: (h) => { handler = h; },
+    };
+
+    const shell = new RemoteShellProxy(core, server) as unknown as { _allowedInputs: Set<string> };
+    shell._allowedInputs.add("__proto__");
+
+    handler!({ type: "set", name: "__proto__", value: { polluted: true }, id: "pollute" });
+
+    expect(send).toHaveBeenCalledWith({
+      type: "throw",
+      id: "pollute",
+      error: {
+        name: "RemoteShellProxyError",
+        message: 'Input "__proto__" is reserved and cannot be assigned remotely',
+      },
+    });
+    expect(Object.prototype).not.toHaveProperty("polluted");
+  });
+
   it("treats an empty string set id as an acknowledged request", () => {
     const core = new TestCore();
     const send = vi.fn();
@@ -915,6 +999,94 @@ describe("RemoteShellProxy", () => {
     });
   });
 
+  it("serializes nested Error cause chains recursively", () => {
+    class ThrowCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+        commands: [{ name: "boom" }],
+      };
+      boom(): never {
+        const root = new Error("root cause", { cause: { status: 503 } });
+        const middle = new Error("middle cause", { cause: root });
+        throw new Error("top level", { cause: middle });
+      }
+    }
+
+    const core = new ThrowCore();
+    const send = vi.fn();
+    let handler: ((msg: ClientMessage) => void) | null = null;
+    const server: ServerTransport = {
+      send,
+      onMessage: (h) => { handler = h; },
+    };
+
+    new RemoteShellProxy(core, server);
+    handler!({ type: "cmd", name: "boom", id: "nested-cause", args: [] });
+
+    expect(send).toHaveBeenCalledWith({
+      type: "throw",
+      id: "nested-cause",
+      error: expect.objectContaining({
+        name: "Error",
+        message: "top level",
+        cause: expect.objectContaining({
+          name: "Error",
+          message: "middle cause",
+          cause: expect.objectContaining({
+            name: "Error",
+            message: "root cause",
+            cause: { status: 503 },
+          }),
+        }),
+      }),
+    });
+  });
+
+  it("notifies when a nested Error cause is not JSON-serializable", () => {
+    class ThrowCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+        commands: [{ name: "boom" }],
+      };
+      boom(): never {
+        const nested = new Error("nested", { cause: { toJSON: () => { throw new Error("bad json"); } } });
+        throw new Error("top", { cause: nested });
+      }
+    }
+
+    const core = new ThrowCore();
+    const send = vi.fn();
+    let handler: ((msg: ClientMessage) => void) | null = null;
+    const server: ServerTransport = {
+      send,
+      onMessage: (h) => { handler = h; },
+    };
+
+    new RemoteShellProxy(core, server);
+    handler!({ type: "cmd", name: "boom", id: "non-json-cause", args: [] });
+
+    expect(send).toHaveBeenCalledWith({
+      type: "throw",
+      id: "non-json-cause",
+      error: expect.objectContaining({
+        name: "Error",
+        message: "top",
+        cause: expect.objectContaining({
+          name: "Error",
+          message: "nested",
+          cause: {
+            name: "RemoteShellProxyError",
+            message: "Error cause is not JSON-serializable",
+          },
+        }),
+      }),
+    });
+  });
+
   it("passes through non-Error sync throws", () => {
     class StringThrowCore extends EventTarget {
       static wcBindable: WcBindableDeclaration = {
@@ -1038,6 +1210,43 @@ describe("RemoteShellProxy", () => {
     await flush();
 
     expect(send).not.toHaveBeenCalled();
+  });
+
+  it("does not log when an async cmd rejects after dispose()", async () => {
+    let rejectFetch: ((reason?: unknown) => void) | null = null;
+    class SlowCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+        commands: [{ name: "slow", async: true }],
+      };
+      slow(): Promise<unknown> {
+        return new Promise((_resolve, reject) => { rejectFetch = reject; });
+      }
+    }
+
+    const core = new SlowCore();
+    const send = vi.fn();
+    let handler: ((msg: ClientMessage) => void) | null = null;
+    const server: ServerTransport = {
+      send,
+      onMessage: (h) => { handler = h; },
+    };
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const shell = new RemoteShellProxy(core, server);
+    handler!({ type: "cmd", name: "slow", id: "reject-after-dispose", args: [] });
+
+    shell.dispose();
+    rejectFetch!(new Error("too-late"));
+    await flush();
+    await flush();
+
+    expect(send).not.toHaveBeenCalled();
+    expect(errorSpy).not.toHaveBeenCalled();
+
+    errorSpy.mockRestore();
   });
 
   it("dispose() is idempotent", () => {

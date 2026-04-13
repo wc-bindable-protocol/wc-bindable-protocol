@@ -5,6 +5,9 @@ import type {
   RemoteInvokeOptions,
   RemoteSerializedError,
 } from "./types.js";
+import { isReservedRemoteName } from "./transport/messageValidation.js";
+
+const DEFAULT_PENDING_TIMEOUT_MS = 30_000;
 
 function createAbortError(signal: AbortSignal): unknown {
   if (signal.reason !== undefined) {
@@ -16,6 +19,28 @@ function createAbortError(signal: AbortSignal): unknown {
   const error = new Error("This operation was aborted");
   error.name = "AbortError";
   return error;
+}
+
+function createTimeoutError(operation: string, timeoutMs: number): Error {
+  const error = new Error(`RemoteCoreProxy: ${operation} timed out after ${timeoutMs}ms`);
+  error.name = "TimeoutError";
+  return error;
+}
+
+function normalizeTimeoutMs(options?: RemoteInvokeOptions): number | null {
+  const timeoutMs = options?.timeoutMs;
+  if (timeoutMs === undefined) {
+    return DEFAULT_PENDING_TIMEOUT_MS;
+  }
+  if (timeoutMs === 0) {
+    return null;
+  }
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+    throw new RangeError(
+      "RemoteCoreProxy: timeoutMs must be a non-negative finite number; use 0 to disable the timeout",
+    );
+  }
+  return timeoutMs;
 }
 
 function createCommandId(getFallbackId: () => number): string {
@@ -139,41 +164,20 @@ export class RemoteCoreProxy extends EventTarget {
       return Promise.reject(createAbortError(signal));
     }
 
-    const id = createCommandId(() => ++this._cmdId);
-    return new Promise<void>((resolve, reject) => {
-      const cleanup = () => {
-        if (signal) {
-          signal.removeEventListener("abort", onAbort);
+    return this._createPendingRequest<void>(
+      "set-ack",
+      options,
+      `setWithAck(\"${name}\")`,
+      (id) => {
+        try {
+          transport.send({ type: "set", name, value, id });
+        } catch (err) {
+          // _handleSendFailure rejects all pending (including this id) and
+          // clears the transport so reconnect() can attach a new one.
+          this._handleSendFailure(transport, err);
         }
-      };
-      const onAbort = () => {
-        if (!signal) return;
-        const pending = this._pending.get(id);
-        if (!pending) return;
-        this._pending.delete(id);
-        pending.cleanup();
-        pending.reject(createAbortError(signal));
-      };
-
-      this._pending.set(id, {
-        kind: "set-ack",
-        resolve: () => resolve(),
-        reject,
-        cleanup,
-      });
-
-      if (signal) {
-        signal.addEventListener("abort", onAbort, { once: true });
-      }
-
-      try {
-        transport.send({ type: "set", name, value, id });
-      } catch (err) {
-        // _handleSendFailure rejects all pending (including this id) and
-        // clears the transport so reconnect() can attach a new one.
-        this._handleSendFailure(transport, err);
-      }
-    });
+      },
+    );
   }
 
   /** Invoke a command on the remote Core and return its result. */
@@ -204,11 +208,48 @@ export class RemoteCoreProxy extends EventTarget {
       return Promise.reject(createAbortError(signal));
     }
 
-    const id = createCommandId(() => ++this._cmdId);
-    return new Promise((resolve, reject) => {
+    return this._createPendingRequest<unknown>(
+      "invoke",
+      options,
+      `invoke(\"${name}\")`,
+      (id) => {
+        try {
+          transport.send({ type: "cmd", name, id, args });
+        } catch (err) {
+          // _handleSendFailure rejects all pending (including this id) and
+          // clears the transport so reconnect() can attach a new one.
+          this._handleSendFailure(transport, err);
+        }
+      },
+    );
+  }
+
+  private _createPendingRequest<T>(
+    kind: "set-ack" | "invoke",
+    options: RemoteInvokeOptions | undefined,
+    timeoutContext: string,
+    dispatch: (id: string) => void,
+  ): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      // Normalize inside the executor so invalid timeoutMs surfaces as an
+      // async rejection, matching the rest of this promise-returning API
+      // (aborted/disposed/transport-closed all reject, never throw).
+      let timeoutMs: number | null;
+      try {
+        timeoutMs = normalizeTimeoutMs(options);
+      } catch (err) {
+        reject(err);
+        return;
+      }
+      const signal = options?.signal;
+      const id = createCommandId(() => ++this._cmdId);
+      let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
       const cleanup = () => {
         if (signal) {
           signal.removeEventListener("abort", onAbort);
+        }
+        if (timeoutHandle !== null) {
+          clearTimeout(timeoutHandle);
         }
       };
       const onAbort = () => {
@@ -219,20 +260,32 @@ export class RemoteCoreProxy extends EventTarget {
         pending.cleanup();
         pending.reject(createAbortError(signal));
       };
+      const onTimeout = () => {
+        const pending = this._pending.get(id);
+        if (!pending || timeoutMs === null) return;
+        this._pending.delete(id);
+        pending.cleanup();
+        pending.reject(createTimeoutError(timeoutContext, timeoutMs));
+      };
 
-      this._pending.set(id, { kind: "invoke", resolve, reject, cleanup });
+      // The pending map is type-erased (resolve: (v: unknown) => void) so
+      // set-ack (T = void) and invoke (T = unknown) can share one table.
+      // Wrap to bridge the generic resolve back into the erased slot.
+      this._pending.set(id, {
+        kind,
+        resolve: (v) => resolve(v as T),
+        reject,
+        cleanup,
+      });
 
       if (signal) {
         signal.addEventListener("abort", onAbort, { once: true });
       }
-
-      try {
-        transport.send({ type: "cmd", name, id, args });
-      } catch (err) {
-        // _handleSendFailure rejects all pending (including this id) and
-        // clears the transport so reconnect() can attach a new one.
-        this._handleSendFailure(transport, err);
+      if (timeoutMs !== null) {
+        timeoutHandle = setTimeout(onTimeout, timeoutMs);
       }
+
+      dispatch(id);
     });
   }
 
@@ -544,10 +597,22 @@ export function createRemoteCoreProxy(
   declaration: WcBindableDeclaration,
   transport: ClientTransport,
 ): RemoteCoreProxy {
+  // Two separate reasons a declared name must be rejected here:
+  //   1. RESERVED_PROXY_MEMBER_NAMES — shadowed by the Proxy target, would
+  //      break bind()/isWcBindable() / input / command routing locally.
+  //   2. isReservedRemoteName — the wire validator drops messages carrying
+  //      these names (see messageValidation.ts). Allowing them at
+  //      construction would turn the property/command into a runtime black
+  //      hole where all traffic is silently discarded. Fail fast instead.
   for (const p of declaration.properties) {
     if (RESERVED_PROXY_MEMBER_NAMES.has(p.name)) {
       throw new Error(
         `RemoteCoreProxy: property name "${p.name}" collides with a reserved EventTarget/proxy member and would break bind()/isWcBindable()`,
+      );
+    }
+    if (isReservedRemoteName(p.name)) {
+      throw new Error(
+        `RemoteCoreProxy: property name "${p.name}" is reserved on the wire protocol and its sync/update messages would be dropped`,
       );
     }
   }
@@ -558,12 +623,22 @@ export function createRemoteCoreProxy(
         `RemoteCoreProxy: input name "${input.name}" collides with a reserved EventTarget/proxy member and would break proxy input access`,
       );
     }
+    if (isReservedRemoteName(input.name)) {
+      throw new Error(
+        `RemoteCoreProxy: input name "${input.name}" is reserved on the wire protocol and its set messages would be dropped`,
+      );
+    }
   }
 
   for (const command of declaration.commands ?? []) {
     if (RESERVED_PROXY_MEMBER_NAMES.has(command.name)) {
       throw new Error(
         `RemoteCoreProxy: command name "${command.name}" collides with a reserved EventTarget/proxy member and would break proxy command access`,
+      );
+    }
+    if (isReservedRemoteName(command.name)) {
+      throw new Error(
+        `RemoteCoreProxy: command name "${command.name}" is reserved on the wire protocol and its cmd messages would be dropped`,
       );
     }
   }
