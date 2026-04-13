@@ -207,7 +207,10 @@ export class RemoteCoreProxy extends EventTarget {
   /** Invoke a command on the remote Core with explicit wire arguments and lifecycle options. */
   invokeWithOptions(name: string, args: unknown[], options?: RemoteRequestOptions): Promise<unknown>;
 
-  /** @deprecated Prefer invokeWithOptions(name, args, options) to avoid options/args ambiguity. */
+  /**
+   * @deprecated Prefer invokeWithOptions(name, args, options) to avoid options/args ambiguity.
+   * The legacy form cannot represent a first wire argument that is itself an array.
+   */
   invokeWithOptions(name: string, options: RemoteRequestOptions, ...args: unknown[]): Promise<unknown>;
 
   invokeWithOptions(

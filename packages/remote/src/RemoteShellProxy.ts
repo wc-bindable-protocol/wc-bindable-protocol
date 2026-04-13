@@ -298,6 +298,11 @@ export class RemoteShellProxy {
           );
           return;
         }
+        // Reserved names are rejected while building _allowedInputs, so this
+        // should be unreachable for normal declarations. Keep the guard at the
+        // assignment boundary as defense in depth in case a malformed message,
+        // mutated declaration, or JS-level private-field escape bypasses the
+        // constructor-time validation.
         if (isReservedRemoteName(msg.name)) {
           if (msg.id != null) {
             this._safeSend({
