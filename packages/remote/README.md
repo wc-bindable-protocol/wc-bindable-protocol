@@ -170,23 +170,23 @@ Custom transport implementations **must guarantee message ordering** (FIFO). The
 
 #### Error handling
 
-- **`invoke()`** errors on the server are serialized and delivered as `throw` messages, which reject the returned Promise. When the server throws an `Error`, the payload preserves at least `name` and `message`, and includes `stack` when available.
+- **`invoke()`** errors on the server are serialized and delivered as `throw` messages, which reject the returned Promise. When the server throws an `Error`, the payload preserves at least `name` and `message`, and includes `stack` when available. If the thrown value itself is not JSON-serializable, `RemoteShellProxy` falls back to a serializable `RemoteShellProxyError` payload instead of leaving the client request pending.
 - **`invokeWithOptions()`** supports `AbortSignal`. Aborting rejects the client-side Promise and forgets the pending response; it does not send a cancellation message to the server.
 - **Timeouts** are still not built in. If the server never replies, the Promise remains pending until it resolves, rejects, the transport closes, or you abort via `invokeWithOptions()`. If you need deadlines, wrap the call at the application layer with `AbortController`.
 - **Transport close** rejects all pending `invoke()` calls with `Transport closed` and leaves the proxy disconnected until you call `reconnect()` with a new transport.
 - **`dispose()`** is terminal: it rejects all pending `invoke()` calls with `RemoteCoreProxy disposed` and causes subsequent `set()`, `invoke()`, and `reconnect()` calls to fail immediately.
-- **`set()`** validates the input name on the client before sending. Undeclared names fail immediately. If a buggy or stale client still sends an undeclared input, `RemoteShellProxy` drops it and logs `console.warn`. Declared inputs remain fire-and-forget: there is no response id and no error is delivered back to the client.
+- **`set()`** validates the input name on the client before sending, so undeclared names fail immediately. It also throws synchronously if the proxy is already disconnected or if the transport send fails while trying to enqueue the message. For declared inputs on a healthy transport, it remains fire-and-forget: there is no response id and no server-side success/error is delivered back to the client. If a buggy or stale client still sends an undeclared input, `RemoteShellProxy` drops it and logs `console.warn`.
 - **`setWithAck()`** sends the same mutation with a request id and waits for a `return`/`throw` response. Use it when the caller needs server-side validation feedback such as type mismatches, read-only assignments, or conversion failures.
 - **Fire-and-forget setter failures** on plain `set()` are still caught and logged via `console.error` on the server so they do not escape the transport's message handler or terminate the connection.
 - **Server send failures** while forwarding `sync`, `update`, `return`, or `throw` messages are caught and logged via `console.error`. The failing message is dropped; the connection is not closed automatically.
-- **Server transport teardown**: if the `ServerTransport` implements `onClose()`, `RemoteShellProxy` disposes itself automatically. `WebSocketServerTransport` does this for standard WebSocket and Node `ws` close events.
+- **Server transport teardown**: if the `ServerTransport` implements `onClose()`, `RemoteShellProxy` disposes itself automatically. If the transport also implements `dispose()`, `RemoteShellProxy.dispose()` calls it so message/close listeners can be released. `WebSocketServerTransport` does both for standard WebSocket and Node `ws` close events.
 
 ### RemoteShellProxy
 
 | Method | Description |
 |---|---|
 | `constructor(core, transport)` | Connect a Core to the transport. Subscribes to Core events and listens for client messages. |
-| `dispose()` | Unsubscribe from Core events. Call when the connection closes. |
+| `dispose()` | Unsubscribe from Core events and release transport-owned listeners if supported. Call when the connection closes. |
 
 ### Message protocol
 
@@ -218,7 +218,7 @@ A Core may declare multiple properties that share the same event and differ only
 Because the server already applies them. The wire value is the already-extracted per-property value, and the client proxy rewrites each property's `event` to a synthetic per-property name (`@wc-bindable/remote:<name>`) so the default getter (`e => e.detail`) is always sufficient. As a consequence, `getter` functions do not need to be serializable — but note that this also means `addEventListener` on the proxy with the original Core event name will not fire. Use `bind()` or property access.
 
 **What values can cross the wire?**
-Messages are encoded with `JSON.stringify`, so only JSON-serializable values round-trip faithfully. Values such as `Date`, `Map`, `Set`, `BigInt`, functions, class instances, or cyclic objects will be transformed, dropped, or throw during serialization. If serialization fails while the server is sending `sync`, `update`, `return`, or `throw`, `RemoteShellProxy` logs the failure and drops that message.
+Messages are encoded with `JSON.stringify`, so only JSON-serializable values round-trip faithfully. Values such as `Date`, `Map`, `Set`, `BigInt`, functions, class instances, or cyclic objects will be transformed, dropped, or throw during serialization. If serialization fails while the server is sending `sync`, `update`, or `return`, `RemoteShellProxy` logs the failure and drops that message. For `throw` responses, it instead falls back to a serializable `RemoteShellProxyError` payload so the client request can still reject.
 
 ## License
 

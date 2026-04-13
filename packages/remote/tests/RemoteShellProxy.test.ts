@@ -181,6 +181,57 @@ describe("RemoteShellProxy", () => {
     });
   });
 
+  it("does not drop events emitted while flushing queued sync updates", () => {
+    class FlushSideEffectCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [
+          { name: "value", event: "flush-side-effect:value" },
+          { name: "status", event: "flush-side-effect:status" },
+        ],
+      };
+
+      get value(): string {
+        this.dispatchEvent(new CustomEvent("flush-side-effect:status", { detail: "queued" }));
+        return "snapshot";
+      }
+
+      get status(): string {
+        return "current";
+      }
+    }
+
+    const core = new FlushSideEffectCore();
+    const sent: ServerMessage[] = [];
+    let handler: ((msg: ClientMessage) => void) | null = null;
+    let emittedDuringFlush = false;
+    const server: ServerTransport = {
+      send: (message) => {
+        sent.push(message);
+        if (
+          !emittedDuringFlush &&
+          message.type === "update" &&
+          message.name === "status" &&
+          message.value === "queued"
+        ) {
+          emittedDuringFlush = true;
+          core.dispatchEvent(new CustomEvent("flush-side-effect:status", { detail: "after-flush" }));
+        }
+      },
+      onMessage: (h) => { handler = h; },
+    };
+
+    new RemoteShellProxy(core, server);
+    handler!({ type: "sync" });
+
+    expect(sent).toEqual([
+      { type: "sync", values: { value: "snapshot", status: "current" } },
+      { type: "update", name: "status", value: "queued" },
+      { type: "update", name: "status", value: "after-flush" },
+    ]);
+  });
+
   it("forwards Core events to transport as property updates", () => {
     const core = new TestCore();
     const send = vi.fn();
@@ -584,6 +635,43 @@ describe("RemoteShellProxy", () => {
     });
   });
 
+  it("falls back to a serializable throw payload for non-serializable setter failures", () => {
+    class ThrowingSetterCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+        inputs: [{ name: "value" }],
+      };
+      set value(_v: unknown) {
+        throw 1n;
+      }
+      get value(): unknown {
+        return undefined;
+      }
+    }
+
+    const core = new ThrowingSetterCore();
+    const send = vi.fn();
+    let handler: ((msg: ClientMessage) => void) | null = null;
+    const server: ServerTransport = {
+      send,
+      onMessage: (h) => { handler = h; },
+    };
+
+    new RemoteShellProxy(core, server);
+    handler!({ type: "set", name: "value", value: "bad", id: "set-bigint" });
+
+    expect(send).toHaveBeenCalledWith({
+      type: "throw",
+      id: "set-bigint",
+      error: {
+        name: "RemoteShellProxyError",
+        message: "Thrown value is not JSON-serializable",
+      },
+    });
+  });
+
   it("sends throw message when async cmd rejects", async () => {
     class FailCore extends EventTarget {
       static wcBindable: WcBindableDeclaration = {
@@ -651,6 +739,46 @@ describe("RemoteShellProxy", () => {
       type: "throw",
       id: "string-async",
       error: "plain failure",
+    });
+  });
+
+  it("falls back to a serializable throw payload for non-serializable async rejections", async () => {
+    const circular: { self?: unknown } = {};
+    circular.self = circular;
+
+    class CircularRejectCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+        commands: [{ name: "fail" }],
+      };
+
+      async fail(): Promise<never> {
+        throw circular;
+      }
+    }
+
+    const core = new CircularRejectCore();
+    const send = vi.fn();
+    let handler: ((msg: ClientMessage) => void) | null = null;
+    const server: ServerTransport = {
+      send,
+      onMessage: (h) => { handler = h; },
+    };
+
+    new RemoteShellProxy(core, server);
+    handler!({ type: "cmd", name: "fail", id: "circular-async", args: [] });
+
+    await flush();
+
+    expect(send).toHaveBeenCalledWith({
+      type: "throw",
+      id: "circular-async",
+      error: {
+        name: "RemoteShellProxyError",
+        message: "Thrown value is not JSON-serializable",
+      },
     });
   });
 
@@ -802,6 +930,21 @@ describe("RemoteShellProxy", () => {
     // sync: no response must be sent either.
     handler!({ type: "sync" });
     expect(send).not.toHaveBeenCalled();
+  });
+
+  it("disposes the transport when shell is disposed", () => {
+    const core = new TestCore();
+    const dispose = vi.fn();
+    const server: ServerTransport = {
+      send: () => {},
+      onMessage: () => {},
+      dispose,
+    };
+
+    const shell = new RemoteShellProxy(core, server);
+    shell.dispose();
+
+    expect(dispose).toHaveBeenCalledTimes(1);
   });
 
   it("swallows async cmd resolution arriving after dispose()", async () => {

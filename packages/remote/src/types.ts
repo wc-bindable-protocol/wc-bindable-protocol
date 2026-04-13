@@ -79,4 +79,6 @@ export interface ServerTransport {
    * handler when called again.
    */
   onClose?(handler: () => void): void;
+  /** Release listeners and any transport-owned resources. Optional. */
+  dispose?(): void;
 }

@@ -108,6 +108,24 @@ describe("WebSocketClientTransport", () => {
     warnSpy.mockRestore();
   });
 
+  it("ignores update messages that omit the value field", () => {
+    const ws = new MockBrowserWebSocket(WebSocket.OPEN);
+    const transport = new WebSocketClientTransport(ws as unknown as WebSocket);
+    const onMessage = vi.fn();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    transport.onMessage(onMessage);
+    ws.emit("message", { data: JSON.stringify({ type: "update", name: "value" }) });
+
+    expect(onMessage).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledWith(
+      "WebSocketClientTransport: ignoring invalid server message",
+      expect.any(Error),
+    );
+
+    warnSpy.mockRestore();
+  });
+
   it("dispose() removes WebSocket listeners", () => {
     const ws = new MockBrowserWebSocket(WebSocket.CONNECTING);
     const transport = new WebSocketClientTransport(ws as unknown as WebSocket);

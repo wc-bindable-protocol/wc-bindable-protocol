@@ -59,7 +59,11 @@ export class RemoteCoreProxy extends EventTarget {
   set(name: string, value: unknown): void {
     this._validateInputName(name);
     const transport = this._requireTransport();
-    transport.send({ type: "set", name, value });
+    try {
+      transport.send({ type: "set", name, value });
+    } catch (err) {
+      throw this._handleSendFailure(transport, err);
+    }
   }
 
   /** Set an input property and wait for the server to acknowledge or reject it. */
@@ -85,8 +89,9 @@ export class RemoteCoreProxy extends EventTarget {
       try {
         transport.send({ type: "set", name, value, id });
       } catch (err) {
-        this._pending.delete(id);
-        reject(err);
+        // _handleSendFailure rejects all pending (including this id) and
+        // clears the transport so reconnect() can attach a new one.
+        this._handleSendFailure(transport, err);
       }
     });
   }
@@ -139,9 +144,9 @@ export class RemoteCoreProxy extends EventTarget {
       try {
         transport.send({ type: "cmd", name, id, args });
       } catch (err) {
-        this._pending.delete(id);
-        cleanup();
-        reject(err);
+        // _handleSendFailure rejects all pending (including this id) and
+        // clears the transport so reconnect() can attach a new one.
+        this._handleSendFailure(transport, err);
       }
     });
   }
@@ -179,6 +184,32 @@ export class RemoteCoreProxy extends EventTarget {
     this._transportGeneration++;
     this._rejectPending(this._connectionError);
     this._disposeTransport(transport);
+  }
+
+  /**
+   * Treat a thrown send() as a transport-level failure: clear the active
+    * transport, reject pending work, and dispose only the failed transport.
+    * The proxy itself remains reconnectable: it transitions into the same
+    * disconnected state used by onClose rather than the terminal disposed
+    * state. Without this, a transport that signals closure only by throwing
+    * from send (and does not implement the optional onClose) would leave the
+    * proxy permanently stuck — reconnect() would refuse because _transport is
+    * still set.
+   *
+   * Returns the normalized Error so callers can throw it synchronously.
+   * Safe to call when the proxy has already been disposed or when another
+   * transport has since been attached — in both cases this is a no-op.
+   */
+  private _handleSendFailure(transport: ClientTransport, err: unknown): Error {
+    const error = err instanceof Error ? err : new Error(String(err));
+    if (this._disposedError) return this._disposedError;
+    if (this._transport !== transport) return error;
+    this._connectionError = error;
+    this._transport = null;
+    this._transportGeneration++;
+    this._rejectPending(error);
+    this._disposeTransport(transport);
+    return error;
   }
 
   private _rejectPending(error: Error): void {

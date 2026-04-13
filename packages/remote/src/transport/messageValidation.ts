@@ -21,7 +21,11 @@ export function isClientMessage(value: unknown): value is ClientMessage {
     case "sync":
       return true;
     case "set":
-      return typeof value.name === "string" && (value.id === undefined || typeof value.id === "string");
+      return (
+        typeof value.name === "string" &&
+        Object.prototype.hasOwnProperty.call(value, "value") &&
+        (value.id === undefined || typeof value.id === "string")
+      );
     case "cmd":
       return (
         typeof value.name === "string" &&
@@ -42,7 +46,7 @@ export function isServerMessage(value: unknown): value is ServerMessage {
     case "sync":
       return isServerSyncValues(value.values);
     case "update":
-      return typeof value.name === "string";
+      return typeof value.name === "string" && Object.prototype.hasOwnProperty.call(value, "value");
     case "return":
     case "throw":
       return typeof value.id === "string";

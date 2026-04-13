@@ -18,21 +18,38 @@ function isThenable(value: unknown): value is PromiseLike<unknown> {
   );
 }
 
+function isSerializableAsThrowPayload(value: unknown): boolean {
+  try {
+    const encoded = JSON.stringify({ error: value });
+    if (typeof encoded !== "string") return false;
+    const decoded = JSON.parse(encoded) as Record<string, unknown>;
+    return Object.prototype.hasOwnProperty.call(decoded, "error");
+  } catch {
+    return false;
+  }
+}
+
 function serializeThrownError(error: unknown): unknown {
-  if (!(error instanceof Error)) {
-    return error;
+  const serialized = error instanceof Error
+    ? (() => {
+      const value: RemoteSerializedError = {
+        name: error.name,
+        message: error.message,
+      };
+
+      if (typeof error.stack === "string") {
+        value.stack = error.stack;
+      }
+
+      return value;
+    })()
+    : error;
+
+  if (isSerializableAsThrowPayload(serialized)) {
+    return serialized;
   }
 
-  const serialized: RemoteSerializedError = {
-    name: error.name,
-    message: error.message,
-  };
-
-  if (typeof error.stack === "string") {
-    serialized.stack = error.stack;
-  }
-
-  return serialized;
+  return createRemoteShellProxyError("Thrown value is not JSON-serializable");
 }
 
 /**
@@ -149,23 +166,23 @@ export class RemoteShellProxy {
 
   private _sendSyncResponse(): void {
     this._isBuildingSyncSnapshot = true;
+    let sent = false;
 
     try {
       const values = this._readCurrentValues();
-      const sent = this._safeSend({ type: "sync", values }, "sync response");
-      if (!sent) {
-        this._queuedSyncUpdates = [];
-        return;
-      }
-
-      const queuedUpdates = this._queuedSyncUpdates;
-      this._queuedSyncUpdates = [];
-      for (const queued of queuedUpdates) {
-        this._safeSend(queued.message, queued.context);
-      }
+      sent = this._safeSend({ type: "sync", values }, "sync response");
     } finally {
       this._isBuildingSyncSnapshot = false;
-      this._queuedSyncUpdates = [];
+    }
+
+    const queuedUpdates = this._queuedSyncUpdates;
+    this._queuedSyncUpdates = [];
+    if (!sent) {
+      return;
+    }
+
+    for (const queued of queuedUpdates) {
+      this._safeSend(queued.message, queued.context);
     }
   }
 
@@ -283,5 +300,6 @@ export class RemoteShellProxy {
     if (this._disposed) return;
     this._disposed = true;
     this._unbind();
+    this._transport.dispose?.();
   }
 }

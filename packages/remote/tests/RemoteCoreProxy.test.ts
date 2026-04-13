@@ -727,6 +727,47 @@ describe("RemoteCoreProxy", () => {
     expect(pending.size).toBe(0);
   });
 
+  it("allows reconnect() after a send failure on a transport without onClose", async () => {
+    // Simulates a custom transport that signals closure only by throwing
+    // from send(). Without onClose support the proxy must still clear its
+    // internal transport on a send failure so reconnect() can attach a
+    // replacement — otherwise the proxy would be permanently stuck.
+    let failing = false;
+    const failingClient: ClientTransport = {
+      send: () => {
+        if (failing) throw new Error("connection is closed");
+      },
+      onMessage: () => {},
+      // Note: no onClose — this is the exact scenario the bug cares about.
+    };
+
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, failingClient);
+
+    // Flip to failing after the initial sync; the next user-triggered send
+    // should fail and clear the internal transport.
+    failing = true;
+    await expect(proxy.invoke("doFetch")).rejects.toThrow("connection is closed");
+
+    // Subsequent calls keep rejecting while the proxy is disconnected.
+    await expect(proxy.invoke("doFetch")).rejects.toThrow("connection is closed");
+
+    // reconnect() must succeed — this was the bug: the proxy used to treat
+    // itself as still connected and reject reconnect() outright.
+    const sent: ClientMessage[] = [];
+    const recoveredClient: ClientTransport = {
+      send: (msg) => { sent.push(msg); },
+      onMessage: () => {},
+    };
+
+    expect(() => (proxy as RemoteCoreProxy).reconnect(recoveredClient)).not.toThrow();
+
+    // The freshly attached transport is used for later sends. invoke() on
+    // the recovered transport stays pending (no response) — just confirm
+    // the message was actually forwarded through the new transport.
+    void proxy.invoke("doFetch");
+    expect(sent.some((m) => m.type === "cmd" && m.name === "doFetch")).toBe(true);
+  });
+
   it("ignores return and throw messages for unknown request ids", () => {
     let handler: ((msg: ServerMessage) => void) | null = null;
     const client: ClientTransport = {
