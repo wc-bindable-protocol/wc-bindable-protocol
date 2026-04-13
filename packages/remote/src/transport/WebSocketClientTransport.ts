@@ -6,6 +6,24 @@ const WS_OPEN = 1;
 const WS_CLOSING = 2;
 const WS_CLOSED = 3;
 
+function isBinaryMessagePayload(data: unknown): boolean {
+  if (typeof ArrayBuffer !== "undefined") {
+    if (data instanceof ArrayBuffer) {
+      return true;
+    }
+
+    if (ArrayBuffer.isView(data)) {
+      return true;
+    }
+  }
+
+  if (typeof Blob !== "undefined" && data instanceof Blob) {
+    return true;
+  }
+
+  return typeof Buffer !== "undefined" && Buffer.isBuffer(data);
+}
+
 function parseServerMessage(data: unknown): ServerMessage | null {
   try {
     const message = JSON.parse(typeof data === "string" ? data : String(data));
@@ -40,6 +58,7 @@ export class WebSocketClientTransport implements ClientTransport {
   private _buffer: ClientMessage[] | null;
   private _closed = false;
   private _disposed = false;
+  private _warnedBinaryPayload = false;
   private _openListener: (() => void) | null = null;
   private _failListener: (() => void) | null = null;
   private _messageListener: ((event: MessageEvent) => void) | null = null;
@@ -101,6 +120,12 @@ export class WebSocketClientTransport implements ClientTransport {
     }
 
     const listener = (event: MessageEvent) => {
+      if (!this._warnedBinaryPayload && isBinaryMessagePayload(event.data)) {
+        this._warnedBinaryPayload = true;
+        console.warn(
+          "WebSocketClientTransport: received a binary message payload; this transport expects text JSON frames from the server. Check the server framing or browser binaryType.",
+        );
+      }
       const msg = parseServerMessage(event.data);
       if (!msg) return;
       handler(msg);

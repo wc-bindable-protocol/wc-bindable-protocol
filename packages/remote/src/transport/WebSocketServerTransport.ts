@@ -1,13 +1,43 @@
 import type { ServerTransport, ServerMessage, ClientMessage } from "../types.js";
 import { isClientMessage } from "./messageValidation.js";
 
+function decodeUtf8Bytes(bytes: Uint8Array): string {
+  if (typeof TextDecoder !== "undefined") {
+    return new TextDecoder().decode(bytes);
+  }
+
+  if (typeof Buffer !== "undefined") {
+    return Buffer.from(bytes).toString("utf8");
+  }
+
+  return String(bytes);
+}
+
+function toJsonText(data: unknown): string {
+  if (typeof data === "string") {
+    return data;
+  }
+
+  if (typeof Buffer !== "undefined" && Buffer.isBuffer(data)) {
+    return data.toString("utf8");
+  }
+
+  if (typeof ArrayBuffer !== "undefined") {
+    if (data instanceof ArrayBuffer) {
+      return decodeUtf8Bytes(new Uint8Array(data));
+    }
+
+    if (ArrayBuffer.isView(data)) {
+      return decodeUtf8Bytes(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+    }
+  }
+
+  return String(data);
+}
+
 function parseClientMessage(data: unknown): ClientMessage | null {
   try {
-    const message = typeof data === "string"
-      ? JSON.parse(data)
-      : typeof Buffer !== "undefined" && Buffer.isBuffer(data)
-        ? JSON.parse(data.toString("utf8"))
-        : JSON.parse(String(data));
+    const message = JSON.parse(toJsonText(data));
 
     if (!isClientMessage(message)) {
       throw new Error("invalid client message shape");
@@ -28,6 +58,10 @@ function parseClientMessage(data: unknown): ClientMessage | null {
  *   (Deno, Bun, Node.js 22+, browsers)
  * - Node EventEmitter: `on("message", (data) => {})`
  *   (ws library, legacy Node.js WebSocket implementations)
+ *
+ * Incoming payloads are expected to already be text JSON or UTF-8 bytes
+ * (`Buffer`, `Uint8Array`, `ArrayBuffer`, etc.). Blob-like payloads are not
+ * decoded here because the ServerTransport contract is synchronous.
  *
  * If both are present, `addEventListener` is preferred.
  */

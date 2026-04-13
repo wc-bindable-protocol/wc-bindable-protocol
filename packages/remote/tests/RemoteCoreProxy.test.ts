@@ -14,6 +14,7 @@ import type {
   ClientTransport,
   ServerMessage,
   ClientMessage,
+  RemoteSerializedError,
 } from "../src/types.js";
 import { createSyncTransportPair, TestCore } from "./_helpers.js";
 
@@ -105,6 +106,20 @@ describe("RemoteCoreProxy", () => {
     expect(send).toHaveBeenCalledWith({ type: "sync" });
   });
 
+  it("routes initial sync send failures through the shared transport failure path", () => {
+    const dispose = vi.fn();
+    const client: ClientTransport = {
+      send: () => {
+        throw new Error("initial sync failed");
+      },
+      onMessage: () => {},
+      dispose,
+    };
+
+    expect(() => createRemoteCoreProxy(TestCore.wcBindable, client)).toThrow("initial sync failed");
+    expect(dispose).toHaveBeenCalledTimes(1);
+  });
+
   it("populates cache and dispatches events on sync response", () => {
     const { client } = createSyncTransportPair();
     // Manually wire: server responds to sync with values.
@@ -171,6 +186,7 @@ describe("RemoteCoreProxy", () => {
   it("setWithAck() rejects on throw response", async () => {
     const send = vi.fn();
     let handler: ((msg: ServerMessage) => void) | null = null;
+    const remoteError: RemoteSerializedError = { name: "TypeError", message: "invalid url" };
     const client: ClientTransport = {
       send,
       onMessage: (h) => { handler = h; },
@@ -183,10 +199,52 @@ describe("RemoteCoreProxy", () => {
     handler!({
       type: "throw",
       id: requestId,
-      error: { name: "TypeError", message: "invalid url" },
+      error: remoteError,
     });
 
-    await expect(pending).rejects.toEqual({ name: "TypeError", message: "invalid url" });
+    const error = await pending.catch((err) => err);
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error.name).toBe("TypeError");
+    expect(error.message).toBe("invalid url");
+    expect((error as Error & { cause?: unknown }).cause).toBe(remoteError);
+  });
+
+  it("rejects setWithAckOptions() immediately when the signal is already aborted", async () => {
+    const send = vi.fn();
+    const client: ClientTransport = {
+      send,
+      onMessage: () => {},
+    };
+    const controller = new AbortController();
+    controller.abort();
+
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+
+    await expect(proxy.setWithAckOptions("url", "/api/ack", { signal: controller.signal })).rejects.toMatchObject({
+      name: "AbortError",
+    });
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects setWithAckOptions() when aborted in flight and clears pending state", async () => {
+    const send = vi.fn();
+    const client: ClientTransport = {
+      send,
+      onMessage: () => {},
+    };
+    const controller = new AbortController();
+
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+    const pendingSet = proxy.setWithAckOptions("url", "/api/ack", { signal: controller.signal });
+
+    controller.abort();
+
+    await expect(pendingSet).rejects.toMatchObject({ name: "AbortError" });
+
+    const pending = Reflect.getOwnPropertyDescriptor(proxy, "_pending")?.value as Map<string, unknown>;
+    expect(pending.size).toBe(0);
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ type: "set", name: "url", value: "/api/ack" }));
   });
 
   it("throws on set() for undeclared inputs without sending", () => {
@@ -282,7 +340,7 @@ describe("RemoteCoreProxy", () => {
     expect(send).toHaveBeenCalledWith({ type: "set", name: "url", value: "/api/direct" });
   });
 
-  it("throws on direct assignment to undeclared properties", () => {
+  it("throws on direct assignment to declared non-input properties", () => {
     const client: ClientTransport = {
       send: () => {},
       onMessage: () => {},
@@ -292,7 +350,7 @@ describe("RemoteCoreProxy", () => {
 
     expect(() => {
       proxy.value = "local";
-    }).toThrow('RemoteCoreProxy: cannot assign to undeclared property "value"');
+    }).toThrow('RemoteCoreProxy: declared property "value" is read-only; only wcBindable.inputs are assignable');
   });
 
   it("rejects assignment to declared properties that collide with inherited members", () => {
@@ -311,7 +369,7 @@ describe("RemoteCoreProxy", () => {
 
     expect(() => {
       proxy.toString = "local";
-    }).toThrow('RemoteCoreProxy: cannot assign to undeclared property "toString"');
+    }).toThrow('RemoteCoreProxy: declared property "toString" is read-only; only wcBindable.inputs are assignable');
   });
 
   it("forwards invoke() as a cmd message and resolves on return", async () => {
@@ -372,6 +430,32 @@ describe("RemoteCoreProxy", () => {
 
     const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
     await expect(proxy.invoke("doFetch")).rejects.toBe("boom");
+  });
+
+  it("revives serialized remote errors into Error instances", async () => {
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const remoteError: RemoteSerializedError = {
+      name: "CustomRemoteError",
+      message: "structured failure",
+      stack: "CustomRemoteError: structured failure\n    at remote:1:1",
+    };
+    const client: ClientTransport = {
+      send: (msg) => {
+        if (msg.type === "cmd") {
+          handler!({ type: "throw", id: msg.id, error: remoteError });
+        }
+      },
+      onMessage: (h) => { handler = h; },
+    };
+
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+    const error = await proxy.invoke("doFetch").catch((err) => err);
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error.name).toBe("CustomRemoteError");
+    expect(error.message).toBe("structured failure");
+    expect(error.stack).toBe(remoteError.stack);
+    expect((error as Error & { cause?: unknown }).cause).toBe(remoteError);
   });
 
   it("dispatches update messages through bind()", () => {

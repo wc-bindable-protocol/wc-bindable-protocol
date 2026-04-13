@@ -1,5 +1,10 @@
 import type { WcBindableDeclaration } from "@wc-bindable/core";
-import type { ClientTransport, ServerMessage, RemoteInvokeOptions } from "./types.js";
+import type {
+  ClientTransport,
+  ServerMessage,
+  RemoteInvokeOptions,
+  RemoteSerializedError,
+} from "./types.js";
 
 function createAbortError(signal: AbortSignal): unknown {
   if (signal.reason !== undefined) {
@@ -19,6 +24,44 @@ function createCommandId(getFallbackId: () => number): string {
   }
 
   return String(getFallbackId());
+}
+
+function isRemoteSerializedError(value: unknown): value is RemoteSerializedError {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const candidate = value as Record<string, unknown>;
+  return (
+    typeof candidate.name === "string" &&
+    typeof candidate.message === "string" &&
+    (candidate.stack === undefined || typeof candidate.stack === "string")
+  );
+}
+
+function reviveThrownError(value: unknown): unknown {
+  if (!isRemoteSerializedError(value)) {
+    return value;
+  }
+
+  const error = new Error(value.message) as Error & { cause?: unknown };
+  error.name = value.name;
+
+  if (typeof value.stack === "string") {
+    error.stack = value.stack;
+  }
+
+  try {
+    Object.defineProperty(error, "cause", {
+      value,
+      configurable: true,
+      writable: true,
+    });
+  } catch {
+    error.cause = value;
+  }
+
+  return error;
 }
 
 /**
@@ -70,6 +113,11 @@ export class RemoteCoreProxy extends EventTarget {
 
   /** Set an input property and wait for the server to acknowledge or reject it. */
   setWithAck(name: string, value: unknown): Promise<void> {
+    return this.setWithAckOptions(name, value, {});
+  }
+
+  /** Set an input property and wait for the server reply with lifecycle options such as AbortSignal. */
+  setWithAckOptions(name: string, value: unknown, options: RemoteInvokeOptions): Promise<void> {
     this._validateInputName(name);
 
     const transport = this._transport;
@@ -79,14 +127,36 @@ export class RemoteCoreProxy extends EventTarget {
     if (!transport) {
       return Promise.reject(this._connectionError ?? new Error("Transport closed"));
     }
+    const signal = options.signal;
+    if (signal?.aborted) {
+      return Promise.reject(createAbortError(signal));
+    }
 
     const id = createCommandId(() => ++this._cmdId);
-    return new Promise((resolve, reject) => {
+    return new Promise<void>((resolve, reject) => {
+      const cleanup = () => {
+        if (signal) {
+          signal.removeEventListener("abort", onAbort);
+        }
+      };
+      const onAbort = () => {
+        if (!signal) return;
+        const pending = this._pending.get(id);
+        if (!pending) return;
+        this._pending.delete(id);
+        pending.cleanup();
+        pending.reject(createAbortError(signal));
+      };
+
       this._pending.set(id, {
         resolve: () => resolve(),
         reject,
-        cleanup: () => {},
+        cleanup,
       });
+
+      if (signal) {
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
 
       try {
         transport.send({ type: "set", name, value, id });
@@ -269,11 +339,7 @@ export class RemoteCoreProxy extends EventTarget {
     try {
       transport.send({ type: "sync" });
     } catch (err) {
-      this._transport = null;
-      this._connectionError = err instanceof Error ? err : new Error(String(err));
-      this._transportGeneration++;
-      this._disposeTransport(transport);
-      throw err;
+      throw this._handleSendFailure(transport, err);
     }
   }
 
@@ -340,7 +406,7 @@ export class RemoteCoreProxy extends EventTarget {
         if (pending) {
           this._pending.delete(msg.id);
           pending.cleanup();
-          pending.reject(msg.error);
+          pending.reject(reviveThrownError(msg.error));
         } else {
           console.warn(`RemoteCoreProxy: received throw for unknown request id "${msg.id}"`);
         }
@@ -398,7 +464,7 @@ const handler: ProxyHandler<RemoteCoreProxy> = {
     }
 
     if (typeof prop === "string" && target._hasDeclaredProperty(prop)) {
-      throw new Error(`RemoteCoreProxy: cannot assign to undeclared property "${prop}"`);
+      throw new Error(`RemoteCoreProxy: declared property "${prop}" is read-only; only wcBindable.inputs are assignable`);
     }
 
     if (typeof prop === "symbol" || prop in target) {

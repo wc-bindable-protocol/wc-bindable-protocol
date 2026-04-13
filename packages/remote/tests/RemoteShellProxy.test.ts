@@ -554,6 +554,21 @@ describe("RemoteShellProxy", () => {
     });
   });
 
+  it("treats an empty string set id as an acknowledged request", () => {
+    const core = new TestCore();
+    const send = vi.fn();
+    let handler: ((msg: ClientMessage) => void) | null = null;
+    const server: ServerTransport = {
+      send,
+      onMessage: (h) => { handler = h; },
+    };
+
+    new RemoteShellProxy(core, server);
+    handler!({ type: "set", name: "url", value: "/empty-id", id: "" });
+
+    expect(send).toHaveBeenCalledWith({ type: "return", id: "", value: undefined });
+  });
+
   it("isolates setter exceptions so the message handler survives", () => {
     class ThrowingSetterCore extends EventTarget {
       static wcBindable: WcBindableDeclaration = {

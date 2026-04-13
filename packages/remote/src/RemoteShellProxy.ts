@@ -199,7 +199,7 @@ export class RemoteShellProxy {
       }
       case "set": {
         if (!this._allowedInputs.has(msg.name)) {
-          if (msg.id) {
+          if (msg.id != null) {
             this._safeSend({
               type: "throw",
               id: msg.id,
@@ -217,11 +217,11 @@ export class RemoteShellProxy {
         }
         try {
           (this._core as unknown as Record<string, unknown>)[msg.name] = msg.value;
-          if (msg.id) {
+          if (msg.id != null) {
             this._safeSend({ type: "return", id: msg.id, value: undefined }, `return response for input "${msg.name}"`);
           }
         } catch (err) {
-          if (msg.id) {
+          if (msg.id != null) {
             this._safeSend({
               type: "throw",
               id: msg.id,

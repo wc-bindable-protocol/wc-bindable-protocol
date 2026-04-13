@@ -88,6 +88,8 @@ const transport = new WebSocketServerTransport(socket);
 const shell = new RemoteShellProxy(core, transport);
 ```
 
+`WebSocketServerTransport` expects incoming client messages to arrive either as text JSON frames or as UTF-8 binary bytes such as Node `Buffer`, `Uint8Array`, or `ArrayBuffer`. If your runtime surfaces `Blob` payloads for message events, prefer text frames or adapt the socket before passing it in, because the transport API is synchronous and does not await `Blob.text()`.
+
 ### Client
 
 ```typescript
@@ -147,6 +149,8 @@ class MyCustomTransport implements ClientTransport {
 
 Custom transport implementations **must guarantee message ordering** (FIFO). The protocol relies on this to ensure consistency between `sync` responses and subsequent `event` messages without sequence numbers.
 
+This package does **not** implement built-in back-pressure or queue limits. In particular, `WebSocketClientTransport` buffers pre-open outbound messages without a cap, `RemoteCoreProxy` keeps pending acknowledged requests in memory until they settle, and `RemoteShellProxy` buffers synchronous `update` messages while a `sync` snapshot is being built. In production, bound these at a higher layer with admission control, timeouts, cancellation, connection quotas, reverse-proxy limits, or per-client rate limiting if untrusted or slow peers are possible.
+
 ## API
 
 | Export | Description |
@@ -163,6 +167,7 @@ Custom transport implementations **must guarantee message ordering** (FIFO). The
 |---|---|
 | `set(name, value)` | Set an input property on the remote Core. Fire-and-forget — see "Error handling" below. |
 | `setWithAck(name, value)` | Set an input property and wait for the server to acknowledge or reject it. |
+| `setWithAckOptions(name, value, options)` | Set an input property with lifecycle options such as `AbortSignal`, without changing the wire payload sent to the server. |
 | `invoke(name, ...args)` | Invoke a command on the remote Core. Returns a Promise that settles when the server replies, the send fails, or the transport closes; there is no built-in timeout or cancellation. |
 | `invokeWithOptions(name, options, ...args)` | Invoke a command with lifecycle options such as `AbortSignal`, without changing the wire arguments sent to the server. |
 | `reconnect(transport)` | Attach a fresh client transport after the previous one closed. Existing `bind()` subscribers stay attached and a new `sync` request is sent immediately. |
@@ -171,12 +176,14 @@ Custom transport implementations **must guarantee message ordering** (FIFO). The
 #### Error handling
 
 - **`invoke()`** errors on the server are serialized and delivered as `throw` messages, which reject the returned Promise. When the server throws an `Error`, the payload preserves at least `name` and `message`, and includes `stack` when available. If the thrown value itself is not JSON-serializable, `RemoteShellProxy` falls back to a serializable `RemoteShellProxyError` payload instead of leaving the client request pending.
+- **`setWithAckOptions()`** supports `AbortSignal`. Aborting rejects the client-side Promise and forgets the pending response; it does not send a cancellation message to the server.
 - **`invokeWithOptions()`** supports `AbortSignal`. Aborting rejects the client-side Promise and forgets the pending response; it does not send a cancellation message to the server.
-- **Timeouts** are still not built in. If the server never replies, the Promise remains pending until it resolves, rejects, the transport closes, or you abort via `invokeWithOptions()`. If you need deadlines, wrap the call at the application layer with `AbortController`.
+- **Timeouts** are still not built in. If the server never replies, the Promise remains pending until it resolves, rejects, the transport closes, or you abort via `setWithAckOptions()` or `invokeWithOptions()`. If you need deadlines, wrap the call at the application layer with `AbortController`.
+- **Back-pressure** is not built in. Pending acknowledgements, pre-open WebSocket sends, and `sync`-time queued updates are all unbounded in-memory queues. If a peer can stall or flood the connection, enforce your own limits above this package.
 - **Transport close** rejects all pending `invoke()` calls with `Transport closed` and leaves the proxy disconnected until you call `reconnect()` with a new transport.
-- **`dispose()`** is terminal: it rejects all pending `invoke()` calls with `RemoteCoreProxy disposed` and causes subsequent `set()`, `invoke()`, and `reconnect()` calls to fail immediately.
+- **`dispose()`** is terminal: it rejects all pending requests with `RemoteCoreProxy disposed` and causes subsequent `set()`, `invoke()`, and `reconnect()` calls to fail immediately.
 - **`set()`** validates the input name on the client before sending, so undeclared names fail immediately. It also throws synchronously if the proxy is already disconnected or if the transport send fails while trying to enqueue the message. For declared inputs on a healthy transport, it remains fire-and-forget: there is no response id and no server-side success/error is delivered back to the client. If a buggy or stale client still sends an undeclared input, `RemoteShellProxy` drops it and logs `console.warn`.
-- **`setWithAck()`** sends the same mutation with a request id and waits for a `return`/`throw` response. Use it when the caller needs server-side validation feedback such as type mismatches, read-only assignments, or conversion failures.
+- **`setWithAck()`** sends the same mutation with a request id and waits for a `return`/`throw` response. Use it when the caller needs server-side validation feedback such as type mismatches, read-only assignments, or conversion failures. Use `setWithAckOptions()` when you also need client-side cancellation.
 - **Fire-and-forget setter failures** on plain `set()` are still caught and logged via `console.error` on the server so they do not escape the transport's message handler or terminate the connection.
 - **Server send failures** while forwarding `sync`, `update`, `return`, or `throw` messages are caught and logged via `console.error`. The failing message is dropped; the connection is not closed automatically.
 - **Server transport teardown**: if the `ServerTransport` implements `onClose()`, `RemoteShellProxy` disposes itself automatically. If the transport also implements `dispose()`, `RemoteShellProxy.dispose()` calls it so message/close listeners can be released. `WebSocketServerTransport` does both for standard WebSocket and Node `ws` close events.

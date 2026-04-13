@@ -86,6 +86,36 @@ describe("WebSocketServerTransport", () => {
     expect(onMessage).toHaveBeenCalledWith({ type: "set", name: "url", value: "/buffer" });
   });
 
+  it("parses ArrayBuffer payloads from EventEmitter-style sockets", () => {
+    const listeners: Array<(data: unknown) => void> = [];
+    const ws = {
+      send: vi.fn(),
+      on: (_type: "message", listener: (data: unknown) => void) => {
+        listeners.push(listener);
+      },
+    };
+    const transport = new WebSocketServerTransport(ws);
+    const onMessage = vi.fn();
+
+    transport.onMessage(onMessage);
+    const bytes = new TextEncoder().encode(JSON.stringify({ type: "set", name: "url", value: "/array-buffer" }));
+    listeners[0](bytes.buffer);
+
+    expect(onMessage).toHaveBeenCalledWith({ type: "set", name: "url", value: "/array-buffer" });
+  });
+
+  it("parses Uint8Array payloads from standard sockets", () => {
+    const ws = new MockBrowserWebSocket(WebSocket.OPEN);
+    const transport = new WebSocketServerTransport(ws as unknown as Parameters<typeof WebSocketServerTransport>[0]);
+    const onMessage = vi.fn();
+
+    transport.onMessage(onMessage);
+    const bytes = new TextEncoder().encode(JSON.stringify({ type: "sync" }));
+    ws.emit("message", { data: bytes });
+
+    expect(onMessage).toHaveBeenCalledWith({ type: "sync" });
+  });
+
   it("ignores parsed client messages with invalid shape", () => {
     const listeners: Array<(data: unknown) => void> = [];
     const ws = {

@@ -126,6 +126,24 @@ describe("WebSocketClientTransport", () => {
     warnSpy.mockRestore();
   });
 
+  it("warns once when binary payloads are received", () => {
+    const ws = new MockBrowserWebSocket(WebSocket.OPEN);
+    const transport = new WebSocketClientTransport(ws as unknown as WebSocket);
+    const onMessage = vi.fn();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const binaryWarning = "WebSocketClientTransport: received a binary message payload; this transport expects text JSON frames from the server. Check the server framing or browser binaryType.";
+
+    transport.onMessage(onMessage);
+    ws.emit("message", { data: new Uint8Array([123, 125]) });
+    ws.emit("message", { data: new Uint8Array([123, 125]) });
+
+    expect(onMessage).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledWith(binaryWarning);
+    expect(warnSpy.mock.calls.filter(([message]) => message === binaryWarning)).toHaveLength(1);
+
+    warnSpy.mockRestore();
+  });
+
   it("dispose() removes WebSocket listeners", () => {
     const ws = new MockBrowserWebSocket(WebSocket.CONNECTING);
     const transport = new WebSocketClientTransport(ws as unknown as WebSocket);
