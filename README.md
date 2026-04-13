@@ -55,6 +55,7 @@ This protocol intentionally does **not** cover:
 | [@wc-bindable/svelte](packages/svelte/) | Svelte action — `use:wcBindable` |
 | [@wc-bindable/angular](packages/angular/) | Angular directive — `wcBindable` |
 | [@wc-bindable/solid](packages/solid/) | Solid primitive — `createWcBindable()` / `use:wcBindable` |
+| [@wc-bindable/remote](packages/remote/) | Remote proxy — connect Core and Shell over a network via WebSocket or custom transport |
 
 ## Quick start
 
@@ -120,6 +121,35 @@ function App() {
   const [values, directive] = createWcBindable();
   return <my-input ref={directive} />;
 }
+```
+
+### Remote (extracting Core to a server)
+
+The `@wc-bindable/remote` package splits the HAWC Core/Shell boundary across a network. The server runs the real Core; the client gets a proxy `EventTarget` that works transparently with `bind()` and framework adapters.
+
+```typescript
+// Server
+import { RemoteShellProxy, WebSocketServerTransport } from "@wc-bindable/remote";
+const core = new MyFetchCore();
+const shell = new RemoteShellProxy(core, new WebSocketServerTransport(socket));
+```
+
+```typescript
+// Client
+import { createRemoteCoreProxy, WebSocketClientTransport } from "@wc-bindable/remote";
+import { bind } from "@wc-bindable/core";
+
+const proxy = createRemoteCoreProxy(
+  MyFetchCore.wcBindable,
+  new WebSocketClientTransport(new WebSocket("ws://localhost:3000")),
+);
+
+bind(proxy, (name, value) => {
+  console.log(name, value); // works exactly as if Core were local
+});
+
+proxy.set("url", "/api/users");
+const result = await proxy.invoke("fetch");
 ```
 
 ## Examples

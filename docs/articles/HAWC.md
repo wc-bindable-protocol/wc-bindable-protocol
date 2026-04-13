@@ -101,6 +101,32 @@ This separation yields three practical benefits:
 2. **Reuse beyond the browser** — The same Core class can power a server-side process, a CLI tool, or a Cloudflare Worker, with `bind()` subscribing to its state just as a framework adapter would.
 3. **Shell minimality** — The Shell contains no business logic at all. It is purely a DOM integration surface, making it trivial to write and maintain.
 
+### Remote: Core/Shell Separation Over the Network
+
+The Core/Shell separation naturally extends to a network boundary. With `@wc-bindable/remote`, the Core runs on a server while the client holds a proxy `EventTarget` — and `bind()` works identically on both sides.
+
+```
+Client (Browser)                        Server (Node / Deno / etc.)
+┌──────────────────────┐  WebSocket   ┌──────────────────────┐
+│  RemoteCoreProxy     │◄────────────►│  RemoteShellProxy    │
+│  (EventTarget)       │              │                      │
+│                      │              │  Core (EventTarget)  │
+│  bind() just works   │              │  Business logic here │
+└──────────────────────┘              └──────────────────────┘
+```
+
+`RemoteShellProxy` subscribes to the Core's declared events, applies per-property getters on the server side, and forwards property-centric `update` messages over the wire. `RemoteCoreProxy` maintains a local cache, dispatches synthetic events, and exposes `set()` / `invoke()` for inputs and commands. Because the proxy is a standard `EventTarget`, every framework adapter works without modification.
+
+This means the three boundaries that HAWC crosses — runtime, framework, and now network — are all handled transparently by the same protocol:
+
+| Boundary | Crossed by | Mechanism |
+|----------|-----------|-----------|
+| Runtime | Core (EventTarget) | No DOM dependency; works in Node, Deno, Workers |
+| Framework | Shell (HTMLElement) | Attribute mapping + `ref` binding |
+| Network | Remote (WebSocket / custom transport) | Proxy EventTarget + JSON wire protocol |
+
+The transport layer is pluggable — WebSocket is the default, but any FIFO channel (MessagePort, BroadcastChannel, WebTransport, etc.) can be used by implementing the minimal `ClientTransport` / `ServerTransport` interfaces.
+
 ### Conversion to a State Machine Subscription
 
 The core insight of this architecture is that async processing is converted into a subscription to a state machine. From the framework's perspective, properties like `values.loading` and `values.error` exposed by a component such as `<my-fetch>` are simply reactive values — there is no need to be aware that async processing is happening at all. Whether written in React or Vue, the code structure becomes nearly identical.
@@ -231,7 +257,7 @@ By treating Web Components not as "visible UI parts" but as an "async service la
 
 What HAWC and wc-bindable-protocol provide is not a replacement for frameworks, but a structure that is free from framework dependency.
 
-A zero-dependency protocol design relying solely on Web standards, adapters that fit in a few dozen lines, and async processing encapsulated in headless Web Components — with the Core (EventTarget) crossing runtime boundaries and the Shell (HTMLElement) crossing framework boundaries — together, these form a practical and durable escape from frontend framework lock-in.
+A zero-dependency protocol design relying solely on Web standards, adapters that fit in a few dozen lines, and async processing encapsulated in headless Web Components — with the Core (EventTarget) crossing runtime boundaries, the Shell (HTMLElement) crossing framework boundaries, and `@wc-bindable/remote` crossing network boundaries — together, these form a practical and durable escape from frontend framework lock-in.
 
 ## Reference
 
