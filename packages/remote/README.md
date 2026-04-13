@@ -25,8 +25,8 @@ Client (Browser)                        Server (Node / Deno / etc.)
                        ◄──────────  { type: "sync", values: { ... } }
   set("url", "/api")  ──────────►  core.url = "/api"
   invoke("fetch")     ──────────►  core.fetch()
-                      ◄──────────  event: loading-changed
-                      ◄──────────  event: response
+                      ◄──────────  update: loading = true
+                      ◄──────────  update: value  = { ... }
 ```
 
 ## Connection lifecycle
@@ -34,6 +34,7 @@ Client (Browser)                        Server (Node / Deno / etc.)
 1. The server creates a `RemoteShellProxy`, which subscribes to the Core via `bind()` and starts forwarding events.
 2. The client creates a `RemoteCoreProxy`, which immediately sends a `sync` request.
 3. The server responds with the Core's current property values.
+  Properties whose current value is `undefined` are omitted, matching local `bind()` initial synchronization.
 4. The client populates its cache and dispatches events for each value — `bind()` on the client side picks these up as if they were normal state changes.
 5. From this point, all Core events are forwarded in real time.
 
@@ -58,13 +59,16 @@ Client                              Server
   │── { type: "set", "url", "/api" }► │  core.url = "/api"
   │── { type: "cmd", "fetch", … } ──► │  core.fetch()
   │                                   │
-  │  ◄── { type: "event",         ── │  core dispatches loading-changed
-  │        event: "…:loading-changed",│
-  │        detail: true }             │
+  │  ◄── { type: "update",        ── │  core dispatches loading-changed
+  │        name: "loading",           │
+  │        value: true }              │
   │                                   │
-  │  ◄── { type: "event",         ── │  core dispatches response
-  │        event: "…:response",       │
-  │        detail: { … } }           │
+  │  ◄── { type: "update",        ── │  core dispatches response;
+  │        name: "value",             │  getters on the server split the
+  │        value: { … } }            │  event into per-property updates
+  │  ◄── { type: "update",        ── │  (e.g. `value` and `status` both
+  │        name: "status",            │  driven by a shared event are sent
+  │        value: 200 }               │  as two distinct updates).
   │                                   │
   │  ◄── { type: "return",        ── │  fetch() resolved
   │        id: "1", value: { … } }   │
@@ -119,6 +123,7 @@ import { bind } from "@wc-bindable/core";
 
 const ws = new WebSocket("ws://localhost:3000");
 const transport = new WebSocketClientTransport(ws);
+// proxy is created once here, so the empty dependency list is intentional.
 const proxy = createRemoteCoreProxy(MyFetchCore.wcBindable, transport);
 
 // Subscribe with bind() and feed into React state
@@ -159,8 +164,14 @@ Custom transport implementations **must guarantee message ordering** (FIFO). The
 
 | Method | Description |
 |---|---|
-| `set(name, value)` | Set an input property on the remote Core. |
-| `invoke(name, ...args)` | Invoke a command on the remote Core. Returns a Promise. |
+| `set(name, value)` | Set an input property on the remote Core. Fire-and-forget — see "Error handling" below. |
+| `invoke(name, ...args)` | Invoke a command on the remote Core. Returns a Promise that settles when the server replies, the send fails, or the transport closes; there is no built-in timeout or cancellation. |
+
+#### Error handling
+
+- **`invoke()`** errors on the server are serialized and delivered as `throw` messages, which reject the returned Promise.
+- **`invoke()`** has no built-in timeout or `AbortSignal` support. If the server never replies, the Promise remains pending until the transport closes or fails. If you need deadlines or cancellation, wrap the call at the application layer for now.
+- **`set()`** is fire-and-forget: there is no response id and no error is delivered back to the client. On the server, setter exceptions (validation, read-only property, type-conversion failure, etc.) are caught and logged via `console.error`, so they do not escape the transport's message handler or terminate the connection. If you need feedback when a mutation fails, expose it as a command instead of an input.
 
 ### RemoteShellProxy
 
@@ -179,7 +190,7 @@ Client → Server:
 
 Server → Client:
   { type: "sync", values: Record<string, unknown> }
-  { type: "event", event: string, detail: unknown }
+  { type: "update", name: string, value: unknown }
   { type: "return", id: string, value: unknown }
   { type: "throw", id: string, error: unknown }
 ```
@@ -192,8 +203,14 @@ The server-side `bind()` fires initial values synchronously in the constructor. 
 **Why no sequence numbers?**
 WebSocket guarantees FIFO message ordering, and JavaScript's single-threaded execution ensures that `sync` responses and `event` messages are enqueued in a consistent order. A `sync` response always reflects the Core's state at the time the request was processed; any events dispatched after that point are sent after the `sync` response. This makes sequence numbers unnecessary under these constraints.
 
+**Why is the wire protocol property-centric, not event-centric?**
+A Core may declare multiple properties that share the same event and differ only by `getter` — for example, `value` and `status` both driven by `my-fetch:response` with `detail.value` and `detail.status`. Sending the raw event name and detail would collapse those properties on the client side. Instead, the server-side `bind()` invokes its callback once per property with the getter-applied value, and each call becomes a distinct `{ type: "update", name, value }` message. The client updates its cache by `name` and dispatches a synthetic per-property event so local `bind()` can discriminate.
+
 **Why are getters not applied on the client?**
-The server-side `bind()` applies the original `getter` functions when extracting values from Core events. The serialized message carries the already-extracted value. The client-side proxy uses only the default getter (`e => e.detail`), so `getter` functions do not need to be serializable.
+Because the server already applies them. The wire value is the already-extracted per-property value, and the client proxy rewrites each property's `event` to a synthetic per-property name (`@wc-bindable/remote:<name>`) so the default getter (`e => e.detail`) is always sufficient. As a consequence, `getter` functions do not need to be serializable — but note that this also means `addEventListener` on the proxy with the original Core event name will not fire. Use `bind()` or property access.
+
+**What values can cross the wire?**
+Messages are encoded with `JSON.stringify`, so only JSON-serializable values round-trip faithfully. Values such as `Date`, `Map`, `Set`, `BigInt`, functions, class instances, or cyclic objects will be transformed, dropped, or throw during serialization.
 
 ## License
 

@@ -2,6 +2,7 @@ node_modules/
 dist/
 coverage/
 .tsc-out/
+test-results/
 .vscode/
 .npmrc
 *.tsbuildinfo

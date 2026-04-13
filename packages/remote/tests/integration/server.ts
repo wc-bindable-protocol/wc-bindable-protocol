@@ -8,7 +8,6 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { WebSocketServer } from "ws";
-import { bind } from "@wc-bindable/core";
 import type { WcBindableDeclaration } from "@wc-bindable/core";
 import { RemoteShellProxy } from "../../src/RemoteShellProxy.js";
 import type { ServerTransport, ServerMessage, ClientMessage } from "../../src/types.js";

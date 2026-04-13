@@ -14,14 +14,14 @@ import type { ClientTransport, ServerMessage } from "./types.js";
  */
 export class RemoteCoreProxy extends EventTarget {
   private _transport: ClientTransport;
-  private _declaration: WcBindableDeclaration;
+  private _eventsByName: Map<string, string>;
   private _values: Record<string, unknown> = {};
   private _pending: Map<string, { resolve: (v: unknown) => void; reject: (e: unknown) => void }> = new Map();
   private _cmdId = 0;
 
   constructor(declaration: WcBindableDeclaration, transport: ClientTransport) {
     super();
-    this._declaration = declaration;
+    this._eventsByName = new Map(declaration.properties.map((prop) => [prop.name, prop.event]));
     this._transport = transport;
 
     transport.onMessage((msg) => this._handleMessage(msg));
@@ -64,22 +64,23 @@ export class RemoteCoreProxy extends EventTarget {
         // Populate cache and dispatch events for each initial value.
         for (const [name, value] of Object.entries(msg.values)) {
           this._values[name] = value;
-          const prop = this._declaration.properties.find((p) => p.name === name);
-          if (prop) {
-            this.dispatchEvent(new CustomEvent(prop.event, { detail: value, bubbles: true }));
+          const eventName = this._eventsByName.get(name);
+          if (eventName) {
+            this.dispatchEvent(new CustomEvent(eventName, { detail: value, bubbles: true }));
           }
         }
         break;
       }
-      case "event": {
-        // Update local cache and re-dispatch the event.
-        // The server has already applied getters, so detail is the extracted value.
-        for (const prop of this._declaration.properties) {
-          if (prop.event === msg.event) {
-            this._values[prop.name] = msg.detail;
-          }
+      case "update": {
+        // Update local cache by property name, then dispatch a per-property
+        // event so local bind() picks it up. The proxy uses synthetic event
+        // names (see createRemoteCoreProxy) to avoid collisions when multiple
+        // properties share an event name on the Core side.
+        this._values[msg.name] = msg.value;
+        const eventName = this._eventsByName.get(msg.name);
+        if (eventName) {
+          this.dispatchEvent(new CustomEvent(eventName, { detail: msg.value, bubbles: true }));
         }
-        this.dispatchEvent(new CustomEvent(msg.event, { detail: msg.detail, bubbles: true }));
         break;
       }
       case "return": {
@@ -119,6 +120,9 @@ const handler: ProxyHandler<RemoteCoreProxy> = {
   },
 };
 
+/** Synthetic event-name prefix used by proxy declarations. */
+const PROXY_EVENT_PREFIX = "@wc-bindable/remote:";
+
 /**
  * Create a RemoteCoreProxy with an isolated `constructor.wcBindable`.
  *
@@ -129,6 +133,13 @@ const handler: ProxyHandler<RemoteCoreProxy> = {
  * The returned object is wrapped in a Proxy so that declared property
  * names (e.g. `proxy.value`, `proxy.loading`) resolve from the internal
  * cache. This is required for `bind()`'s initial value synchronization.
+ *
+ * The proxy declaration rewrites each property's `event` to a synthetic
+ * per-property name. This prevents collisions when the original Core
+ * declares multiple properties on the same event (e.g. `value` and
+ * `status` both driven by `my-fetch:response` with different getters) —
+ * the wire protocol is property-centric, so the proxy must dispatch
+ * per-property events internally for local `bind()` to discriminate.
  */
 export function createRemoteCoreProxy(
   declaration: WcBindableDeclaration,
@@ -138,19 +149,21 @@ export function createRemoteCoreProxy(
   // constructor.wcBindable is isolated per proxy instance.
   const proxyProperties = declaration.properties.map((p) => ({
     name: p.name,
-    event: p.event,
+    event: PROXY_EVENT_PREFIX + p.name,
   }));
 
+  const proxyDeclaration: WcBindableDeclaration = {
+    protocol: "wc-bindable",
+    version: 1,
+    properties: proxyProperties,
+    inputs: declaration.inputs,
+    commands: declaration.commands,
+  };
+
   class IsolatedProxy extends RemoteCoreProxy {
-    static wcBindable: WcBindableDeclaration = {
-      protocol: "wc-bindable",
-      version: 1,
-      properties: proxyProperties,
-      inputs: declaration.inputs,
-      commands: declaration.commands,
-    };
+    static wcBindable: WcBindableDeclaration = proxyDeclaration;
   }
 
-  const instance = new IsolatedProxy(declaration, transport);
+  const instance = new IsolatedProxy(proxyDeclaration, transport);
   return new Proxy(instance, handler);
 }

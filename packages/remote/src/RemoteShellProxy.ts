@@ -22,6 +22,7 @@ export class RemoteShellProxy {
   private _allowedInputs: Set<string>;
   private _allowedCommands: Set<string>;
   private _unbind: UnbindFn;
+  private _disposed = false;
 
   constructor(core: EventTarget, transport: ServerTransport) {
     this._core = core;
@@ -38,13 +39,19 @@ export class RemoteShellProxy {
     // Subscribe to Core events via bind().
     // Skip initial values here — they are sent on "sync" request instead.
     // bind() fires initial values synchronously, so we flag them to ignore.
+    // If bind() synchronously triggers real Core events through some side
+    // effect, they are intentionally suppressed here as well: the following
+    // sync response reads the latest property values and becomes the single
+    // source of truth for that initialization window.
+    // Forwarding is property-centric (not event-centric): when two properties
+    // share an event and differ only by getter (e.g. value/status on the same
+    // response event), bind() invokes this callback once per property with
+    // its getter-applied value. Sending { name, value } preserves that
+    // distinction — sending by event would collapse them.
     let initializing = true;
     this._unbind = bind(core, (name, value) => {
       if (initializing) return;
-      const prop = this._declaration.properties.find((p) => p.name === name);
-      if (prop) {
-        transport.send({ type: "event", event: prop.event, detail: value });
-      }
+      transport.send({ type: "update", name, value });
     });
     initializing = false;
 
@@ -66,6 +73,11 @@ export class RemoteShellProxy {
   }
 
   private _handleMessage(msg: ClientMessage): void {
+    // The ServerTransport interface has no way to unregister an onMessage
+    // handler, so dispose() sets this flag and we drop every subsequent
+    // inbound message. This prevents late-arriving or reused-transport
+    // messages from mutating the Core or invoking commands after teardown.
+    if (this._disposed) return;
     switch (msg.type) {
       case "sync": {
         this._transport.send({ type: "sync", values: this._readCurrentValues() });
@@ -73,7 +85,20 @@ export class RemoteShellProxy {
       }
       case "set": {
         if (!this._allowedInputs.has(msg.name)) return;
-        (this._core as unknown as Record<string, unknown>)[msg.name] = msg.value;
+        // Isolate setter exceptions so a throwing setter (validation,
+        // read-only property, type-conversion failure, etc.) does not
+        // escape the transport's message handler and kill the connection.
+        // `set` is fire-and-forget — there is no response id to surface
+        // the error to the client. Applications that need feedback should
+        // model the mutation as a command instead.
+        try {
+          (this._core as unknown as Record<string, unknown>)[msg.name] = msg.value;
+        } catch (err) {
+          console.error(
+            `RemoteShellProxy: setter for "${msg.name}" threw:`,
+            err,
+          );
+        }
         break;
       }
       case "cmd": {
@@ -99,9 +124,11 @@ export class RemoteShellProxy {
           if (result instanceof Promise) {
             result
               .then((value) => {
+                if (this._disposed) return;
                 this._transport.send({ type: "return", id: msg.id, value });
               })
               .catch((err) => {
+                if (this._disposed) return;
                 this._transport.send({
                   type: "throw",
                   id: msg.id,
@@ -123,8 +150,13 @@ export class RemoteShellProxy {
     }
   }
 
-  /** Clean up event subscriptions. Call when the connection closes. */
+  /**
+   * Stop forwarding events from the Core and reject any further inbound
+   * client messages. Call when the connection closes. Idempotent.
+   */
   dispose(): void {
+    if (this._disposed) return;
+    this._disposed = true;
     this._unbind();
   }
 }

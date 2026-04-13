@@ -1,5 +1,14 @@
 import type { ServerTransport, ServerMessage, ClientMessage } from "../types.js";
 
+function parseClientMessage(data: unknown): ClientMessage | null {
+  try {
+    return JSON.parse(typeof data === "string" ? data : String(data)) as ClientMessage;
+  } catch (error) {
+    console.warn("WebSocketServerTransport: ignoring invalid client message", error);
+    return null;
+  }
+}
+
 /**
  * Minimal interface for a server-side WebSocket connection.
  *
@@ -49,14 +58,15 @@ export class WebSocketServerTransport implements ServerTransport {
     if (this._ws.addEventListener) {
       // Standard API: event.data contains the payload.
       this._ws.addEventListener("message", (event: { data: unknown }) => {
-        const raw = event.data;
-        const msg = JSON.parse(typeof raw === "string" ? raw : String(raw)) as ClientMessage;
+        const msg = parseClientMessage(event.data);
+        if (!msg) return;
         handler(msg);
       });
     } else if (this._ws.on) {
       // Node EventEmitter style (ws library): data is passed directly.
       this._ws.on("message", (data: unknown) => {
-        const msg = JSON.parse(typeof data === "string" ? data : String(data)) as ClientMessage;
+        const msg = parseClientMessage(data);
+        if (!msg) return;
         handler(msg);
       });
     }

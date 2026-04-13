@@ -239,8 +239,8 @@ describe("RemoteCoreProxy", () => {
     bind(proxyB, onUpdateB);
 
     // Deliver events via transport (simulating server-side events).
-    handlerA!({ type: "event", event: "a:changed", detail: 1 });
-    handlerB!({ type: "event", event: "b:changed", detail: 2 });
+    handlerA!({ type: "update", name: "alpha", value: 1 });
+    handlerB!({ type: "update", name: "beta", value: 2 });
 
     expect(onUpdateA).toHaveBeenCalledWith("alpha", 1);
     expect(onUpdateB).toHaveBeenCalledWith("beta", 2);
@@ -334,7 +334,7 @@ describe("RemoteCoreProxy", () => {
     await expect(proxy.invoke("doFetch")).rejects.toBe("boom");
   });
 
-  it("dispatches event messages as CustomEvents", () => {
+  it("dispatches update messages through bind()", () => {
     let handler: ((msg: ServerMessage) => void) | null = null;
     const client: ClientTransport = {
       send: () => {},
@@ -345,8 +345,40 @@ describe("RemoteCoreProxy", () => {
     const onUpdate = vi.fn();
     bind(proxy, onUpdate);
 
-    handler!({ type: "event", event: "test:value-changed", detail: 42 });
+    handler!({ type: "update", name: "value", value: 42 });
     expect(onUpdate).toHaveBeenCalledWith("value", 42);
+  });
+
+  it("preserves per-property updates when Core properties share an event name", () => {
+    // Mirrors MyFetchCore: `value` and `status` are driven by the same
+    // server-side event but distinguished by getters. The wire protocol
+    // must carry each property independently.
+    const sharedDecl: WcBindableDeclaration = {
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [
+        { name: "value", event: "my-fetch:response", getter: (e) => (e as CustomEvent).detail.value },
+        { name: "status", event: "my-fetch:response", getter: (e) => (e as CustomEvent).detail.status },
+      ],
+    };
+
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const client: ClientTransport = {
+      send: () => {},
+      onMessage: (h) => { handler = h; },
+    };
+
+    const proxy = createRemoteCoreProxy(sharedDecl, client);
+    const onUpdate = vi.fn();
+    bind(proxy, onUpdate);
+
+    handler!({ type: "update", name: "value", value: { hello: "world" } });
+    handler!({ type: "update", name: "status", value: 200 });
+
+    expect(onUpdate).toHaveBeenCalledWith("value", { hello: "world" });
+    expect(onUpdate).toHaveBeenCalledWith("status", 200);
+    expect((proxy as unknown as Record<string, unknown>).value).toEqual({ hello: "world" });
+    expect((proxy as unknown as Record<string, unknown>).status).toBe(200);
   });
 
   it("ignores sync values for undeclared properties", () => {
@@ -366,7 +398,7 @@ describe("RemoteCoreProxy", () => {
     expect((proxy as unknown as Record<string, unknown>).unknown).toBe(123);
   });
 
-  it("updates cache on event messages so property access works", () => {
+  it("updates cache on update messages so property access works", () => {
     let handler: ((msg: ServerMessage) => void) | null = null;
     const client: ClientTransport = {
       send: () => {},
@@ -374,7 +406,7 @@ describe("RemoteCoreProxy", () => {
     };
 
     const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
-    handler!({ type: "event", event: "test:value-changed", detail: "cached" });
+    handler!({ type: "update", name: "value", value: "cached" });
 
     // Property access via Proxy should return cached value.
     expect((proxy as unknown as Record<string, unknown>).value).toBe("cached");
@@ -714,7 +746,7 @@ describe("RemoteShellProxy", () => {
     expect(send).toHaveBeenCalledWith({ type: "sync", values: {} });
   });
 
-  it("forwards Core events to transport", () => {
+  it("forwards Core events to transport as property updates", () => {
     const core = new TestCore();
     const send = vi.fn();
     let handler: ((msg: ClientMessage) => void) | null = null;
@@ -727,31 +759,39 @@ describe("RemoteShellProxy", () => {
     core.dispatchEvent(new CustomEvent("test:value-changed", { detail: "hello" }));
 
     expect(send).toHaveBeenCalledWith({
-      type: "event",
-      event: "test:value-changed",
-      detail: "hello",
+      type: "update",
+      name: "value",
+      value: "hello",
     });
   });
 
-  it("skips forwarding if the declaration no longer contains the emitted property", () => {
-    const core = new TestCore();
+  it("forwards shared-event properties as separate updates with getter-applied values", () => {
+    class SharedEventCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [
+          { name: "value", event: "shared:response", getter: (e) => (e as CustomEvent).detail.value },
+          { name: "status", event: "shared:response", getter: (e) => (e as CustomEvent).detail.status },
+        ],
+      };
+    }
+
+    const core = new SharedEventCore();
     const send = vi.fn();
     const server: ServerTransport = {
       send,
       onMessage: () => {},
     };
 
-    const shell = new RemoteShellProxy(core, server) as unknown as {
-      _declaration: WcBindableDeclaration;
-    };
-    shell._declaration = {
-      ...TestCore.wcBindable,
-      properties: [{ name: "other", event: "other:changed" }],
-    };
+    new RemoteShellProxy(core, server);
+    core.dispatchEvent(
+      new CustomEvent("shared:response", { detail: { value: { ok: true }, status: 200 } }),
+    );
 
-    core.dispatchEvent(new CustomEvent("test:value-changed", { detail: "ignored" }));
-
-    expect(send).not.toHaveBeenCalled();
+    // Two distinct updates — one per property — with getter-applied values.
+    expect(send).toHaveBeenCalledWith({ type: "update", name: "value", value: { ok: true } });
+    expect(send).toHaveBeenCalledWith({ type: "update", name: "status", value: 200 });
   });
 
   it("applies set messages to Core properties", () => {
@@ -872,6 +912,50 @@ describe("RemoteShellProxy", () => {
     // url IS declared in inputs — should work
     handler!({ type: "set", name: "url", value: "/allowed" });
     expect(core.url).toBe("/allowed");
+  });
+
+  it("isolates setter exceptions so the message handler survives", () => {
+    class ThrowingSetterCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+        inputs: [{ name: "value" }],
+      };
+      set value(_v: unknown) {
+        throw new Error("invalid");
+      }
+      get value(): unknown {
+        return undefined;
+      }
+    }
+
+    const core = new ThrowingSetterCore();
+    const send = vi.fn();
+    let handler: ((msg: ClientMessage) => void) | null = null;
+    const server: ServerTransport = {
+      send,
+      onMessage: (h) => { handler = h; },
+    };
+
+    new RemoteShellProxy(core, server);
+
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // Must not throw — the exception should be caught inside the handler.
+    expect(() => handler!({ type: "set", name: "value", value: "bad" })).not.toThrow();
+
+    // Developer-visible log captures the failure.
+    expect(errorSpy).toHaveBeenCalled();
+    const call = errorSpy.mock.calls[0];
+    expect(String(call[0])).toContain("value");
+    expect((call[1] as Error).message).toBe("invalid");
+
+    // Handler still alive — subsequent sync request is processed.
+    handler!({ type: "sync" });
+    expect(send).toHaveBeenCalledWith({ type: "sync", values: {} });
+
+    errorSpy.mockRestore();
   });
 
   it("sends throw message when async cmd rejects", async () => {
@@ -1017,6 +1101,82 @@ describe("RemoteShellProxy", () => {
 
     core.dispatchEvent(new CustomEvent("test:value-changed", { detail: "ignored" }));
     expect(send).not.toHaveBeenCalled();
+  });
+
+  it("drops inbound client messages after dispose()", () => {
+    const core = new TestCore();
+    const send = vi.fn();
+    let handler: ((msg: ClientMessage) => void) | null = null;
+    const server: ServerTransport = {
+      send,
+      onMessage: (h) => { handler = h; },
+    };
+
+    const shell = new RemoteShellProxy(core, server);
+    shell.dispose();
+
+    // set: Core must not be mutated via a post-dispose message.
+    handler!({ type: "set", name: "url", value: "/should-not-apply" });
+    expect(core.url).toBe("");
+
+    // cmd: no response must be sent, and the method must not be invoked.
+    const spy = vi.spyOn(core, "abort");
+    handler!({ type: "cmd", name: "abort", id: "late", args: [] });
+    expect(spy).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+
+    // sync: no response must be sent either.
+    handler!({ type: "sync" });
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("swallows async cmd resolution arriving after dispose()", async () => {
+    let resolveFetch: ((value: unknown) => void) | null = null;
+    class SlowCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+        commands: [{ name: "slow", async: true }],
+      };
+      slow(): Promise<unknown> {
+        return new Promise((resolve) => { resolveFetch = resolve; });
+      }
+    }
+
+    const core = new SlowCore();
+    const send = vi.fn();
+    let handler: ((msg: ClientMessage) => void) | null = null;
+    const server: ServerTransport = {
+      send,
+      onMessage: (h) => { handler = h; },
+    };
+
+    const shell = new RemoteShellProxy(core, server);
+
+    // Kick off an in-flight command.
+    handler!({ type: "cmd", name: "slow", id: "99", args: [] });
+    // Dispose before the command resolves.
+    shell.dispose();
+    // Now resolve the Promise — the `.then` must not send anything.
+    resolveFetch!("too-late");
+    await flush();
+    await flush();
+
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("dispose() is idempotent", () => {
+    const core = new TestCore();
+    const server: ServerTransport = {
+      send: () => {},
+      onMessage: () => {},
+    };
+    const shell = new RemoteShellProxy(core, server);
+    expect(() => {
+      shell.dispose();
+      shell.dispose();
+    }).not.toThrow();
   });
 });
 

@@ -11,7 +11,7 @@ export type ClientMessage =
  */
 export type ServerMessage =
   | { type: "sync"; values: Record<string, unknown> }
-  | { type: "event"; event: string; detail: unknown }
+  | { type: "update"; name: string; value: unknown }
   | { type: "return"; id: string; value: unknown }
   | { type: "throw"; id: string; error: unknown };
 

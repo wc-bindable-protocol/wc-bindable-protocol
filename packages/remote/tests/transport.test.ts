@@ -132,6 +132,24 @@ describe("WebSocketClientTransport", () => {
     expect(handler).toHaveBeenCalledWith(msg);
   });
 
+  it("ignores invalid server messages and warns instead of throwing", () => {
+    const { ws, fire } = createMockWebSocket(1);
+    const transport = new WebSocketClientTransport(ws);
+    const handler = vi.fn();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    transport.onMessage(handler);
+
+    expect(() => fire("message", "not json")).not.toThrow();
+    expect(handler).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledWith(
+      "WebSocketClientTransport: ignoring invalid server message",
+      expect.any(SyntaxError),
+    );
+
+    warn.mockRestore();
+  });
+
   it("onClose fires on close event", () => {
     const { ws, fire } = createMockWebSocket(1);
     const transport = new WebSocketClientTransport(ws);
@@ -178,7 +196,7 @@ describe("WebSocketServerTransport", () => {
       addEventListener: vi.fn(),
     };
     const transport = new WebSocketServerTransport(ws);
-    const msg: ServerMessage = { type: "event", event: "t:v", detail: 42 };
+    const msg: ServerMessage = { type: "update", name: "v", value: 42 };
 
     transport.send(msg);
 
@@ -203,6 +221,30 @@ describe("WebSocketServerTransport", () => {
     expect(handler).toHaveBeenCalledWith(msg);
   });
 
+  it("ignores invalid addEventListener payloads and warns instead of throwing", () => {
+    let listener: ((event: { data: unknown }) => void) | null = null;
+    const ws: WebSocketLike = {
+      send: vi.fn(),
+      addEventListener: vi.fn((_type: string, fn: (event: { data: unknown }) => void) => {
+        listener = fn;
+      }),
+    };
+    const transport = new WebSocketServerTransport(ws);
+    const handler = vi.fn();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    transport.onMessage(handler);
+
+    expect(() => listener!({ data: "not json" })).not.toThrow();
+    expect(handler).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledWith(
+      "WebSocketServerTransport: ignoring invalid client message",
+      expect.any(SyntaxError),
+    );
+
+    warn.mockRestore();
+  });
+
   it("receives messages via on() (ws library style) when addEventListener is absent", () => {
     let listener: ((data: unknown) => void) | null = null;
     const ws: WebSocketLike = {
@@ -219,6 +261,30 @@ describe("WebSocketServerTransport", () => {
     listener!(JSON.stringify(msg));
 
     expect(handler).toHaveBeenCalledWith(msg);
+  });
+
+  it("ignores invalid EventEmitter payloads and warns instead of throwing", () => {
+    let listener: ((data: unknown) => void) | null = null;
+    const ws: WebSocketLike = {
+      send: vi.fn(),
+      on: vi.fn((_type: string, fn: (data: unknown) => void) => {
+        listener = fn;
+      }),
+    };
+    const transport = new WebSocketServerTransport(ws);
+    const handler = vi.fn();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    transport.onMessage(handler);
+
+    expect(() => listener!("not json")).not.toThrow();
+    expect(handler).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledWith(
+      "WebSocketServerTransport: ignoring invalid client message",
+      expect.any(SyntaxError),
+    );
+
+    warn.mockRestore();
   });
 
   it("prefers addEventListener over on() when both are present", () => {

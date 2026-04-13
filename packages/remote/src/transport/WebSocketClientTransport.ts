@@ -1,5 +1,14 @@
 import type { ClientTransport, ClientMessage, ServerMessage } from "../types.js";
 
+function parseServerMessage(data: unknown): ServerMessage | null {
+  try {
+    return JSON.parse(typeof data === "string" ? data : String(data)) as ServerMessage;
+  } catch (error) {
+    console.warn("WebSocketClientTransport: ignoring invalid server message", error);
+    return null;
+  }
+}
+
 /**
  * ClientTransport implementation using the standard WebSocket API.
  *
@@ -62,7 +71,8 @@ export class WebSocketClientTransport implements ClientTransport {
 
   onMessage(handler: (message: ServerMessage) => void): void {
     this._ws.addEventListener("message", (event: MessageEvent) => {
-      const msg = JSON.parse(typeof event.data === "string" ? event.data : String(event.data)) as ServerMessage;
+      const msg = parseServerMessage(event.data);
+      if (!msg) return;
       handler(msg);
     });
   }
