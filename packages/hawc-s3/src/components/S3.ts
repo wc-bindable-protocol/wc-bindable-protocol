@@ -226,11 +226,24 @@ export class S3 extends HTMLElement {
   get file(): Blob | null { return this._file; }
   set file(value: Blob | null) { this._file = value; }
 
+  private _requestedKey(): string {
+    return this._explicitKey || this.getAttribute("key") || "";
+  }
+
   /**
    * Optional explicit object key. When unset, we derive one from the file
    * name (if available) or fall back to a timestamp-based key.
    */
-  get key(): string { return this._explicitKey || this.getAttribute("key") || ""; }
+  get key(): string {
+    if (this._isRemote) {
+      const resolved = this._remoteValues.key;
+      if (typeof resolved === "string" && resolved) return resolved;
+    } else {
+      const resolved = this._core?.key;
+      if (resolved) return resolved;
+    }
+    return this._requestedKey();
+  }
   set key(value: string) { this._explicitKey = value || ""; }
 
   // --- Output state ---
@@ -299,7 +312,8 @@ export class S3 extends HTMLElement {
   // --- Methods ---
 
   private _deriveKey(file: Blob): string {
-    if (this.key) return this.key;
+    const requested = this._requestedKey();
+    if (requested) return requested;
     const name = (file as File).name;
     if (name) return name;
     return `upload-${Date.now()}`;

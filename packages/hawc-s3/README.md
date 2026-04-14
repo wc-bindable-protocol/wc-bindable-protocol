@@ -157,6 +157,9 @@ Required environment: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`
 | `file` | the `Blob`/`File` to upload |
 | `trigger` | set to `true` to start; auto-resets to `false` on completion |
 
+`key` is a dual-role property: set/attribute it before upload to force the object key,
+then read it as state to get the resolved key emitted by the Core (`hawc-s3:key-changed`).
+
 ### `<hawc-s3>` state (read-only, dispatched as events)
 
 | property | event | description |
