@@ -11,8 +11,16 @@
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "lib": ["ES2020", "DOM"]
+    "lib": ["ES2020", "DOM"],
+    "paths": {
+      "@wc-bindable/core": ["../core/src/index.ts"],
+      "@wc-bindable/remote": ["../remote/src/index.ts"]
+    }
   },
   "include": ["src"],
-  "exclude": ["src/auto"]
+  "exclude": ["src/auto"],
+  "references": [
+    { "path": "../core" },
+    { "path": "../remote" }
+  ]
 }

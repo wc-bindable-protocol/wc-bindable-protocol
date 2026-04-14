@@ -117,6 +117,87 @@ describe("AiCore", () => {
     });
   });
 
+  describe("send — 入力検証", () => {
+    it("temperatureがNaN/Infinityの場合エラーをスローする", () => {
+      const core = new AiCore();
+      core.provider = "openai";
+      for (const bad of [NaN, Infinity, -Infinity]) {
+        expect(() => core.send("Hi", { model: "gpt-4o", temperature: bad }))
+          .toThrow(/temperature must be a finite number/);
+      }
+    });
+
+    it("maxTokensが0/負/非整数の場合エラーをスローする", () => {
+      const core = new AiCore();
+      core.provider = "openai";
+      for (const bad of [0, -1, 1.5, NaN]) {
+        expect(() => core.send("Hi", { model: "gpt-4o", maxTokens: bad }))
+          .toThrow(/maxTokens must be a positive integer/);
+      }
+    });
+
+    it("ストリームが空行なしで閉じてもtrailingイベントを処理できる", async () => {
+      fetchSpy.mockResolvedValueOnce(createMockStreamResponse([
+        'data: {"choices":[{"delta":{"content":"tail"}}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}',
+      ]));
+
+      const core = new AiCore();
+      core.provider = "openai";
+
+      const result = await core.send("Hi", { model: "gpt-4o" });
+
+      expect(result).toBe("tail");
+      expect(core.content).toBe("tail");
+      expect(core.usage).toEqual({ promptTokens: 1, completionTokens: 2, totalTokens: 3 });
+      expect(core.messages).toEqual([
+        { role: "user", content: "Hi" },
+        { role: "assistant", content: "tail" },
+      ]);
+    });
+
+    it("TextDecoderのremaining経由で完結したイベントも処理できる", async () => {
+      const bytes = new Uint8Array([
+        ...new TextEncoder().encode("data: hi"),
+        0xe2, 0x82,
+        0x0a, 0x0a,
+      ]);
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(bytes);
+          controller.close();
+        },
+      });
+      fetchSpy.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        headers: new Headers({ "Content-Type": "text/event-stream" }),
+        body: stream,
+        json: () => Promise.reject(new Error("streaming")),
+        text: () => Promise.reject(new Error("streaming")),
+      } as unknown as Response);
+
+      const parseStreamChunk = vi.fn(() => ({
+        delta: "TAIL",
+        usage: { promptTokens: 3, completionTokens: 4 },
+        done: false,
+      }));
+      const core = new AiCore();
+      core.provider = {
+        buildRequest: () => ({ url: "https://example.test", headers: {}, body: "{}" }),
+        parseResponse: vi.fn(),
+        parseStreamChunk,
+      };
+
+      const result = await core.send("Hi", { model: "custom" });
+
+      expect(result).toBe("TAIL");
+      expect(parseStreamChunk).toHaveBeenCalledTimes(1);
+      expect(parseStreamChunk.mock.calls[0][1]).toContain("hi");
+      expect(core.usage).toEqual({ promptTokens: 3, completionTokens: 4, totalTokens: 7 });
+    });
+  });
+
   describe("messages", () => {
     it("メッセージの設定と取得ができる", () => {
       const core = new AiCore();
@@ -160,6 +241,19 @@ describe("AiCore", () => {
   });
 
   describe("internal helpers", () => {
+    it("Error.toJSONはstackが空ならstackを含めない", () => {
+      const core = new AiCore();
+      const error = new Error("boom");
+      error.stack = "";
+
+      (core as any)._setError(error);
+
+      expect((error as any).toJSON()).toEqual({
+        name: "Error",
+        message: "boom",
+      });
+    });
+
     it("rAF未提供でもflushを一度だけ予約して実行できる", async () => {
       const core = new AiCore();
       const coreAny = core as any;
@@ -313,6 +407,211 @@ describe("AiCore", () => {
 
       expect(result).toBe("");
       expect(core.messages).toEqual([{ role: "assistant", content: "" }]);
+    });
+
+    it("event-streamでもbodyが無ければjsonレスポンスとして処理する", async () => {
+      fetchSpy.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        headers: new Headers({ "Content-Type": "text/event-stream" }),
+        body: null,
+        json: () => Promise.resolve({ choices: [{ message: { content: "json-fallback" } }] }),
+        text: () => Promise.resolve(""),
+      } as unknown as Response);
+
+      const core = new AiCore();
+      core.provider = "openai";
+
+      await expect(core.send("Hi", { model: "gpt-4o" })).resolves.toBe("json-fallback");
+    });
+
+    it("content-typeがnullでも非ストリーミングとして処理する", async () => {
+      fetchSpy.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        headers: { get: () => null },
+        body: null,
+        json: () => Promise.resolve({ choices: [{ message: { content: "no-header" } }] }),
+        text: () => Promise.resolve(""),
+      } as unknown as Response);
+
+      const core = new AiCore();
+      core.provider = "openai";
+
+      await expect(core.send("Hi", { model: "gpt-4o" })).resolves.toBe("no-header");
+    });
+
+    it("trailingイベントのparse結果がnullなら無視する", async () => {
+      fetchSpy.mockResolvedValueOnce(createMockStreamResponse(["data: trailing"]));
+
+      const core = new AiCore();
+      core.provider = {
+        buildRequest: () => ({ url: "https://example.test", headers: {}, body: "{}" }),
+        parseResponse: vi.fn(),
+        parseStreamChunk: vi.fn(() => null),
+      };
+
+      await expect(core.send("Hi", { model: "custom" })).resolves.toBe("");
+      expect(core.messages).toEqual([
+        { role: "user", content: "Hi" },
+        { role: "assistant", content: "" },
+      ]);
+    });
+
+    it("TextDecoderのremainingが返したイベントも処理できる", async () => {
+      const OriginalTextDecoder = globalThis.TextDecoder;
+
+      class FakeTextDecoder {
+        decode(_value?: Uint8Array, options?: { stream?: boolean }): string {
+          if (options?.stream) return "";
+          return "data: remain\n\n";
+        }
+      }
+
+      fetchSpy.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        headers: new Headers({ "Content-Type": "text/event-stream" }),
+        body: new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new Uint8Array([1]));
+            controller.close();
+          },
+        }),
+        json: () => Promise.reject(new Error("streaming")),
+        text: () => Promise.reject(new Error("streaming")),
+      } as unknown as Response);
+
+      const core = new AiCore();
+      const parseStreamChunk = vi.fn(() => ({
+        delta: "remain",
+        usage: { promptTokens: 2, completionTokens: 3 },
+        done: false,
+      }));
+      core.provider = {
+        buildRequest: () => ({ url: "https://example.test", headers: {}, body: "{}" }),
+        parseResponse: vi.fn(),
+        parseStreamChunk,
+      };
+
+      (globalThis as any).TextDecoder = FakeTextDecoder;
+      try {
+        await expect(core.send("Hi", { model: "custom" })).resolves.toBe("remain");
+      } finally {
+        (globalThis as any).TextDecoder = OriginalTextDecoder;
+      }
+
+      expect(parseStreamChunk).toHaveBeenCalledWith(undefined, "remain");
+      expect(core.usage).toEqual({ promptTokens: 2, completionTokens: 3, totalTokens: 5 });
+    });
+
+    it("remaining経由イベントのdelta/usage未設定も処理できる", async () => {
+      const OriginalTextDecoder = globalThis.TextDecoder;
+
+      class FakeTextDecoder {
+        decode(_value?: Uint8Array, options?: { stream?: boolean }): string {
+          if (options?.stream) return "";
+          return "data: remain\n\n";
+        }
+      }
+
+      fetchSpy.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        headers: new Headers({ "Content-Type": "text/event-stream" }),
+        body: new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new Uint8Array([1]));
+            controller.close();
+          },
+        }),
+        json: () => Promise.reject(new Error("streaming")),
+        text: () => Promise.reject(new Error("streaming")),
+      } as unknown as Response);
+
+      const parseStreamChunk = vi.fn(() => ({ done: false }));
+      const core = new AiCore();
+      core.provider = {
+        buildRequest: () => ({ url: "https://example.test", headers: {}, body: "{}" }),
+        parseResponse: vi.fn(),
+        parseStreamChunk,
+      };
+
+      (globalThis as any).TextDecoder = FakeTextDecoder;
+      try {
+        await expect(core.send("Hi", { model: "custom" })).resolves.toBe("");
+      } finally {
+        (globalThis as any).TextDecoder = OriginalTextDecoder;
+      }
+
+      expect(parseStreamChunk).toHaveBeenCalledWith(undefined, "remain");
+      expect(core.usage).toBeNull();
+    });
+
+    it("remaining経由イベントでparse結果がnullでも継続できる", async () => {
+      const OriginalTextDecoder = globalThis.TextDecoder;
+
+      class FakeTextDecoder {
+        decode(_value?: Uint8Array, options?: { stream?: boolean }): string {
+          if (options?.stream) return "";
+          return "data: remain\n\n";
+        }
+      }
+
+      fetchSpy.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        headers: new Headers({ "Content-Type": "text/event-stream" }),
+        body: new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new Uint8Array([1]));
+            controller.close();
+          },
+        }),
+        json: () => Promise.reject(new Error("streaming")),
+        text: () => Promise.reject(new Error("streaming")),
+      } as unknown as Response);
+
+      const parseStreamChunk = vi.fn(() => null);
+      const core = new AiCore();
+      core.provider = {
+        buildRequest: () => ({ url: "https://example.test", headers: {}, body: "{}" }),
+        parseResponse: vi.fn(),
+        parseStreamChunk,
+      };
+
+      (globalThis as any).TextDecoder = FakeTextDecoder;
+      try {
+        await expect(core.send("Hi", { model: "custom" })).resolves.toBe("");
+      } finally {
+        (globalThis as any).TextDecoder = OriginalTextDecoder;
+      }
+
+      expect(parseStreamChunk).toHaveBeenCalledWith(undefined, "remain");
+      expect(core.content).toBe("");
+    });
+
+    it("mergeUsageはexistingとincomingの欠損値を補完する", () => {
+      const coreAny = new AiCore() as any;
+
+      expect(coreAny._mergeUsage(undefined, {})).toEqual({
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
+      });
+      expect(coreAny._mergeUsage(
+        { promptTokens: 1, completionTokens: 2, totalTokens: 3 },
+        { completionTokens: 5 },
+      )).toEqual({
+        promptTokens: 1,
+        completionTokens: 5,
+        totalTokens: 6,
+      });
     });
   });
 
@@ -844,6 +1143,44 @@ describe("AiCore", () => {
 
       await second;
       expect(core.loading).toBe(false);
+    });
+
+    it("ストリーミング中にresendすると1回目のuserメッセージが履歴に残らない", async () => {
+      // 1回目: ストリーミング開始後、abortでcontroller.close()（done:true で自然終了）
+      fetchSpy.mockImplementationOnce((_url, init) => {
+        const signal = (init as RequestInit).signal!;
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            signal.addEventListener("abort", () => {
+              try { controller.close(); } catch { /* already closed */ }
+            });
+          },
+        });
+        return Promise.resolve({
+          ok: true, status: 200, statusText: "OK",
+          headers: new Headers({ "Content-Type": "text/event-stream" }),
+          body: stream,
+          json: () => Promise.reject(), text: () => Promise.reject(),
+        } as unknown as Response);
+      });
+      // 2回目: 非ストリーミングで即座に成功
+      fetchSpy.mockResolvedValueOnce(createMockResponse({
+        choices: [{ message: { content: "OK" } }],
+      }));
+
+      const core = new AiCore();
+      core.provider = "openai";
+
+      const first = core.send("First", { model: "gpt-4o" });
+      await new Promise(r => setTimeout(r, 10));
+      const second = core.send("Second", { model: "gpt-4o", stream: false });
+
+      await Promise.all([first, second]);
+
+      expect(core.messages).toEqual([
+        { role: "user", content: "Second" },
+        { role: "assistant", content: "OK" },
+      ]);
     });
 
     it("ストリーミング中にresendするとstreamingがリセットされる", async () => {

@@ -312,6 +312,52 @@ describe("Ai (hawc-ai)", () => {
       await expect(el.send()).rejects.toThrow("provider is required");
     });
 
+    it("不正なproviderに変更したらsendは旧providerで送信せずrejectする", async () => {
+      const el = document.createElement("hawc-ai") as Ai;
+      el.setAttribute("provider", "openai");
+      el.setAttribute("model", "gpt-4o");
+      el.stream = false;
+      document.body.appendChild(el);
+
+      const errors: any[] = [];
+      el.addEventListener("hawc-ai:error", (e: Event) => {
+        errors.push((e as CustomEvent).detail);
+      });
+
+      // 不正なproviderへ変更：setAttributeが例外を投げずに属性は更新され、
+      // errorイベントが発火し、send()は旧openaiで送信せずrejectすること
+      el.setAttribute("provider", "invalid-provider");
+      expect(el.getAttribute("provider")).toBe("invalid-provider");
+      expect(errors.length).toBeGreaterThan(0);
+
+      el.prompt = "Hi";
+      await expect(el.send()).rejects.toThrow("Unknown provider");
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it("不正provider設定後に正しいproviderへ戻すとerrorがクリアされsendできる", async () => {
+      fetchSpy.mockResolvedValueOnce(createMockResponse({
+        choices: [{ message: { content: "recovered" } }],
+      }));
+
+      const el = document.createElement("hawc-ai") as Ai;
+      el.setAttribute("provider", "openai");
+      el.setAttribute("model", "gpt-4o");
+      el.stream = false;
+      document.body.appendChild(el);
+
+      // 不正providerでerrorを発生させる
+      el.setAttribute("provider", "invalid-provider");
+      expect(el.error).toBeInstanceOf(Error);
+
+      // 正しいproviderへ戻す
+      el.setAttribute("provider", "openai");
+      expect(el.error).toBeNull();
+
+      el.prompt = "Hi";
+      await expect(el.send()).resolves.toBe("recovered");
+    });
+
     it("autoTrigger無効時にautoTrigger登録しない", () => {
       setConfig({ autoTrigger: false });
       const el = document.createElement("hawc-ai") as Ai;
@@ -322,6 +368,21 @@ describe("Ai (hawc-ai)", () => {
   });
 
   describe("send", () => {
+    it("remote有効だが未接続の要素では初期化エラーになる", async () => {
+      setConfig({ remote: { enableRemote: true, remoteSettingType: "config", remoteCoreUrl: "ws://localhost:3000" } });
+
+      try {
+        const el = document.createElement("hawc-ai") as Ai;
+        el.setAttribute("provider", "openai");
+        el.setAttribute("model", "gpt-4o");
+        el.prompt = "Hi";
+
+        await expect(el.send()).rejects.toThrow("Ai is not initialized yet");
+      } finally {
+        setConfig({ remote: { enableRemote: false, remoteSettingType: "config", remoteCoreUrl: "" } });
+      }
+    });
+
     it("非ストリーミングでsendできる", async () => {
       fetchSpy.mockResolvedValueOnce(createMockResponse({
         choices: [{ message: { content: "Hello!" } }],
@@ -512,6 +573,19 @@ describe("Ai (hawc-ai)", () => {
       el.trigger = false;
       expect(fetchSpy).not.toHaveBeenCalled();
     });
+
+    it("trigger=trueでsendが失敗してもfinallyでtrigger=falseへ戻る", async () => {
+      const el = document.createElement("hawc-ai") as Ai;
+      el.setAttribute("provider", "openai");
+      document.body.appendChild(el);
+
+      el.prompt = "Hello";
+      el.trigger = true;
+      await new Promise(resolve => setTimeout(resolve, 20));
+
+      expect(el.trigger).toBe(false);
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
   });
 
   describe("messages", () => {
@@ -533,6 +607,65 @@ describe("Ai (hawc-ai)", () => {
       el.messages = [];
       expect(el.messages).toHaveLength(0);
     });
+
+    it("remote modeで未同期messagesは空配列へフォールバックする", () => {
+      const el = document.createElement("hawc-ai") as any;
+      el._proxy = {};
+      el._remoteValues = {};
+
+      expect(el.messages).toEqual([]);
+    });
+
+    it("local modeでcore不在時のmessages getter/setterは空配列/no-opになる", () => {
+      const el = document.createElement("hawc-ai") as any;
+      el._core = null;
+
+      expect(el.messages).toEqual([]);
+      expect(() => {
+        el.messages = [{ role: "user", content: "ignored" }];
+      }).not.toThrow();
+    });
+  });
+
+  describe("output fallback state", () => {
+    it("remote modeで未同期値は既定値へフォールバックする", () => {
+      const el = document.createElement("hawc-ai") as any;
+      el._proxy = {};
+      el._remoteValues = {};
+
+      expect(el.content).toBe("");
+      expect(el.loading).toBe(false);
+      expect(el.streaming).toBe(false);
+      expect(el.usage).toBeNull();
+    });
+
+    it("local modeでcore不在時は既定値や_errorStateへフォールバックする", () => {
+      const el = document.createElement("hawc-ai") as any;
+      el._core = null;
+      el._errorState = "local-error";
+
+      expect(el.content).toBe("");
+      expect(el.loading).toBe(false);
+      expect(el.streaming).toBe(false);
+      expect(el.usage).toBeNull();
+      expect(el.error).toBe("local-error");
+    });
+
+    it("remote modeのerrorはlocal error優先とserver error fallbackの両方を返す", () => {
+      const el = document.createElement("hawc-ai") as any;
+      el._proxy = {};
+      el._remoteValues = {};
+      el._errorState = "local-error";
+      el._hasLocalError = true;
+
+      expect(el.error).toBe("local-error");
+
+      el._hasLocalError = false;
+      expect(el.error).toBe("local-error");
+
+      el._remoteValues.error = "remote-error";
+      expect(el.error).toBe("remote-error");
+    });
   });
 
   describe("abort", () => {
@@ -543,6 +676,21 @@ describe("Ai (hawc-ai)", () => {
       // abortが例外なく呼べることを確認
       expect(() => el.abort()).not.toThrow();
     });
+
+    it("coreもproxyも無い場合のabortはno-op", () => {
+      const el = document.createElement("hawc-ai") as any;
+      el._core = null;
+      expect(() => el.abort()).not.toThrow();
+    });
+
+    it("remote abortのrejectも内部で握りつぶす", async () => {
+      const el = document.createElement("hawc-ai") as any;
+      el._proxy = { invoke: vi.fn().mockRejectedValue(new Error("abort failed")) };
+
+      expect(() => el.abort()).not.toThrow();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
   });
 
   describe("disconnectedCallback", () => {
@@ -552,6 +700,145 @@ describe("Ai (hawc-ai)", () => {
       document.body.appendChild(el);
       // abortSpyは内部なので、間接的に確認
       expect(() => el.remove()).not.toThrow();
+    });
+  });
+
+  describe("internal helpers", () => {
+    it("serialized error objectをErrorインスタンスへ復元する", () => {
+      const revived = (Ai as any)._reviveError({
+        name: "RemoteError",
+        message: "boom",
+        stack: "stack-trace",
+      });
+
+      expect(revived).toBeInstanceOf(Error);
+      expect(revived.name).toBe("RemoteError");
+      expect(revived.message).toBe("boom");
+      expect(revived.stack).toBe("stack-trace");
+    });
+
+    it("status付きerror objectはそのまま返す", () => {
+      const httpError = { status: 401, statusText: "Unauthorized", body: "denied" };
+      expect((Ai as any)._reviveError(httpError)).toBe(httpError);
+    });
+
+    it("stack無しserialized errorも復元できる", () => {
+      const revived = (Ai as any)._reviveError({
+        name: "RemoteError",
+        message: "boom",
+      });
+
+      expect(revived).toBeInstanceOf(Error);
+      expect(revived.name).toBe("RemoteError");
+      expect(revived.message).toBe("boom");
+    });
+
+    it("transportエラー判定がclosed/disposed/timeoutのみtrueになる", () => {
+      const timeoutError = new Error("timed out");
+      timeoutError.name = "TimeoutError";
+
+      expect((Ai as any)._isTransportError(new Error("Transport closed"))).toBe(true);
+      expect((Ai as any)._isTransportError(new Error("RemoteCoreProxy disposed"))).toBe(true);
+      expect((Ai as any)._isTransportError(timeoutError)).toBe(true);
+      expect((Ai as any)._isTransportError(new Error("provider is required"))).toBe(false);
+      expect((Ai as any)._isTransportError("closed")).toBe(false);
+    });
+
+    it("provider以外のattributeChangedCallbackは無視する", () => {
+      const el = document.createElement("hawc-ai") as any;
+      const spy = vi.spyOn(el, "_applyProvider");
+
+      el.attributeChangedCallback("model", null, "gpt-4o");
+
+      expect(spy).not.toHaveBeenCalled();
+    });
+
+    it("messages setter成功時はlocal errorをクリアする", async () => {
+      const el = document.createElement("hawc-ai") as any;
+      el._proxy = { setWithAck: vi.fn().mockResolvedValue(undefined) };
+      el._hasLocalError = true;
+      el._errorState = new Error("local");
+
+      el.messages = [{ role: "user", content: "hello" }];
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(el.error).toBeNull();
+    });
+
+    it("remote provider更新失敗のnon-ErrorもErrorへ正規化される", async () => {
+      const el = document.createElement("hawc-ai") as any;
+      el._proxy = { setWithAck: vi.fn().mockRejectedValue("bad-provider") };
+
+      el._applyProvider("openai");
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(el.error).toBe("bad-provider");
+      expect(el._lastProviderError).toBeInstanceOf(Error);
+      expect(el._lastProviderError.message).toBe("bad-provider");
+    });
+
+    it("local provider setterのnon-Error失敗をErrorへ正規化する", () => {
+      const el = document.createElement("hawc-ai") as any;
+      Object.defineProperty(el, "_core", {
+        value: {},
+        writable: true,
+      });
+      Object.defineProperty(el._core, "provider", {
+        set() {
+          throw "bad-provider";
+        },
+      });
+
+      el._applyProvider("openai");
+
+      expect(el.error).toBe("bad-provider");
+      expect(el._lastProviderError).toBeInstanceOf(Error);
+      expect(el._lastProviderError.message).toBe("bad-provider");
+    });
+
+    it("古いprovider更新成功ackは無視される", async () => {
+      const el = document.createElement("hawc-ai") as any;
+      let resolveFirst!: () => void;
+      const first = new Promise<void>((resolve) => {
+        resolveFirst = resolve;
+      });
+      el._proxy = {
+        setWithAck: vi.fn()
+          .mockReturnValueOnce(first)
+          .mockResolvedValueOnce(undefined),
+      };
+
+      el._applyProvider("openai");
+      el._applyProvider("anthropic");
+      resolveFirst();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(el._lastProviderError).toBeNull();
+    });
+
+    it("古いprovider更新失敗ackは無視される", async () => {
+      const el = document.createElement("hawc-ai") as any;
+      let rejectFirst!: (reason?: unknown) => void;
+      const first = new Promise<void>((_resolve, reject) => {
+        rejectFirst = reject;
+      });
+      el._proxy = {
+        setWithAck: vi.fn()
+          .mockReturnValueOnce(first)
+          .mockResolvedValueOnce(undefined),
+      };
+
+      el._applyProvider("openai");
+      el._applyProvider("anthropic");
+      rejectFirst(new Error("stale"));
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(el._lastProviderError).toBeNull();
+      expect(el.error).toBeNull();
     });
   });
 });
@@ -664,5 +951,50 @@ describe("autoTrigger", () => {
     const button = document.createElement("button");
     document.body.appendChild(button);
     expect(() => button.click()).not.toThrow();
+  });
+
+  it("send失敗時もautoTriggerのcatchで握りつぶされる", async () => {
+    registerAutoTrigger();
+
+    const aiEl = document.createElement("hawc-ai") as Ai;
+    aiEl.id = "ai-fail";
+    aiEl.setAttribute("provider", "openai");
+    document.body.appendChild(aiEl);
+    (aiEl as any)._prompt = "Hello";
+
+    const button = document.createElement("button");
+    button.setAttribute("data-aitarget", "ai-fail");
+    document.body.appendChild(button);
+
+    expect(() => button.click()).not.toThrow();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("nested targetからのクリックでもclosest経由で発火できる", async () => {
+    fetchSpy.mockResolvedValue(createMockResponse({
+      choices: [{ message: { content: "OK" } }],
+    }));
+
+    registerAutoTrigger();
+
+    const aiEl = document.createElement("hawc-ai") as Ai;
+    aiEl.id = "ai-nested";
+    aiEl.setAttribute("provider", "openai");
+    aiEl.setAttribute("model", "gpt-4o");
+    aiEl.stream = false;
+    document.body.appendChild(aiEl);
+    (aiEl as any)._prompt = "Hello";
+
+    const button = document.createElement("button");
+    button.setAttribute("data-aitarget", "ai-nested");
+    const span = document.createElement("span");
+    button.appendChild(span);
+    document.body.appendChild(button);
+
+    span.click();
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    expect(fetchSpy).toHaveBeenCalled();
   });
 });

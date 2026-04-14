@@ -1,8 +1,10 @@
 import { warnStreamParseFailure } from "../debug.js";
 import { IAiProvider, AiMessage, AiUsage, AiRequestOptions, AiProviderRequest, AiStreamChunkResult } from "../types.js";
+import { validateRequestOptions } from "./validateRequestOptions.js";
 
 export class AnthropicProvider implements IAiProvider {
   buildRequest(messages: AiMessage[], options: AiRequestOptions): AiProviderRequest {
+    validateRequestOptions(options);
     const baseUrl = options.baseUrl || "https://api.anthropic.com";
     const url = `${baseUrl}/v1/messages`;
 
@@ -20,6 +22,7 @@ export class AnthropicProvider implements IAiProvider {
     const body: Record<string, any> = {
       model: options.model,
       messages: nonSystemMessages.map(m => ({ role: m.role, content: m.content })),
+      // Anthropic API requires max_tokens; fall back to a sane default when omitted.
       max_tokens: options.maxTokens ?? 4096,
       stream: options.stream ?? true,
     };

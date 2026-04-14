@@ -33,6 +33,8 @@ export class Ai extends HTMLElement {
   private _prompt: string = "";
   private _errorState: any = null;
   private _hasLocalError: boolean = false;
+  private _lastProviderError: Error | null = null;
+  private _providerUpdate: Promise<unknown> | null = null;
   private _autoTriggerRegistered: boolean = false;
 
   private get _isRemote(): boolean {
@@ -53,8 +55,40 @@ export class Ai extends HTMLElement {
     }
     const ws = new WebSocket(url);
     this._ws = ws;
+
+    // Surface async connection failures. A deliberate close from disconnectedCallback
+    // nulls out _ws before the event fires, so those are suppressed.
+    let opened = false;
+    let failed = false;
+    ws.addEventListener("open", () => { opened = true; }, { once: true });
+    const onFail = () => {
+      if (failed) return;
+      failed = true;
+      if (this._ws !== ws) return;
+      this._setErrorState(new Error(
+        `[@wc-bindable/hawc-ai] WebSocket connection ${opened ? "lost" : "failed"}: ${url}`
+      ));
+      // The socket may drop outside any active send() — reset busy state so the
+      // UI does not stay stuck showing loading/streaming from the last sync.
+      this._resetRemoteBusyState();
+    };
+    ws.addEventListener("error", onFail, { once: true });
+    ws.addEventListener("close", onFail, { once: true });
+
     const transport = new WebSocketClientTransport(ws);
     this._connectRemote(transport);
+  }
+
+  /** Reset remote-synced busy state on transport failure so the UI does not stay stuck. */
+  private _resetRemoteBusyState(): void {
+    if (this._remoteValues.loading) {
+      this._remoteValues.loading = false;
+      this.dispatchEvent(new CustomEvent("hawc-ai:loading-changed", { detail: false, bubbles: true }));
+    }
+    if (this._remoteValues.streaming) {
+      this._remoteValues.streaming = false;
+      this.dispatchEvent(new CustomEvent("hawc-ai:streaming-changed", { detail: false, bubbles: true }));
+    }
   }
 
   private _setErrorState(error: any): void {
@@ -79,11 +113,38 @@ export class Ai extends HTMLElement {
 
   private _applyProvider(value: string | null): void {
     if (this._isRemote) {
-      this._proxy!.setWithAck("provider", value || null)
-        .then(() => this._clearErrorState())
-        .catch(e => this._setErrorState(e));
+      // Track the latest in-flight ack so send() can wait for it before
+      // gating on _lastProviderError. Stale acks (superseded by a newer
+      // _applyProvider call) no longer mutate state.
+      const ack = this._proxy!.setWithAck("provider", value || null);
+      this._providerUpdate = ack;
+      ack.then(
+        () => {
+          if (this._providerUpdate !== ack) return;
+          this._providerUpdate = null;
+          this._lastProviderError = null;
+          this._clearErrorState();
+        },
+        (e: unknown) => {
+          if (this._providerUpdate !== ack) return;
+          this._providerUpdate = null;
+          this._lastProviderError = e instanceof Error ? e : new Error(String(e));
+          this._setErrorState(e);
+        },
+      );
     } else if (this._core) {
-      this._core.provider = value || null;
+      try {
+        this._core.provider = value || null;
+        this._lastProviderError = null;
+        this._clearErrorState();
+      } catch (e: unknown) {
+        // Invalid provider names throw synchronously. Swallow here so setAttribute
+        // does not re-throw through attributeChangedCallback, and surface the failure
+        // via error state so send() can refuse rather than silently using the
+        // previously resolved provider.
+        this._lastProviderError = e instanceof Error ? e : new Error(String(e));
+        this._setErrorState(e);
+      }
     }
   }
 
@@ -97,18 +158,25 @@ export class Ai extends HTMLElement {
       // el.error instanceof Error holds in remote mode just as it does locally.
       if (name === "error") {
         value = Ai._reviveError(value);
-        this._errorState = null;
-        this._hasLocalError = false;
+        // Preserve local provider error: a pending provider validation failure
+        // is still blocking send(), so we must not let a server-side error=null
+        // sync make the UI look healthy while send() continues to reject.
+        if (!this._lastProviderError) {
+          this._errorState = null;
+          this._hasLocalError = false;
+        }
       }
       this._remoteValues[name] = value;
       // Find the matching event name from the declaration
       const prop = Ai.wcBindable.properties.find(p => p.name === name);
+      /* v8 ignore start -- bind callback names always come from declared wcBindable properties */
       if (prop) {
         this.dispatchEvent(new CustomEvent(prop.event, {
           detail: value,
           bubbles: true,
         }));
       }
+      /* v8 ignore stop */
     });
   }
 
@@ -255,7 +323,7 @@ export class Ai extends HTMLElement {
     if (this._isRemote) {
       this._proxy!.setWithAck("messages", value)
         .then(() => this._clearErrorState())
-        .catch(e => this._setErrorState(e));
+        .catch((e: unknown) => this._setErrorState(e));
     } else if (this._core) {
       this._core!.messages = value;
     }
@@ -298,6 +366,16 @@ export class Ai extends HTMLElement {
   }
 
   async send(): Promise<string | null> {
+    // Wait for any in-flight provider update so we gate on the latest result,
+    // not a stale error from a previously superseded attempt.
+    if (this._providerUpdate) {
+      try { await this._providerUpdate; } catch { /* error captured via _lastProviderError */ }
+    }
+    // Refuse when the current provider attribute failed to apply so that callers
+    // do not silently send with a stale, previously resolved provider.
+    if (this._lastProviderError) {
+      throw this._lastProviderError;
+    }
     if (this._isRemote) {
       try {
         // Use invokeWithOptions with timeoutMs: 0 to disable the default 30s
@@ -318,10 +396,7 @@ export class Ai extends HTMLElement {
           // by the server's AiCore error events, so expose them through the component state.
           // Also reset loading/streaming so UI does not stay permanently busy.
           this._setErrorState(e);
-          this._remoteValues.loading = false;
-          this._remoteValues.streaming = false;
-          this.dispatchEvent(new CustomEvent("hawc-ai:loading-changed", { detail: false, bubbles: true }));
-          this.dispatchEvent(new CustomEvent("hawc-ai:streaming-changed", { detail: false, bubbles: true }));
+          this._resetRemoteBusyState();
           return null;
         }
         // Server-side command errors (validation, provider errors) are re-thrown
@@ -387,8 +462,12 @@ export class Ai extends HTMLElement {
       this._proxy = null;
       this._remoteValues = {};
       if (this._ws) {
-        this._ws.close();
+        // Clear the reference first so that any close/error dispatched
+        // synchronously by close() is suppressed by the _ws !== ws guard
+        // in _initRemote's onFail handler.
+        const ws = this._ws;
         this._ws = null;
+        ws.close();
       }
     } else if (this._core) {
       this._core!.abort();
@@ -414,10 +493,27 @@ export class Ai extends HTMLElement {
     return value;
   }
 
-  /** Detect transport-level errors from RemoteCoreProxy (disposed, closed, timeout). */
+  /**
+   * Detect transport-level errors from RemoteCoreProxy / client transport.
+   * Server-side business errors that happen to contain substrings like
+   * "closed" or "disposed" in their messages must not match — those are
+   * re-thrown to callers like local mode.
+   */
   private static _isTransportError(e: unknown): boolean {
     if (!(e instanceof Error)) return false;
+    if (e.name === "TimeoutError") return true;
+    // Raw runtime exceptions from WebSocket.send: the socket can transition
+    // to CLOSING/CLOSED after the transport's own _closed check passed but
+    // before its close listener fires, and ws.send() then throws a
+    // DOMException (usually "InvalidStateError"). Treat these as transport
+    // failures so loading/streaming state is reset instead of being re-thrown
+    // as a business error.
+    if (typeof DOMException !== "undefined" && e instanceof DOMException) return true;
     const msg = e.message;
-    return msg.includes("disposed") || msg.includes("closed") || e.name === "TimeoutError";
+    return (
+      msg === "RemoteCoreProxy disposed" ||
+      msg === "Transport closed" ||
+      msg.startsWith("WebSocketClientTransport:")
+    );
   }
 }

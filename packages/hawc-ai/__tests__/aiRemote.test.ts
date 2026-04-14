@@ -52,6 +52,29 @@ function createMockResponse(body: any): Response {
   } as unknown as Response;
 }
 
+function createMockStreamResponse(chunks: string[]): Response {
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream({
+    start(controller) {
+      for (const chunk of chunks) {
+        controller.enqueue(encoder.encode(chunk));
+      }
+      controller.close();
+    },
+  });
+  return {
+    ok: true, status: 200, statusText: "OK",
+    headers: new Headers({ "Content-Type": "text/event-stream" }),
+    body: stream,
+    json: () => Promise.reject(new Error("streaming")),
+    text: () => Promise.reject(new Error("streaming")),
+  } as unknown as Response;
+}
+
+function sseData(data: string): string {
+  return `data: ${data}\n\n`;
+}
+
 /**
  * Create a remote Ai element connected to a real AiCore via mock transport.
  * Returns the element, the server-side core, and a cleanup function.
@@ -109,6 +132,179 @@ describe("Ai (remote mode)", () => {
         expect(el.error).toBe(errors[0]);
       } finally {
         setConfig({ remote: { enableRemote: false } });
+      }
+    });
+
+    it("open後の切断はconnection lostとして通知する", () => {
+      setConfig({ remote: { enableRemote: true, remoteSettingType: "config", remoteCoreUrl: "ws://localhost:9999" } });
+
+      class FakeWebSocket extends EventTarget {
+        static readonly CONNECTING = 0;
+        static readonly OPEN = 1;
+        readonly CONNECTING = 0;
+        readonly OPEN = 1;
+        readyState = 0;
+        url: string;
+        constructor(url: string) {
+          super();
+          this.url = url;
+        }
+        send(): void { /* noop */ }
+        close(): void { /* noop */ }
+      }
+
+      const realWs = globalThis.WebSocket;
+      (globalThis as any).WebSocket = FakeWebSocket;
+
+      try {
+        const el = document.createElement("hawc-ai") as Ai;
+        const errors: Error[] = [];
+        el.addEventListener("hawc-ai:error", (e: Event) => {
+          errors.push((e as CustomEvent).detail);
+        });
+
+        document.body.appendChild(el);
+        const ws = (el as any)._ws as EventTarget;
+        ws.dispatchEvent(new Event("open"));
+        ws.dispatchEvent(new Event("error"));
+
+        expect(errors).toHaveLength(1);
+        expect(errors[0].message).toContain("connection lost");
+      } finally {
+        (globalThis as any).WebSocket = realWs;
+        setConfig({ remote: { enableRemote: false, remoteSettingType: "config", remoteCoreUrl: "" } });
+      }
+    });
+
+    it("パッシブな切断でloading/streamingが立っていてもリセットされる", () => {
+      setConfig({ remote: { enableRemote: true, remoteSettingType: "config", remoteCoreUrl: "ws://localhost:9999" } });
+
+      class FakeWebSocket extends EventTarget {
+        static readonly CONNECTING = 0;
+        static readonly OPEN = 1;
+        readonly CONNECTING = 0;
+        readonly OPEN = 1;
+        readyState = 0;
+        url: string;
+        constructor(url: string) {
+          super();
+          this.url = url;
+        }
+        send(): void { /* noop */ }
+        close(): void { /* noop */ }
+      }
+      const realWs = globalThis.WebSocket;
+      (globalThis as any).WebSocket = FakeWebSocket;
+
+      try {
+        const el = document.createElement("hawc-ai") as Ai;
+        const loadingEvents: boolean[] = [];
+        const streamingEvents: boolean[] = [];
+        el.addEventListener("hawc-ai:loading-changed", (e: Event) => {
+          loadingEvents.push((e as CustomEvent).detail);
+        });
+        el.addEventListener("hawc-ai:streaming-changed", (e: Event) => {
+          streamingEvents.push((e as CustomEvent).detail);
+        });
+
+        document.body.appendChild(el);
+
+        // サーバー側同期でloading/streamingが立っている状態を模擬
+        (el as any)._remoteValues.loading = true;
+        (el as any)._remoteValues.streaming = true;
+        expect(el.loading).toBe(true);
+        expect(el.streaming).toBe(true);
+
+        // send()の外側でソケットがドロップ（パッシブな切断）
+        const ws = (el as any)._ws as EventTarget;
+        ws.dispatchEvent(new Event("open"));
+        ws.dispatchEvent(new Event("close"));
+
+        // 以降UIが固まらないようbusy状態がリセットされる
+        expect(el.loading).toBe(false);
+        expect(el.streaming).toBe(false);
+        expect(loadingEvents).toEqual([false]);
+        expect(streamingEvents).toEqual([false]);
+      } finally {
+        (globalThis as any).WebSocket = realWs;
+        setConfig({ remote: { enableRemote: false, remoteSettingType: "config", remoteCoreUrl: "" } });
+      }
+    });
+
+    it("disconnectedCallbackのclose()が同期的にcloseを発火しても偽のconnection失敗通知が出ない", () => {
+      setConfig({ remote: { enableRemote: true, remoteSettingType: "config", remoteCoreUrl: "ws://localhost:9999" } });
+
+      // close()が同期的にcloseイベントを発火するWebSocket — 意図的teardownがerror通知を
+      // 誤発火させないかを確認する
+      class SyncCloseWebSocket extends EventTarget {
+        static readonly CONNECTING = 0;
+        readonly CONNECTING = 0;
+        readyState = 0;
+        url: string;
+        constructor(url: string) {
+          super();
+          this.url = url;
+        }
+        send(): void { /* noop */ }
+        close(): void {
+          this.dispatchEvent(new Event("close"));
+        }
+      }
+      const realWs = globalThis.WebSocket;
+      (globalThis as any).WebSocket = SyncCloseWebSocket;
+
+      try {
+        const el = document.createElement("hawc-ai") as Ai;
+        const errors: Error[] = [];
+        el.addEventListener("hawc-ai:error", (e: Event) => {
+          errors.push((e as CustomEvent).detail);
+        });
+
+        document.body.appendChild(el);
+        el.remove();
+
+        expect(errors).toHaveLength(0);
+      } finally {
+        (globalThis as any).WebSocket = realWs;
+        setConfig({ remote: { enableRemote: false, remoteSettingType: "config", remoteCoreUrl: "" } });
+      }
+    });
+
+    it("古いWebSocketのerrorは現在の接続に紐付かないので無視する", () => {
+      setConfig({ remote: { enableRemote: true, remoteSettingType: "config", remoteCoreUrl: "ws://localhost:9999" } });
+
+      class FakeWebSocket extends EventTarget {
+        static readonly CONNECTING = 0;
+        readonly CONNECTING = 0;
+        readyState = 0;
+        url: string;
+        constructor(url: string) {
+          super();
+          this.url = url;
+        }
+        send(): void { /* noop */ }
+        close(): void { /* noop */ }
+      }
+
+      const realWs = globalThis.WebSocket;
+      (globalThis as any).WebSocket = FakeWebSocket;
+
+      try {
+        const el = document.createElement("hawc-ai") as Ai;
+        const errors: Error[] = [];
+        el.addEventListener("hawc-ai:error", (e: Event) => {
+          errors.push((e as CustomEvent).detail);
+        });
+
+        document.body.appendChild(el);
+        const oldWs = (el as any)._ws as EventTarget;
+        (el as any)._ws = new FakeWebSocket("ws://other");
+        oldWs.dispatchEvent(new Event("error"));
+
+        expect(errors).toHaveLength(0);
+      } finally {
+        (globalThis as any).WebSocket = realWs;
+        setConfig({ remote: { enableRemote: false, remoteSettingType: "config", remoteCoreUrl: "" } });
       }
     });
   });
@@ -230,6 +426,157 @@ describe("Ai (remote mode)", () => {
 
       expect(caughtError).not.toBeNull();
       expect(caughtError.message).toContain("model is required");
+
+      cleanup();
+    });
+  });
+
+  describe("send — 競合/resend（リモート経路）", () => {
+    it("重なったsend()の1回目のuserメッセージが残らず、2回目の結果が返る", async () => {
+      // 1回目: abort されるまで解決しない
+      fetchSpy.mockImplementationOnce((_url, init) => {
+        return new Promise((_resolve, reject) => {
+          (init as RequestInit).signal?.addEventListener("abort", () => {
+            reject(new DOMException("The operation was aborted.", "AbortError"));
+          });
+        });
+      });
+      // 2回目: 即応答
+      fetchSpy.mockResolvedValueOnce(createMockResponse({
+        choices: [{ message: { content: "Second response" } }],
+      }));
+
+      const { el, core, cleanup } = createRemoteAi();
+      await flush();
+      await flush();
+      core.provider = "openai";
+      el.setAttribute("model", "gpt-4o");
+      el.stream = false;
+
+      el.prompt = "First";
+      const first = el.send();
+      el.prompt = "Second";
+      const second = el.send();
+
+      const [r1, r2] = await Promise.all([first, second]);
+
+      // 状態更新の伝搬を待つ
+      await flush();
+      await flush();
+      await flush();
+      await flush();
+
+      expect(r1).toBeNull();
+      expect(r2).toBe("Second response");
+      expect(el.loading).toBe(false);
+      expect(el.messages).toEqual([
+        { role: "user", content: "Second" },
+        { role: "assistant", content: "Second response" },
+      ]);
+    });
+
+    it("ストリーミング中にresendすると1回目のuserメッセージが履歴に残らない", async () => {
+      // 1回目: ストリームを開き、abort(=signalのabort)でcontroller.close()して自然終了
+      fetchSpy.mockImplementationOnce((_url, init) => {
+        const signal = (init as RequestInit).signal!;
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            signal.addEventListener("abort", () => {
+              try { controller.close(); } catch { /* already closed */ }
+            });
+          },
+        });
+        return Promise.resolve({
+          ok: true, status: 200, statusText: "OK",
+          headers: new Headers({ "Content-Type": "text/event-stream" }),
+          body: stream,
+          json: () => Promise.reject(), text: () => Promise.reject(),
+        } as unknown as Response);
+      });
+      // 2回目: 非ストリーミングで即座に成功
+      fetchSpy.mockResolvedValueOnce(createMockResponse({
+        choices: [{ message: { content: "OK" } }],
+      }));
+
+      const { el, core, cleanup } = createRemoteAi();
+      await flush();
+      await flush();
+      core.provider = "openai";
+      el.setAttribute("model", "gpt-4o");
+
+      el.prompt = "First";
+      el.stream = true;
+      const first = el.send();
+      // 1回目のfetchが解決するまで少し待つ（ストリーミング開始）
+      await new Promise(r => setTimeout(r, 10));
+
+      el.prompt = "Second";
+      el.stream = false;
+      const second = el.send();
+
+      const [r1, r2] = await Promise.all([first, second]);
+
+      // 状態更新の伝搬を待つ
+      await flush();
+      await flush();
+      await flush();
+      await flush();
+
+      expect(r1).toBeNull();
+      expect(r2).toBe("OK");
+      expect(el.streaming).toBe(false);
+      expect(el.loading).toBe(false);
+      expect(el.messages).toEqual([
+        { role: "user", content: "Second" },
+        { role: "assistant", content: "OK" },
+      ]);
+
+      cleanup();
+    });
+
+    it("重なったストリーミングsend()でも1回目のメッセージが残らない", async () => {
+      // 1回目: abortされるまで解決しない
+      fetchSpy.mockImplementationOnce((_url, init) => {
+        return new Promise((_resolve, reject) => {
+          (init as RequestInit).signal?.addEventListener("abort", () => {
+            reject(new DOMException("The operation was aborted.", "AbortError"));
+          });
+        });
+      });
+      // 2回目: ストリーミング応答
+      const chunks = [
+        sseData('{"choices":[{"delta":{"content":"Streamed"}}]}'),
+        sseData("[DONE]"),
+      ];
+      fetchSpy.mockResolvedValueOnce(createMockStreamResponse(chunks));
+
+      const { el, core, cleanup } = createRemoteAi();
+      await flush();
+      await flush();
+      core.provider = "openai";
+      el.setAttribute("model", "gpt-4o");
+      el.stream = true;
+
+      el.prompt = "First";
+      const first = el.send();
+      el.prompt = "Second";
+      const second = el.send();
+
+      const [r1, r2] = await Promise.all([first, second]);
+
+      await flush();
+      await flush();
+      await flush();
+      await flush();
+
+      expect(r1).toBeNull();
+      expect(r2).toBe("Streamed");
+      expect(el.streaming).toBe(false);
+      expect(el.loading).toBe(false);
+      expect(el.messages).toEqual([
+        { role: "user", content: "Second" },
+        { role: "assistant", content: "Streamed" },
+      ]);
 
       cleanup();
     });
@@ -359,6 +706,23 @@ describe("Ai (remote mode)", () => {
     it("DOM再アタッチ後に再接続され正常に動作する", async () => {
       setConfig({ remote: { enableRemote: true, remoteSettingType: "config", remoteCoreUrl: "ws://localhost:9999" } });
 
+      // 実WebSocketに依存すると接続試行のタイミングで自発的にerror/closeが
+      // 飛んでテストが不安定になる。CONNECTINGのまま何も発火しないスタブに差し替える。
+      class FakeWebSocket extends EventTarget {
+        static readonly CONNECTING = 0;
+        readonly CONNECTING = 0;
+        readyState = 0;
+        url: string;
+        constructor(url: string) {
+          super();
+          this.url = url;
+        }
+        send(): void { /* noop */ }
+        close(): void { /* noop */ }
+      }
+      const realWs = globalThis.WebSocket;
+      (globalThis as any).WebSocket = FakeWebSocket;
+
       try {
         const { el, cleanup } = createRemoteAi();
         document.body.appendChild(el);
@@ -369,20 +733,27 @@ describe("Ai (remote mode)", () => {
         el.remove();
         expect((el as any)._proxy).toBeNull();
 
-        // 再アタッチ — _initRemoteが再び呼ばれる（WebSocket接続は失敗するがエラーイベントで通知される）
+        // 再アタッチ — _initRemoteが再び呼ばれる
         const errors: any[] = [];
         el.addEventListener("hawc-ai:error", (e: Event) => {
           errors.push((e as CustomEvent).detail);
         });
         document.body.appendChild(el);
 
-        // enableRemoteなのでconnectedCallbackで_initRemoteが実行される
-        // WebSocket("ws://localhost:9999") は実際には接続できないが、
-        // _initRemote自体がthrowしなければ再接続のパスが動いている証拠
-        // (WebSocket constructorはthrowしない — 非同期でfailする)
+        // ブラウザは接続失敗でerror→closeを両方発火するため、
+        // _wsに直接ディスパッチして二重通知ガードを検証する
+        const ws = (el as any)._ws as EventTarget;
+        ws.dispatchEvent(new Event("error"));
+        ws.dispatchEvent(new Event("close"));
+
+        // error/closeが両方発火してもhawc-ai:errorは1回だけ
+        expect(errors.length).toBe(1);
+        expect(errors[0]).toBeInstanceOf(Error);
+        expect((errors[0] as Error).message).toMatch(/WebSocket connection (failed|lost)/);
 
         cleanup();
       } finally {
+        (globalThis as any).WebSocket = realWs;
         setConfig({ remote: { enableRemote: false, remoteSettingType: "config", remoteCoreUrl: "" } });
       }
     });
@@ -409,6 +780,67 @@ describe("Ai (remote mode)", () => {
       await flush();
 
       expect(errors.length).toBeGreaterThan(0);
+
+      cleanup();
+    });
+
+    it("不正なprovider設定後のsendは旧providerで送信せずrejectする", async () => {
+      const { el, cleanup } = createRemoteAi();
+      document.body.appendChild(el);
+      el.setAttribute("provider", "openai");
+      el.setAttribute("model", "gpt-4o");
+      await flush();
+      await flush();
+      await flush();
+      await flush();
+
+      // 不正なproviderへ変更 — setWithAckが非同期にrejectする
+      el.setAttribute("provider", "invalid-provider");
+      await flush();
+      await flush();
+      await flush();
+      await flush();
+
+      el.prompt = "Hi";
+      await expect(el.send()).rejects.toThrow(/Unknown provider|invalid/i);
+
+      cleanup();
+    });
+
+    it("invalid→validへ戻してackを待たずにsendしても旧エラーで落ちない", async () => {
+      fetchSpy.mockResolvedValueOnce(createMockResponse({
+        choices: [{ message: { content: "recovered" } }],
+      }));
+
+      const { el, cleanup } = createRemoteAi();
+      document.body.appendChild(el);
+      el.setAttribute("provider", "openai");
+      el.setAttribute("model", "gpt-4o");
+      el.stream = false;
+      await flush();
+      await flush();
+      await flush();
+      await flush();
+
+      // 1. 不正provider → ackがrejectするまで待ち、エラー状態を確立
+      el.setAttribute("provider", "invalid-provider");
+      await flush();
+      await flush();
+      await flush();
+      await flush();
+      expect(el.error).toBeInstanceOf(Error);
+
+      // 2. valid providerへ戻す。ack前にsend()を発火（flushなし）
+      el.setAttribute("provider", "openai");
+      el.prompt = "Hi";
+      const resultPromise = el.send();
+
+      // 3. send()はin-flightな最新provider更新を待ち、旧エラーで拒否しない
+      await flush();
+      await flush();
+      await flush();
+      await flush();
+      await expect(resultPromise).resolves.toBe("recovered");
 
       cleanup();
     });
@@ -575,6 +1007,40 @@ describe("Ai (remote mode)", () => {
       cleanup();
     });
 
+    it("provider更新失敗中のサーバーerror=null同期はローカルprovider errorを消さない", async () => {
+      const { el, core, cleanup } = createRemoteAi();
+      document.body.appendChild(el);
+      el.setAttribute("provider", "openai");
+      el.setAttribute("model", "gpt-4o");
+      await flush();
+      await flush();
+      await flush();
+      await flush();
+
+      // provider更新を失敗させてローカルprovider errorを確立
+      el.setAttribute("provider", "invalid-provider");
+      await flush();
+      await flush();
+      await flush();
+      await flush();
+
+      expect(el.error).toBeInstanceOf(Error);
+      expect((el.error as Error).message).toMatch(/Unknown provider/);
+
+      // サーバー側が（別要因で）error=nullを同期してくる
+      (core as any)._setError(null);
+      await flush();
+
+      // UI上のerrorはprovider errorのまま残り、send()も引き続きreject
+      expect(el.error).toBeInstanceOf(Error);
+      expect((el.error as Error).message).toMatch(/Unknown provider/);
+
+      el.prompt = "Hi";
+      await expect(el.send()).rejects.toThrow(/Unknown provider/);
+
+      cleanup();
+    });
+
     it("リモート接続前はローカルエラーが返される", () => {
       const el = document.createElement("hawc-ai") as Ai;
       (el as any)._errorState = new Error("init error");
@@ -607,6 +1073,65 @@ describe("Ai (remote mode)", () => {
       expect(result).toBeNull();
       expect(errors.length).toBeGreaterThan(0);
       expect(el.error).not.toBeNull();
+
+      cleanup();
+    });
+
+    it("ws.sendのraw DOMException(InvalidStateError)はtransport error扱いでloading/streamingをリセットする", async () => {
+      const { el, core, cleanup } = createRemoteAi();
+      document.body.appendChild(el);
+      await flush();
+      await flush();
+
+      // サーバー側でloading/streamingを立てクライアントに伝播させる
+      (core as any)._setLoading(true);
+      (core as any)._setStreaming(true);
+      await flush();
+      expect(el.loading).toBe(true);
+      expect(el.streaming).toBe(true);
+
+      // native WebSocket.sendが投げうるraw DOMException
+      // （WebSocketClientTransport._closedが立つ前の競合窓）をシミュレート
+      const rawErr = new DOMException("Failed to execute 'send' on 'WebSocket'", "InvalidStateError");
+      (el as any)._proxy.invokeWithOptions = () => Promise.reject(rawErr);
+
+      const errors: any[] = [];
+      el.addEventListener("hawc-ai:error", (e: Event) => {
+        errors.push((e as CustomEvent).detail);
+      });
+
+      el.prompt = "Hello";
+      el.setAttribute("model", "gpt-4o");
+      const result = await el.send();
+
+      // transport failure として扱われ、reject されず null が返り、状態がリセットされる
+      expect(result).toBeNull();
+      expect(errors.length).toBeGreaterThan(0);
+      expect(el.loading).toBe(false);
+      expect(el.streaming).toBe(false);
+
+      cleanup();
+    });
+
+    it("サーバー由来の業務エラー（'closed'/'disposed'を含む）はreject伝搬する", async () => {
+      const { el, cleanup } = createRemoteAi();
+      document.body.appendChild(el);
+      await flush();
+      await flush();
+
+      // proxy.invokeWithOptionsが業務エラーでrejectする状況を模擬
+      // メッセージにclosed/disposedが含まれていてもtransport errorとして扱わないこと
+      const businessErrors = [
+        new Error("database connection closed"),
+        new Error("session disposed"),
+      ];
+      for (const err of businessErrors) {
+        (el as any)._proxy.invokeWithOptions = () => Promise.reject(err);
+
+        el.prompt = "Hi";
+        el.setAttribute("model", "gpt-4o");
+        await expect(el.send()).rejects.toBe(err);
+      }
 
       cleanup();
     });

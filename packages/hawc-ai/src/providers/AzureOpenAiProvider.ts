@@ -1,9 +1,11 @@
 import { AiMessage, AiRequestOptions, AiProviderRequest } from "../types.js";
 import { raiseError } from "../raiseError.js";
 import { OpenAiProvider } from "./OpenAiProvider.js";
+import { validateRequestOptions } from "./validateRequestOptions.js";
 
 export class AzureOpenAiProvider extends OpenAiProvider {
   override buildRequest(messages: AiMessage[], options: AiRequestOptions): AiProviderRequest {
+    validateRequestOptions(options);
     if (!options.baseUrl) {
       raiseError("base-url is required for Azure OpenAI.");
     }

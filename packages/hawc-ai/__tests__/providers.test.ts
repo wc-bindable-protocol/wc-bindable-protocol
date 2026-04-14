@@ -90,6 +90,19 @@ describe("OpenAiProvider", () => {
       expect(body.stream).toBe(true);
       expect(body.stream_options).toBeUndefined();
     });
+
+    it("無効なtemperature/maxTokensはエラーをスローする", () => {
+      expect(() => provider.buildRequest(
+        [{ role: "user", content: "Hi" }],
+        { model: "gpt-4o", temperature: NaN }
+      )).toThrow(/temperature must be a finite number/);
+      for (const invalid of [0, -1, 1.5]) {
+        expect(() => provider.buildRequest(
+          [{ role: "user", content: "Hi" }],
+          { model: "gpt-4o", maxTokens: invalid }
+        )).toThrow(/maxTokens must be a positive integer/);
+      }
+    });
   });
 
   describe("parseResponse", () => {
@@ -227,13 +240,22 @@ describe("AnthropicProvider", () => {
       expect(body.max_tokens).toBe(1000);
     });
 
-    it("maxTokens=0が明示指定された場合はデフォルトに上書きしない", () => {
+    it("maxTokens未指定時はデフォルト(4096)にフォールバックする", () => {
       const req = provider.buildRequest(
         [{ role: "user", content: "Hi" }],
-        { model: "claude-sonnet-4-20250514", maxTokens: 0 }
+        { model: "claude-sonnet-4-20250514" }
       );
       const body = JSON.parse(req.body);
-      expect(body.max_tokens).toBe(0);
+      expect(body.max_tokens).toBe(4096);
+    });
+
+    it("maxTokensに無効値を渡すとエラーをスローする", () => {
+      for (const invalid of [0, -1, NaN, 1.5]) {
+        expect(() => provider.buildRequest(
+          [{ role: "user", content: "Hi" }],
+          { model: "claude-sonnet-4-20250514", maxTokens: invalid }
+        )).toThrow(/maxTokens must be a positive integer/);
+      }
     });
 
     it("apiKey未設定時はx-api-keyヘッダーを含まない", () => {
@@ -467,6 +489,20 @@ describe("AzureOpenAiProvider", () => {
       const body = JSON.parse(req.body);
       expect(body.stream).toBe(false);
       expect(body.stream_options).toBeUndefined();
+    });
+
+    it("無効なtemperature/maxTokensはエラーをスローする", () => {
+      const opts = { model: "gpt-4o", baseUrl: "https://test.openai.azure.com" };
+      expect(() => provider.buildRequest(
+        [{ role: "user", content: "Hi" }],
+        { ...opts, temperature: NaN }
+      )).toThrow(/temperature must be a finite number/);
+      for (const invalid of [0, -1, 1.5]) {
+        expect(() => provider.buildRequest(
+          [{ role: "user", content: "Hi" }],
+          { ...opts, maxTokens: invalid }
+        )).toThrow(/maxTokens must be a positive integer/);
+      }
     });
   });
 

@@ -158,6 +158,7 @@ These properties control inference execution:
 | `no-stream` | `boolean` | Disable streaming |
 | `temperature` | `number` | Generation temperature |
 | `max-tokens` | `number` | Maximum output tokens |
+| `api-version` | `string` | Azure OpenAI API version (default `2024-02-01`) |
 
 ## Architecture
 
@@ -321,6 +322,23 @@ console.log(aiEl.usage);      // { promptTokens, completionTokens, totalTokens }
 console.log(aiEl.loading);    // false
 console.log(aiEl.streaming);  // false
 ```
+
+## Input Validation
+
+`<hawc-ai>` and `AiCore` validate request parameters up front so that bad values surface as immediate errors instead of provider `400` responses or silent NaN payloads.
+
+| Option | Accepted | Rejected |
+|--------|----------|----------|
+| `temperature` | any finite `number` | `NaN`, `±Infinity` |
+| `max-tokens` / `maxTokens` | positive integer (`>= 1`) | `0`, negative, `NaN`, non-integer (e.g. `1.5`) |
+| `provider` (attribute) | `"openai" \| "anthropic" \| "azure-openai"` | anything else |
+
+Behavior on invalid input:
+
+- `core.send()` throws `Error("... temperature must be a finite number, got ...")` / `Error("... maxTokens must be a positive integer, got ...")` synchronously.
+- `<hawc-ai>` `send()` rejects with the same error; no HTTP request is dispatched.
+- `<hawc-ai>` `provider` attribute: `setAttribute("provider", "bogus")` does **not** throw through `attributeChangedCallback`. The previous request is halted, `el.error` is populated, and any subsequent `send()` rejects until the attribute is corrected. The DOM attribute stays as the user wrote it for inspectability.
+- Providers invoked directly (`new OpenAiProvider().buildRequest(...)`) apply the same validation, so every path is consistent.
 
 ## Optional DOM Triggering
 
@@ -508,6 +526,68 @@ bind(aiEl, (name, value) => {
 });
 ```
 
+## Remote Mode
+
+`<hawc-ai>` can run its Core on a different host and drive the Shell in the browser over WebSocket. This keeps the provider API key entirely server-side (no `api-key` attribute in the DOM, no backend proxy path) and lets you centralize conversation state / rate limiting / audit logging.
+
+```
+browser                                         server
+┌────────────────────┐    WebSocket    ┌───────────────────────┐
+│ <hawc-ai>  (Shell) │  ─────────────▶ │ RemoteShellProxy      │
+│ RemoteCoreProxy    │  ◀───────────── │  ↕                    │
+└────────────────────┘                 │ AiCore → fetch(LLM)   │
+                                       └───────────────────────┘
+```
+
+The Shell exposes the same surface — `prompt`, `model`, `content`, `messages`, `error`, `send()`, `abort()` — whether the Core is local or remote. `provider` / `model` / streaming state / conversation history are all synced through `wc-bindable-protocol`.
+
+### Enable remote mode
+
+Set the `remote` config before calling `bootstrapAi()` (or before the first `<hawc-ai>` connects):
+
+```js
+import { bootstrapAi } from "@wc-bindable/hawc-ai";
+
+bootstrapAi({
+  remote: {
+    enableRemote: true,
+    remoteSettingType: "config",
+    remoteCoreUrl: "wss://example.com/hawc-ai",
+  },
+});
+```
+
+Or load the environment-resolving auto entrypoint (see below) and skip `bootstrapAi()`:
+
+```js
+import "@wc-bindable/hawc-ai/auto/remoteEnv";
+```
+
+### `remoteSettingType`
+
+| Value | Resolution order for `remoteCoreUrl` |
+|-------|--------------------------------------|
+| `"config"` (default) | Uses the literal `remoteCoreUrl` string you pass in. |
+| `"env"` | `globalThis.process?.env?.AI_REMOTE_CORE_URL` → `globalThis.AI_REMOTE_CORE_URL` → `""`. Good for Node bundler replacement (Vite `define`, webpack `DefinePlugin`) or `<script>window.AI_REMOTE_CORE_URL = "..."</script>` prior to module load. |
+
+### Error surface
+
+Remote-mode failures are exposed through the same `hawc-ai:error` event and `el.error` getter as local mode. Two classes of failures are surfaced locally even though they originate outside the server's `AiCore`:
+
+- **Connection failures.** Initial failure fires `hawc-ai:error` with `Error("... WebSocket connection failed: <url>")`; a drop after `open` uses `"connection lost"`. If the server had synced `loading`/`streaming`=`true`, they are reset to `false` so the UI does not stay busy.
+- **Transport-layer errors during `send()`.** Timeouts, disposed proxies, and raw `DOMException` from `WebSocket.send` are treated as transport failures: `el.send()` resolves to `null`, `el.error` is populated, `loading`/`streaming` are reset. Server-side business errors (validation, provider 4xx/5xx) are re-thrown to match local-mode contract.
+
+### `remoteCoreUrl` is required when enabled
+
+Setting `enableRemote: true` with an empty URL raises a synchronous `Error` from `connectedCallback` and fires `hawc-ai:error` on the element (the element does not throw out of `appendChild`).
+
+### Auto entrypoints
+
+| Entrypoint | Behavior |
+|------------|----------|
+| `@wc-bindable/hawc-ai/auto` | Registers the custom elements with default (local) config. |
+| `@wc-bindable/hawc-ai/auto/remoteEnv` | Registers the custom elements and enables remote mode with `remoteSettingType: "env"` — resolves `AI_REMOTE_CORE_URL` at import time. |
+
 ## Configuration
 
 ```javascript
@@ -519,6 +599,11 @@ bootstrapAi({
   tagNames: {
     ai: "hawc-ai",
     aiMessage: "hawc-ai-message",
+  },
+  remote: {
+    enableRemote: false,         // true で WebSocket 経由の remote Core に切り替え
+    remoteSettingType: "config", // "config" | "env"
+    remoteCoreUrl: "",           // "config" の時に使われる URL
   },
 });
 ```

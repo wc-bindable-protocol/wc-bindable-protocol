@@ -1,8 +1,10 @@
 import { warnStreamParseFailure } from "../debug.js";
 import { IAiProvider, AiMessage, AiUsage, AiRequestOptions, AiProviderRequest, AiStreamChunkResult } from "../types.js";
+import { validateRequestOptions } from "./validateRequestOptions.js";
 
 export class OpenAiProvider implements IAiProvider {
   buildRequest(messages: AiMessage[], options: AiRequestOptions): AiProviderRequest {
+    validateRequestOptions(options);
     const baseUrl = options.baseUrl || "https://api.openai.com";
     const url = `${baseUrl}/v1/chat/completions`;
 

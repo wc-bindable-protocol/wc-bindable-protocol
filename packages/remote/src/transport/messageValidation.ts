@@ -87,7 +87,8 @@ export function isServerMessage(value: unknown): value is ServerMessage {
       return (
         isServerSyncValues(value.values) &&
         (value.capabilities === undefined || isRemoteCapabilities(value.capabilities)) &&
-        (value.getterFailures === undefined || isStringArray(value.getterFailures))
+        (value.getterFailures === undefined || isStringArray(value.getterFailures)) &&
+        (value.undefinedProperties === undefined || isStringArray(value.undefinedProperties))
       );
     case "update":
       // See note on "set": an absent `value` key represents an undefined

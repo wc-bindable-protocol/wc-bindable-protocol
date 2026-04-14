@@ -8,6 +8,8 @@
   "scripts": {
     "build": "npm run build --workspaces",
     "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "npm run test:coverage --workspaces --if-present",
     "examples": "vite --config examples/vite.config.ts"
   },
   "devDependencies": {

@@ -122,6 +122,42 @@ describe("SseParser", () => {
       expect(trailing!.data).toBe('{"usage":{"output_tokens":10}}');
     });
 
+    it("flush時にbuffer内のevent行だけを保持できる", () => {
+      const parser = new SseParser();
+
+      parser.feed("event: trailing");
+      expect(parser.flush()).toBeNull();
+
+      parser.feed("data: hello");
+      const trailing = parser.flush();
+
+      expect(trailing).not.toBeNull();
+      expect(trailing!.event).toBe("trailing");
+      expect(trailing!.data).toBe("hello");
+    });
+
+    it("flushでdata/eventの後ろにスペースがない形式も処理できる", () => {
+      const parser = new SseParser();
+
+      parser.feed("event:trailing");
+      expect(parser.flush()).toBeNull();
+
+      parser.feed("data:hello");
+      const trailing = parser.flush();
+
+      expect(trailing).not.toBeNull();
+      expect(trailing!.event).toBe("trailing");
+      expect(trailing!.data).toBe("hello");
+    });
+
+    it("flushはdata/event以外の未解釈行を無視する", () => {
+      const parser = new SseParser();
+
+      parser.feed("id: 1");
+
+      expect(parser.flush()).toBeNull();
+    });
+
     it("バッファもデータも空の場合はnullを返す", () => {
       const parser = new SseParser();
       expect(parser.flush()).toBeNull();

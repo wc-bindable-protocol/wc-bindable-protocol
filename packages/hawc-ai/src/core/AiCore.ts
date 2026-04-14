@@ -175,6 +175,12 @@ export class AiCore extends EventTarget {
     if (!prompt) raiseError("prompt is required.");
     if (!this._provider) raiseError("provider is required. Set provider before calling send().");
     if (!options.model) raiseError("model is required.");
+    if (options.temperature !== undefined && !Number.isFinite(options.temperature)) {
+      raiseError(`temperature must be a finite number, got ${options.temperature}.`);
+    }
+    if (options.maxTokens !== undefined && (!Number.isInteger(options.maxTokens) || options.maxTokens <= 0)) {
+      raiseError(`maxTokens must be a positive integer, got ${options.maxTokens}.`);
+    }
     return this._doSend(prompt, options);
   }
 
@@ -229,7 +235,9 @@ export class AiCore extends EventTarget {
       const isEventStream = contentType.includes("text/event-stream");
       const shouldStream = (options.stream !== false) && isEventStream && response.body;
       if (shouldStream) {
-        return await this._processStream(response.body!, abortController);
+        const streamResult = await this._processStream(response.body!, abortController);
+        if (!isCurrent()) this._removeMessage(userMessage);
+        return streamResult;
       } else {
         const data = await response.json();
         const result = this._provider!.parseResponse(data);
