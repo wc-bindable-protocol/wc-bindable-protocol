@@ -182,6 +182,13 @@ describe("Auth (hawc-auth0)", () => {
       el.popup = false;
       expect(el.popup).toBe(false);
     });
+
+    it("remoteUrl属性を取得・設定できる", () => {
+      const el = document.createElement("hawc-auth0") as Auth;
+      expect(el.remoteUrl).toBe("");
+      el.remoteUrl = "ws://localhost:3000";
+      expect(el.remoteUrl).toBe("ws://localhost:3000");
+    });
   });
 
   describe("connectedCallback", () => {
@@ -266,6 +273,19 @@ describe("Auth (hawc-auth0)", () => {
       expect(el.token).toBe("access-token");
       expect(el.loading).toBe(false);
       expect(el.error).toBeNull();
+    });
+
+    it("connectedがShellから委譲される", async () => {
+      const mockClient = createMockAuth0Client();
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const el = document.createElement("hawc-auth0") as Auth;
+      el.setAttribute("domain", "test.auth0.com");
+      el.setAttribute("client-id", "client-id");
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      expect(el.connected).toBe(false);
     });
   });
 
@@ -451,6 +471,67 @@ describe("Auth (hawc-auth0)", () => {
 
       const token = await el.getToken();
       expect(token).toBe("new-token");
+    });
+
+    it("connect()は引数URLをShellに委譲する", async () => {
+      const mockClient = createMockAuth0Client();
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const el = document.createElement("hawc-auth0") as Auth;
+      el.setAttribute("domain", "test.auth0.com");
+      el.setAttribute("client-id", "client-id");
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      const connectSpy = vi.spyOn((el as any)._shell, "connect").mockResolvedValue({} as any);
+      await el.connect("ws://example.com");
+      expect(connectSpy).toHaveBeenCalledWith("ws://example.com");
+    });
+
+    it("connect()はURL未指定時にremote-url属性を使う", async () => {
+      const mockClient = createMockAuth0Client();
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const el = document.createElement("hawc-auth0") as Auth;
+      el.setAttribute("domain", "test.auth0.com");
+      el.setAttribute("client-id", "client-id");
+      el.setAttribute("remote-url", "ws://attr-url");
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      const connectSpy = vi.spyOn((el as any)._shell, "connect").mockResolvedValue({} as any);
+      await el.connect();
+      expect(connectSpy).toHaveBeenCalledWith("ws://attr-url");
+    });
+
+    it("refreshToken()を呼び出せる", async () => {
+      const mockClient = createMockAuth0Client();
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const el = document.createElement("hawc-auth0") as Auth;
+      el.setAttribute("domain", "test.auth0.com");
+      el.setAttribute("client-id", "client-id");
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      const refreshSpy = vi.spyOn((el as any)._shell, "refreshToken").mockResolvedValue(undefined);
+      await el.refreshToken();
+      expect(refreshSpy).toHaveBeenCalled();
+    });
+
+    it("reconnect()を呼び出せる", async () => {
+      const mockClient = createMockAuth0Client();
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const el = document.createElement("hawc-auth0") as Auth;
+      el.setAttribute("domain", "test.auth0.com");
+      el.setAttribute("client-id", "client-id");
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      const reconnectSpy = vi.spyOn((el as any)._shell, "reconnect").mockResolvedValue({} as any);
+      await el.reconnect();
+      expect(reconnectSpy).toHaveBeenCalled();
     });
   });
 
