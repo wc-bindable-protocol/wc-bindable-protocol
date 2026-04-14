@@ -1548,4 +1548,74 @@ describe("RemoteShellProxy", () => {
 
     expect(send).not.toHaveBeenCalled();
   });
+
+  describe("maxSyncUpdateBuffer", () => {
+    it("logs a warning once when the sync update buffer exceeds the limit", () => {
+      // A getter that fires several same-name update events while sync is
+      // building its snapshot, so the queue fills beyond the cap.
+      class ChattyGetterCore extends EventTarget {
+        static wcBindable: WcBindableDeclaration = {
+          protocol: "wc-bindable",
+          version: 1,
+          properties: [
+            { name: "value", event: "chatty:value" },
+            { name: "status", event: "chatty:status" },
+          ],
+        };
+
+        get value(): string {
+          for (let i = 0; i < 5; i++) {
+            this.dispatchEvent(new CustomEvent("chatty:status", { detail: `n${i}` }));
+          }
+          return "ok";
+        }
+
+        get status(): string {
+          return "current";
+        }
+      }
+
+      const core = new ChattyGetterCore();
+      let handler: ((msg: ClientMessage) => void) | null = null;
+      const server: ServerTransport = {
+        send: () => {},
+        onMessage: (h) => { handler = h; },
+      };
+
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        new RemoteShellProxy(core, server, { maxSyncUpdateBuffer: 2 });
+        handler!({ type: "sync" });
+
+        // Fires once per sync cycle, even though the buffer crossed the limit
+        // multiple times within a single snapshot build.
+        expect(warn).toHaveBeenCalledTimes(1);
+        expect(warn.mock.calls[0]?.[0]).toMatch(/maxSyncUpdateBuffer=2/);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it("does not warn when the buffer stays within the limit", () => {
+      const core = new TestCore();
+      const { server } = createSyncTransportPair();
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        new RemoteShellProxy(core, server, { maxSyncUpdateBuffer: 100 });
+        // No sync request → no buffering activity.
+        expect(warn).not.toHaveBeenCalled();
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it("rejects invalid limit values at construction", () => {
+      const { server } = createSyncTransportPair();
+      for (const bad of [0, -1, 1.5, NaN]) {
+        expect(() => new RemoteShellProxy(new TestCore(), server, {
+          maxSyncUpdateBuffer: bad,
+        })).toThrow(/maxSyncUpdateBuffer must be a positive integer/);
+      }
+    });
+  });
 });

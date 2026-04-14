@@ -157,10 +157,10 @@ This package does **not** implement built-in back-pressure or queue limits. In p
 
 | Export | Description |
 |---|---|
-| `createRemoteCoreProxy(declaration, transport)` | Create a client-side proxy. Returns an EventTarget compatible with `bind()`. |
+| `createRemoteCoreProxy(declaration, transport, options?)` | Create a client-side proxy. Returns an EventTarget compatible with `bind()`. `options` accepts `maxPendingInvocations` (see Back-pressure). |
 | `RemoteCoreProxy` | The underlying proxy class (use `createRemoteCoreProxy` for property access support). |
-| `RemoteShellProxy` | Server-side proxy that connects a real Core to the transport. |
-| `WebSocketClientTransport` | `ClientTransport` implementation using the standard `WebSocket` API. |
+| `RemoteShellProxy` | Server-side proxy that connects a real Core to the transport. Constructor accepts an options bag; see Back-pressure. |
+| `WebSocketClientTransport` | `ClientTransport` implementation using the standard `WebSocket` API. Constructor accepts an options bag; see Back-pressure. |
 | `WebSocketServerTransport` | `ServerTransport` implementation using any `WebSocketLike` object. |
 
 ### RemoteCoreProxy
@@ -181,7 +181,7 @@ This package does **not** implement built-in back-pressure or queue limits. In p
 - **`setWithAckOptions()`** supports `AbortSignal` and `timeoutMs`. Aborting rejects the client-side Promise and forgets the pending response; it does not send a cancellation message to the server. Timeouts reject with `TimeoutError` and also clear the pending entry. `setWithAck()` uses the same behavior with a default 30s timeout.
 - **`invokeWithOptions()`** supports `AbortSignal` and `timeoutMs`. Prefer `invokeWithOptions(name, args, options)` so the wire arguments stay explicit and are harder to confuse with the options object. The legacy `invokeWithOptions(name, options, ...args)` form is still accepted for backward compatibility, but it cannot disambiguate a first wire argument that is itself an array. If a command's first or only argument is an array, migrate that call site to the explicit form and pass the full wire argument list as `args` instead, for example `invokeWithOptions("save", [[1, 2, 3]], options)`. Aborting rejects the client-side Promise and forgets the pending response; it does not send a cancellation message to the server. Timeouts reject with `TimeoutError` and also clear the pending entry. `invoke()` uses the same behavior with a default 30s timeout.
 - **Timeout configuration**: pass `timeoutMs` to override the default 30s deadline, or `timeoutMs: 0` to disable the built-in timeout for an individual call. Invalid timeout values (negative or non-finite) are surfaced as `RangeError` rejections from the returned Promise rather than synchronous throws. If the initial `sync` response does not advertise `capabilities.setAck`, `setWithAck()` and `setWithAckOptions()` reject instead of waiting forever against a legacy server.
-- **Back-pressure** is not built in. Pending acknowledgements, pre-open WebSocket sends, and `sync`-time queued updates are all unbounded in-memory queues. If a peer can stall or flood the connection, enforce your own limits above this package.
+- **Back-pressure** is opt-in, not automatic. The three in-memory queues in this package — pending `setWithAck`/`invoke` requests on `RemoteCoreProxy`, pre-open send buffer on `WebSocketClientTransport`, and `sync`-time queued `update` messages on `RemoteShellProxy` — default to unbounded. Opt-in soft limits are available via constructor options: `createRemoteCoreProxy(decl, transport, { maxPendingInvocations: N })` rejects further `setWithAck`/`invoke` calls with `Error("RemoteCoreProxy: pending invocations exceeded maxPendingInvocations=N")` once the pending map is at capacity; `new WebSocketClientTransport(ws, { maxPreOpenQueue: N })` throws `Error("WebSocketClientTransport: pre-open queue exceeded maxPreOpenQueue=N")` when a send() would grow the pre-open buffer past N; `new RemoteShellProxy(core, transport, { maxSyncUpdateBuffer: N })` logs a single `console.warn` per sync cycle when a getter side-effect pushes the queued-updates buffer past N (buffering continues so wire-level ordering is preserved). Each accepts positive integers only; defaults are `Infinity` for backward compatibility. These are soft operational guardrails — set them alongside admission control, connection quotas, reverse-proxy limits, or per-client rate limiting if untrusted or slow peers are possible.
 - **Transport close** rejects all pending `invoke()` calls with `Transport closed` and leaves the proxy disconnected until you call `reconnect()` with a new transport.
 - **`dispose()`** is terminal: it rejects all pending requests with `RemoteCoreProxy disposed` and causes subsequent `set()`, `invoke()`, and `reconnect()` calls to fail immediately.
 - **`set()`** validates the input name on the client before sending, so undeclared names fail immediately. It also throws synchronously if the proxy is already disconnected or if the transport send fails while trying to enqueue the message. For declared inputs on a healthy transport, it remains fire-and-forget: there is no response id and no server-side success/error is delivered back to the client. If a buggy or stale client still sends an undeclared input, `RemoteShellProxy` drops it and logs `console.warn`.
@@ -194,7 +194,7 @@ This package does **not** implement built-in back-pressure or queue limits. In p
 
 | Method | Description |
 |---|---|
-| `constructor(core, transport)` | Connect a Core to the transport. Subscribes to Core events and listens for client messages. |
+| `constructor(core, transport, options?)` | Connect a Core to the transport. Subscribes to Core events and listens for client messages. `options.maxSyncUpdateBuffer` logs a one-shot warning when a runaway getter side-effect pushes the sync-time queue past the threshold (see Back-pressure). |
 | `dispose()` | Unsubscribe from Core events and release transport-owned listeners if supported. Call when the connection closes. |
 
 ### Message protocol
