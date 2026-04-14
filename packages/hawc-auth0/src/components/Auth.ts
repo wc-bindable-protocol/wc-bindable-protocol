@@ -1,28 +1,32 @@
+import type { ClientTransport } from "@wc-bindable/remote";
 import { config } from "../config.js";
 import { IWcBindable } from "../types.js";
-import { AuthCore } from "../core/AuthCore.js";
+import { AuthShell } from "../shell/AuthShell.js";
 import { registerAutoTrigger } from "../autoTrigger.js";
 
 export class Auth extends HTMLElement {
   static hasConnectedCallbackPromise = true;
   static wcBindable: IWcBindable = {
-    ...AuthCore.wcBindable,
+    ...AuthShell.wcBindable,
     properties: [
-      ...AuthCore.wcBindable.properties,
+      ...AuthShell.wcBindable.properties,
       { name: "trigger", event: "hawc-auth0:trigger-changed" },
     ],
   };
   static get observedAttributes(): string[] {
-    return ["domain", "client-id", "redirect-uri", "audience", "scope"];
+    return [
+      "domain", "client-id", "redirect-uri", "audience", "scope",
+      "remote-url",
+    ];
   }
 
-  private _core: AuthCore;
+  private _shell: AuthShell;
   private _trigger: boolean = false;
   private _connectedCallbackPromise: Promise<void> = Promise.resolve();
 
   constructor() {
     super();
-    this._core = new AuthCore(this);
+    this._shell = new AuthShell(this);
   }
 
   // --- Input attributes ---
@@ -100,30 +104,43 @@ export class Auth extends HTMLElement {
     }
   }
 
-  // --- Output state (delegated to core) ---
+  get remoteUrl(): string {
+    return this.getAttribute("remote-url") || "";
+  }
+
+  set remoteUrl(value: string) {
+    this.setAttribute("remote-url", value);
+  }
+
+  // --- Output state (delegated to shell) ---
 
   get authenticated(): boolean {
-    return this._core.authenticated;
+    return this._shell.authenticated;
   }
 
   get user(): any {
-    return this._core.user;
+    return this._shell.user;
   }
 
+  /** Access token. Available via JS but NOT exposed in wcBindable. */
   get token(): string | null {
-    return this._core.token;
+    return this._shell.token;
   }
 
   get loading(): boolean {
-    return this._core.loading;
+    return this._shell.loading;
   }
 
   get error(): any {
-    return this._core.error;
+    return this._shell.error;
+  }
+
+  get connected(): boolean {
+    return this._shell.connected;
   }
 
   get client(): any {
-    return this._core.client;
+    return this._shell.client;
   }
 
   get connectedCallbackPromise(): Promise<void> {
@@ -152,46 +169,65 @@ export class Auth extends HTMLElement {
 
   // --- Methods ---
 
-  private _buildClientOptions() {
-    const authorizationParams: Record<string, any> = {
-      scope: this.scope,
-    };
-    if (this.redirectUri) {
-      authorizationParams.redirect_uri = this.redirectUri;
-    }
-    if (this.audience) {
-      authorizationParams.audience = this.audience;
-    }
-
+  private _buildShellOptions() {
     return {
       domain: this.domain,
       clientId: this.clientId,
-      authorizationParams,
+      audience: this.audience,
+      scope: this.scope,
+      redirectUri: this.redirectUri || undefined,
       cacheLocation: this.cacheLocation,
       useRefreshTokens: this.useRefreshTokens,
     };
   }
 
   async initialize(): Promise<void> {
-    return this._core.initialize(this._buildClientOptions());
+    return this._shell.initialize(this._buildShellOptions());
   }
 
   async login(options?: Record<string, any>): Promise<void> {
     await this._connectedCallbackPromise;
     if (this.popup) {
-      return this._core.loginWithPopup(options);
+      return this._shell.loginWithPopup(options);
     }
-    return this._core.login(options);
+    return this._shell.login(options);
   }
 
   async logout(options?: Record<string, any>): Promise<void> {
     await this._connectedCallbackPromise;
-    return this._core.logout(options);
+    return this._shell.logout(options);
   }
 
   async getToken(options?: Record<string, any>): Promise<string | null> {
     await this._connectedCallbackPromise;
-    return this._core.getToken(options);
+    return this._shell.getToken(options);
+  }
+
+  /**
+   * Establish an authenticated WebSocket connection.
+   * If no URL is provided, uses the `remote-url` attribute.
+   */
+  async connect(url?: string): Promise<ClientTransport> {
+    await this._connectedCallbackPromise;
+    return this._shell.connect(url || this.remoteUrl);
+  }
+
+  /**
+   * In-band token refresh (§3.4.1). Sends a fresh token to the server
+   * over the existing WebSocket. Core state is fully continuous.
+   */
+  async refreshToken(): Promise<void> {
+    await this._connectedCallbackPromise;
+    return this._shell.refreshToken();
+  }
+
+  /**
+   * Refresh the token and establish a new WebSocket connection
+   * (§3.4.2 — fallback for crash recovery).
+   */
+  async reconnect(): Promise<ClientTransport> {
+    await this._connectedCallbackPromise;
+    return this._shell.reconnect();
   }
 
   // --- Lifecycle ---
@@ -201,16 +237,16 @@ export class Auth extends HTMLElement {
     if (config.autoTrigger) {
       registerAutoTrigger();
     }
-    if (!this._core.client && this.domain && this.clientId) {
+    if (!this._shell.client && this.domain && this.clientId) {
       this._connectedCallbackPromise = this.initialize();
     }
   }
 
   attributeChangedCallback(_name: string, _oldValue: string | null, _newValue: string | null): void {
-    // domain/client-id変更時の再初期化はしない（初期化は1回のみ）
+    // No re-initialisation on attribute changes (initialise once only)
   }
 
   disconnectedCallback(): void {
-    // クリーンアップ不要（Auth0クライアントはシングルトン的に使う）
+    // No cleanup needed (Auth0 client is used singleton-style)
   }
 }

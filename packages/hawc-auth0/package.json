@@ -10,6 +10,10 @@
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
+    "./server": {
+      "types": "./dist/server/index.d.ts",
+      "default": "./dist/server/index.js"
+    },
     "./auto": {
       "types": "./src/auto/auto.d.ts",
       "default": "./src/auto/auto.min.js"
@@ -40,13 +44,18 @@
   ],
   "dependencies": {
     "@wc-bindable/core": "^0.4.0",
-    "@wc-bindable/remote": "^0.4.0"
+    "@wc-bindable/remote": "^0.4.0",
+    "jose": "^6.0.0"
   },
   "peerDependencies": {
-    "@auth0/auth0-spa-js": "^2.0.0"
+    "@auth0/auth0-spa-js": "^2.0.0",
+    "ws": "^8.0.0"
   },
   "peerDependenciesMeta": {
     "@auth0/auth0-spa-js": {
+      "optional": true
+    },
+    "ws": {
       "optional": true
     }
   },
@@ -58,6 +67,8 @@
   },
   "license": "MIT",
   "devDependencies": {
-    "@auth0/auth0-spa-js": "^2.19.1"
+    "@auth0/auth0-spa-js": "^2.19.1",
+    "@types/ws": "^8.18.1",
+    "ws": "^8.18.2"
   }
 }

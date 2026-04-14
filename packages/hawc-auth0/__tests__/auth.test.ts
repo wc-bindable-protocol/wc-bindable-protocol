@@ -118,7 +118,7 @@ describe("Auth (hawc-auth0)", () => {
 
   it("observedAttributesが正しい", () => {
     expect(Auth.observedAttributes).toEqual([
-      "domain", "client-id", "redirect-uri", "audience", "scope"
+      "domain", "client-id", "redirect-uri", "audience", "scope", "remote-url"
     ]);
   });
 
