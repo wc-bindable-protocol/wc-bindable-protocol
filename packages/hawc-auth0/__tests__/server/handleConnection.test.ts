@@ -282,6 +282,53 @@ describe("handleConnection", () => {
     expect(events.some((e) => e.type === "auth:refresh-failure")).toBe(true);
   });
 
+  it("closes socket when refresh token subject mismatches initial subject", async () => {
+    jwtVerify.mockResolvedValueOnce({
+      payload: { sub: "auth0|123", permissions: [] },
+    });
+
+    const socket = createMockSocket();
+    const core = new EventTarget();
+    (core.constructor as any).wcBindable = {
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [],
+    };
+
+    const events: AuthEvent[] = [];
+
+    await handleConnection(
+      socket,
+      "hawc-auth0.bearer." + makeJwt({ sub: "auth0|123" }),
+      {
+        auth0Domain: "test.auth0.com",
+        auth0Audience: "https://api.example.com",
+        createCores: () => core,
+        onEvent: (e) => events.push(e),
+      },
+    );
+
+    jwtVerify.mockResolvedValueOnce({
+      payload: { sub: "auth0|999", permissions: [] },
+    });
+
+    const messageHandlers = socket._listeners["message"];
+    messageHandlers[0]({
+      data: JSON.stringify({
+        type: "cmd",
+        name: "auth:refresh",
+        id: "refresh-sub-mismatch",
+        args: [makeJwt({ sub: "auth0|999" })],
+      }),
+    });
+
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(socket.close).toHaveBeenCalledWith(4403, "Token subject mismatch");
+    const mismatchEvent = events.find((e) => e.type === "auth:refresh-failure");
+    expect(mismatchEvent?.error?.message).toBe("Token subject mismatch");
+  });
+
   it("forwards non-refresh messages to proxy transport handler", async () => {
     jwtVerify.mockResolvedValue({
       payload: { sub: "auth0|123", permissions: [] },

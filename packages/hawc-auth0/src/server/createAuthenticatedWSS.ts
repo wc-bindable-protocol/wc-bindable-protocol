@@ -79,6 +79,7 @@ export async function handleConnection(
   onEvent?.({ type: "auth:success", user });
   onEvent?.({ type: "connection:open", user });
 
+  const initialSub = user.sub;
   const core = options.createCores(user);
 
   // Parse initial token expiry for session enforcement
@@ -123,6 +124,14 @@ export async function handleConnection(
             audience: options.auth0Audience,
           })
             .then((newUser) => {
+              if (newUser.sub !== initialSub) {
+                onEvent?.({
+                  type: "auth:refresh-failure",
+                  error: new Error("Token subject mismatch"),
+                });
+                socket.close?.(4403, "Token subject mismatch");
+                return;
+              }
               user = newUser;
               sessionExpiresAt = _getExpFromToken(newToken, sessionGraceMs);
               scheduleExpiryCheck();

@@ -162,6 +162,4 @@ export interface AuthenticatedConnectionOptions {
 export interface VerifyTokenOptions {
   domain: string;
   audience: string;
-  /** JWKS cache TTL in milliseconds (default: 600000 = 10 minutes). */
-  jwksCacheTtl?: number;
 }

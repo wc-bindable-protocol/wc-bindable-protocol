@@ -195,16 +195,43 @@ export class AuthShell extends EventTarget {
     const ws = this._ws;
 
     return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        ws.removeEventListener("message", onMessage);
+        ws.removeEventListener("close", onClose);
+        ws.removeEventListener("error", onError);
+      };
+
       const onMessage = (event: MessageEvent) => {
         let msg: any;
         try { msg = JSON.parse(event.data); } catch { return; }
         if (msg.id !== id) return;
-        ws.removeEventListener("message", onMessage);
+        cleanup();
         if (msg.type === "return") resolve();
         else reject(new Error(msg.error?.message ?? "Token refresh failed"));
       };
 
+      const onClose = () => {
+        cleanup();
+        reject(new Error("WebSocket closed before token refresh completed"));
+      };
+
+      const onError = () => {
+        cleanup();
+        reject(new Error("WebSocket error during token refresh"));
+      };
+
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new Error("Token refresh timed out"));
+      }, 30_000);
+
       ws.addEventListener("message", onMessage);
+      ws.addEventListener("close", onClose, { once: true });
+      ws.addEventListener("error", onError, { once: true });
       ws.send(JSON.stringify({
         type: "cmd",
         name: "auth:refresh",

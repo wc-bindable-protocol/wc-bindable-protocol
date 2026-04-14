@@ -714,6 +714,117 @@ describe("AuthShell", () => {
         (globalThis as any).WebSocket = originalWS;
       }
     });
+
+    it("rejects when websocket closes before refresh response", async () => {
+      const mockClient = createMockAuth0Client({
+        getTokenSilently: vi.fn().mockResolvedValue("token"),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      let capturedWs: MockWebSocket;
+      const originalWS = globalThis.WebSocket;
+      (globalThis as any).WebSocket = class extends MockWebSocket {
+        constructor(url: string, protocols?: string | string[]) {
+          super(url, protocols);
+          capturedWs = this;
+        }
+      };
+
+      try {
+        const shell = new AuthShell();
+        await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+        await shell.connect("ws://localhost:3000");
+
+        capturedWs!.onSend = (data: string) => {
+          const msg = JSON.parse(data);
+          if (msg.name === "auth:refresh") {
+            queueMicrotask(() => capturedWs!.close());
+          }
+        };
+
+        await expect(shell.refreshToken()).rejects.toThrow(
+          "WebSocket closed before token refresh completed",
+        );
+      } finally {
+        (globalThis as any).WebSocket = originalWS;
+      }
+    });
+
+    it("rejects when websocket errors before refresh response", async () => {
+      const mockClient = createMockAuth0Client({
+        getTokenSilently: vi.fn().mockResolvedValue("token"),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      let capturedWs: MockWebSocket;
+      const originalWS = globalThis.WebSocket;
+      (globalThis as any).WebSocket = class extends MockWebSocket {
+        constructor(url: string, protocols?: string | string[]) {
+          super(url, protocols);
+          capturedWs = this;
+        }
+      };
+
+      try {
+        const shell = new AuthShell();
+        await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+        await shell.connect("ws://localhost:3000");
+
+        capturedWs!.onSend = (data: string) => {
+          const msg = JSON.parse(data);
+          if (msg.name === "auth:refresh") {
+            queueMicrotask(() => capturedWs!._simulateError());
+          }
+        };
+
+        await expect(shell.refreshToken()).rejects.toThrow(
+          "WebSocket error during token refresh",
+        );
+      } finally {
+        (globalThis as any).WebSocket = originalWS;
+      }
+    });
+
+    it("rejects when refresh response times out", async () => {
+      const mockClient = createMockAuth0Client({
+        getTokenSilently: vi.fn().mockResolvedValue("token"),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      let capturedWs: MockWebSocket;
+      const originalWS = globalThis.WebSocket;
+      (globalThis as any).WebSocket = class extends MockWebSocket {
+        constructor(url: string, protocols?: string | string[]) {
+          super(url, protocols);
+          capturedWs = this;
+        }
+      };
+
+      try {
+        const shell = new AuthShell();
+        await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+        await shell.connect("ws://localhost:3000");
+
+        capturedWs!.onSend = (data: string) => {
+          const msg = JSON.parse(data);
+          if (msg.name === "auth:refresh") {
+            // Intentionally do not send any response.
+          }
+        };
+
+        vi.useFakeTimers();
+        try {
+          const refreshPromise = shell.refreshToken();
+          const rejectionAssertion = expect(refreshPromise).rejects.toThrow("Token refresh timed out");
+          await vi.advanceTimersByTimeAsync(30_000);
+          await rejectionAssertion;
+        } finally {
+          vi.useRealTimers();
+        }
+      } finally {
+        (globalThis as any).WebSocket = originalWS;
+      }
+    });
   });
 
   describe("events from AuthCore bubble through AuthShell", () => {
