@@ -153,7 +153,12 @@ describe("RemoteShellProxy", () => {
     new RemoteShellProxy(core, server);
     handler!({ type: "sync" });
 
-    expect(send).toHaveBeenCalledWith({ type: "sync", values: {}, capabilities: { setAck: true } });
+    expect(send).toHaveBeenCalledWith({
+      type: "sync",
+      values: {},
+      capabilities: { setAck: true },
+      undefinedProperties: ["missing"],
+    });
   });
 
   it("falls back when JSON.stringify does not return a string for a thrown cause", () => {
@@ -1549,6 +1554,99 @@ describe("RemoteShellProxy", () => {
     expect(send).not.toHaveBeenCalled();
   });
 
+  describe("undefinedProperties on sync", () => {
+    it("lists declared properties whose getter returned undefined", () => {
+      class MixedUndefinedCore extends EventTarget {
+        static wcBindable: WcBindableDeclaration = {
+          protocol: "wc-bindable",
+          version: 1,
+          properties: [
+            { name: "ready", event: "mixed:ready" },
+            { name: "value", event: "mixed:value" },
+            { name: "status", event: "mixed:status" },
+          ],
+        };
+        get ready(): boolean { return true; }
+        get value(): undefined { return undefined; }
+        get status(): undefined { return undefined; }
+      }
+
+      const core = new MixedUndefinedCore();
+      const send = vi.fn();
+      let handler: ((msg: ClientMessage) => void) | null = null;
+      new RemoteShellProxy(core, { send, onMessage: (h) => { handler = h; } });
+      handler!({ type: "sync" });
+
+      expect(send).toHaveBeenCalledWith({
+        type: "sync",
+        values: { ready: true },
+        capabilities: { setAck: true },
+        undefinedProperties: ["value", "status"],
+      });
+    });
+
+    it("omits the field when every declared property has a concrete value", () => {
+      class AllDefinedCore extends EventTarget {
+        static wcBindable: WcBindableDeclaration = {
+          protocol: "wc-bindable",
+          version: 1,
+          properties: [{ name: "value", event: "all:value" }],
+        };
+        get value(): number { return 42; }
+      }
+
+      const core = new AllDefinedCore();
+      const send = vi.fn();
+      let handler: ((msg: ClientMessage) => void) | null = null;
+      new RemoteShellProxy(core, { send, onMessage: (h) => { handler = h; } });
+      handler!({ type: "sync" });
+
+      const payload = send.mock.calls[0]?.[0];
+      expect(payload).toEqual({
+        type: "sync",
+        values: { value: 42 },
+        capabilities: { setAck: true },
+      });
+      expect(payload).not.toHaveProperty("undefinedProperties");
+    });
+
+    it("does not include a property in both undefinedProperties and getterFailures", () => {
+      class MixedFailureCore extends EventTarget {
+        static wcBindable: WcBindableDeclaration = {
+          protocol: "wc-bindable",
+          version: 1,
+          properties: [
+            { name: "ok", event: "mixed:ok" },
+            { name: "undef", event: "mixed:undef" },
+            { name: "bad", event: "mixed:bad" },
+          ],
+        };
+        get ok(): string { return "hello"; }
+        get undef(): undefined { return undefined; }
+        get bad(): never { throw new Error("boom"); }
+      }
+
+      const core = new MixedFailureCore();
+      const send = vi.fn();
+      let handler: ((msg: ClientMessage) => void) | null = null;
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        new RemoteShellProxy(core, { send, onMessage: (h) => { handler = h; } });
+        handler!({ type: "sync" });
+      } finally {
+        errorSpy.mockRestore();
+      }
+
+      expect(send).toHaveBeenCalledWith({
+        type: "sync",
+        values: { ok: "hello" },
+        capabilities: { setAck: true },
+        getterFailures: ["bad"],
+        undefinedProperties: ["undef"],
+      });
+    });
+  });
+
   describe("maxSyncUpdateBuffer", () => {
     it("logs a warning once when the sync update buffer exceeds the limit", () => {
       // A getter that fires several same-name update events while sync is
@@ -1615,6 +1713,83 @@ describe("RemoteShellProxy", () => {
         expect(() => new RemoteShellProxy(new TestCore(), server, {
           maxSyncUpdateBuffer: bad,
         })).toThrow(/maxSyncUpdateBuffer must be a positive integer/);
+      }
+    });
+  });
+
+  describe("logger injection", () => {
+    it("routes dropped set warnings through a custom logger instead of console", () => {
+      class StrictInputCore extends EventTarget {
+        static wcBindable: WcBindableDeclaration = {
+          protocol: "wc-bindable",
+          version: 1,
+          properties: [],
+          inputs: [{ name: "allowed" }],
+        };
+      }
+      const core = new StrictInputCore();
+      let handler: ((msg: ClientMessage) => void) | null = null;
+      const server: ServerTransport = {
+        send: () => {},
+        onMessage: (h) => { handler = h; },
+      };
+      const warnCalls: unknown[][] = [];
+      const errorCalls: unknown[][] = [];
+      const logger = {
+        warn: (...args: unknown[]) => warnCalls.push(args),
+        error: (...args: unknown[]) => errorCalls.push(args),
+      };
+
+      const originalWarn = console.warn;
+      console.warn = () => {
+        throw new Error("console.warn must not be touched when a logger is injected");
+      };
+      try {
+        new RemoteShellProxy(core, server, { logger });
+        handler!({ type: "set", name: "undeclared", value: 1 });
+
+        expect(warnCalls.length).toBe(1);
+        expect(warnCalls[0]?.[0]).toMatch(/ignored set for undeclared input "undeclared"/);
+        expect(errorCalls).toEqual([]);
+      } finally {
+        console.warn = originalWarn;
+      }
+    });
+
+    it("routes getter-failure errors through a custom logger instead of console", () => {
+      class BadGetterCore extends EventTarget {
+        static wcBindable: WcBindableDeclaration = {
+          protocol: "wc-bindable",
+          version: 1,
+          properties: [{ name: "bad", event: "bad:changed" }],
+        };
+        get bad(): never { throw new Error("boom"); }
+      }
+      const core = new BadGetterCore();
+      let handler: ((msg: ClientMessage) => void) | null = null;
+      const server: ServerTransport = {
+        send: () => {},
+        onMessage: (h) => { handler = h; },
+      };
+      const warnCalls: unknown[][] = [];
+      const errorCalls: unknown[][] = [];
+      const logger = {
+        warn: (...args: unknown[]) => warnCalls.push(args),
+        error: (...args: unknown[]) => errorCalls.push(args),
+      };
+
+      const originalError = console.error;
+      console.error = () => {
+        throw new Error("console.error must not be touched when a logger is injected");
+      };
+      try {
+        new RemoteShellProxy(core, server, { logger });
+        handler!({ type: "sync" });
+
+        expect(errorCalls.length).toBe(1);
+        expect(errorCalls[0]?.[0]).toMatch(/getter for "bad" threw during sync/);
+      } finally {
+        console.error = originalError;
       }
     });
   });

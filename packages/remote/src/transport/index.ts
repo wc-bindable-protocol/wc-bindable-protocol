@@ -1,4 +1,4 @@
 export { WebSocketClientTransport } from "./WebSocketClientTransport.js";
 export type { WebSocketClientTransportOptions } from "./WebSocketClientTransport.js";
 export { WebSocketServerTransport } from "./WebSocketServerTransport.js";
-export type { WebSocketLike } from "./WebSocketServerTransport.js";
+export type { WebSocketLike, WebSocketServerTransportOptions } from "./WebSocketServerTransport.js";

@@ -1,5 +1,6 @@
 import type { ClientTransport, ClientMessage, ServerMessage } from "../types.js";
 import { isServerMessage } from "./messageValidation.js";
+import { type Logger, resolveLogger } from "../logger.js";
 
 const WS_CONNECTING = 0;
 const WS_OPEN = 1;
@@ -35,9 +36,9 @@ function isBinaryMessagePayload(data: unknown): boolean {
   return typeof Buffer !== "undefined" && Buffer.isBuffer(data);
 }
 
-function parseServerMessage(data: unknown): ServerMessage | null {
+function parseServerMessage(data: unknown, logger: Logger): ServerMessage | null {
   if (typeof Blob !== "undefined" && data instanceof Blob) {
-    console.warn(
+    logger.warn(
       "WebSocketClientTransport: ignoring invalid server message",
       new Error("Blob payloads are not supported; expected a text JSON frame"),
     );
@@ -51,7 +52,7 @@ function parseServerMessage(data: unknown): ServerMessage | null {
     }
     return message;
   } catch (error) {
-    console.warn("WebSocketClientTransport: ignoring invalid server message", error);
+    logger.warn("WebSocketClientTransport: ignoring invalid server message", error);
     return null;
   }
 }
@@ -80,6 +81,12 @@ export interface WebSocketClientTransportOptions {
    * Defaults to `Infinity` (no limit) to preserve prior behavior.
    */
   maxPreOpenQueue?: number;
+  /**
+   * Logger used for diagnostic output (invalid server frames, unexpected
+   * binary payloads). Defaults to `console.warn`. Inject a structured
+   * logger in production.
+   */
+  logger?: Logger;
 }
 
 export class WebSocketClientTransport implements ClientTransport {
@@ -95,6 +102,7 @@ export class WebSocketClientTransport implements ClientTransport {
   private _disposed = false;
   private _warnedBinaryPayload = false;
   private _maxPreOpenQueue: number;
+  private _logger: Logger;
   private _openListener: (() => void) | null = null;
   private _failListener: (() => void) | null = null;
   private _messageListener: ((event: MessageEvent) => void) | null = null;
@@ -104,6 +112,7 @@ export class WebSocketClientTransport implements ClientTransport {
   constructor(ws: WebSocket, options: WebSocketClientTransportOptions = {}) {
     this._ws = ws;
     this._maxPreOpenQueue = normalizeLimit(options.maxPreOpenQueue, "maxPreOpenQueue");
+    this._logger = resolveLogger(options.logger);
 
     if (ws.readyState === WS_CLOSING || ws.readyState === WS_CLOSED) {
       // Already dead on arrival — no listeners needed.
@@ -168,11 +177,11 @@ export class WebSocketClientTransport implements ClientTransport {
     const listener = (event: MessageEvent) => {
       if (!this._warnedBinaryPayload && isBinaryMessagePayload(event.data)) {
         this._warnedBinaryPayload = true;
-        console.warn(
+        this._logger.warn(
           "WebSocketClientTransport: received a binary message payload; this transport expects text JSON frames from the server. Check the server framing or browser binaryType.",
         );
       }
-      const msg = parseServerMessage(event.data);
+      const msg = parseServerMessage(event.data, this._logger);
       /* v8 ignore next -- invalid frames are dropped after parseServerMessage logs a warning */
       if (!msg) return;
       handler(msg);

@@ -66,6 +66,22 @@ describe("messageValidation", () => {
       getterFailures: [1],
     })).toBe(false);
 
+    expect(isServerMessage({
+      type: "sync",
+      values: {},
+      undefinedProperties: ["loading", "value"],
+    })).toBe(true);
+    expect(isServerMessage({
+      type: "sync",
+      values: {},
+      undefinedProperties: "loading",
+    })).toBe(false);
+    expect(isServerMessage({
+      type: "sync",
+      values: {},
+      undefinedProperties: [1, 2],
+    })).toBe(false);
+
     expect(isServerMessage({ type: "update", name: "value" })).toBe(true);
     expect(isServerMessage({ type: "update", name: "prototype" })).toBe(false);
     expect(isServerMessage({ type: "return", id: "1", value: 42 })).toBe(true);

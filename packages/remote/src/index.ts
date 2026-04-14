@@ -3,7 +3,13 @@ export type { RemoteCoreProxyOptions } from "./RemoteCoreProxy.js";
 export { RemoteShellProxy } from "./RemoteShellProxy.js";
 export type { RemoteShellProxyOptions } from "./RemoteShellProxy.js";
 export { WebSocketClientTransport, WebSocketServerTransport } from "./transport/index.js";
-export type { WebSocketLike, WebSocketClientTransportOptions } from "./transport/index.js";
+export type {
+  WebSocketLike,
+  WebSocketClientTransportOptions,
+  WebSocketServerTransportOptions,
+} from "./transport/index.js";
+export { consoleLogger } from "./logger.js";
+export type { Logger } from "./logger.js";
 export type {
   ClientTransport,
   ServerTransport,

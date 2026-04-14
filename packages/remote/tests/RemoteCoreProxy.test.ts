@@ -1738,6 +1738,130 @@ describe("RemoteCoreProxy", () => {
     expect(onEvent).toHaveBeenCalledTimes(1);
   });
 
+  describe("undefinedProperties on sync", () => {
+    it("dispatches an explicit undefined event on the initial sync", () => {
+      let handler: ((msg: ServerMessage) => void) | null = null;
+      const client: ClientTransport = {
+        send: () => {},
+        onMessage: (h) => { handler = h; },
+      };
+      const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+
+      const events: Array<{ name: string; value: unknown }> = [];
+      bind(proxy, (name, value) => events.push({ name, value }));
+
+      handler!({
+        type: "sync",
+        values: { value: "hello" },
+        capabilities: { setAck: true },
+        undefinedProperties: ["loading"],
+      });
+
+      // value initialized normally; loading surfaces via bind() even though
+      // no concrete value was on the wire. CustomEvent normalizes
+      // `detail: undefined` to null, so the callback observes null while the
+      // cache reads back as undefined.
+      expect(events).toContainEqual({ name: "value", value: "hello" });
+      expect(events).toContainEqual({ name: "loading", value: null });
+      expect((proxy as unknown as Record<string, unknown>).loading).toBeUndefined();
+    });
+
+    it("does not double-dispatch when a property was already undefined in the client cache", () => {
+      let handler: ((msg: ServerMessage) => void) | null = null;
+      const client: ClientTransport = {
+        send: () => {},
+        onMessage: (h) => { handler = h; },
+      };
+      const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+
+      // First sync populates the cache with loading=undefined explicitly
+      handler!({
+        type: "sync",
+        values: {},
+        capabilities: { setAck: true },
+        undefinedProperties: ["value", "loading"],
+      });
+
+      // Start observing only after initial sync
+      const events: Array<{ name: string; value: unknown }> = [];
+      bind(proxy, (name, value) => events.push({ name, value }));
+      const initialEventCount = events.length;
+
+      // Re-sync with the same undefined state: no re-dispatch.
+      handler!({
+        type: "sync",
+        values: {},
+        capabilities: { setAck: true },
+        undefinedProperties: ["value", "loading"],
+      });
+
+      expect(events.length).toBe(initialEventCount);
+    });
+
+    it("falls back to the omitted-key convention when the server does not send undefinedProperties", () => {
+      let handler: ((msg: ServerMessage) => void) | null = null;
+      const client: ClientTransport = {
+        send: () => {},
+        onMessage: (h) => { handler = h; },
+      };
+      const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+
+      // First sync populates value=hello
+      handler!({
+        type: "sync",
+        values: { value: "hello" },
+        capabilities: { setAck: true },
+      });
+
+      const events: Array<{ name: string; value: unknown }> = [];
+      bind(proxy, (name, value) => events.push({ name, value }));
+
+      // Re-sync omits value entirely, no undefinedProperties field — legacy
+      // reset fallback should still emit an event. CustomEvent normalizes
+      // undefined to null at the listener boundary.
+      handler!({
+        type: "sync",
+        values: {},
+        capabilities: { setAck: true },
+      });
+
+      expect(events).toContainEqual({ name: "value", value: null });
+      expect((proxy as unknown as Record<string, unknown>).value).toBeUndefined();
+    });
+
+    it("ignores undefinedProperties entries for undeclared names with a warning", () => {
+      const originalWarn = console.warn;
+      const warnCalls: unknown[][] = [];
+      console.warn = (...args: unknown[]) => { warnCalls.push(args); };
+      try {
+        let handler: ((msg: ServerMessage) => void) | null = null;
+        const client: ClientTransport = {
+          send: () => {},
+          onMessage: (h) => { handler = h; },
+        };
+        const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+        const events: Array<{ name: string; value: unknown }> = [];
+        bind(proxy, (name, value) => events.push({ name, value }));
+
+        handler!({
+          type: "sync",
+          values: {},
+          capabilities: { setAck: true },
+          undefinedProperties: ["bogus"],
+        });
+
+        expect(events.find((e) => e.name === "bogus")).toBeUndefined();
+        const warnedAbout = warnCalls.some((call) =>
+          typeof call[0] === "string" &&
+          /undefinedProperties entry for undeclared property "bogus"/.test(call[0]),
+        );
+        expect(warnedAbout).toBe(true);
+      } finally {
+        console.warn = originalWarn;
+      }
+    });
+  });
+
   describe("maxPendingInvocations", () => {
     it("rejects new invoke once pending reaches the limit", async () => {
       // Hanging transport: messages go out but no response ever comes back.
@@ -1792,6 +1916,42 @@ describe("RemoteCoreProxy", () => {
         expect(() => createRemoteCoreProxy(TestCore.wcBindable, client, {
           maxPendingInvocations: bad,
         })).toThrow(/maxPendingInvocations must be a positive integer/);
+      }
+    });
+  });
+
+  describe("logger injection", () => {
+    it("routes diagnostic warnings through a custom logger instead of console", () => {
+      let handler: ((msg: ServerMessage) => void) | null = null;
+      const client: ClientTransport = {
+        send: () => {},
+        onMessage: (h) => { handler = h; },
+      };
+      const warnCalls: unknown[][] = [];
+      const errorCalls: unknown[][] = [];
+      const logger = {
+        warn: (...args: unknown[]) => warnCalls.push(args),
+        error: (...args: unknown[]) => errorCalls.push(args),
+      };
+
+      const originalWarn = console.warn;
+      console.warn = () => {
+        throw new Error("console.warn must not be touched when a logger is injected");
+      };
+      try {
+        const proxy = createRemoteCoreProxy(TestCore.wcBindable, client, { logger });
+        // Force a warning path: return message for an unknown pending id.
+        handler!({ type: "return", id: "nope", value: 1 } as ServerMessage);
+        // Also: ignored sync for an undeclared name.
+        handler!({ type: "sync", values: { bogus: 1 }, capabilities: { setAck: true } } as ServerMessage);
+
+        expect(warnCalls.length).toBeGreaterThanOrEqual(2);
+        expect(warnCalls.some((c) => typeof c[0] === "string" && /unknown request id "nope"/.test(c[0] as string))).toBe(true);
+        expect(warnCalls.some((c) => typeof c[0] === "string" && /undeclared property "bogus"/.test(c[0] as string))).toBe(true);
+        expect(errorCalls).toEqual([]);
+        void proxy;
+      } finally {
+        console.warn = originalWarn;
       }
     });
   });

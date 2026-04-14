@@ -1,5 +1,6 @@
 import type { ServerTransport, ServerMessage, ClientMessage } from "../types.js";
 import { isClientMessage } from "./messageValidation.js";
+import { type Logger, resolveLogger } from "../logger.js";
 
 function decodeUtf8Bytes(bytes: Uint8Array): string {
   if (typeof TextDecoder !== "undefined") {
@@ -35,7 +36,7 @@ function toJsonText(data: unknown): string {
   return String(data);
 }
 
-function parseClientMessage(data: unknown): ClientMessage | null {
+function parseClientMessage(data: unknown, logger: Logger): ClientMessage | null {
   try {
     const message = JSON.parse(toJsonText(data));
 
@@ -45,7 +46,7 @@ function parseClientMessage(data: unknown): ClientMessage | null {
 
     return message;
   } catch (error) {
-    console.warn("WebSocketServerTransport: ignoring invalid client message", error);
+    logger.warn("WebSocketServerTransport: ignoring invalid client message", error);
     return null;
   }
 }
@@ -98,6 +99,14 @@ export interface WebSocketLike {
  *     const shell = new RemoteShellProxy(core, transport);
  *   });
  */
+export interface WebSocketServerTransportOptions {
+  /**
+   * Logger used for diagnostic output (invalid client frames). Defaults to
+   * `console.warn`. Inject a structured logger in production.
+   */
+  logger?: Logger;
+}
+
 export class WebSocketServerTransport implements ServerTransport {
   private _ws: WebSocketLike;
   // WebSocketLike does not require a removeEventListener/off method, so we
@@ -112,9 +121,11 @@ export class WebSocketServerTransport implements ServerTransport {
   private _closeHandler: (() => void) | null = null;
   private _closeFired = false;
   private _closeListener: (() => void) | null = null;
+  private _logger: Logger;
 
-  constructor(ws: WebSocketLike) {
+  constructor(ws: WebSocketLike, options: WebSocketServerTransportOptions = {}) {
     this._ws = ws;
+    this._logger = resolveLogger(options.logger);
 
     const guard = () => {
       if (this._closeFired) return;
@@ -142,7 +153,7 @@ export class WebSocketServerTransport implements ServerTransport {
 
     const dispatch = (data: unknown) => {
       if (!this._messageHandler) return;
-      const msg = parseClientMessage(data);
+      const msg = parseClientMessage(data, this._logger);
       if (!msg) return;
       this._messageHandler(msg);
     };

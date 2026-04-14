@@ -7,6 +7,7 @@ import type {
   RemoteSerializedError,
 } from "./types.js";
 import { isReservedRemoteName } from "./transport/messageValidation.js";
+import { type Logger, resolveLogger } from "./logger.js";
 
 const DEFAULT_PENDING_TIMEOUT_MS = 30_000;
 
@@ -20,6 +21,12 @@ export interface RemoteCoreProxyOptions {
    * peers.
    */
   maxPendingInvocations?: number;
+  /**
+   * Logger used for diagnostic output (ignored-sync-value warnings,
+   * unknown-response warnings, etc.). Defaults to `console.warn` /
+   * `console.error`. Inject a structured logger in production.
+   */
+  logger?: Logger;
 }
 
 function normalizePendingLimit(value: number | undefined): number {
@@ -150,6 +157,7 @@ export class RemoteCoreProxy extends EventTarget {
   private _transportGeneration = 0;
   private _setAckSupported: boolean | null = null;
   private _maxPendingInvocations: number;
+  private _logger: Logger;
 
   constructor(
     declaration: WcBindableDeclaration,
@@ -161,6 +169,7 @@ export class RemoteCoreProxy extends EventTarget {
     this._inputs = new Set((declaration.inputs ?? []).map((input) => input.name));
     this._commands = new Set((declaration.commands ?? []).map((command) => command.name));
     this._maxPendingInvocations = normalizePendingLimit(options.maxPendingInvocations);
+    this._logger = resolveLogger(options.logger);
 
     this._attachTransport(transport);
   }
@@ -237,8 +246,18 @@ export class RemoteCoreProxy extends EventTarget {
   invokeWithOptions(name: string, args: unknown[], options?: RemoteRequestOptions): Promise<unknown>;
 
   /**
-   * @deprecated Prefer invokeWithOptions(name, args, options) to avoid options/args ambiguity.
-   * The legacy form cannot represent a first wire argument that is itself an array.
+   * @deprecated Scheduled for removal in v1.0. Use the explicit form
+   * `invokeWithOptions(name, args, options)` instead.
+   *
+   * This legacy `invokeWithOptions(name, options, ...args)` overload is kept
+   * only so existing 0.x callers do not break. It cannot disambiguate a first
+   * wire argument that is itself an array — the runtime branches on
+   * `Array.isArray(optionsOrArgs)`, so `invokeWithOptions("save", [1, 2, 3])`
+   * is always interpreted as `args = [1, 2, 3]`, never as
+   * `options = [1, 2, 3]`. New code must use the explicit form.
+   *
+   * Migration: pass wire args as a single array and options as the last
+   * argument, e.g. `invokeWithOptions("save", [[1, 2, 3]], { timeoutMs: 0 })`.
    */
   invokeWithOptions(name: string, options: RemoteRequestOptions, ...args: unknown[]): Promise<unknown>;
 
@@ -520,27 +539,45 @@ export class RemoteCoreProxy extends EventTarget {
           this._rejectUnsupportedSetAckPending();
         }
         const getterFailures = new Set(msg.getterFailures ?? []);
+        const undefinedProperties = new Set(msg.undefinedProperties ?? []);
         // Populate cache and dispatch events for each initial value.
         for (const [name, value] of Object.entries(msg.values)) {
           const eventName = this._eventsByName.get(name);
           if (!eventName) {
-            console.warn(`RemoteCoreProxy: ignored sync value for undeclared property "${name}"`);
+            this._logger.warn(`RemoteCoreProxy: ignored sync value for undeclared property "${name}"`);
             continue;
           }
 
           this._values[name] = value;
           this.dispatchEvent(new CustomEvent(eventName, { detail: value }));
         }
-        // Reset declared properties that were cached but omitted from this
-        // sync. The server omits properties whose current value is undefined
-        // (see README "Connection lifecycle"), so an absent entry on a
-        // re-sync means the property has reverted to undefined upstream —
-        // the cached value would otherwise stay stale and bind() subscribers
-        // would never observe the reset.
+        // Emit explicit `undefined` events for properties the server marked
+        // as currently undefined. Doing this unconditionally (rather than
+        // only "when the cache was non-undefined") lets bind() subscribers
+        // observe the initial undefined value on the very first sync, which
+        // the omitted-key convention alone cannot disambiguate.
+        for (const name of undefinedProperties) {
+          const eventName = this._eventsByName.get(name);
+          if (!eventName) {
+            this._logger.warn(`RemoteCoreProxy: ignored sync undefinedProperties entry for undeclared property "${name}"`);
+            continue;
+          }
+          if (this._values[name] === undefined && Object.prototype.hasOwnProperty.call(this._values, name)) {
+            // Already cached as undefined and the client has already seen
+            // an event for it; skip to avoid redundant dispatch.
+            continue;
+          }
+          this._values[name] = undefined;
+          this.dispatchEvent(new CustomEvent(eventName, { detail: undefined }));
+        }
+        // Fallback for legacy servers that do not send `undefinedProperties`:
+        // reset declared properties that were cached but omitted from this
+        // sync so re-syncs still observe reverted-to-undefined values.
         for (const name of this._eventsByName.keys()) {
           if (Object.prototype.hasOwnProperty.call(msg.values, name)) continue;
           /* v8 ignore next -- getterFailures only appears when an omitted property failed during sync */
           if (getterFailures.has(name)) continue;
+          if (undefinedProperties.has(name)) continue;
           if (this._values[name] === undefined) continue;
           this._values[name] = undefined;
           const eventName = this._eventsByName.get(name)!;
@@ -555,7 +592,7 @@ export class RemoteCoreProxy extends EventTarget {
         // properties share an event name on the Core side.
         const eventName = this._eventsByName.get(msg.name);
         if (!eventName) {
-          console.warn(`RemoteCoreProxy: ignored update for undeclared property "${msg.name}"`);
+          this._logger.warn(`RemoteCoreProxy: ignored update for undeclared property "${msg.name}"`);
           break;
         }
 
@@ -567,7 +604,7 @@ export class RemoteCoreProxy extends EventTarget {
         const pending = this._pending.get(msg.id);
         if (pending) {
           if (pending.kind === "set-ack" && msg.value !== undefined) {
-            console.warn(
+            this._logger.warn(
               `RemoteCoreProxy: received return payload for setWithAck request id "${msg.id}"; ignoring unexpected value`,
             );
           }
@@ -575,7 +612,7 @@ export class RemoteCoreProxy extends EventTarget {
           pending.cleanup();
           pending.resolve(pending.kind === "set-ack" ? undefined : msg.value);
         } else {
-          console.warn(`RemoteCoreProxy: received return for unknown request id "${msg.id}"`);
+          this._logger.warn(`RemoteCoreProxy: received return for unknown request id "${msg.id}"`);
         }
         break;
       }
@@ -586,7 +623,7 @@ export class RemoteCoreProxy extends EventTarget {
           pending.cleanup();
           pending.reject(reviveThrownError(msg.error));
         } else {
-          console.warn(`RemoteCoreProxy: received throw for unknown request id "${msg.id}"`);
+          this._logger.warn(`RemoteCoreProxy: received throw for unknown request id "${msg.id}"`);
         }
         break;
       }

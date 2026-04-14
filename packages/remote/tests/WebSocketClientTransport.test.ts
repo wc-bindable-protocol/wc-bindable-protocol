@@ -414,4 +414,32 @@ describe("WebSocketClientTransport", () => {
       }
     });
   });
+
+  describe("logger injection", () => {
+    it("routes invalid-server-message warnings through a custom logger instead of console", () => {
+      const warnCalls: unknown[][] = [];
+      const logger = {
+        warn: (...args: unknown[]) => warnCalls.push(args),
+        error: () => {},
+      };
+
+      const originalWarn = console.warn;
+      console.warn = () => {
+        throw new Error("console.warn must not be touched when a logger is injected");
+      };
+      try {
+        const ws = new MockBrowserWebSocket(WebSocket.OPEN);
+        const transport = new WebSocketClientTransport(ws as unknown as WebSocket, { logger });
+        transport.onMessage(() => {});
+
+        // Feed a malformed frame so parseServerMessage logs via the injected logger.
+        ws.emit("message", { data: "not json" });
+
+        expect(warnCalls.length).toBeGreaterThanOrEqual(1);
+        expect(warnCalls[0]?.[0]).toMatch(/ignoring invalid server message/);
+      } finally {
+        console.warn = originalWarn;
+      }
+    });
+  });
 });

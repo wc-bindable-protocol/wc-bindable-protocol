@@ -7,6 +7,7 @@ import type {
   RemoteSerializedError,
 } from "./types.js";
 import { isReservedRemoteName } from "./transport/messageValidation.js";
+import { type Logger, resolveLogger } from "./logger.js";
 
 const REMOTE_CAPABILITIES: RemoteCapabilities = {
   setAck: true,
@@ -125,6 +126,12 @@ export interface RemoteShellProxyOptions {
    * wire-level ordering is preserved. Defaults to `Infinity`.
    */
   maxSyncUpdateBuffer?: number;
+  /**
+   * Logger used for diagnostic output (dropped `set`/`cmd` frames, getter
+   * failures, send failures, etc.). Defaults to `console.warn` /
+   * `console.error`. Inject a structured logger in production.
+   */
+  logger?: Logger;
 }
 
 function normalizeSyncBufferLimit(value: number | undefined): number {
@@ -149,6 +156,7 @@ export class RemoteShellProxy {
   private _queuedSyncUpdates: Array<{ message: ServerMessage; context: string }> = [];
   private _maxSyncUpdateBuffer: number;
   private _warnedSyncBufferOverflow = false;
+  private _logger: Logger;
 
   constructor(
     core: EventTarget,
@@ -158,6 +166,7 @@ export class RemoteShellProxy {
     this._core = core;
     this._transport = transport;
     this._maxSyncUpdateBuffer = normalizeSyncBufferLimit(options.maxSyncUpdateBuffer);
+    this._logger = resolveLogger(options.logger);
 
     const ctor = core.constructor as { wcBindable?: WcBindableDeclaration };
     if (!ctor.wcBindable) {
@@ -205,25 +214,36 @@ export class RemoteShellProxy {
   }
 
   /** Read current values of all declared properties from the Core. */
-  private _readCurrentValues(): { values: Record<string, unknown>; getterFailures: string[] } {
+  private _readCurrentValues(): {
+    values: Record<string, unknown>;
+    getterFailures: string[];
+    undefinedProperties: string[];
+  } {
     const values: Record<string, unknown> = {};
     const getterFailures: string[] = [];
+    const undefinedProperties: string[] = [];
     const coreRecord = this._core as unknown as Record<string, unknown>;
     for (const prop of this._declaration.properties) {
       try {
         const v = coreRecord[prop.name];
         if (v !== undefined) {
           values[prop.name] = v;
+        } else {
+          // Omit from `values` (to keep wire payload minimal and preserve
+          // local bind() parity) but record the name explicitly so the
+          // client can distinguish "currently undefined" from any other
+          // reason a property is missing from `values`.
+          undefinedProperties.push(prop.name);
         }
       } catch (err) {
         getterFailures.push(prop.name);
-        console.error(
+        this._logger.error(
           `RemoteShellProxy: getter for "${prop.name}" threw during sync:`,
           err,
         );
       }
     }
-    return { values, getterFailures };
+    return { values, getterFailures, undefinedProperties };
   }
 
   private _subscribeToCoreEvents(): UnbindFn {
@@ -245,7 +265,7 @@ export class RemoteShellProxy {
               this._queuedSyncUpdates.length > this._maxSyncUpdateBuffer
             ) {
               this._warnedSyncBufferOverflow = true;
-              console.warn(
+              this._logger.warn(
                 `RemoteShellProxy: sync update buffer exceeded maxSyncUpdateBuffer=${this._maxSyncUpdateBuffer}; a runaway getter side-effect may be emitting updates during sync snapshot build`,
               );
             }
@@ -254,7 +274,7 @@ export class RemoteShellProxy {
 
           this._safeSend(message, `update for "${prop.name}"`);
         } catch (err) {
-          console.error(
+          this._logger.error(
             `RemoteShellProxy: getter for "${prop.name}" threw during update:`,
             err,
           );
@@ -274,7 +294,7 @@ export class RemoteShellProxy {
       this._transport.send(message);
       return true;
     } catch (err) {
-      console.error(`RemoteShellProxy: failed to send ${context}:`, err);
+      this._logger.error(`RemoteShellProxy: failed to send ${context}:`, err);
       return false;
     }
   }
@@ -284,12 +304,13 @@ export class RemoteShellProxy {
     let sent = false;
 
     try {
-      const { values, getterFailures } = this._readCurrentValues();
+      const { values, getterFailures, undefinedProperties } = this._readCurrentValues();
       sent = this._safeSend({
         type: "sync",
         values,
         capabilities: REMOTE_CAPABILITIES,
         ...(getterFailures.length > 0 ? { getterFailures } : {}),
+        ...(undefinedProperties.length > 0 ? { undefinedProperties } : {}),
       }, "sync response");
     } finally {
       this._isBuildingSyncSnapshot = false;
@@ -331,7 +352,7 @@ export class RemoteShellProxy {
             return;
           }
 
-          console.warn(
+          this._logger.warn(
             `RemoteShellProxy: ignored set for undeclared input "${msg.name}"`,
           );
           return;
@@ -353,7 +374,7 @@ export class RemoteShellProxy {
             return;
           }
 
-          console.warn(
+          this._logger.warn(
             `RemoteShellProxy: ignored set for reserved input "${msg.name}"`,
           );
           return;
@@ -373,7 +394,7 @@ export class RemoteShellProxy {
             return;
           }
 
-          console.error(
+          this._logger.error(
             `RemoteShellProxy: setter for "${msg.name}" threw:`,
             err,
           );
