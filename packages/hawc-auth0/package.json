@@ -1,0 +1,63 @@
+{
+  "name": "@wc-bindable/hawc-auth0",
+  "version": "0.4.0",
+  "description": "Declarative Auth0 authentication component for Web Components. Framework-agnostic auth via wc-bindable-protocol.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./auto": {
+      "types": "./src/auto/auto.d.ts",
+      "default": "./src/auto/auto.min.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src/auto",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest run __tests__",
+    "test:watch": "vitest __tests__",
+    "test:coverage": "vitest run __tests__ --coverage --coverage.provider=v8 --coverage.reporter=text --coverage.include=src/**/*.ts --coverage.exclude=src/types.ts --coverage.exclude=src/index.ts --coverage.exclude=src/auto/**/*.d.ts"
+  },
+  "keywords": [
+    "web-components",
+    "auth0",
+    "authentication",
+    "custom-elements",
+    "wc-bindable",
+    "hawc",
+    "declarative",
+    "framework-agnostic"
+  ],
+  "dependencies": {
+    "@wc-bindable/core": "^0.4.0",
+    "@wc-bindable/remote": "^0.4.0"
+  },
+  "peerDependencies": {
+    "@auth0/auth0-spa-js": "^2.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@auth0/auth0-spa-js": {
+      "optional": true
+    }
+  },
+  "author": "mogera551",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wc-bindable-protocol/wc-bindable-protocol.git",
+    "directory": "packages/hawc-auth0"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@auth0/auth0-spa-js": "^2.19.1"
+  }
+}
