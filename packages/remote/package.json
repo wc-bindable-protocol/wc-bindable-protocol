@@ -19,6 +19,8 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
+    "test": "vitest run tests",
+    "test:watch": "vitest tests",
     "test:coverage": "vitest run tests --coverage --coverage.include=src/**/*.ts --coverage.exclude=src/types.ts --coverage.exclude=src/index.ts --coverage.exclude=src/transport/index.ts",
     "test:integration": "playwright test"
   },

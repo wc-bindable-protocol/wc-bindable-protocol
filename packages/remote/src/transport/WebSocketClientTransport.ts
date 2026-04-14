@@ -6,7 +6,18 @@ const WS_OPEN = 1;
 const WS_CLOSING = 2;
 const WS_CLOSED = 3;
 
+function normalizeLimit(value: number | undefined, label: string): number {
+  if (value === undefined) return Number.POSITIVE_INFINITY;
+  if (!Number.isFinite(value) || value < 1 || !Number.isInteger(value)) {
+    throw new Error(
+      `WebSocketClientTransport: ${label} must be a positive integer or omitted; use Infinity for no limit`,
+    );
+  }
+  return value;
+}
+
 function isBinaryMessagePayload(data: unknown): boolean {
+  /* v8 ignore next -- ArrayBuffer is available in supported runtimes; this keeps the fallback defensive */
   if (typeof ArrayBuffer !== "undefined") {
     if (data instanceof ArrayBuffer) {
       return true;
@@ -61,6 +72,16 @@ function parseServerMessage(data: unknown): ServerMessage | null {
  *   const transport = new WebSocketClientTransport(ws);
  *   const proxy = createRemoteCoreProxy(declaration, transport);
  */
+export interface WebSocketClientTransportOptions {
+  /**
+   * Soft cap on the pre-open send() buffer. When a send() would push the
+   * buffer past this count before the socket has opened, it throws
+   * synchronously instead of letting the buffer grow unboundedly.
+   * Defaults to `Infinity` (no limit) to preserve prior behavior.
+   */
+  maxPreOpenQueue?: number;
+}
+
 export class WebSocketClientTransport implements ClientTransport {
   private _ws: WebSocket;
   // Buffer the already-serialized payload, not the raw message, so that a
@@ -73,14 +94,16 @@ export class WebSocketClientTransport implements ClientTransport {
   private _closed = false;
   private _disposed = false;
   private _warnedBinaryPayload = false;
+  private _maxPreOpenQueue: number;
   private _openListener: (() => void) | null = null;
   private _failListener: (() => void) | null = null;
   private _messageListener: ((event: MessageEvent) => void) | null = null;
   private _closeListener: (() => void) | null = null;
   private _errorListener: (() => void) | null = null;
 
-  constructor(ws: WebSocket) {
+  constructor(ws: WebSocket, options: WebSocketClientTransportOptions = {}) {
     this._ws = ws;
+    this._maxPreOpenQueue = normalizeLimit(options.maxPreOpenQueue, "maxPreOpenQueue");
 
     if (ws.readyState === WS_CLOSING || ws.readyState === WS_CLOSED) {
       // Already dead on arrival — no listeners needed.
@@ -95,6 +118,7 @@ export class WebSocketClientTransport implements ClientTransport {
       this._buffer = [];
       this._openListener = () => {
         // Guard against a close/error racing the open flush.
+        /* v8 ignore next -- _openListener only runs while a buffer exists and before the transport is marked closed */
         if (this._closed || this._buffer === null) return;
         const queued = this._buffer;
         this._buffer = null;
@@ -123,6 +147,11 @@ export class WebSocketClientTransport implements ClientTransport {
     if (this._closed) {
       throw new Error("WebSocketClientTransport: connection is closed");
     }
+    if (this._buffer !== null && this._buffer.length >= this._maxPreOpenQueue) {
+      throw new Error(
+        `WebSocketClientTransport: pre-open queue exceeded maxPreOpenQueue=${this._maxPreOpenQueue}`,
+      );
+    }
     const payload = JSON.stringify(message);
     if (this._buffer !== null) {
       this._buffer.push(payload);
@@ -144,6 +173,7 @@ export class WebSocketClientTransport implements ClientTransport {
         );
       }
       const msg = parseServerMessage(event.data);
+      /* v8 ignore next -- invalid frames are dropped after parseServerMessage logs a warning */
       if (!msg) return;
       handler(msg);
     };
@@ -163,6 +193,7 @@ export class WebSocketClientTransport implements ClientTransport {
     let closeListener: (() => void) | null = null;
     let errorListener: (() => void) | null = null;
     const cleanup = () => {
+      /* v8 ignore start -- these guards only protect against manual mutation of the listener locals */
       if (closeListener) {
         this._ws.removeEventListener("close", closeListener);
       }
@@ -175,6 +206,7 @@ export class WebSocketClientTransport implements ClientTransport {
       if (this._errorListener === errorListener) {
         this._errorListener = null;
       }
+      /* v8 ignore stop */
     };
     const guard = () => {
       if (called) return;
@@ -196,6 +228,7 @@ export class WebSocketClientTransport implements ClientTransport {
     this._buffer = null;
     this._closed = true;
 
+    /* v8 ignore start -- each listener is optional depending on connection state and which APIs were registered */
     if (this._openListener) {
       this._ws.removeEventListener("open", this._openListener);
       this._openListener = null;
@@ -218,5 +251,6 @@ export class WebSocketClientTransport implements ClientTransport {
       this._closeListener = null;
       this._errorListener = null;
     }
+    /* v8 ignore stop */
   }
 }

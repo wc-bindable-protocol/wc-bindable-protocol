@@ -494,6 +494,37 @@ describe("RemoteCoreProxy", () => {
     randomUuidSpy.mockRestore();
   });
 
+  it("falls back to incrementing command ids when crypto.randomUUID is unavailable", async () => {
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const send = vi.fn();
+    const client: ClientTransport = {
+      send: (msg) => {
+        send(msg);
+        if (msg.type === "cmd") {
+          handler!({ type: "return", id: msg.id, value: "fallback-id" });
+        }
+      },
+      onMessage: (h) => { handler = h; },
+    };
+    const originalCrypto = globalThis.crypto;
+
+    Object.defineProperty(globalThis, "crypto", {
+      configurable: true,
+      value: { ...originalCrypto, randomUUID: undefined },
+    });
+
+    try {
+      const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+      await expect(proxy.invoke("doFetch")).resolves.toBe("fallback-id");
+      expect(send).toHaveBeenCalledWith({ type: "cmd", name: "doFetch", id: "1", args: [] });
+    } finally {
+      Object.defineProperty(globalThis, "crypto", {
+        configurable: true,
+        value: originalCrypto,
+      });
+    }
+  });
+
   it("rejects invoke() on throw message", async () => {
     let handler: ((msg: ServerMessage) => void) | null = null;
     const client: ClientTransport = {
@@ -534,6 +565,32 @@ describe("RemoteCoreProxy", () => {
     expect(error.message).toBe("structured failure");
     expect(error.stack).toBe(remoteError.stack);
     expect((error as Error & { cause?: unknown }).cause).toBe(remoteError);
+  });
+
+  it("falls back to direct cause assignment when Object.defineProperty throws during error revival", async () => {
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const remoteError: RemoteSerializedError = { name: "BrokenDefine", message: "fallback cause" };
+    const client: ClientTransport = {
+      send: (msg) => {
+        if (msg.type === "cmd") {
+          handler!({ type: "throw", id: msg.id, error: remoteError });
+        }
+      },
+      onMessage: (h) => { handler = h; },
+    };
+    const definePropertySpy = vi.spyOn(Object, "defineProperty").mockImplementation(() => {
+      throw new Error("defineProperty blocked");
+    });
+
+    try {
+      const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+      const error = await proxy.invoke("doFetch").catch((err) => err);
+
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error & { cause?: unknown }).cause).toBe(remoteError);
+    } finally {
+      definePropertySpy.mockRestore();
+    }
   });
 
   it("dispatches update messages through bind()", () => {
@@ -670,6 +727,25 @@ describe("RemoteCoreProxy", () => {
     expect(() => {
       (proxy as RemoteCoreProxy & { _values: unknown })._values = {};
     }).toThrow('RemoteCoreProxy: cannot assign to internal property "_values"');
+  });
+
+  it("allows symbol-keyed local assignments through the proxy target", () => {
+    const { client } = createSyncTransportPair();
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client) as RemoteCoreProxy & Record<symbol, unknown>;
+    const key = Symbol("local");
+
+    proxy[key] = 123;
+
+    expect(proxy[key]).toBe(123);
+  });
+
+  it("rejects undeclared string property assignments", () => {
+    const { client } = createSyncTransportPair();
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client) as RemoteCoreProxy & { localOnly?: unknown };
+
+    expect(() => {
+      proxy.localOnly = 123;
+    }).toThrow('RemoteCoreProxy: cannot assign to undeclared property "localOnly"');
   });
 
   it("passes invoke arguments to the server", async () => {
@@ -822,6 +898,317 @@ describe("RemoteCoreProxy", () => {
     handler!({ type: "return", id: requestId, value: undefined });
 
     await expect(goodPending).resolves.toBeUndefined();
+  });
+
+  it("rejects pending setWithAck() with a default transport-closed error when the transport disappears without a connection error", async () => {
+    const { client } = createSyncTransportPair();
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client) as RemoteCoreProxy;
+
+    Object.defineProperty(proxy, "_transport", { value: null, writable: true });
+    Object.defineProperty(proxy, "_connectionError", { value: null, writable: true });
+
+    await expect(proxy.setWithAck("url", "/api")).rejects.toThrow("Transport closed");
+  });
+
+  it("rejects invoke() with a default transport-closed error when the transport disappears without a connection error", async () => {
+    const { client } = createSyncTransportPair();
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client) as RemoteCoreProxy;
+
+    Object.defineProperty(proxy, "_transport", { value: null, writable: true });
+    Object.defineProperty(proxy, "_connectionError", { value: null, writable: true });
+
+    await expect(proxy.invoke("doFetch")).rejects.toThrow("Transport closed");
+  });
+
+  it("disconnects and rejects setWithAck() when sending a serializable payload throws", async () => {
+    const dispose = vi.fn();
+    const client: ClientTransport = {
+      send: (msg) => {
+        if (msg.type === "sync") return;
+        throw new Error("socket blew up");
+      },
+      onMessage: () => {},
+      dispose,
+    };
+
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+
+    await expect(proxy.setWithAck("url", "/api")).rejects.toThrow("socket blew up");
+    expect(dispose).toHaveBeenCalledTimes(1);
+    await expect(proxy.invoke("doFetch")).rejects.toThrow("socket blew up");
+  });
+
+  it("throws from set() when sending a serializable payload fails", () => {
+    const dispose = vi.fn();
+    const client: ClientTransport = {
+      send: (msg) => {
+        if (msg.type === "sync") return;
+        throw new Error("set send failed");
+      },
+      onMessage: () => {},
+      dispose,
+    };
+
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+
+    expect(() => proxy.set("url", "/api")).toThrow("set send failed");
+    expect(dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects setWithAck() after dispose with the disposed error", async () => {
+    const { client } = createSyncTransportPair();
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+
+    proxy.dispose();
+
+    await expect(proxy.setWithAck("url", "/api")).rejects.toThrow("RemoteCoreProxy disposed");
+  });
+
+  it("ignores late close callbacks after dispose", () => {
+    let closeHandler: (() => void) | null = null;
+    const client: ClientTransport = {
+      send: () => {},
+      onMessage: () => {},
+      onClose: (handler) => { closeHandler = handler; },
+    };
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+
+    proxy.dispose();
+
+    expect(() => closeHandler!()).not.toThrow();
+  });
+
+  it("ignores stale onClose callbacks from a previous transport after reconnect", async () => {
+    let firstCloseHandler: (() => void) | null = null;
+    let secondHandler: ((msg: ServerMessage) => void) | null = null;
+    const secondSend = vi.fn();
+    const firstClient: ClientTransport = {
+      send: () => {},
+      onMessage: () => {},
+      onClose: (handler) => { firstCloseHandler = handler; },
+    };
+
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, firstClient);
+    firstCloseHandler!();
+    proxy.reconnect({
+      send: secondSend,
+      onMessage: (handler) => { secondHandler = handler; },
+    });
+
+    expect(() => firstCloseHandler!()).not.toThrow();
+
+    const pending = proxy.invoke("doFetch");
+    const requestId = secondSend.mock.calls.at(-1)?.[0]?.id as string;
+    secondHandler!({ type: "return", id: requestId, value: "fresh" });
+    await expect(pending).resolves.toBe("fresh");
+  });
+
+  it("ignores late transport messages after dispose", () => {
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const client: ClientTransport = {
+      send: () => {},
+      onMessage: (next) => { handler = next; },
+    };
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+
+    proxy.dispose();
+
+    expect(() => handler!({ type: "sync", values: { value: "ignored" } })).not.toThrow();
+    expect((proxy as unknown as Record<string, unknown>).value).toBeUndefined();
+  });
+
+  it("direct raw proxy tolerates missing pending ids", () => {
+    const raw = new RemoteCoreProxy(TestCore.wcBindable, {
+      send: () => {},
+      onMessage: () => {},
+    }) as RemoteCoreProxy & { _rejectPendingRequest(id: string, error: unknown): void };
+
+    expect(() => raw._rejectPendingRequest("missing", new Error("boom"))).not.toThrow();
+  });
+
+  it("direct raw proxy falls back to Transport closed in set() when no connection error is recorded", () => {
+    const raw = new RemoteCoreProxy(TestCore.wcBindable, {
+      send: () => {},
+      onMessage: () => {},
+    }) as RemoteCoreProxy & { _transport: ClientTransport | null; _connectionError: Error | null };
+
+    raw._transport = null;
+    raw._connectionError = null;
+
+    expect(() => raw.set("url", "/api")).toThrow("Transport closed");
+  });
+
+  it("direct raw proxy skips optional transport disposal when dispose() is absent", () => {
+    const raw = new RemoteCoreProxy(TestCore.wcBindable, {
+      send: () => {},
+      onMessage: () => {},
+    }) as RemoteCoreProxy & { _disposeTransport(transport: ClientTransport | null): void };
+
+    expect(() => raw._disposeTransport({ send: () => {}, onMessage: () => {} })).not.toThrow();
+  });
+
+  it("direct raw proxy ignores late messages after disposal", () => {
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const raw = new RemoteCoreProxy(TestCore.wcBindable, {
+      send: () => {},
+      onMessage: (next) => { handler = next; },
+    }) as RemoteCoreProxy;
+
+    raw.dispose();
+
+    expect(() => handler!({ type: "sync", values: { value: "ignored" } })).not.toThrow();
+  });
+
+  it("direct raw proxy tolerates redundant abort callbacks after pending cleanup", async () => {
+    let abortHandler: (() => void) | null = null;
+    const signal = {
+      aborted: false,
+      reason: undefined,
+      addEventListener: (_type: string, handler: () => void) => { abortHandler = handler; },
+      removeEventListener: () => {},
+    } as unknown as AbortSignal;
+    const raw = new RemoteCoreProxy(TestCore.wcBindable, {
+      send: () => {},
+      onMessage: () => {},
+    });
+
+    const pending = raw.setWithAckOptions("url", "/api", { signal });
+
+    abortHandler!();
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    expect(() => abortHandler!()).not.toThrow();
+  });
+
+  it("direct raw proxy tolerates late timeout callbacks after pending cleanup", async () => {
+    vi.useFakeTimers();
+    const clearTimeoutSpy = vi.spyOn(globalThis, "clearTimeout").mockImplementation(() => {});
+    try {
+      let handler: ((msg: ServerMessage) => void) | null = null;
+      const send = vi.fn();
+      const raw = new RemoteCoreProxy(TestCore.wcBindable, {
+        send,
+        onMessage: (next) => { handler = next; },
+      });
+
+      const pending = raw.setWithAckOptions("url", "/api", { timeoutMs: 10 });
+      const requestId = send.mock.calls.at(-1)?.[0]?.id as string;
+
+      handler!({ type: "return", id: requestId, value: undefined });
+      await expect(pending).resolves.toBeUndefined();
+
+      await vi.advanceTimersByTimeAsync(10);
+    } finally {
+      clearTimeoutSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("direct raw proxy ignores handleClose after disposal", () => {
+    const raw = new RemoteCoreProxy(TestCore.wcBindable, {
+      send: () => {},
+      onMessage: () => {},
+    }) as RemoteCoreProxy & { _handleClose(): void };
+
+    raw.dispose();
+
+    expect(() => raw._handleClose()).not.toThrow();
+  });
+
+  it("direct raw proxy leaves invoke pending entries alone when rejecting unsupported setAck", () => {
+    const raw = new RemoteCoreProxy(TestCore.wcBindable, {
+      send: () => {},
+      onMessage: () => {},
+    }) as RemoteCoreProxy & {
+      _pending: Map<string, { kind: "set-ack" | "invoke"; cleanup: () => void; reject: (e: unknown) => void; resolve: (v: unknown) => void }>;
+      _rejectUnsupportedSetAckPending(): void;
+    };
+
+    raw._pending.set("invoke-1", {
+      kind: "invoke",
+      cleanup: vi.fn(),
+      reject: vi.fn(),
+      resolve: vi.fn(),
+    });
+
+    raw._rejectUnsupportedSetAckPending();
+
+    expect(raw._pending.has("invoke-1")).toBe(true);
+  });
+
+  it("direct raw proxy ignores handleMessage after disposal", () => {
+    const raw = new RemoteCoreProxy(TestCore.wcBindable, {
+      send: () => {},
+      onMessage: () => {},
+    }) as RemoteCoreProxy & { _handleMessage(msg: ServerMessage): void };
+
+    raw.dispose();
+
+    expect(() => raw._handleMessage({ type: "sync", values: { value: "ignored" } })).not.toThrow();
+  });
+
+  it("uses a DOMException AbortError fallback when an already-aborted signal has no reason", async () => {
+    const client: ClientTransport = {
+      send: vi.fn(),
+      onMessage: () => {},
+    };
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+    const signal = {
+      aborted: true,
+      reason: undefined,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    } as unknown as AbortSignal;
+
+    await expect(proxy.setWithAckOptions("url", "/api", { signal })).rejects.toMatchObject({
+      name: "AbortError",
+    });
+  });
+
+  it("uses an Error AbortError fallback when DOMException is unavailable", async () => {
+    const client: ClientTransport = {
+      send: vi.fn(),
+      onMessage: () => {},
+    };
+    const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+    const signal = {
+      aborted: true,
+      reason: undefined,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    } as unknown as AbortSignal;
+    const originalDomException = globalThis.DOMException;
+
+    (globalThis as { DOMException?: typeof DOMException }).DOMException = undefined;
+    try {
+      await expect(proxy.invokeWithOptions("doFetch", { signal })).rejects.toMatchObject({
+        name: "AbortError",
+        message: "This operation was aborted",
+      });
+    } finally {
+      (globalThis as { DOMException?: typeof DOMException }).DOMException = originalDomException;
+    }
+  });
+
+  it("disables pending timeouts when timeoutMs is zero", async () => {
+    vi.useFakeTimers();
+    try {
+      const send = vi.fn();
+      let handler: ((msg: ServerMessage) => void) | null = null;
+      const client: ClientTransport = {
+        send,
+        onMessage: (h) => { handler = h; },
+      };
+      const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+      const pending = proxy.invokeWithOptions("doFetch", [], { timeoutMs: 0 });
+      const requestId = send.mock.calls.at(-1)?.[0]?.id as string;
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      handler!({ type: "return", id: requestId, value: "no-timeout" });
+
+      await expect(pending).resolves.toBe("no-timeout");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("rejects only the pending invoke() when send() fails on a non-serializable payload", async () => {

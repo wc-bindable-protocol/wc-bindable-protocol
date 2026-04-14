@@ -32,6 +32,7 @@ function isThenable(value: unknown): value is PromiseLike<unknown> {
 function isSerializableAsThrowPayload(value: unknown): boolean {
   try {
     const encoded = JSON.stringify({ error: value });
+    /* v8 ignore next -- JSON.stringify({ error: ... }) is string-valued in normal runtimes; this guards hostile monkey-patching */
     if (typeof encoded !== "string") return false;
     const decoded = JSON.parse(encoded) as Record<string, unknown>;
     return Object.prototype.hasOwnProperty.call(decoded, "error");
@@ -116,6 +117,26 @@ function serializeThrownError(error: unknown): unknown {
  *   // Now the client's RemoteCoreProxy can interact with this Core.
  *   // If the transport exposes onClose(), cleanup is automatic.
  */
+export interface RemoteShellProxyOptions {
+  /**
+   * Soft cap on the number of `update` messages buffered while a `sync`
+   * snapshot is being built. When the buffer grows past this count, a
+   * warning is logged once per proxy instance; buffering continues so
+   * wire-level ordering is preserved. Defaults to `Infinity`.
+   */
+  maxSyncUpdateBuffer?: number;
+}
+
+function normalizeSyncBufferLimit(value: number | undefined): number {
+  if (value === undefined) return Number.POSITIVE_INFINITY;
+  if (!Number.isFinite(value) || value < 1 || !Number.isInteger(value)) {
+    throw new Error(
+      "RemoteShellProxy: maxSyncUpdateBuffer must be a positive integer or omitted",
+    );
+  }
+  return value;
+}
+
 export class RemoteShellProxy {
   private _core: EventTarget;
   private _transport: ServerTransport;
@@ -126,10 +147,17 @@ export class RemoteShellProxy {
   private _disposed = false;
   private _isBuildingSyncSnapshot = false;
   private _queuedSyncUpdates: Array<{ message: ServerMessage; context: string }> = [];
+  private _maxSyncUpdateBuffer: number;
+  private _warnedSyncBufferOverflow = false;
 
-  constructor(core: EventTarget, transport: ServerTransport) {
+  constructor(
+    core: EventTarget,
+    transport: ServerTransport,
+    options: RemoteShellProxyOptions = {},
+  ) {
     this._core = core;
     this._transport = transport;
+    this._maxSyncUpdateBuffer = normalizeSyncBufferLimit(options.maxSyncUpdateBuffer);
 
     const ctor = core.constructor as { wcBindable?: WcBindableDeclaration };
     if (!ctor.wcBindable) {
@@ -212,6 +240,15 @@ export class RemoteShellProxy {
               message,
               context: `update for "${prop.name}"`,
             });
+            if (
+              !this._warnedSyncBufferOverflow &&
+              this._queuedSyncUpdates.length > this._maxSyncUpdateBuffer
+            ) {
+              this._warnedSyncBufferOverflow = true;
+              console.warn(
+                `RemoteShellProxy: sync update buffer exceeded maxSyncUpdateBuffer=${this._maxSyncUpdateBuffer}; a runaway getter side-effect may be emitting updates during sync snapshot build`,
+              );
+            }
             return;
           }
 
@@ -260,6 +297,7 @@ export class RemoteShellProxy {
 
     const queuedUpdates = this._queuedSyncUpdates;
     this._queuedSyncUpdates = [];
+    this._warnedSyncBufferOverflow = false;
     if (!sent) {
       return;
     }

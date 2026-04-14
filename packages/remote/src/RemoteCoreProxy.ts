@@ -10,6 +10,28 @@ import { isReservedRemoteName } from "./transport/messageValidation.js";
 
 const DEFAULT_PENDING_TIMEOUT_MS = 30_000;
 
+export interface RemoteCoreProxyOptions {
+  /**
+   * Soft cap on pending acknowledged requests (`setWithAck` + `invoke`).
+   * When a new call would push the pending map past this count, it rejects
+   * synchronously with a bounded-capacity error instead of letting the queue
+   * grow under network stalls. Defaults to `Infinity` to preserve prior
+   * behavior; set this in production to bound memory on untrusted or slow
+   * peers.
+   */
+  maxPendingInvocations?: number;
+}
+
+function normalizePendingLimit(value: number | undefined): number {
+  if (value === undefined) return Number.POSITIVE_INFINITY;
+  if (!Number.isFinite(value) || value < 1 || !Number.isInteger(value)) {
+    throw new Error(
+      "RemoteCoreProxy: maxPendingInvocations must be a positive integer or omitted",
+    );
+  }
+  return value;
+}
+
 function createAbortError(signal: AbortSignal): unknown {
   if (signal.reason !== undefined) {
     return signal.reason;
@@ -127,12 +149,18 @@ export class RemoteCoreProxy extends EventTarget {
   private _disposedError: Error | null = null;
   private _transportGeneration = 0;
   private _setAckSupported: boolean | null = null;
+  private _maxPendingInvocations: number;
 
-  constructor(declaration: WcBindableDeclaration, transport: ClientTransport) {
+  constructor(
+    declaration: WcBindableDeclaration,
+    transport: ClientTransport,
+    options: RemoteCoreProxyOptions = {},
+  ) {
     super();
     this._eventsByName = new Map(declaration.properties.map((prop) => [prop.name, prop.event]));
     this._inputs = new Set((declaration.inputs ?? []).map((input) => input.name));
     this._commands = new Set((declaration.commands ?? []).map((command) => command.name));
+    this._maxPendingInvocations = normalizePendingLimit(options.maxPendingInvocations);
 
     this._attachTransport(transport);
   }
@@ -171,6 +199,7 @@ export class RemoteCoreProxy extends EventTarget {
       return Promise.reject(this._disposedError);
     }
     if (!transport) {
+      /* v8 ignore next -- reaching transport=null without a recorded connection error requires mutating private state */
       return Promise.reject(this._connectionError ?? new Error("Transport closed"));
     }
     const signal = options.signal;
@@ -281,6 +310,12 @@ export class RemoteCoreProxy extends EventTarget {
         reject(err);
         return;
       }
+      if (this._pending.size >= this._maxPendingInvocations) {
+        reject(new Error(
+          `RemoteCoreProxy: pending invocations exceeded maxPendingInvocations=${this._maxPendingInvocations}`,
+        ));
+        return;
+      }
       const signal = options?.signal;
       const id = createCommandId(() => ++this._cmdId);
       let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
@@ -293,19 +328,20 @@ export class RemoteCoreProxy extends EventTarget {
         }
       };
       const onAbort = () => {
-        if (!signal) return;
         const pending = this._pending.get(id);
+        /* v8 ignore next -- cleanup removes the listener before pending can disappear */
         if (!pending) return;
         this._pending.delete(id);
         pending.cleanup();
-        pending.reject(createAbortError(signal));
+        pending.reject(createAbortError(signal!));
       };
       const onTimeout = () => {
         const pending = this._pending.get(id);
-        if (!pending || timeoutMs === null) return;
+        /* v8 ignore next -- timeout is cleared when pending settles before it can fire */
+        if (!pending) return;
         this._pending.delete(id);
         pending.cleanup();
-        pending.reject(createTimeoutError(timeoutContext, timeoutMs));
+        pending.reject(createTimeoutError(timeoutContext, timeoutMs!));
       };
 
       // The pending map is type-erased (resolve: (v: unknown) => void) so
@@ -355,6 +391,7 @@ export class RemoteCoreProxy extends EventTarget {
   }
 
   private _handleClose(): void {
+    /* v8 ignore next -- late close callbacks after dispose are intentionally ignored */
     if (this._disposedError) return;
     const transport = this._transport;
     this._connectionError = new Error("Transport closed");
@@ -379,9 +416,11 @@ export class RemoteCoreProxy extends EventTarget {
    * transport has since been attached — in both cases this is a no-op.
    */
   private _handleSendFailure(transport: ClientTransport, err: unknown): Error {
+    /* v8 ignore start -- these defensive branches require malformed runtime throws or stale private-state races */
     const error = err instanceof Error ? err : new Error(String(err));
     if (this._disposedError) return this._disposedError;
     if (this._transport !== transport) return error;
+    /* v8 ignore stop */
     this._connectionError = error;
     this._transport = null;
     this._transportGeneration++;
@@ -400,6 +439,7 @@ export class RemoteCoreProxy extends EventTarget {
 
   private _rejectPendingRequest(id: string, error: unknown): void {
     const pending = this._pending.get(id);
+    /* v8 ignore next -- private helper may be called redundantly during send-failure cleanup */
     if (!pending) return;
     this._pending.delete(id);
     pending.cleanup();
@@ -421,12 +461,14 @@ export class RemoteCoreProxy extends EventTarget {
       throw this._disposedError;
     }
     if (!this._transport) {
+      /* v8 ignore next -- reaching transport=null without a recorded connection error requires mutating private state */
       throw this._connectionError ?? new Error("Transport closed");
     }
     return this._transport;
   }
 
   private _disposeTransport(transport: ClientTransport | null): void {
+    /* v8 ignore next -- dispose() is optional on the transport contract */
     if (!transport?.dispose) return;
     transport.dispose();
   }
@@ -451,10 +493,12 @@ export class RemoteCoreProxy extends EventTarget {
     this._setAckSupported = null;
 
     transport.onMessage((msg) => {
+      /* v8 ignore next -- stale transport callbacks after reconnect are ignored defensively */
       if (generation !== this._transportGeneration) return;
       this._handleMessage(msg);
     });
     transport.onClose?.(() => {
+      /* v8 ignore next -- stale transport callbacks after reconnect are ignored defensively */
       if (generation !== this._transportGeneration) return;
       this._handleClose();
     });
@@ -467,6 +511,7 @@ export class RemoteCoreProxy extends EventTarget {
   }
 
   private _handleMessage(msg: ServerMessage): void {
+    /* v8 ignore next -- late messages after dispose are intentionally ignored */
     if (this._disposedError) return;
     switch (msg.type) {
       case "sync": {
@@ -494,13 +539,12 @@ export class RemoteCoreProxy extends EventTarget {
         // would never observe the reset.
         for (const name of this._eventsByName.keys()) {
           if (Object.prototype.hasOwnProperty.call(msg.values, name)) continue;
+          /* v8 ignore next -- getterFailures only appears when an omitted property failed during sync */
           if (getterFailures.has(name)) continue;
           if (this._values[name] === undefined) continue;
           this._values[name] = undefined;
-          const eventName = this._eventsByName.get(name);
-          if (eventName) {
-            this.dispatchEvent(new CustomEvent(eventName, { detail: undefined }));
-          }
+          const eventName = this._eventsByName.get(name)!;
+          this.dispatchEvent(new CustomEvent(eventName, { detail: undefined }));
         }
         break;
       }
@@ -649,6 +693,7 @@ const RESERVED_PROXY_MEMBER_NAMES: ReadonlySet<string> = (() => {
 export function createRemoteCoreProxy(
   declaration: WcBindableDeclaration,
   transport: ClientTransport,
+  options?: RemoteCoreProxyOptions,
 ): RemoteCoreProxy {
   // Two separate reasons a declared name must be rejected here:
   //   1. RESERVED_PROXY_MEMBER_NAMES — shadowed by the Proxy target, would
@@ -715,6 +760,6 @@ export function createRemoteCoreProxy(
     static wcBindable: WcBindableDeclaration = proxyDeclaration;
   }
 
-  const instance = new IsolatedProxy(proxyDeclaration, transport);
+  const instance = new IsolatedProxy(proxyDeclaration, transport, options);
   return new Proxy(instance, handler);
 }

@@ -211,6 +211,69 @@ describe("WebSocketClientTransport", () => {
     warnSpy.mockRestore();
   });
 
+  it("treats ArrayBuffer views as binary payloads for warning purposes", () => {
+    const ws = new MockBrowserWebSocket(WebSocket.OPEN);
+    const transport = new WebSocketClientTransport(ws as unknown as WebSocket);
+    const onMessage = vi.fn();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    transport.onMessage(onMessage);
+    ws.emit("message", { data: new DataView(new ArrayBuffer(4)) });
+
+    expect(onMessage).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledWith(
+      "WebSocketClientTransport: received a binary message payload; this transport expects text JSON frames from the server. Check the server framing or browser binaryType.",
+    );
+
+    warnSpy.mockRestore();
+  });
+
+  it("treats raw ArrayBuffer payloads as binary payloads for warning purposes", () => {
+    const ws = new MockBrowserWebSocket(WebSocket.OPEN);
+    const transport = new WebSocketClientTransport(ws as unknown as WebSocket);
+    const onMessage = vi.fn();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    transport.onMessage(onMessage);
+    ws.emit("message", { data: new ArrayBuffer(4) });
+
+    expect(onMessage).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledWith(
+      "WebSocketClientTransport: received a binary message payload; this transport expects text JSON frames from the server. Check the server framing or browser binaryType.",
+    );
+
+    warnSpy.mockRestore();
+  });
+
+  it("ignores a late open event after the transport has already been closed", () => {
+    const ws = new MockBrowserWebSocket(WebSocket.CONNECTING);
+    const transport = new WebSocketClientTransport(ws as unknown as WebSocket);
+
+    transport.send({ type: "sync" });
+    ws.emit("close");
+    ws.emit("open");
+
+    expect(ws.sent).toEqual([]);
+    expect(() => transport.send({ type: "sync" })).toThrow("connection is closed");
+  });
+
+  it("handles environments without ArrayBuffer when checking binary payloads", () => {
+    const ws = new MockBrowserWebSocket(WebSocket.OPEN);
+    const transport = new WebSocketClientTransport(ws as unknown as WebSocket);
+    const onMessage = vi.fn();
+    const originalArrayBuffer = globalThis.ArrayBuffer;
+
+    (globalThis as { ArrayBuffer?: typeof ArrayBuffer }).ArrayBuffer = undefined;
+    try {
+      transport.onMessage(onMessage);
+      ws.emit("message", { data: JSON.stringify({ type: "sync", values: { value: 1 } }) });
+    } finally {
+      (globalThis as { ArrayBuffer?: typeof ArrayBuffer }).ArrayBuffer = originalArrayBuffer;
+    }
+
+    expect(onMessage).toHaveBeenCalledWith({ type: "sync", values: { value: 1 } });
+  });
+
   it("rejects Blob payloads with a clearer diagnostic before parse fallback", () => {
     const ws = new MockBrowserWebSocket(WebSocket.OPEN);
     const transport = new WebSocketClientTransport(ws as unknown as WebSocket);
@@ -306,5 +369,49 @@ describe("WebSocketClientTransport", () => {
     ws.emit("error");
 
     expect(() => transport.send({ type: "sync" })).toThrow("connection is closed");
+  });
+
+  describe("maxPreOpenQueue", () => {
+    it("throws when the pre-open buffer would exceed the limit", () => {
+      const ws = new MockBrowserWebSocket(WebSocket.CONNECTING);
+      const transport = new WebSocketClientTransport(ws as unknown as WebSocket, {
+        maxPreOpenQueue: 2,
+      });
+
+      transport.send({ type: "sync" });
+      transport.send({ type: "set", name: "a", value: 1 });
+      expect(() => transport.send({ type: "set", name: "b", value: 2 }))
+        .toThrow(/pre-open queue exceeded maxPreOpenQueue=2/);
+
+      // already-buffered messages still flush normally
+      ws.emit("open");
+      expect(ws.sent).toEqual([
+        JSON.stringify({ type: "sync" }),
+        JSON.stringify({ type: "set", name: "a", value: 1 }),
+      ]);
+    });
+
+    it("does not apply once the socket is OPEN", () => {
+      const ws = new MockBrowserWebSocket(WebSocket.OPEN);
+      const transport = new WebSocketClientTransport(ws as unknown as WebSocket, {
+        maxPreOpenQueue: 1,
+      });
+
+      // These bypass the buffer since the socket is already OPEN.
+      expect(() => {
+        transport.send({ type: "sync" });
+        transport.send({ type: "set", name: "a", value: 1 });
+        transport.send({ type: "set", name: "b", value: 2 });
+      }).not.toThrow();
+    });
+
+    it("rejects invalid limit values at construction", () => {
+      const ws = new MockBrowserWebSocket(WebSocket.CONNECTING);
+      for (const bad of [0, -1, 1.5, NaN]) {
+        expect(() => new WebSocketClientTransport(ws as unknown as WebSocket, {
+          maxPreOpenQueue: bad,
+        })).toThrow(/maxPreOpenQueue must be a positive integer/);
+      }
+    });
   });
 });

@@ -120,6 +120,72 @@ describe("WebSocketServerTransport", () => {
     expect(onMessage).toHaveBeenCalledWith({ type: "sync" });
   });
 
+  it("falls back to Buffer decoding when TextDecoder is unavailable", () => {
+    const ws = new MockBrowserWebSocket(WebSocket.OPEN);
+    const transport = new WebSocketServerTransport(ws as unknown as Parameters<typeof WebSocketServerTransport>[0]);
+    const onMessage = vi.fn();
+    const originalTextDecoder = globalThis.TextDecoder;
+
+    (globalThis as { TextDecoder?: typeof TextDecoder }).TextDecoder = undefined;
+    try {
+      transport.onMessage(onMessage);
+      const bytes = new TextEncoder().encode(JSON.stringify({ type: "sync" }));
+      ws.emit("message", { data: bytes });
+    } finally {
+      (globalThis as { TextDecoder?: typeof TextDecoder }).TextDecoder = originalTextDecoder;
+    }
+
+    expect(onMessage).toHaveBeenCalledWith({ type: "sync" });
+  });
+
+  it("falls back to String(bytes) decoding when neither TextDecoder nor Buffer is available", () => {
+    const ws = new MockBrowserWebSocket(WebSocket.OPEN);
+    const transport = new WebSocketServerTransport(ws as unknown as Parameters<typeof WebSocketServerTransport>[0]);
+    const onMessage = vi.fn();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const originalTextDecoder = globalThis.TextDecoder;
+    const originalBuffer = globalThis.Buffer;
+
+    (globalThis as { TextDecoder?: typeof TextDecoder }).TextDecoder = undefined;
+    (globalThis as { Buffer?: typeof Buffer }).Buffer = undefined;
+    try {
+      transport.onMessage(onMessage);
+      ws.emit("message", { data: new Uint8Array([123, 125]) });
+    } finally {
+      (globalThis as { TextDecoder?: typeof TextDecoder }).TextDecoder = originalTextDecoder;
+      (globalThis as { Buffer?: typeof Buffer }).Buffer = originalBuffer;
+    }
+
+    expect(onMessage).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledWith(
+      "WebSocketServerTransport: ignoring invalid client message",
+      expect.any(Error),
+    );
+
+    warnSpy.mockRestore();
+  });
+
+  it("falls back to String(data) when ArrayBuffer is unavailable", () => {
+    const ws = new MockBrowserWebSocket(WebSocket.OPEN);
+    const transport = new WebSocketServerTransport(ws as unknown as Parameters<typeof WebSocketServerTransport>[0]);
+    const onMessage = vi.fn();
+    const originalArrayBuffer = globalThis.ArrayBuffer;
+
+    (globalThis as { ArrayBuffer?: typeof ArrayBuffer }).ArrayBuffer = undefined;
+    try {
+      transport.onMessage(onMessage);
+      ws.emit("message", {
+        data: {
+          toString: () => JSON.stringify({ type: "sync" }),
+        },
+      });
+    } finally {
+      (globalThis as { ArrayBuffer?: typeof ArrayBuffer }).ArrayBuffer = originalArrayBuffer;
+    }
+
+    expect(onMessage).toHaveBeenCalledWith({ type: "sync" });
+  });
+
   it("ignores parsed client messages with invalid shape", () => {
     const listeners: Array<(data: unknown) => void> = [];
     const ws = {
@@ -197,6 +263,21 @@ describe("WebSocketServerTransport", () => {
     const transport = new WebSocketServerTransport(ws);
 
     expect(() => transport.onMessage(() => {})).not.toThrow();
+  });
+
+  it("drops messages when the internal handler has been cleared after listener attachment", () => {
+    const ws = new MockBrowserWebSocket(WebSocket.OPEN);
+    const transport = new WebSocketServerTransport(ws as unknown as Parameters<typeof WebSocketServerTransport>[0]) as unknown as {
+      onMessage(handler: (message: { type: string }) => void): void;
+      _messageHandler: ((message: { type: string }) => void) | null;
+    };
+    const onMessage = vi.fn();
+
+    transport.onMessage(onMessage);
+    transport._messageHandler = null;
+    ws.emit("message", { data: JSON.stringify({ type: "sync" }) });
+
+    expect(onMessage).not.toHaveBeenCalled();
   });
 
   it("notifies close handlers when using addEventListener", () => {

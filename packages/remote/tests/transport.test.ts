@@ -220,6 +220,32 @@ describe("WebSocketClientTransport", () => {
 
     expect(handler).toHaveBeenCalledTimes(1);
   });
+
+  it("replaces onClose listeners by removing the previous socket listeners", () => {
+    const { ws } = createMockWebSocket(1);
+    const transport = new WebSocketClientTransport(ws);
+
+    transport.onClose(() => {});
+    transport.onClose(() => {});
+
+    expect(ws.removeEventListener).toHaveBeenCalledWith("close", expect.any(Function));
+    expect(ws.removeEventListener).toHaveBeenCalledWith("error", expect.any(Function));
+  });
+
+  it("dispose() removes registered socket listeners and is idempotent", () => {
+    const { ws } = createMockWebSocket(0);
+    const transport = new WebSocketClientTransport(ws);
+
+    transport.onMessage(() => {});
+    transport.onClose(() => {});
+    transport.dispose();
+    transport.dispose();
+
+    expect(ws.removeEventListener).toHaveBeenCalledWith("open", expect.any(Function));
+    expect(ws.removeEventListener).toHaveBeenCalledWith("close", expect.any(Function));
+    expect(ws.removeEventListener).toHaveBeenCalledWith("error", expect.any(Function));
+    expect(ws.removeEventListener).toHaveBeenCalledWith("message", expect.any(Function));
+  });
 });
 
 // ---------------------------------------------------------------------------

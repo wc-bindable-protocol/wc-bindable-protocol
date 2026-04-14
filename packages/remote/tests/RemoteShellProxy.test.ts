@@ -156,6 +156,119 @@ describe("RemoteShellProxy", () => {
     expect(send).toHaveBeenCalledWith({ type: "sync", values: {}, capabilities: { setAck: true } });
   });
 
+  it("falls back when JSON.stringify does not return a string for a thrown cause", () => {
+    class UndefinedJsonCauseCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+        commands: [{ name: "boom" }],
+      };
+
+      boom(): never {
+        throw new Error("top", { cause: { toJSON: () => undefined } });
+      }
+    }
+
+    const core = new UndefinedJsonCauseCore();
+    const send = vi.fn();
+    let handler: ((msg: ClientMessage) => void) | null = null;
+    const server: ServerTransport = {
+      send,
+      onMessage: (h) => { handler = h; },
+    };
+
+    new RemoteShellProxy(core, server);
+    handler!({ type: "cmd", name: "boom", id: "undefined-json-cause", args: [] });
+
+    expect(send).toHaveBeenCalledWith({
+      type: "throw",
+      id: "undefined-json-cause",
+      error: expect.objectContaining({
+        name: "Error",
+        message: "top",
+        cause: {
+          name: "RemoteShellProxyError",
+          message: "Error cause is not JSON-serializable",
+        },
+      }),
+    });
+  });
+
+  it("treats non-string JSON.stringify results as non-serializable throw payloads", () => {
+    class UndefinedThrownValueCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+        commands: [{ name: "boom" }],
+      };
+
+      boom(): never {
+        throw { toJSON: () => undefined };
+      }
+    }
+
+    const core = new UndefinedThrownValueCore();
+    const send = vi.fn();
+    let handler: ((msg: ClientMessage) => void) | null = null;
+    const server: ServerTransport = {
+      send,
+      onMessage: (h) => { handler = h; },
+    };
+
+    new RemoteShellProxy(core, server);
+    handler!({ type: "cmd", name: "boom", id: "undefined-json-throw", args: [] });
+
+    expect(send).toHaveBeenCalledWith({
+      type: "throw",
+      id: "undefined-json-throw",
+      error: {
+        name: "RemoteShellProxyError",
+        message: "Thrown value is not JSON-serializable",
+      },
+    });
+  });
+
+  it("treats monkey-patched non-string JSON.stringify results as non-serializable", () => {
+    class BoomCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+        commands: [{ name: "boom" }],
+      };
+
+      boom(): never {
+        throw new Error("boom");
+      }
+    }
+
+    const send = vi.fn();
+    let handler: ((msg: ClientMessage) => void) | null = null;
+    const server: ServerTransport = {
+      send,
+      onMessage: (h) => { handler = h; },
+    };
+    const stringifySpy = vi.spyOn(JSON, "stringify").mockReturnValueOnce(undefined as unknown as string);
+
+    try {
+      new RemoteShellProxy(new BoomCore(), server);
+      handler!({ type: "cmd", name: "boom", id: "monkey-json", args: [] });
+
+      expect(send).toHaveBeenCalledWith({
+        type: "throw",
+        id: "monkey-json",
+        error: {
+          name: "RemoteShellProxyError",
+          message: "Thrown value is not JSON-serializable",
+        },
+      });
+    } finally {
+      stringifySpy.mockRestore();
+    }
+  });
+
   it("logs and skips properties whose getters throw during sync", () => {
     class ThrowingGetterCore extends EventTarget {
       static wcBindable: WcBindableDeclaration = {
@@ -336,6 +449,43 @@ describe("RemoteShellProxy", () => {
     expect(errorSpy).toHaveBeenCalledWith(
       'RemoteShellProxy: failed to send update for "value":',
       expect.any(TypeError),
+    );
+
+    errorSpy.mockRestore();
+  });
+
+  it("logs and swallows getter failures during update handling", () => {
+    class ThrowingUpdateGetterCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [{
+          name: "value",
+          event: "throwing-update:value",
+          getter: () => {
+            throw new Error("broken update getter");
+          },
+        }],
+      };
+    }
+
+    const core = new ThrowingUpdateGetterCore();
+    const send = vi.fn();
+    const server: ServerTransport = {
+      send,
+      onMessage: () => {},
+    };
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    new RemoteShellProxy(core, server);
+    expect(() => {
+      core.dispatchEvent(new CustomEvent("throwing-update:value"));
+    }).not.toThrow();
+
+    expect(send).not.toHaveBeenCalled();
+    expect(errorSpy).toHaveBeenCalledWith(
+      'RemoteShellProxy: getter for "value" threw during update:',
+      expect.any(Error),
     );
 
     errorSpy.mockRestore();
@@ -643,6 +793,30 @@ describe("RemoteShellProxy", () => {
       },
     });
     expect(Object.prototype).not.toHaveProperty("polluted");
+  });
+
+  it("warns and ignores reserved input names without an ack id even if allowed inputs are corrupted", () => {
+    const core = new TestCore();
+    const send = vi.fn();
+    let handler: ((msg: ClientMessage) => void) | null = null;
+    const server: ServerTransport = {
+      send,
+      onMessage: (h) => { handler = h; },
+    };
+
+    const shell = new RemoteShellProxy(core, server) as unknown as { _allowedInputs: Set<string> };
+    shell._allowedInputs.add("__proto__");
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    handler!({ type: "set", name: "__proto__", value: { polluted: true } });
+
+    expect(send).not.toHaveBeenCalled();
+    expect(warnSpy).toHaveBeenCalledWith(
+      'RemoteShellProxy: ignored set for reserved input "__proto__"',
+    );
+    expect(Object.prototype).not.toHaveProperty("polluted");
+
+    warnSpy.mockRestore();
   });
 
   it("treats an empty string set id as an acknowledged request", () => {
@@ -1042,6 +1216,101 @@ describe("RemoteShellProxy", () => {
         }),
       }),
     });
+  });
+
+  it("replaces cyclic Error causes with an explicit RemoteShellProxyError", () => {
+    class CyclicCauseCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+        commands: [{ name: "boom" }],
+      };
+
+      boom(): never {
+        const error = new Error("cycle root") as Error & { cause?: unknown };
+        error.cause = error;
+        throw error;
+      }
+    }
+
+    const core = new CyclicCauseCore();
+    const send = vi.fn();
+    let handler: ((msg: ClientMessage) => void) | null = null;
+    const server: ServerTransport = {
+      send,
+      onMessage: (h) => { handler = h; },
+    };
+
+    new RemoteShellProxy(core, server);
+    handler!({ type: "cmd", name: "boom", id: "cyclic-cause", args: [] });
+
+    expect(send).toHaveBeenCalledWith({
+      type: "throw",
+      id: "cyclic-cause",
+      error: expect.objectContaining({
+        name: "Error",
+        message: "cycle root",
+        cause: {
+          name: "RemoteShellProxyError",
+          message: "Error cause chain contains a cycle",
+        },
+      }),
+    });
+  });
+
+  it("serializes errors even when stack is missing", () => {
+    class NoStackCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+        commands: [{ name: "boom" }],
+      };
+
+      boom(): never {
+        const error = new Error("no stack");
+        (error as Error & { stack?: string }).stack = undefined;
+        throw error;
+      }
+    }
+
+    const core = new NoStackCore();
+    const send = vi.fn();
+    let handler: ((msg: ClientMessage) => void) | null = null;
+    const server: ServerTransport = {
+      send,
+      onMessage: (h) => { handler = h; },
+    };
+
+    new RemoteShellProxy(core, server);
+    handler!({ type: "cmd", name: "boom", id: "no-stack", args: [] });
+
+    expect(send).toHaveBeenCalledWith({
+      type: "throw",
+      id: "no-stack",
+      error: {
+        name: "Error",
+        message: "no stack",
+      },
+    });
+  });
+
+  it("returns false from internal safeSend after dispose", () => {
+    const core = new TestCore();
+    const server: ServerTransport = {
+      send: vi.fn(),
+      onMessage: () => {},
+    };
+
+    const shell = new RemoteShellProxy(core, server) as unknown as {
+      dispose(): void;
+      _safeSend(message: ClientMessage, context: string): boolean;
+    };
+
+    shell.dispose();
+
+    expect(shell._safeSend({ type: "sync" }, "after dispose")).toBe(false);
   });
 
   it("notifies when a nested Error cause is not JSON-serializable", () => {

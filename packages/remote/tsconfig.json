@@ -11,6 +11,7 @@
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
+    "composite": true,
     "lib": ["ES2020", "DOM"],
     "paths": {
       "@wc-bindable/core": ["../core/src/index.ts"]
