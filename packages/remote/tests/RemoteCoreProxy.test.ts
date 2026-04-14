@@ -1737,4 +1737,62 @@ describe("RemoteCoreProxy", () => {
 
     expect(onEvent).toHaveBeenCalledTimes(1);
   });
+
+  describe("maxPendingInvocations", () => {
+    it("rejects new invoke once pending reaches the limit", async () => {
+      // Hanging transport: messages go out but no response ever comes back.
+      const client: ClientTransport = {
+        send: () => {},
+        onMessage: () => {},
+      };
+      const proxy = createRemoteCoreProxy(TestCore.wcBindable, client, {
+        maxPendingInvocations: 2,
+      });
+
+      const first = proxy.invoke("doFetch");
+      const second = proxy.invoke("doFetch");
+      // Third exceeds the limit — rejects synchronously via Promise executor.
+      await expect(proxy.invoke("doFetch"))
+        .rejects.toThrow(/pending invocations exceeded maxPendingInvocations=2/);
+
+      // The first two remain pending (they will eventually time out, but the
+      // important invariant here is that the limit blocked the third).
+      expect(first).toBeInstanceOf(Promise);
+      expect(second).toBeInstanceOf(Promise);
+    });
+
+    it("releases capacity when a pending invoke settles", async () => {
+      // Transport that captures cmd ids so the test can echo returns.
+      let clientHandler: ((msg: ServerMessage) => void) | null = null;
+      const pending: string[] = [];
+      const client: ClientTransport = {
+        send: (msg) => {
+          if (msg.type === "cmd") pending.push(msg.id);
+        },
+        onMessage: (h) => { clientHandler = h; },
+      };
+      const proxy = createRemoteCoreProxy(TestCore.wcBindable, client, {
+        maxPendingInvocations: 1,
+      });
+
+      const first = proxy.invoke("doFetch");
+      await expect(proxy.invoke("doFetch"))
+        .rejects.toThrow(/maxPendingInvocations=1/);
+
+      clientHandler!({ type: "return", id: pending[0]!, value: "ok" } as ServerMessage);
+      await expect(first).resolves.toBe("ok");
+
+      // Capacity is available again.
+      expect(proxy.invoke("doFetch")).toBeInstanceOf(Promise);
+    });
+
+    it("rejects invalid limit values at construction", () => {
+      const { client } = createSyncTransportPair();
+      for (const bad of [0, -1, 1.5, NaN]) {
+        expect(() => createRemoteCoreProxy(TestCore.wcBindable, client, {
+          maxPendingInvocations: bad,
+        })).toThrow(/maxPendingInvocations must be a positive integer/);
+      }
+    });
+  });
 });
