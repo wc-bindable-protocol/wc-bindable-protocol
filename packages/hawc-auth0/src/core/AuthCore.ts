@@ -368,10 +368,24 @@ export class AuthCore extends EventTarget {
   }
 }
 
+/**
+ * Runtime-agnostic base64url decoder that returns a proper UTF-8
+ * string — `atob` alone yields a "binary string" (one char per byte)
+ * which silently corrupts non-ASCII JWT claims (e.g. `name` in
+ * Japanese) and can make `JSON.parse` throw. Going through
+ * `TextDecoder` keeps callers honest if they ever read claims beyond
+ * the current `exp`-only use site, without breaking the
+ * `payload.exp` path that worked fine under binary decoding.
+ */
 function _base64UrlDecode(input: string): string {
   const padded = input + "=".repeat((4 - (input.length % 4)) % 4);
   const base64 = padded.replace(/-/g, "+").replace(/_/g, "/");
-  if (typeof atob === "function") return atob(base64);
-  // Node fallback for environments without atob.
-  return Buffer.from(base64, "base64").toString("binary");
+  if (typeof atob === "function") {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new TextDecoder("utf-8").decode(bytes);
+  }
+  // Node ≤ 15 fallback (Node 16+ exposes a global `atob`).
+  return Buffer.from(base64, "base64").toString("utf-8");
 }

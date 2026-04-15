@@ -930,6 +930,56 @@ describe("handleConnection", () => {
     expect(event?.error).toBeInstanceOf(Error);
   });
 
+  it("decodes JWT exp from a payload containing non-ASCII claims without mojibake", async () => {
+    // Regression: _base64UrlDecode used to return a binary string from
+    // atob / Buffer.toString("binary"), which silently corrupts
+    // non-ASCII payloads and can make JSON.parse throw — at which
+    // point session expiry enforcement would silently drop to
+    // Infinity. Verify we still extract `exp` from a payload whose
+    // other claims carry Japanese text.
+    vi.useFakeTimers();
+    try {
+      jwtVerify.mockResolvedValue({
+        payload: { sub: "auth0|123", permissions: [] },
+      });
+
+      const socket = createMockSocket();
+      const core = new EventTarget();
+      (core.constructor as any).wcBindable = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+      };
+
+      const events: AuthEvent[] = [];
+
+      await handleConnection(
+        socket,
+        "hawc-auth0.bearer." + makeJwt({
+          sub: "auth0|123",
+          name: "山田 太郎",
+          email: "太郎@例.jp",
+          exp: Math.floor(Date.now() / 1000) - 1,
+        }),
+        {
+          auth0Domain: "test.auth0.com",
+          auth0Audience: "https://api.example.com",
+          createCores: () => core,
+          sessionGraceMs: 1,
+          onEvent: (e) => events.push(e),
+        },
+      );
+
+      await vi.runAllTimersAsync();
+
+      // exp was decodable despite non-ASCII claims — 4401 fires.
+      expect(socket.close).toHaveBeenCalledWith(4401, "Session expired");
+      expect(events.some((e) => e.type === "auth:exp-parse-failure")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("decodes JWT exp via atob (runtime-agnostic) and enforces expiry", async () => {
     // Simulate a non-Node runtime where `Buffer` is not defined. The
     // implementation must fall through to `atob` (globally available on

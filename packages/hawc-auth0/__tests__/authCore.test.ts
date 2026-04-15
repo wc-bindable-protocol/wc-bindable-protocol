@@ -587,6 +587,39 @@ describe("AuthCore", () => {
         vi.stubGlobal("atob", savedAtob);
       }
     });
+
+    it("decodes JWTs whose payload contains non-ASCII claims without corrupting exp", () => {
+      // Regression: decoder used to return a "binary string" via atob,
+      // which garbles non-ASCII code units and can break JSON.parse.
+      // Read the exp claim from a JWT whose `name` is a Japanese string
+      // to lock in UTF-8 round-tripping.
+      const expSeconds = Math.floor(Date.now() / 1000) + 120;
+      const core = new AuthCore();
+      (core as any)._token = makeJwt({
+        sub: "auth0|1",
+        name: "山田 太郎",
+        email: "太郎@例.jp",
+        exp: expSeconds,
+      });
+      expect(core.getTokenExpiry()).toBe(expSeconds * 1000);
+    });
+
+    it("decodes non-ASCII JWT payloads under the Buffer fallback too", () => {
+      const expSeconds = Math.floor(Date.now() / 1000) + 120;
+      const core = new AuthCore();
+      const savedAtob = globalThis.atob;
+      try {
+        vi.stubGlobal("atob", undefined);
+        (core as any)._token = makeJwt({
+          sub: "auth0|1",
+          name: "山田 太郎",
+          exp: expSeconds,
+        });
+        expect(core.getTokenExpiry()).toBe(expSeconds * 1000);
+      } finally {
+        vi.stubGlobal("atob", savedAtob);
+      }
+    });
   });
 
   describe("fetchToken / fetchFreshToken / commitToken", () => {

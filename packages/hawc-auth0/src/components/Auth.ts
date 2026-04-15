@@ -2,7 +2,7 @@ import type { ClientTransport } from "@wc-bindable/remote";
 import { config } from "../config.js";
 import { IWcBindable, AuthMode } from "../types.js";
 import { AuthShell } from "../shell/AuthShell.js";
-import { registerAutoTrigger } from "../autoTrigger.js";
+import { registerAutoTrigger, unregisterAutoTrigger } from "../autoTrigger.js";
 
 export class Auth extends HTMLElement {
   static hasConnectedCallbackPromise = true;
@@ -23,6 +23,12 @@ export class Auth extends HTMLElement {
   private _shell: AuthShell;
   private _trigger: boolean = false;
   private _connectedCallbackPromise: Promise<void> = Promise.resolve();
+  // Track whether THIS instance called registerAutoTrigger(), so that
+  // disconnectedCallback can pair it with a single unregisterAutoTrigger().
+  // Required because `config.autoTrigger` may toggle between connect
+  // and disconnect — without this flag a false reading on disconnect
+  // would unbalance the refcount in autoTrigger.ts.
+  private _autoTriggerRegistered: boolean = false;
 
   constructor() {
     super();
@@ -279,8 +285,9 @@ export class Auth extends HTMLElement {
 
   connectedCallback(): void {
     this.style.display = "none";
-    if (config.autoTrigger) {
+    if (config.autoTrigger && !this._autoTriggerRegistered) {
       registerAutoTrigger();
+      this._autoTriggerRegistered = true;
     }
     // Guard against double-init during the in-flight window.
     // `_shell.client` alone is not sufficient: it is set only after
@@ -307,6 +314,17 @@ export class Auth extends HTMLElement {
   }
 
   disconnectedCallback(): void {
-    // No cleanup needed (Auth0 client is used singleton-style)
+    // Balance the registerAutoTrigger() call from connectedCallback so
+    // the global `document` click listener is detached once the last
+    // <hawc-auth0> instance leaves the DOM. Only unregister if THIS
+    // instance actually registered — otherwise we would under-decrement
+    // the refcount for an element whose connect happened while
+    // `config.autoTrigger` was false.
+    if (this._autoTriggerRegistered) {
+      unregisterAutoTrigger();
+      this._autoTriggerRegistered = false;
+    }
+    // The Auth0 client itself is used singleton-style, so no further
+    // cleanup is needed here.
   }
 }

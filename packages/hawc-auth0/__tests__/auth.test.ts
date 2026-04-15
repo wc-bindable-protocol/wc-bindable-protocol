@@ -1092,6 +1092,126 @@ describe("autoTrigger", () => {
     registerAutoTrigger();
     // エラーなく呼び出せる
     unregisterAutoTrigger();
+    unregisterAutoTrigger();
+  });
+
+  it("全Auth要素がdisconnectedCallbackで破棄されるとdocumentリスナーが解除される", async () => {
+    // Regression: before the refcounted cleanup, the global click
+    // listener was attached once and never detached — long-lived SPAs
+    // that mount/unmount <hawc-auth0> (routing, dynamic toolbars)
+    // accumulated a dangling listener for the session lifetime.
+    const mockClient = createMockAuth0Client();
+    createAuth0Client.mockResolvedValue(mockClient);
+
+    // Start clean — no external callers holding the listener.
+    const addSpy = vi.spyOn(document, "addEventListener");
+    const removeSpy = vi.spyOn(document, "removeEventListener");
+
+    try {
+      const el1 = document.createElement("hawc-auth0") as Auth;
+      el1.id = "a1";
+      el1.setAttribute("domain", "test.auth0.com");
+      el1.setAttribute("client-id", "client-id");
+
+      const el2 = document.createElement("hawc-auth0") as Auth;
+      el2.id = "a2";
+      el2.setAttribute("domain", "test.auth0.com");
+      el2.setAttribute("client-id", "client-id");
+
+      document.body.appendChild(el1);
+      document.body.appendChild(el2);
+      await el1.connectedCallbackPromise;
+      await el2.connectedCallbackPromise;
+
+      // Listener must have been attached exactly once even with two
+      // simultaneous <hawc-auth0> elements.
+      const clickAdds = addSpy.mock.calls.filter(
+        (c: any[]) => c[0] === "click",
+      );
+      expect(clickAdds.length).toBe(1);
+
+      // Removing the first element must NOT detach the listener — el2
+      // is still on the page and needs the handler.
+      el1.remove();
+      let clickRemoves = removeSpy.mock.calls.filter(
+        (c: any[]) => c[0] === "click",
+      );
+      expect(clickRemoves.length).toBe(0);
+
+      // Removing the last element detaches the listener (refcount -> 0).
+      el2.remove();
+      clickRemoves = removeSpy.mock.calls.filter(
+        (c: any[]) => c[0] === "click",
+      );
+      expect(clickRemoves.length).toBe(1);
+
+      // Click on an <data-authtarget> element after teardown must NOT
+      // fire login — the listener is gone.
+      const danglingAuth = document.createElement("hawc-auth0") as Auth;
+      danglingAuth.id = "a3";
+      danglingAuth.setAttribute("domain", "test.auth0.com");
+      danglingAuth.setAttribute("client-id", "client-id");
+      // Connect with autoTrigger disabled so this element does NOT
+      // re-register. We are specifically verifying that the listener
+      // stays detached in that window.
+      setConfig({ autoTrigger: false });
+      document.body.appendChild(danglingAuth);
+      await danglingAuth.connectedCallbackPromise;
+      const loginSpy = vi.spyOn(danglingAuth, "login").mockResolvedValue(undefined);
+
+      const button = document.createElement("button");
+      button.setAttribute("data-authtarget", "a3");
+      document.body.appendChild(button);
+      button.click();
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(loginSpy).not.toHaveBeenCalled();
+      setConfig({ autoTrigger: true });
+    } finally {
+      addSpy.mockRestore();
+      removeSpy.mockRestore();
+    }
+  });
+
+  it("autoTrigger無効で接続したAuth要素はdisconnect時にrefcountを減らさない", async () => {
+    // Per-instance `_autoTriggerRegistered` flag guard: if an element
+    // never registered (because `config.autoTrigger` was false at its
+    // connect time), disconnect must NOT call unregister — otherwise
+    // the shared refcount drifts negative and a later register could
+    // re-attach a listener that nobody balances.
+    const mockClient = createMockAuth0Client();
+    createAuth0Client.mockResolvedValue(mockClient);
+
+    // External caller holds the listener at refcount 1.
+    registerAutoTrigger();
+    const removeSpy = vi.spyOn(document, "removeEventListener");
+
+    try {
+      setConfig({ autoTrigger: false });
+
+      const el = document.createElement("hawc-auth0") as Auth;
+      el.id = "a4";
+      el.setAttribute("domain", "test.auth0.com");
+      el.setAttribute("client-id", "client-id");
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      el.remove();
+
+      // This element never registered, so disconnect must not fire
+      // removeEventListener either directly or by draining the external
+      // caller's refcount.
+      const clickRemoves = removeSpy.mock.calls.filter(
+        (c: any[]) => c[0] === "click",
+      );
+      expect(clickRemoves.length).toBe(0);
+
+      setConfig({ autoTrigger: true });
+    } finally {
+      removeSpy.mockRestore();
+      // External caller releases its refcount.
+      unregisterAutoTrigger();
+    }
   });
 
   it("event.targetがElementでない場合は無視する", () => {

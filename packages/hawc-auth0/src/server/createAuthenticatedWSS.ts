@@ -387,17 +387,26 @@ function _getExpFromToken(
 }
 
 /**
- * Runtime-agnostic base64url decoder. Returns a binary string suitable
- * for `JSON.parse` when the payload is ASCII-compatible JSON (JWT `exp`
- * extraction only reads a numeric claim, so binary-string decoding is
- * sufficient here).
+ * Runtime-agnostic base64url decoder that returns a proper UTF-8
+ * string. `atob` alone yields a "binary string" (one char per byte)
+ * which would silently corrupt non-ASCII JWT claims and can make
+ * `JSON.parse` throw. Today the caller only reads the numeric `exp`
+ * claim, so binary decoding worked by accident; routing through
+ * `TextDecoder` future-proofs the helper for any additional claim
+ * we might start inspecting on the server (and for operator log
+ * inspection of `auth:exp-parse-failure` error payloads).
  */
 function _base64UrlDecode(input: string): string {
   const padded = input + "=".repeat((4 - (input.length % 4)) % 4);
   const base64 = padded.replace(/-/g, "+").replace(/_/g, "/");
-  if (typeof atob === "function") return atob(base64);
+  if (typeof atob === "function") {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new TextDecoder("utf-8").decode(bytes);
+  }
   // Node ≤ 15 fallback (Node 16+ exposes a global `atob`).
-  return Buffer.from(base64, "base64").toString("binary");
+  return Buffer.from(base64, "base64").toString("utf-8");
 }
 
 const PROTOCOL_PREFIX = "hawc-auth0.bearer.";
