@@ -2,6 +2,7 @@ import { RemoteShellProxy, WebSocketServerTransport } from "@wc-bindable/remote"
 import type { ServerTransport } from "@wc-bindable/remote";
 import { verifyAuth0Token } from "./verifyAuth0Token.js";
 import { extractTokenFromProtocol } from "./extractTokenFromProtocol.js";
+import { PROTOCOL_PREFIX } from "../protocolPrefix.js";
 import type { AuthenticatedConnectionOptions, UserContext } from "../types.js";
 
 /**
@@ -181,7 +182,6 @@ export async function handleConnection(
 
   // Create a transport wrapper that intercepts auth:refresh
   const rawTransport: ServerTransport = new WebSocketServerTransport(socket as any);
-  let proxyMessageHandler: ((msg: any) => void) | null = null;
 
   // `rawTransport.send()` can throw synchronously once the peer has
   // already closed (e.g. `ws` throws on a CLOSING/CLOSED socket).
@@ -204,7 +204,6 @@ export async function handleConnection(
   const interceptingTransport: ServerTransport = {
     send: rawTransport.send.bind(rawTransport),
     onMessage(handler) {
-      proxyMessageHandler = handler;
       rawTransport.onMessage((msg: any) => {
         // Intercept auth:refresh before it reaches RemoteShellProxy
         if (msg.type === "cmd" && msg.name === "auth:refresh") {
@@ -408,8 +407,6 @@ function _base64UrlDecode(input: string): string {
   // Node ≤ 15 fallback (Node 16+ exposes a global `atob`).
   return Buffer.from(base64, "base64").toString("utf-8");
 }
-
-const PROTOCOL_PREFIX = "hawc-auth0.bearer.";
 
 /**
  * Convenience factory that creates a `ws.WebSocketServer` with built-in

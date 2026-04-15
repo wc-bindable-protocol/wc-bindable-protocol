@@ -3,8 +3,8 @@ import type { ClientTransport, ClientMessage, ServerMessage } from "@wc-bindable
 import { AuthCore } from "../core/AuthCore.js";
 import { raiseError } from "../raiseError.js";
 import { IWcBindable, AuthMode, AuthShellOptions } from "../types.js";
+import { PROTOCOL_PREFIX } from "../protocolPrefix.js";
 
-const PROTOCOL_PREFIX = "hawc-auth0.bearer.";
 let _nextRefreshId = 1;
 type RefreshResponseMessage = Extract<ServerMessage, { type: "return" | "throw" }>;
 

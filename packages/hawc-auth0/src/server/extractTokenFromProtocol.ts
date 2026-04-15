@@ -1,11 +1,11 @@
-const PROTOCOL_PREFIX = "hawc-auth0.bearer.";
+import { PROTOCOL_PREFIX } from "../protocolPrefix.js";
 
 /**
  * Extract a JWT from the `Sec-WebSocket-Protocol` header.
  *
  * The client sends the token as a subprotocol in the form
- * `hawc-auth0.bearer.{JWT}`. This function finds the matching
- * entry and returns the bare token string.
+ * `{PROTOCOL_PREFIX}{JWT}`. This function finds the matching entry
+ * and returns the bare token string.
  *
  * @throws If no matching protocol entry is found.
  */
@@ -31,5 +31,7 @@ export function extractTokenFromProtocol(
     }
   }
 
-  throw new Error("[@wc-bindable/hawc-auth0] No hawc-auth0.bearer.* entry in Sec-WebSocket-Protocol.");
+  throw new Error(
+    `[@wc-bindable/hawc-auth0] No ${PROTOCOL_PREFIX}* entry in Sec-WebSocket-Protocol.`,
+  );
 }

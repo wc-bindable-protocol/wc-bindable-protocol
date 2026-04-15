@@ -2,12 +2,12 @@ import { config } from "../config.js";
 import { Auth } from "./Auth.js";
 
 /**
- * <wcs-auth-logout> — declarative logout button.
- * Finds the parent or referenced <wcs-auth> element and calls logout().
+ * <hawc-auth0-logout> — declarative logout button.
+ * Finds the parent or referenced <hawc-auth0> element and calls logout().
  *
  * Usage:
- *   <wcs-auth-logout target="auth-id">ログアウト</wcs-auth-logout>
- *   <wcs-auth-logout return-to="/">ログアウト</wcs-auth-logout>
+ *   <hawc-auth0-logout target="auth-id">ログアウト</hawc-auth0-logout>
+ *   <hawc-auth0-logout return-to="/">ログアウト</hawc-auth0-logout>
  */
 export class AuthLogout extends HTMLElement {
   connectedCallback(): void {
@@ -59,13 +59,13 @@ export class AuthLogout extends HTMLElement {
       return null;
     }
 
-    // 最寄りの<wcs-auth>を探す
+    // 最寄りの<hawc-auth0>を探す
     const closest = this.closest(config.tagNames.auth);
     if (closest) {
       return closest as unknown as Auth;
     }
 
-    // ドキュメント内の最初の<wcs-auth>を探す
+    // ドキュメント内の最初の<hawc-auth0>を探す
     const first = document.querySelector(config.tagNames.auth);
     return first as unknown as Auth | null;
   }
