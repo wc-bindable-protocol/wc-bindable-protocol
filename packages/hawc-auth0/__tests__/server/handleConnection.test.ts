@@ -643,6 +643,55 @@ describe("handleConnection", () => {
     expect(events.find((e) => e.type === "auth:refresh-failure")).toBeDefined();
   });
 
+  it("wraps non-Error token refresh hook failures in auth:refresh-failure event", async () => {
+    jwtVerify.mockResolvedValueOnce({
+      payload: { sub: "auth0|123", permissions: [] },
+    });
+
+    const socket = createMockSocket();
+    const core = new EventTarget();
+    (core.constructor as any).wcBindable = {
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [],
+    };
+
+    const events: AuthEvent[] = [];
+
+    await handleConnection(
+      socket,
+      "hawc-auth0.bearer." + makeJwt({ sub: "auth0|123" }),
+      {
+        auth0Domain: "test.auth0.com",
+        auth0Audience: "https://api.example.com",
+        createCores: () => core,
+        onEvent: (e) => events.push(e),
+        onTokenRefresh: () => {
+          throw "hook string failure";
+        },
+      },
+    );
+
+    jwtVerify.mockResolvedValueOnce({
+      payload: { sub: "auth0|123", permissions: [], exp: Math.floor(Date.now() / 1000) + 300 },
+    });
+
+    const messageHandlers = socket._listeners["message"];
+    messageHandlers[0]({
+      data: JSON.stringify({
+        type: "cmd",
+        name: "auth:refresh",
+        id: "refresh-hook-string",
+        args: [makeJwt({ sub: "auth0|123" })],
+      }),
+    });
+
+    await new Promise((r) => setTimeout(r, 10));
+
+    const failure = events.find((e) => e.type === "auth:refresh-failure");
+    expect(failure?.error?.message).toBe("hook string failure");
+  });
+
   it("returns throw when auth:refresh token argument is missing", async () => {
     jwtVerify.mockResolvedValue({
       payload: { sub: "auth0|123", permissions: [] },

@@ -1,6 +1,6 @@
 import type { ClientTransport } from "@wc-bindable/remote";
 import { config } from "../config.js";
-import { IWcBindable } from "../types.js";
+import { IWcBindable, AuthMode } from "../types.js";
 import { AuthShell } from "../shell/AuthShell.js";
 import { registerAutoTrigger } from "../autoTrigger.js";
 
@@ -16,7 +16,7 @@ export class Auth extends HTMLElement {
   static get observedAttributes(): string[] {
     return [
       "domain", "client-id", "redirect-uri", "audience", "scope",
-      "remote-url",
+      "remote-url", "mode",
     ];
   }
 
@@ -109,6 +109,25 @@ export class Auth extends HTMLElement {
     this.setAttribute("remote-url", value);
   }
 
+  /**
+   * Deployment mode. Resolved from:
+   *
+   * 1. `mode` attribute, if set to `"local"` or `"remote"` (wins).
+   * 2. Otherwise, implicit: `"remote"` when `remote-url` is set, else `"local"`.
+   *
+   * In `"remote"` mode the access token is not reachable from JS —
+   * `.token` returns `null` and `getToken()` throws.
+   */
+  get mode(): AuthMode {
+    const attr = this.getAttribute("mode");
+    if (attr === "remote" || attr === "local") return attr;
+    return this.hasAttribute("remote-url") ? "remote" : "local";
+  }
+
+  set mode(value: AuthMode) {
+    this.setAttribute("mode", value);
+  }
+
   // --- Output state (delegated to shell) ---
 
   get authenticated(): boolean {
@@ -119,7 +138,18 @@ export class Auth extends HTMLElement {
     return this._shell.user;
   }
 
-  /** Access token. Available via JS but NOT exposed in wcBindable. */
+  /**
+   * Access token.
+   *
+   * Local mode: returns the current access token (or `null`) so application
+   * code can attach `Authorization: Bearer` headers to outbound requests.
+   *
+   * Remote mode: always returns `null`. The token stays inside AuthShell and
+   * is sent on the wire only at the WebSocket handshake and during in-band
+   * `auth:refresh`. See README-REMOTE for the rationale.
+   *
+   * Never part of the wcBindable surface (both modes).
+   */
   get token(): string | null {
     return this._shell.token;
   }
@@ -175,6 +205,7 @@ export class Auth extends HTMLElement {
       redirectUri: this.redirectUri || undefined,
       cacheLocation: this.cacheLocation,
       useRefreshTokens: this.useRefreshTokens,
+      mode: this.mode,
     };
   }
 

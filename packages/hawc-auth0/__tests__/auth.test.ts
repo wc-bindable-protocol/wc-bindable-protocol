@@ -118,7 +118,7 @@ describe("Auth (hawc-auth0)", () => {
 
   it("observedAttributesが正しい", () => {
     expect(Auth.observedAttributes).toEqual([
-      "domain", "client-id", "redirect-uri", "audience", "scope", "remote-url"
+      "domain", "client-id", "redirect-uri", "audience", "scope", "remote-url", "mode"
     ]);
   });
 
@@ -286,6 +286,21 @@ describe("Auth (hawc-auth0)", () => {
       await el.connectedCallbackPromise;
 
       expect(el.connected).toBe(false);
+    });
+
+    it("getTokenExpiry()がShellから委譲される", async () => {
+      const mockClient = createMockAuth0Client();
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const el = document.createElement("hawc-auth0") as Auth;
+      el.setAttribute("domain", "test.auth0.com");
+      el.setAttribute("client-id", "client-id");
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      const expirySpy = vi.spyOn((el as any)._shell, "getTokenExpiry").mockReturnValue(123456);
+      expect(el.getTokenExpiry()).toBe(123456);
+      expect(expirySpy).toHaveBeenCalled();
     });
   });
 
@@ -547,6 +562,80 @@ describe("Auth (hawc-auth0)", () => {
       await el.connectedCallbackPromise;
 
       expect(el.client).toBe(mockClient);
+    });
+  });
+
+  describe("mode", () => {
+    it("属性なし・remote-url なしなら local", () => {
+      const el = document.createElement("hawc-auth0") as Auth;
+      expect(el.mode).toBe("local");
+    });
+
+    it("remote-url が指定されると暗黙的に remote", () => {
+      const el = document.createElement("hawc-auth0") as Auth;
+      el.setAttribute("remote-url", "ws://example.com");
+      expect(el.mode).toBe("remote");
+    });
+
+    it("mode 属性が明示されればそれが優先", () => {
+      const el = document.createElement("hawc-auth0") as Auth;
+      el.setAttribute("remote-url", "ws://example.com");
+      el.setAttribute("mode", "local");
+      expect(el.mode).toBe("local");
+    });
+
+    it("mode プロパティ setter で属性を書き換えられる", () => {
+      const el = document.createElement("hawc-auth0") as Auth;
+      el.mode = "remote";
+      expect(el.getAttribute("mode")).toBe("remote");
+      expect(el.mode).toBe("remote");
+    });
+
+    it("local モードでは el.token が値を返し、el.getToken() も動く", async () => {
+      const mockClient = createMockAuth0Client({
+        isAuthenticated: vi.fn().mockResolvedValue(true),
+        getUser: vi.fn().mockResolvedValue({ sub: "u" }),
+        getTokenSilently: vi.fn().mockResolvedValue("local-token"),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const el = document.createElement("hawc-auth0") as Auth;
+      el.setAttribute("domain", "test.auth0.com");
+      el.setAttribute("client-id", "client-id");
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      expect(el.mode).toBe("local");
+      expect(el.token).toBe("local-token");
+      await expect(el.getToken()).resolves.toBe("local-token");
+    });
+
+    it("remote モードでは el.token が null、el.getToken() が throw する", async () => {
+      const mockClient = createMockAuth0Client({
+        isAuthenticated: vi.fn().mockResolvedValue(true),
+        getUser: vi.fn().mockResolvedValue({ sub: "u" }),
+        getTokenSilently: vi.fn().mockResolvedValue("secret-token"),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const el = document.createElement("hawc-auth0") as Auth;
+      el.setAttribute("domain", "test.auth0.com");
+      el.setAttribute("client-id", "client-id");
+      el.setAttribute("mode", "remote");
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      expect(el.mode).toBe("remote");
+      expect(el.token).toBeNull();
+      await expect(el.getToken()).rejects.toThrow(
+        "getToken() is disabled in remote mode",
+      );
+    });
+
+    it("attributeChangedCallback と disconnectedCallback は no-op で呼び出せる", () => {
+      const el = document.createElement("hawc-auth0") as Auth;
+      expect(() => el.attributeChangedCallback("mode", "local", "remote")).not.toThrow();
+      expect(() => el.disconnectedCallback()).not.toThrow();
     });
   });
 });

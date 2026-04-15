@@ -173,6 +173,67 @@ describe("AuthShell", () => {
     });
   });
 
+  describe("mode", () => {
+    it("defaults to local and exposes token via .token / getToken()", async () => {
+      const mockClient = createMockAuth0Client({
+        isAuthenticated: vi.fn().mockResolvedValue(true),
+        getUser: vi.fn().mockResolvedValue({ sub: "u" }),
+        getTokenSilently: vi.fn().mockResolvedValue("local-token"),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const shell = new AuthShell();
+      await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+
+      expect(shell.mode).toBe("local");
+      expect(shell.token).toBe("local-token");
+      await expect(shell.getToken()).resolves.toBe("local-token");
+    });
+
+    it("remote mode hides token and blocks getToken()", async () => {
+      const mockClient = createMockAuth0Client({
+        isAuthenticated: vi.fn().mockResolvedValue(true),
+        getUser: vi.fn().mockResolvedValue({ sub: "u" }),
+        getTokenSilently: vi.fn().mockResolvedValue("remote-token"),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const shell = new AuthShell();
+      await shell.initialize({
+        domain: "d", clientId: "c", audience: "a",
+        mode: "remote",
+      });
+
+      expect(shell.mode).toBe("remote");
+      // Token is held internally (connect() still works), but not readable.
+      expect(shell.token).toBeNull();
+      await expect(shell.getToken()).rejects.toThrow(
+        "getToken() is disabled in remote mode",
+      );
+    });
+
+    it("remote mode still allows connect() and refresh flow internally", async () => {
+      const mockClient = createMockAuth0Client({
+        isAuthenticated: vi.fn().mockResolvedValue(true),
+        getUser: vi.fn().mockResolvedValue({ sub: "u" }),
+        getTokenSilently: vi.fn().mockResolvedValue("handshake-token"),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const shell = new AuthShell();
+      await shell.initialize({
+        domain: "d", clientId: "c", audience: "a",
+        mode: "remote",
+      });
+
+      const transport = await shell.connect("ws://localhost:3000");
+      expect(transport).toBeDefined();
+      expect(shell.connected).toBe(true);
+      // Even after connect, application code must not read the token.
+      expect(shell.token).toBeNull();
+    });
+  });
+
   describe("login / logout", () => {
     it("delegates login to AuthCore", async () => {
       const mockClient = createMockAuth0Client();
@@ -239,6 +300,18 @@ describe("AuthShell", () => {
       const shell = new AuthShell();
       await expect(shell.connect("ws://localhost:3000")).rejects.toThrow(
         "[@wc-bindable/hawc-auth0] Auth0 client is not initialized",
+      );
+    });
+
+    it("throws a friendly error when called with an empty URL", async () => {
+      const mockClient = createMockAuth0Client();
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const shell = new AuthShell();
+      await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+
+      await expect(shell.connect("")).rejects.toThrow(
+        /WebSocket URL is required.*remote-url/,
       );
     });
 
@@ -781,6 +854,43 @@ describe("AuthShell", () => {
       await expect(shell.refreshToken()).rejects.toThrow("Token refresh failed");
     });
 
+    it("falls back to a generic message when server throw payload has no message", async () => {
+      const mockClient = createMockAuth0Client({
+        isAuthenticated: vi.fn().mockResolvedValue(true),
+        getUser: vi.fn().mockResolvedValue({ sub: "u" }),
+        getTokenSilently: vi.fn().mockResolvedValue("token"),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      let capturedWs: MockWebSocket;
+      const originalWS = globalThis.WebSocket;
+      (globalThis as any).WebSocket = class extends MockWebSocket {
+        constructor(url: string, protocols?: string | string[]) {
+          super(url, protocols);
+          capturedWs = this;
+        }
+      };
+
+      try {
+        const shell = new AuthShell();
+        await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+        await shell.connect("ws://localhost:3000");
+
+        capturedWs!.onSend = (data: string) => {
+          const msg = JSON.parse(data);
+          if (msg.name === "auth:refresh") {
+            queueMicrotask(() => {
+              capturedWs!._receiveMessage({ type: "throw", id: msg.id, error: "opaque" });
+            });
+          }
+        };
+
+        await expect(shell.refreshToken()).rejects.toThrow("Token refresh failed");
+      } finally {
+        (globalThis as any).WebSocket = originalWS;
+      }
+    });
+
     it("uses default message when throw payload has no error.message", async () => {
       const mockClient = createMockAuth0Client({
         isAuthenticated: vi.fn().mockResolvedValue(true),
@@ -824,6 +934,23 @@ describe("AuthShell", () => {
 
       await expect(shell.refreshToken()).rejects.toThrow(
         "[@wc-bindable/hawc-auth0] No active connection",
+      );
+    });
+
+    it("throws if the socket is open but no transport is registered", async () => {
+      const mockClient = createMockAuth0Client({
+        getTokenSilently: vi.fn().mockResolvedValue("token"),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const shell = new AuthShell();
+      await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+      await shell.connect("ws://localhost:3000");
+
+      (shell as any)._transport = null;
+
+      await expect(shell.refreshToken()).rejects.toThrow(
+        "[@wc-bindable/hawc-auth0] No active connection. Call connect() first.",
       );
     });
 
@@ -956,6 +1083,45 @@ describe("AuthShell", () => {
       }
     });
 
+    it("cleans up safely when close fires before send throws synchronously", async () => {
+      const mockClient = createMockAuth0Client({
+        getTokenSilently: vi.fn().mockResolvedValue("token"),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      let capturedWs: MockWebSocket;
+      const originalWS = globalThis.WebSocket;
+      (globalThis as any).WebSocket = class extends MockWebSocket {
+        constructor(url: string, protocols?: string | string[]) {
+          super(url, protocols);
+          capturedWs = this;
+        }
+
+        override send(data: string): void {
+          const msg = JSON.parse(data);
+          if (msg.name === "auth:refresh") {
+            this._emit("close");
+            throw new Error("send failed after close");
+          }
+          super.send(data);
+        }
+      };
+
+      try {
+        const shell = new AuthShell();
+        await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+        await shell.connect("ws://localhost:3000");
+
+        await expect(shell.refreshToken()).rejects.toThrow(
+          "WebSocket closed before token refresh completed",
+        );
+
+        expect(capturedWs!.readyState).toBe(MockWebSocket.OPEN);
+      } finally {
+        (globalThis as any).WebSocket = originalWS;
+      }
+    });
+
     it("rejects when refresh response times out", async () => {
       const mockClient = createMockAuth0Client({
         getTokenSilently: vi.fn().mockResolvedValue("token"),
@@ -1058,6 +1224,38 @@ describe("AuthShell", () => {
 
         setTimeoutSpy.mockRestore();
         clearTimeoutSpy.mockRestore();
+      } finally {
+        (globalThis as any).WebSocket = originalWS;
+      }
+    });
+
+    it("wraps non-Error ws.send failures", async () => {
+      const mockClient = createMockAuth0Client({
+        isAuthenticated: vi.fn().mockResolvedValue(true),
+        getUser: vi.fn().mockResolvedValue({ sub: "u" }),
+        getTokenSilently: vi.fn().mockResolvedValue("token"),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const originalWS = globalThis.WebSocket;
+      let capturedWs: MockWebSocket | null = null;
+      (globalThis as any).WebSocket = class extends MockWebSocket {
+        constructor(url: string, protocols?: string | string[]) {
+          super(url, protocols);
+          capturedWs = this;
+        }
+      };
+
+      try {
+        const shell = new AuthShell();
+        await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+        await shell.connect("ws://localhost:3000");
+
+        capturedWs!.onSend = () => {
+          throw "string failure";
+        };
+
+        await expect(shell.refreshToken()).rejects.toThrow("string failure");
       } finally {
         (globalThis as any).WebSocket = originalWS;
       }
@@ -1342,6 +1540,51 @@ describe("AuthShell", () => {
 
       expect(events).toContain(true);
       expect(shell.authenticated).toBe(true);
+    });
+  });
+
+  describe("transport passthrough helpers", () => {
+    it("forwards onClose to the underlying transport", async () => {
+      const mockClient = createMockAuth0Client({
+        getTokenSilently: vi.fn().mockResolvedValue("token"),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      let capturedWs: MockWebSocket;
+      const originalWS = globalThis.WebSocket;
+      (globalThis as any).WebSocket = class extends MockWebSocket {
+        constructor(url: string, protocols?: string | string[]) {
+          super(url, protocols);
+          capturedWs = this;
+        }
+      };
+
+      try {
+        const shell = new AuthShell();
+        await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+        const transport = await shell.connect("ws://localhost:3000");
+        const onClose = vi.fn();
+
+        transport.onClose?.(onClose);
+        capturedWs!._emit("close");
+
+        expect(onClose).toHaveBeenCalled();
+      } finally {
+        (globalThis as any).WebSocket = originalWS;
+      }
+    });
+
+    it("dispose() can be called on the returned transport", async () => {
+      const mockClient = createMockAuth0Client({
+        getTokenSilently: vi.fn().mockResolvedValue("token"),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const shell = new AuthShell();
+      await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+      const transport = await shell.connect("ws://localhost:3000");
+
+      expect(() => transport.dispose?.()).not.toThrow();
     });
   });
 });

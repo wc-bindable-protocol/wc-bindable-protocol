@@ -574,5 +574,77 @@ describe("AuthCore", () => {
       (core as any)._token = "not.a.valid.jwt.at.all";
       expect(core.getTokenExpiry()).toBeNull();
     });
+
+    it("uses Buffer fallback when atob is unavailable", () => {
+      const expSeconds = Math.floor(Date.now() / 1000) + 60;
+      const core = new AuthCore();
+      const savedAtob = globalThis.atob;
+      try {
+        vi.stubGlobal("atob", undefined);
+        (core as any)._token = makeJwt({ sub: "auth0|1", exp: expSeconds });
+        expect(core.getTokenExpiry()).toBe(expSeconds * 1000);
+      } finally {
+        vi.stubGlobal("atob", savedAtob);
+      }
+    });
+  });
+
+  describe("fetchToken / fetchFreshToken / commitToken", () => {
+    it("fetchToken throws when called before initialize", async () => {
+      const core = new AuthCore();
+      await expect(core.fetchToken()).rejects.toThrow(
+        "[@wc-bindable/hawc-auth0] Auth0 client is not initialized.",
+      );
+    });
+
+    it("fetchToken returns null and stores the error when the SDK rejects", async () => {
+      const sdkError = new Error("fetch failed");
+      const mockClient = createMockAuth0Client({
+        getTokenSilently: vi.fn().mockRejectedValue(sdkError),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const core = new AuthCore();
+      await core.initialize({ domain: "d", clientId: "c" });
+
+      await expect(core.fetchToken()).resolves.toBeNull();
+      expect(core.error).toBe(sdkError);
+    });
+
+    it("fetchFreshToken forces cacheMode off", async () => {
+      const mockClient = createMockAuth0Client({
+        getTokenSilently: vi.fn().mockResolvedValue("fresh-token"),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const core = new AuthCore();
+      await core.initialize({ domain: "d", clientId: "c" });
+
+      await expect(core.fetchFreshToken()).resolves.toBe("fresh-token");
+      expect(mockClient.getTokenSilently).toHaveBeenLastCalledWith({ cacheMode: "off" });
+    });
+
+    it("commitToken updates token and dispatches token-changed", () => {
+      const core = new AuthCore();
+      const events: Array<string | null> = [];
+      core.addEventListener("hawc-auth0:token-changed", (e: Event) => {
+        events.push((e as CustomEvent).detail);
+      });
+
+      core.commitToken("committed-token");
+
+      expect(core.token).toBe("committed-token");
+      expect(events).toEqual(["committed-token"]);
+    });
+  });
+
+  describe("getTokenExpiry", () => {
+    it("returns null for malformed tokens without a payload segment", () => {
+      const core = new AuthCore();
+
+      core.commitToken("not-a-jwt");
+
+      expect(core.getTokenExpiry()).toBeNull();
+    });
   });
 });

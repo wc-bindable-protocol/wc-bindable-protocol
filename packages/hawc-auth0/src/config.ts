@@ -6,6 +6,7 @@ interface IInternalConfig extends IConfig {
   tagNames: {
     auth: string;
     authLogout: string;
+    authSession: string;
   };
 }
 
@@ -15,6 +16,7 @@ const _config: IInternalConfig = {
   tagNames: {
     auth: "hawc-auth0",
     authLogout: "hawc-auth0-logout",
+    authSession: "hawc-auth0-session",
   },
 };
 

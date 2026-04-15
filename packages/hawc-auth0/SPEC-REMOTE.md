@@ -137,7 +137,7 @@ export class AuthShell extends EventTarget {
 | `error`        | `AuthError \| null`     | Most recent error                              |
 | `connected`    | `boolean`               | WebSocket connection is open (transport layer ready) |
 
-> **Note**: The `token` property present in the local version is **intentionally not exposed** externally. The token is held only within the browser and is sent on the wire only at the WebSocket handshake and during in-band `auth:refresh` (§3.4.1) — application-level frames never carry it. This minimizes the risk of token leakage via XSS.
+> **Note**: In remote mode the element's `token` property (JS getter) returns `null` and `getToken()` throws. The token is held only within the browser and is sent on the wire only at the WebSocket handshake and during in-band `auth:refresh` (§3.4.1) — application-level frames never carry it, and application JS cannot read it through the element. This minimizes the risk of token leakage via framework state or XSS-readable properties. (In local mode `token` / `getToken()` remain reachable so applications can attach `Authorization: Bearer` headers; see `README-LOCAL.md`.)
 
 #### Semantics of `connected`
 
@@ -166,7 +166,7 @@ bind(proxy, (name, value) => {
 });
 ```
 
-If `<hawc-auth0 remote-url="...">` auto-connects, the element emits `connected=true` after the WebSocket opens. The application must still create the proxy and wait for sync before rendering Core-dependent UI.
+`<hawc-auth0>` itself does **not** auto-connect — `connect()` must be invoked by someone. The two supported ways are described in §3.7 "Connection Ownership"; in either case `connected=true` emits after the WebSocket opens, and the application must still wait for the proxy sync to complete before rendering Core-dependent UI.
 
 #### Commands
 
@@ -208,11 +208,20 @@ interface AuthShellOptions {
 
 ```typescript
 async connect(url: string): Promise<ClientTransport> {
-  // 1. Obtain access token from Auth0 SPA SDK
-  const token = await this._client.getTokenSilently();
+  // 1. Obtain access token from Auth0 SPA SDK (fetch-then-commit: the
+  //    token is published to AuthCore only after the server accepts it
+  //    via the WebSocket handshake — see §3.4 for the invariant).
+  const token = await this._core.fetchToken();
+  if (!token) raiseError("Failed to obtain access token.");
 
-  // 2. Open WebSocket with token in Sec-WebSocket-Protocol
+  this._closeWebSocket();
+
+  // 2. Open WebSocket with token in Sec-WebSocket-Protocol.
+  //    Store `_ws` and `_url` — refreshToken() (§3.4.1) and reconnect()
+  //    (§3.4.2) both depend on these being set.
+  this._url = url;
   const ws = new WebSocket(url, [`hawc-auth0.bearer.${token}`]);
+  this._ws = ws;
 
   // 3. Track close events up front (covers failure paths too)
   ws.addEventListener("close", () => {
@@ -223,16 +232,25 @@ async connect(url: string): Promise<ClientTransport> {
   //    `connected` reflects the WebSocket `open` event (§3.1) — it must
   //    NOT be set true on construction, otherwise subscribers observe
   //    a window in which `connected === true` while no bytes can flow.
-  await new Promise<void>((resolve, reject) => {
-    ws.addEventListener("open", () => resolve(), { once: true });
-    ws.addEventListener("error", () => {
-      reject(new Error(`[@wc-bindable/hawc-auth0] WebSocket connection failed: ${url}`));
-    }, { once: true });
-  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      ws.addEventListener("open", () => resolve(), { once: true });
+      ws.addEventListener("error", () => {
+        reject(new Error(`[@wc-bindable/hawc-auth0] WebSocket connection failed: ${url}`));
+      }, { once: true });
+    });
+  } catch (err) {
+    this._setConnected(false);
+    throw err;
+  }
 
-  // 5. open confirmed → publish connected=true and hand back the transport
+  // 5. Server accepted the token at handshake — safe to commit and
+  //    publish connected=true. Wrap the raw WebSocket in an
+  //    InterceptingClientTransport (§3.3.1) so refreshToken() can hook
+  //    id-keyed response interception on the same transport.
+  this._core.commitToken(token);
   this._setConnected(true);
-  return new WebSocketClientTransport(ws);
+  return this._createTransport(ws);
 }
 ```
 
@@ -245,6 +263,37 @@ async connect(url: string): Promise<ClientTransport> {
 **Alternative methods (not recommended)**:
 - Query parameter `?token=...` — risk of URL being logged
 - First message after connection — socket is open before verification
+
+#### 3.3.1 The returned `ClientTransport` is `InterceptingClientTransport`
+
+`connect()` and `reconnect()` MUST NOT return a bare `WebSocketClientTransport`. They wrap the WebSocket in an `InterceptingClientTransport` — the `ClientTransport` the application receives is the same object `AuthShell` holds as `this._transport`, which is a load-bearing prerequisite for `refreshToken()` (§3.4.1).
+
+`InterceptingClientTransport` behaves identically to `WebSocketClientTransport` for the application (`send`, `onMessage`, `onClose`, `dispose`) but additionally exposes `interceptResponse(id, handler)`: an id-keyed, one-shot response interceptor. When a `return` / `throw` frame with the registered id arrives, the interceptor consumes it and the application-level `onMessage` handler is NOT invoked for that frame. `AuthShell` uses this to consume its own `auth:refresh` reply without leaking it to the `RemoteCoreProxy`.
+
+```typescript
+// AuthShell-internal helper — single point where the transport is created
+// and saved. Both connect() and reconnect() funnel through this.
+private _createTransport(ws: WebSocket): InterceptingClientTransport {
+  const transport = new InterceptingClientTransport(ws);
+  this._transport = transport;
+  return transport;
+}
+
+// The interceptor API added on top of WebSocketClientTransport.
+class InterceptingClientTransport implements ClientTransport {
+  // ... send / onMessage / onClose / dispose delegate to WebSocketClientTransport
+
+  interceptResponse(
+    id: string,
+    handler: (message: { type: "return" | "throw"; id: string; /* ... */ }) => void,
+  ): () => void {
+    // Register id-keyed one-shot interceptor. Returns a release function
+    // that unregisters it (used by refreshToken's cleanup path).
+  }
+}
+```
+
+Implementations MAY expose `InterceptingClientTransport` publicly or keep it internal — only the invariant "the transport returned by `connect()` / `reconnect()` is the same object stored in `this._transport`, and it supports `interceptResponse()`" is required. The reference implementation keeps it internal.
 
 ### 3.4 Token Refresh Strategies
 
@@ -261,7 +310,7 @@ The WebSocket connection stays open. The client periodically obtains a fresh tok
 
 **Shell side:**
 
-`AuthShell` is a gatekeeper and does **not** own a `RemoteCoreProxy` (§3.1). It therefore cannot and must not go through `proxy.invoke(...)`. Instead, the transport `AuthShell` returns from `connect()` is an `InterceptingClientTransport` that wraps the WebSocket: the proxy uses it as its normal `ClientTransport`, and `AuthShell` additionally registers a one-shot, id-keyed **response interceptor** for `auth:refresh`. When the matching `return` / `throw` frame arrives, the interceptor consumes it and the proxy's `onMessage` handler is **never called for that frame**, so the proxy's unknown-id warning is not triggered.
+`AuthShell` is a gatekeeper and does **not** own a `RemoteCoreProxy` (§3.1). It therefore cannot and must not go through `proxy.invoke(...)`. Instead, the transport `AuthShell` returns from `connect()` / `reconnect()` is an `InterceptingClientTransport` (§3.3.1), which wraps the WebSocket: the proxy uses it as its normal `ClientTransport`, and `AuthShell` additionally registers a one-shot, id-keyed **response interceptor** for `auth:refresh` via the same object it retained as `this._transport`. When the matching `return` / `throw` frame arrives, the interceptor consumes it and the proxy's `onMessage` handler is **never called for that frame**, so the proxy's unknown-id warning is not triggered.
 
 Two invariants of this code are load-bearing — copy them as-is:
 
@@ -275,7 +324,7 @@ async refreshToken(): Promise<void> {
 
   const id = `auth-refresh-${nextId++}`;
   const ws = this._ws;
-  const transport = this._transport; // the InterceptingClientTransport from connect()
+  const transport = this._transport; // InterceptingClientTransport retained by connect()/reconnect(), see §3.3.1
 
   await new Promise<void>((resolve, reject) => {
     let releaseIntercept = () => {};
@@ -381,11 +430,40 @@ Do NOT use a fixed `setInterval`. The access token's `exp` claim is the authorit
 /**
  * Schedule token refresh based on the access token's `exp` claim.
  * Refreshes `marginMs` before expiry (default 30s).
+ *
+ * Failure handling follows the escalation ladder below rather than
+ * dropping straight to logout on any error:
+ *   1. `refreshToken()` fails → attempt `reconnect()` with exponential
+ *      backoff (Strategy B, §3.4.2). Transient network issues, a
+ *      restarted server, or a sleeping tab waking up mid-refresh are
+ *      all covered here.
+ *   2. Reconnect attempts exhaust → `logout()`. At that point the
+ *      session cannot be rescued — either the refresh token itself was
+ *      revoked, the network is durably down, or the server is refusing
+ *      connections; forcing the user back through the login flow is
+ *      the only correct recovery.
+ *
+ * An auth error on refresh (`4401`-class server reject, refresh token
+ * revoked) does NOT retry — reconnect would fail the same way. Treat
+ * it as a terminal signal and go straight to logout.
  */
 function scheduleTokenRefresh(
   authShell: AuthShell,
-  marginMs: number = 30_000,
+  proxy: RemoteCoreProxy,
+  options: {
+    marginMs?: number;
+    maxReconnectAttempts?: number;
+    initialBackoffMs?: number;
+    maxBackoffMs?: number;
+    isAuthError?: (err: unknown) => boolean;
+  } = {},
 ): () => void {
+  const marginMs             = options.marginMs ?? 30_000;
+  const maxReconnectAttempts = options.maxReconnectAttempts ?? 5;
+  const initialBackoffMs     = options.initialBackoffMs ?? 1_000;
+  const maxBackoffMs         = options.maxBackoffMs ?? 30_000;
+  const isAuthError          = options.isAuthError ?? _defaultIsAuthError;
+
   let timerId: ReturnType<typeof setTimeout> | null = null;
   let disposed = false;
 
@@ -393,11 +471,42 @@ function scheduleTokenRefresh(
     if (disposed) return;
     try {
       await authShell.refreshToken();
-      // After refresh, schedule the next one based on the new token's exp
       scheduleNext();
-    } catch {
-      await authShell.logout();
+    } catch (err) {
+      if (isAuthError(err)) {
+        // Revoked refresh token, server 4401 on the new token, etc. —
+        // the session is done. No amount of reconnecting will fix it.
+        await authShell.logout();
+        return;
+      }
+      await recoverByReconnect();
     }
+  }
+
+  async function recoverByReconnect() {
+    for (let attempt = 0; attempt < maxReconnectAttempts; attempt++) {
+      if (disposed) return;
+      const backoff = Math.min(initialBackoffMs * 2 ** attempt, maxBackoffMs);
+      await _sleep(backoff);
+      if (disposed) return;
+      try {
+        const transport = await authShell.reconnect();
+        proxy.reconnect(transport);
+        // reconnect() fetched a fresh token and server-side Core state
+        // was rebuilt from scratch (§3.4.2). Resume the exp-based
+        // schedule against the new token.
+        scheduleNext();
+        return;
+      } catch (err) {
+        if (isAuthError(err)) {
+          await authShell.logout();
+          return;
+        }
+        // Transient failure — continue backoff loop.
+      }
+    }
+    // All reconnect attempts exhausted — surrender.
+    await authShell.logout();
   }
 
   function scheduleNext() {
@@ -420,7 +529,31 @@ function scheduleTokenRefresh(
     if (timerId !== null) clearTimeout(timerId);
   };
 }
+
+function _sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Default classifier: treat Auth0 SDK `login_required` / `consent_required`
+ * errors, server reject messages mentioning "invalid_token" / "revoked",
+ * and explicit 4401/4403 close codes as terminal auth failures.
+ *
+ * Applications with custom error shapes should pass their own
+ * `isAuthError`. Anything not matched is treated as transient and
+ * retried.
+ */
+function _defaultIsAuthError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const e = err as { error?: string; code?: number; message?: string };
+  if (e.error === "login_required" || e.error === "consent_required") return true;
+  if (e.code === 4401 || e.code === 4403) return true;
+  const msg = typeof e.message === "string" ? e.message.toLowerCase() : "";
+  return msg.includes("invalid_token") || msg.includes("revoked");
+}
 ```
+
+The `proxy` argument is required because Strategy B needs `proxy.reconnect(newTransport)` to swap the proxy onto the rebuilt connection (§3.4.2). Callers using `<hawc-auth0-session>` can pass `session.proxy` once `session.ready` is true.
 
 #### 3.4.2 Strategy B: WebSocket Reconnection (Fallback)
 
@@ -439,7 +572,10 @@ This makes Strategy B unsuitable during active operations. It is appropriate for
 
 ```typescript
 async reconnect(): Promise<ClientTransport> {
-  const token = await this._core.client.getTokenSilently({ cacheMode: "off" });
+  // Same fetch-then-commit invariant as connect() / refreshToken():
+  // the new token is published to AuthCore only after the server
+  // accepts it at the handshake.
+  const token = await this._core.fetchFreshToken();
   if (!token) raiseError("Failed to refresh access token.");
 
   this._closeWebSocket();
@@ -450,15 +586,25 @@ async reconnect(): Promise<ClientTransport> {
     if (this._ws === ws) this._setConnected(false);
   });
 
-  await new Promise<void>((resolve, reject) => {
-    ws.addEventListener("open", () => resolve(), { once: true });
-    ws.addEventListener("error", () => reject(
-      new Error(`[@wc-bindable/hawc-auth0] WebSocket reconnection failed: ${this._url}`)
-    ), { once: true });
-  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      ws.addEventListener("open", () => resolve(), { once: true });
+      ws.addEventListener("error", () => reject(
+        new Error(`[@wc-bindable/hawc-auth0] WebSocket reconnection failed: ${this._url}`)
+      ), { once: true });
+    });
+  } catch (err) {
+    this._setConnected(false);
+    throw err;
+  }
 
+  // Server accepted at handshake → commit, publish connected=true, and
+  // return an InterceptingClientTransport (§3.3.1). The same object is
+  // stored as `this._transport` so a subsequent refreshToken() can
+  // register its id-keyed interceptor on it.
+  this._core.commitToken(token);
   this._setConnected(true);
-  return new WebSocketClientTransport(ws);
+  return this._createTransport(ws);
 }
 ```
 
@@ -502,9 +648,35 @@ export class Auth extends HTMLElement {
 
 | Attribute     | Description                            | Example                        |
 |---------------|----------------------------------------|--------------------------------|
-| `remote-url`  | WebSocket URL of the Core server       | `wss://api.example.com/hawc`   |
+| `remote-url`  | WebSocket URL of the Core server. **Setting this does NOT make `<hawc-auth0>` auto-connect** — it only provides the default URL used by `connect()` / `<hawc-auth0-session>`. See §3.7. | `wss://api.example.com/hawc` |
 
-When `remote-url` is set, `connect()` is automatically called after successful authentication.
+### 3.7 Connection Ownership (mutual exclusion)
+
+`<hawc-auth0>` does not open a WebSocket on its own. A connection is only created when something calls `authShell.connect(url)` (or `authEl.connect(url)`). There are exactly **two supported patterns**, and they MUST NOT be combined on the same `<hawc-auth0>` instance:
+
+**Pattern A — declarative session element (recommended):**
+
+```html
+<hawc-auth0 id="auth" remote-url="wss://..."></hawc-auth0>
+<hawc-auth0-session target="auth" core="app-core"></hawc-auth0-session>
+```
+
+`<hawc-auth0-session>` observes `hawc-auth0:authenticated-changed`, calls `authEl.connect()` when the target becomes authenticated, wraps the transport with `createRemoteCoreProxy`, and owns the proxy lifecycle. This is the path whose `ready` signal is correct for gating UI (§3.1, §11).
+
+**Pattern B — fully imperative:**
+
+```ts
+const auth = document.querySelector("hawc-auth0");
+await auth.login();
+const transport = await auth.connect();
+const proxy = createRemoteCoreProxy(AppCore.wcBindable, transport);
+```
+
+The application owns the transport and the proxy. No session element is mounted.
+
+**Why they must not be combined.** `AuthShell.connect()` unconditionally calls `_closeWebSocket()` at its start (so a failed handshake cannot leak a previous socket). This means a second `connect()` call from the application closes the WebSocket that `<hawc-auth0-session>` just opened, leaving the session's `RemoteCoreProxy` bound to a transport that will never deliver another frame. The session keeps `ready=true` but property updates silently stop. There is no way for the session element to "take over" a transport it did not create. **Pick one pattern per `<hawc-auth0>` instance.**
+
+**Enforcement.** `<hawc-auth0-session>` fails fast: if `authEl.connected === true` at the point where the session would have called `connect()` itself, the session sets `error` to a message describing the conflict and does not build a proxy. This surfaces the mistake immediately instead of producing a silently-dead session.
 
 ---
 
@@ -696,6 +868,50 @@ export class UserCore extends EventTarget {
   get roles(): string[] {
     return [...this._user.roles];
   }
+
+  /**
+   * Apply a refreshed `UserContext` after a successful in-band
+   * `auth:refresh` (§3.4.1). Dispatches only the `*-changed` events
+   * whose value actually differs from the previous token — so clients
+   * observe exactly the deltas the new token implies and nothing more.
+   *
+   * Wire this as `onTokenRefresh: (core, user) => core.updateUser(user)`
+   * in `createAuthenticatedWSS` options (§4.1).
+   */
+  updateUser(user: UserContext): void {
+    const prev = this._user;
+    this._user = user;
+
+    const identityChanged =
+      prev.sub   !== user.sub ||
+      prev.email !== user.email ||
+      prev.name  !== user.name;
+    if (identityChanged) {
+      this.dispatchEvent(new CustomEvent("hawc-auth0:user-changed", {
+        detail: this.currentUser,
+      }));
+    }
+
+    if (!_sameStringSet(prev.permissions, user.permissions)) {
+      this.dispatchEvent(new CustomEvent("hawc-auth0:permissions-changed", {
+        detail: this.permissions,
+      }));
+    }
+
+    if (!_sameStringSet(prev.roles, user.roles)) {
+      this.dispatchEvent(new CustomEvent("hawc-auth0:roles-changed", {
+        detail: this.roles,
+      }));
+    }
+  }
+}
+
+/** Order-insensitive set equality on string arrays. */
+function _sameStringSet(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  const seen = new Set(a);
+  for (const v of b) if (!seen.has(v)) return false;
+  return true;
 }
 ```
 
@@ -865,7 +1081,7 @@ The declarative layer handles the common case (80%+). The imperative layer handl
       └─ Emit authenticated=true
 
 4. Establish WebSocket connection
-   └─ Call AuthShell.connect(url) (or auto-connect via remote-url attribute)
+   └─ Call AuthShell.connect(url) — either directly or via <hawc-auth0-session> (§3.7)
       └─ getTokenSilently() to obtain access token
       └─ WebSocket(url, ["hawc-auth0.bearer.{token}"])
       └─ WebSocket open event fires

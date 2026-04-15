@@ -131,5 +131,41 @@ describe("UserCore", () => {
       expect(detail).toEqual(["x", "y"]);
       expect(detail).not.toBe(core.permissions);
     });
+
+    it("does not emit array-change events when the same array references are reused", () => {
+      const permissions = ["storage:upload"];
+      const roles = ["admin"];
+      const core = new UserCore({
+        ...mockUser,
+        permissions,
+        roles,
+      });
+      const events: string[] = [];
+      core.addEventListener("hawc-auth0:permissions-changed", () => events.push("perm"));
+      core.addEventListener("hawc-auth0:roles-changed", () => events.push("role"));
+
+      core.updateUser({
+        ...mockUser,
+        permissions,
+        roles,
+      });
+
+      expect(events).toEqual([]);
+    });
+
+    it("does not emit array-change events when arrays have identical contents", () => {
+      const core = new UserCore(mockUser);
+      const events: string[] = [];
+      core.addEventListener("hawc-auth0:permissions-changed", () => events.push("perm"));
+      core.addEventListener("hawc-auth0:roles-changed", () => events.push("role"));
+
+      core.updateUser({
+        ...mockUser,
+        permissions: [...mockUser.permissions],
+        roles: [...mockUser.roles],
+      });
+
+      expect(events).toEqual([]);
+    });
   });
 });

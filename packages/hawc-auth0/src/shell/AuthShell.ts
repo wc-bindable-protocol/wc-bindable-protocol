@@ -2,7 +2,7 @@ import { WebSocketClientTransport } from "@wc-bindable/remote";
 import type { ClientTransport, ClientMessage, ServerMessage } from "@wc-bindable/remote";
 import { AuthCore } from "../core/AuthCore.js";
 import { raiseError } from "../raiseError.js";
-import { IWcBindable, AuthShellOptions } from "../types.js";
+import { IWcBindable, AuthMode, AuthShellOptions } from "../types.js";
 
 const PROTOCOL_PREFIX = "hawc-auth0.bearer.";
 let _nextRefreshId = 1;
@@ -36,6 +36,7 @@ export class AuthShell extends EventTarget {
   private _ws: WebSocket | null = null;
   private _transport: InterceptingClientTransport | null = null;
   private _url: string = "";
+  private _mode: AuthMode = "local";
 
   constructor(target?: EventTarget) {
     super();
@@ -71,8 +72,26 @@ export class AuthShell extends EventTarget {
     return this._core.client;
   }
 
-  /** Access token — available via JS but NOT in wcBindable (by design). */
+  /** Deployment mode. See {@link AuthMode}. */
+  get mode(): AuthMode {
+    return this._mode;
+  }
+
+  /**
+   * Access token.
+   *
+   * In `"local"` mode: returns the current access token (or `null`) so
+   * application code can attach `Authorization: Bearer` headers.
+   *
+   * In `"remote"` mode: always returns `null`. The token is held inside
+   * AuthShell and sent on the wire only at the WebSocket handshake and
+   * during in-band `auth:refresh`; application code must not read or
+   * forward it.
+   *
+   * Never part of the wcBindable surface (by design).
+   */
   get token(): string | null {
+    if (this._mode === "remote") return null;
     return this._core.token;
   }
 
@@ -97,6 +116,8 @@ export class AuthShell extends EventTarget {
    * Auth0ClientOptions that AuthCore expects.
    */
   initialize(options: AuthShellOptions): Promise<void> {
+    this._mode = options.mode ?? "local";
+
     const authorizationParams: Record<string, any> = {
       scope: options.scope ?? "openid profile email",
     };
@@ -131,6 +152,11 @@ export class AuthShell extends EventTarget {
   }
 
   async getToken(options?: Record<string, any>): Promise<string | null> {
+    if (this._mode === "remote") {
+      raiseError(
+        "getToken() is disabled in remote mode. The access token stays inside AuthShell; use the WebSocket transport for authenticated calls and getTokenExpiry() for refresh scheduling.",
+      );
+    }
     return this._core.getToken(options);
   }
 
@@ -146,6 +172,11 @@ export class AuthShell extends EventTarget {
   async connect(url: string): Promise<ClientTransport> {
     if (!this._core.client) {
       raiseError("Auth0 client is not initialized. Call initialize() first.");
+    }
+    if (!url) {
+      raiseError(
+        "connect(): WebSocket URL is required. Pass it as the argument or set the `remote-url` attribute on <hawc-auth0>.",
+      );
     }
 
     // Fetch-then-commit: same invariant as refreshToken / reconnect.
@@ -236,12 +267,12 @@ export class AuthShell extends EventTarget {
 
     await new Promise<void>((resolve, reject) => {
       let settled = false;
-      let releaseIntercept = () => {};
+      let releaseIntercept: (() => void) | undefined;
       const cleanup = () => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        releaseIntercept();
+        releaseIntercept?.();
         ws.removeEventListener("close", onClose);
         ws.removeEventListener("error", onError);
       };

@@ -1,11 +1,13 @@
 export interface ITagNames {
   readonly auth: string;
   readonly authLogout: string;
+  readonly authSession: string;
 }
 
 export interface IWritableTagNames {
   auth?: string;
   authLogout?: string;
+  authSession?: string;
 }
 
 export interface IConfig {
@@ -128,6 +130,20 @@ export interface AuthShellValues {
 }
 
 /**
+ * Deployment mode for AuthShell / `<hawc-auth0>`.
+ *
+ * - `"local"`: Auth0-only. `.token` / `getToken()` are JS-reachable so the
+ *   application can attach `Authorization: Bearer` headers to outbound
+ *   fetches.
+ * - `"remote"`: the access token is held inside AuthShell and sent on the
+ *   wire only at the WebSocket handshake and during in-band `auth:refresh`.
+ *   `.token` returns `null` and `getToken()` throws — applications rely on
+ *   the remote transport for auth and use `getTokenExpiry()` for refresh
+ *   scheduling.
+ */
+export type AuthMode = "local" | "remote";
+
+/**
  * Options for AuthShell.initialize().
  */
 export interface AuthShellOptions {
@@ -143,6 +159,8 @@ export interface AuthShellOptions {
   cacheLocation?: "memory" | "localstorage";
   /** Whether to use Refresh Tokens (default: true — recommended). */
   useRefreshTokens?: boolean;
+  /** Deployment mode (default: "local"). See {@link AuthMode}. */
+  mode?: AuthMode;
 }
 
 // ---------------------------------------------------------------------------
