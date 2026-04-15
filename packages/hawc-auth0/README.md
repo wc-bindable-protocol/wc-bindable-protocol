@@ -1,26 +1,21 @@
-# @wcstack/auth0
+# @wc-bindable/hawc-auth0
 
-`@wcstack/auth0` is a headless authentication component for the wcstack ecosystem.
-
-> **Note:** This package is **not an official `@wcstack` package**.
-> Official `@wcstack` packages have zero runtime dependencies.
-> `@wcstack/auth0` depends on `@auth0/auth0-spa-js` as a peer dependency,
-> so it is provided as a **community-style extension** that follows the same HAWC architecture.
+`@wc-bindable/hawc-auth0` is a headless authentication component for the wc-bindable ecosystem.
 
 It is not a visual UI widget.
 It is an **I/O node** that connects Auth0 authentication to reactive state.
 
-With `@wcstack/state`, `<wcs-auth>` can be bound directly through path contracts:
+With `@wcstack/state`, `<hawc-auth0>` can be bound directly through path contracts:
 
 - **input / command surface**: `domain`, `client-id`, `trigger`
 - **output state surface**: `authenticated`, `user`, `token`, `loading`, `error`
 
 This means authentication state can be expressed declaratively in HTML, without writing OAuth flows, token management, or login/logout glue code in your UI layer.
 
-`@wcstack/auth0` follows the [HAWC](https://github.com/wc-bindable-protocol/wc-bindable-protocol/blob/main/docs/articles/HAWC.md) architecture:
+`@wc-bindable/hawc-auth0` follows the [HAWC](https://github.com/wc-bindable-protocol/wc-bindable-protocol/blob/main/docs/articles/HAWC.md) architecture:
 
 - **Core** (`AuthCore`) handles Auth0 SDK interaction, token management, and auth state
-- **Shell** (`<wcs-auth>`) connects that state to the DOM
+- **Shell** (`<hawc-auth0>`) connects that state to the DOM
 - frameworks and binding systems consume it through [wc-bindable-protocol](https://github.com/wc-bindable-protocol/wc-bindable-protocol)
 
 ## Why this exists
@@ -28,11 +23,11 @@ This means authentication state can be expressed declaratively in HTML, without 
 Authentication is one of the most common cross-cutting concerns in SPAs.
 Login flows, token refresh, user profile retrieval, and route protection require significant imperative code.
 
-`@wcstack/auth0` moves authentication logic into a reusable component and exposes the result as bindable state.
+`@wc-bindable/hawc-auth0` moves authentication logic into a reusable component and exposes the result as bindable state.
 
 With `@wcstack/state`, the flow becomes:
 
-1. `<wcs-auth>` initializes the Auth0 client on connect
+1. `<hawc-auth0>` initializes the Auth0 client on connect
 2. redirect callback is handled automatically
 3. auth results return as `authenticated`, `user`, `token`, `loading`, `error`
 4. UI binds to those paths with `data-wcs`
@@ -42,12 +37,12 @@ This turns authentication into **state transitions**, not imperative UI code.
 ## Install
 
 ```bash
-npm install @wcstack/auth0
+npm install @wc-bindable/hawc-auth0
 ```
 
 ### Peer dependency
 
-`@wcstack/auth0` requires the Auth0 SPA SDK:
+`@wc-bindable/hawc-auth0` requires the Auth0 SPA SDK:
 
 ```bash
 npm install @auth0/auth0-spa-js
@@ -57,11 +52,11 @@ npm install @auth0/auth0-spa-js
 
 ### 1. Basic authentication with state binding
 
-When `<wcs-auth>` connects to the DOM, it initializes the Auth0 client, handles any pending redirect callback, and syncs authentication state.
+When `<hawc-auth0>` connects to the DOM, it initializes the Auth0 client, handles any pending redirect callback, and syncs authentication state.
 
 ```html
 <script type="module" src="https://esm.run/@wcstack/state/auto"></script>
-<script type="module" src="https://esm.run/@wcstack/auth0/auto"></script>
+<script type="module" src="https://esm.run/@wc-bindable/hawc-auth0/auto"></script>
 
 <wcs-state>
   <script type="module">
@@ -73,7 +68,7 @@ When `<wcs-auth>` connects to the DOM, it initializes the Auth0 client, handles 
     };
   </script>
 
-  <wcs-auth
+  <hawc-auth0
     id="auth"
     domain="example.auth0.com"
     client-id="your-client-id"
@@ -85,7 +80,7 @@ When `<wcs-auth>` connects to the DOM, it initializes the Auth0 client, handles 
       token: accessToken;
       loading: authLoading
     ">
-  </wcs-auth>
+  </hawc-auth0>
 
   <template data-wcs="if: authLoading">
     <p>Authenticating...</p>
@@ -93,7 +88,7 @@ When `<wcs-auth>` connects to the DOM, it initializes the Auth0 client, handles 
 
   <template data-wcs="if: isLoggedIn">
     <p data-wcs="textContent: currentUser.name"></p>
-    <wcs-auth-logout target="auth">Sign Out</wcs-auth-logout>
+    <hawc-auth0-logout target="auth">Sign Out</hawc-auth0-logout>
   </template>
 
   <template data-wcs="if: !isLoggedIn">
@@ -120,7 +115,7 @@ Use `trigger` to initiate login from a state method:
     };
   </script>
 
-  <wcs-auth
+  <hawc-auth0
     domain="example.auth0.com"
     client-id="your-client-id"
     data-wcs="
@@ -128,7 +123,7 @@ Use `trigger` to initiate login from a state method:
       user: currentUser;
       trigger: shouldLogin
     ">
-  </wcs-auth>
+  </hawc-auth0>
 
   <template data-wcs="if: !isLoggedIn">
     <button data-wcs="onclick: login">Sign In</button>
@@ -140,11 +135,11 @@ Use `trigger` to initiate login from a state method:
 
 - writing `true` starts `login()`
 - it resets itself to `false` after completion
-- the reset emits `wcs-auth:trigger-changed`
+- the reset emits `hawc-auth0:trigger-changed`
 
 ```
 external write:  false → true   No event (triggers login)
-auto-reset:      true  → false  Dispatches wcs-auth:trigger-changed
+auto-reset:      true  → false  Dispatches hawc-auth0:trigger-changed
 ```
 
 ### 3. Popup login mode
@@ -152,17 +147,17 @@ auto-reset:      true  → false  Dispatches wcs-auth:trigger-changed
 Use the `popup` attribute to open a popup window instead of redirecting:
 
 ```html
-<wcs-auth
+<hawc-auth0
   domain="example.auth0.com"
   client-id="your-client-id"
   popup
   data-wcs="authenticated: isLoggedIn; user: currentUser">
-</wcs-auth>
+</hawc-auth0>
 ```
 
 ### 4. Authenticated API requests with `@wcstack/fetch`
 
-Combine `<wcs-auth>` with `<wcs-fetch>` for authenticated data fetching:
+Combine `<hawc-auth0>` with `<wcs-fetch>` for authenticated data fetching:
 
 ```html
 <wcs-state>
@@ -178,12 +173,12 @@ Combine `<wcs-auth>` with `<wcs-fetch>` for authenticated data fetching:
     };
   </script>
 
-  <wcs-auth
+  <hawc-auth0
     domain="example.auth0.com"
     client-id="your-client-id"
     audience="https://api.example.com"
     data-wcs="authenticated: isLoggedIn; token: accessToken">
-  </wcs-auth>
+  </hawc-auth0>
 
   <wcs-fetch
     data-wcs="url: usersUrl; value: users">
@@ -203,7 +198,7 @@ Combine `<wcs-auth>` with `<wcs-fetch>` for authenticated data fetching:
 
 ## State Surface vs Command Surface
 
-`<wcs-auth>` exposes two different kinds of properties.
+`<hawc-auth0>` exposes two different kinds of properties.
 
 ### Output state (bindable auth state)
 
@@ -233,7 +228,7 @@ These properties control authentication from HTML, JS, or `@wcstack/state` bindi
 
 ## Architecture
 
-`@wcstack/auth0` follows the HAWC architecture.
+`@wc-bindable/hawc-auth0` follows the HAWC architecture.
 
 ### Core: `AuthCore`
 
@@ -248,9 +243,9 @@ It contains:
 
 It can run headlessly in any runtime that supports `EventTarget`.
 
-### Shell: `<wcs-auth>`
+### Shell: `<hawc-auth0>`
 
-`<wcs-auth>` is a thin `HTMLElement` wrapper around `AuthCore`.
+`<hawc-auth0>` is a thin `HTMLElement` wrapper around `AuthCore`.
 It adds:
 
 - attribute / property mapping
@@ -269,7 +264,7 @@ The Core dispatches events directly on the Shell via **target injection**, so no
 `AuthCore` can be used without the Shell element. Since it declares `static wcBindable`, you can use `@wc-bindable/core`'s `bind()` to subscribe to its state:
 
 ```typescript
-import { AuthCore } from "@wcstack/auth0";
+import { AuthCore } from "@wc-bindable/hawc-auth0";
 import { bind } from "@wc-bindable/core";
 
 const core = new AuthCore();
@@ -294,7 +289,7 @@ unbind();
 
 ## Redirect Callback
 
-When the user returns from Auth0's login page, the URL contains `code` and `state` query parameters. `<wcs-auth>` automatically detects and processes this callback during initialization:
+When the user returns from Auth0's login page, the URL contains `code` and `state` query parameters. `<hawc-auth0>` automatically detects and processes this callback during initialization:
 
 1. Calls `handleRedirectCallback()` on the Auth0 client
 2. Removes `code` and `state` from the URL via `history.replaceState()`
@@ -305,7 +300,7 @@ No additional configuration or route handling is required.
 ## Programmatic Usage
 
 ```javascript
-const authEl = document.querySelector("wcs-auth");
+const authEl = document.querySelector("hawc-auth0");
 
 // Wait for initialization
 await authEl.connectedCallbackPromise;
@@ -328,23 +323,23 @@ const token = await authEl.getToken();
 
 ## Optional DOM Triggering
 
-If `autoTrigger` is enabled (default), clicking an element with `data-authtarget` triggers the corresponding `<wcs-auth>` element's login:
+If `autoTrigger` is enabled (default), clicking an element with `data-authtarget` triggers the corresponding `<hawc-auth0>` element's login:
 
 ```html
 <button data-authtarget="auth">Sign In</button>
-<wcs-auth id="auth" domain="example.auth0.com" client-id="your-client-id"></wcs-auth>
+<hawc-auth0 id="auth" domain="example.auth0.com" client-id="your-client-id"></hawc-auth0>
 ```
 
 Event delegation is used — works with dynamically added elements. The `closest()` API handles nested elements (e.g., icon inside a button).
 
-If the target id does not match any element, or the matched element is not a `<wcs-auth>`, the click is silently ignored.
+If the target id does not match any element, or the matched element is not a `<hawc-auth0>`, the click is silently ignored.
 
 This is a convenience feature.
-In wcstack applications, **state-driven triggering via `trigger`** is usually the primary pattern.
+In wc-bindable applications, **state-driven triggering via `trigger`** is usually the primary pattern.
 
 ## Elements
 
-### `<wcs-auth>`
+### `<hawc-auth0>`
 
 | Attribute | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -354,7 +349,7 @@ In wcstack applications, **state-driven triggering via `trigger`** is usually th
 | `audience` | `string` | — | API audience identifier |
 | `scope` | `string` | `openid profile email` | OAuth scopes |
 | `cache-location` | `"memory" \| "localstorage"` | `memory` | Token cache location |
-| `use-refresh-tokens` | `boolean` | `false` | Use refresh tokens for silent renewal |
+| `use-refresh-tokens` | `boolean` | `true` | Use refresh tokens for silent renewal. Set `use-refresh-tokens="false"` to opt out |
 | `popup` | `boolean` | `false` | Use popup instead of redirect for login |
 
 | Property | Type | Description |
@@ -374,22 +369,22 @@ In wcstack applications, **state-driven triggering via `trigger`** is usually th
 | `logout(options?)` | Logout from Auth0 |
 | `getToken(options?)` | Get access token silently |
 
-### `<wcs-auth-logout>`
+### `<hawc-auth0-logout>`
 
-Declarative logout element. Clicking it triggers logout on the associated `<wcs-auth>`.
+Declarative logout element. Clicking it triggers logout on the associated `<hawc-auth0>`.
 
 | Attribute | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `target` | `string` | — | ID of the `<wcs-auth>` element |
+| `target` | `string` | — | ID of the `<hawc-auth0>` element |
 | `return-to` | `string` | — | URL to redirect after logout |
 
 Target resolution:
-- If `target` is set: resolve by ID only. If the ID does not match a `<wcs-auth>`, the click is silently ignored (no fallback).
-- If `target` is not set: closest ancestor `<wcs-auth>`, then first `<wcs-auth>` in the document.
+- If `target` is set: resolve by ID only. If the ID does not match a `<hawc-auth0>`, the click is silently ignored (no fallback).
+- If `target` is not set: closest ancestor `<hawc-auth0>`, then first `<hawc-auth0>` in the document.
 
 ## wc-bindable-protocol
 
-Both `AuthCore` and `<wcs-auth>` declare `wc-bindable-protocol` compliance, making them interoperable with any framework or component that supports the protocol.
+Both `AuthCore` and `<hawc-auth0>` declare `wc-bindable-protocol` compliance, making them interoperable with any framework or component that supports the protocol.
 
 ### Core (`AuthCore`)
 
@@ -400,18 +395,18 @@ static wcBindable = {
   protocol: "wc-bindable",
   version: 1,
   properties: [
-    { name: "authenticated", event: "wcs-auth:authenticated-changed" },
-    { name: "user",          event: "wcs-auth:user-changed" },
-    { name: "token",         event: "wcs-auth:token-changed" },
-    { name: "loading",       event: "wcs-auth:loading-changed" },
-    { name: "error",         event: "wcs-auth:error" },
+    { name: "authenticated", event: "hawc-auth0:authenticated-changed" },
+    { name: "user",          event: "hawc-auth0:user-changed" },
+    { name: "token",         event: "hawc-auth0:token-changed" },
+    { name: "loading",       event: "hawc-auth0:loading-changed" },
+    { name: "error",         event: "hawc-auth0:error" },
   ],
 };
 ```
 
 Headless consumers call `core.login()` / `core.logout()` directly — no `trigger` needed.
 
-### Shell (`<wcs-auth>`)
+### Shell (`<hawc-auth0>`)
 
 The Shell extends the Core declaration with `trigger` so binding systems can execute login declaratively:
 
@@ -420,7 +415,7 @@ static wcBindable = {
   ...AuthCore.wcBindable,
   properties: [
     ...AuthCore.wcBindable.properties,
-    { name: "trigger", event: "wcs-auth:trigger-changed" },
+    { name: "trigger", event: "hawc-auth0:trigger-changed" },
   ],
 };
 ```
@@ -430,7 +425,7 @@ static wcBindable = {
 ```typescript
 import type {
   WcsAuthUser, WcsAuthError, WcsAuthCoreValues, WcsAuthValues, Auth0ClientOptions
-} from "@wcstack/auth0";
+} from "@wc-bindable/hawc-auth0";
 ```
 
 ```typescript
@@ -459,7 +454,7 @@ interface WcsAuthCoreValues {
   error: WcsAuthError | Error | null;
 }
 
-// Shell (<wcs-auth>) — extends Core with trigger
+// Shell (<hawc-auth0>) — extends Core with trigger
 interface WcsAuthValues extends WcsAuthCoreValues {
   trigger: boolean;
 }
@@ -468,9 +463,9 @@ interface WcsAuthValues extends WcsAuthCoreValues {
 ## Why this works well with `@wcstack/state`
 
 `@wcstack/state` uses path strings as the only contract between UI and state.
-`<wcs-auth>` fits this model naturally:
+`<hawc-auth0>` fits this model naturally:
 
-- `<wcs-auth>` initializes and manages the Auth0 lifecycle
+- `<hawc-auth0>` initializes and manages the Auth0 lifecycle
 - auth results return as `authenticated`, `user`, `token`, `loading`, `error`
 - UI binds to those paths without writing auth glue code
 
@@ -478,13 +473,13 @@ This makes authentication look like ordinary state updates.
 
 ## Framework Integration
 
-Since `<wcs-auth>` is HAWC + `wc-bindable-protocol`, it works with any framework through thin adapters from `@wc-bindable/*`.
+Since `<hawc-auth0>` is HAWC + `wc-bindable-protocol`, it works with any framework through thin adapters from `@wc-bindable/*`.
 
 ### React
 
 ```tsx
 import { useWcBindable } from "@wc-bindable/react";
-import type { WcsAuthValues } from "@wcstack/auth0";
+import type { WcsAuthValues } from "@wc-bindable/hawc-auth0";
 
 function AuthGuard() {
   const [ref, { authenticated, user, loading }] =
@@ -492,7 +487,7 @@ function AuthGuard() {
 
   return (
     <>
-      <wcs-auth ref={ref}
+      <hawc-auth0 ref={ref}
         domain="example.auth0.com"
         client-id="your-client-id" />
       {loading && <p>Loading...</p>}
@@ -511,13 +506,13 @@ function AuthGuard() {
 ```vue
 <script setup lang="ts">
 import { useWcBindable } from "@wc-bindable/vue";
-import type { WcsAuthValues } from "@wcstack/auth0";
+import type { WcsAuthValues } from "@wc-bindable/hawc-auth0";
 
 const { ref, values } = useWcBindable<HTMLElement, WcsAuthValues>();
 </script>
 
 <template>
-  <wcs-auth :ref="ref"
+  <hawc-auth0 :ref="ref"
     domain="example.auth0.com"
     client-id="your-client-id" />
   <p v-if="values.loading">Loading...</p>
@@ -537,7 +532,7 @@ let user = $state(null);
 let loading = $state(true);
 </script>
 
-<wcs-auth domain="example.auth0.com" client-id="your-client-id"
+<hawc-auth0 domain="example.auth0.com" client-id="your-client-id"
   use:wcBindable={{ onUpdate: (name, v) => {
     if (name === "authenticated") authenticated = v;
     if (name === "user") user = v;
@@ -557,14 +552,14 @@ let loading = $state(true);
 
 ```tsx
 import { createWcBindable } from "@wc-bindable/solid";
-import type { WcsAuthValues } from "@wcstack/auth0";
+import type { WcsAuthValues } from "@wc-bindable/hawc-auth0";
 
 function AuthGuard() {
   const [values, directive] = createWcBindable<WcsAuthValues>();
 
   return (
     <>
-      <wcs-auth ref={directive}
+      <hawc-auth0 ref={directive}
         domain="example.auth0.com"
         client-id="your-client-id" />
       <Show when={!values.loading} fallback={<p>Loading...</p>}>
@@ -583,7 +578,7 @@ function AuthGuard() {
 ```javascript
 import { bind } from "@wc-bindable/core";
 
-const authEl = document.querySelector("wcs-auth");
+const authEl = document.querySelector("hawc-auth0");
 
 bind(authEl, (name, value) => {
   console.log(`${name} changed:`, value);
@@ -593,14 +588,14 @@ bind(authEl, (name, value) => {
 ## Configuration
 
 ```javascript
-import { bootstrapAuth } from "@wcstack/auth0";
+import { bootstrapAuth } from "@wc-bindable/hawc-auth0";
 
 bootstrapAuth({
   autoTrigger: true,
   triggerAttribute: "data-authtarget",
   tagNames: {
-    auth: "wcs-auth",
-    authLogout: "wcs-auth-logout",
+    auth: "hawc-auth0",
+    authLogout: "hawc-auth0-logout",
   },
 });
 ```
@@ -612,7 +607,7 @@ bootstrapAuth({
 - `trigger` is intentionally one-way: writing `true` executes login, reset emits completion
 - initialization happens once on `connectedCallback` — changing `domain` or `client-id` after connect does not re-initialize
 - redirect callback is automatically detected and processed during initialization
-- `<wcs-auth-logout>` with explicit `target` resolves by ID only (no fallback); without `target`, it falls back to closest ancestor, then first-in-document
+- `<hawc-auth0-logout>` with explicit `target` resolves by ID only (no fallback); without `target`, it falls back to closest ancestor, then first-in-document
 - `popup` mode uses `loginWithPopup` — no redirect required, state syncs after popup closes
 - Shell methods (`login()`, `logout()`, `getToken()`) await initialization before executing — safe to call immediately after connect
 - `@auth0/auth0-spa-js` is a peer dependency — bring your own version

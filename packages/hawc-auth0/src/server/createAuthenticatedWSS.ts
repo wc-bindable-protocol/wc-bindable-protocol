@@ -38,6 +38,16 @@ export interface HandleConnectionOptions {
   /** Observability hook — called for auth and connection lifecycle events. */
   onEvent?: (event: AuthEvent) => void;
   /**
+   * Called after `auth:refresh` re-verifies a new token, before the
+   * success response is sent to the client. Use this to propagate the
+   * refreshed `UserContext` (e.g. updated permissions/roles) into the
+   * Core(s) returned by `createCores`. The library does not presume any
+   * particular Core shape.
+   *
+   * For the reference `UserCore`, pass `(core, user) => core.updateUser(user)`.
+   */
+  onTokenRefresh?: (core: EventTarget, user: UserContext) => void;
+  /**
    * Grace period (ms) after token `exp` before the server forcefully
    * closes the connection. Set to 0 to disable server-side expiry
    * enforcement. Default: 60000 (60 seconds).
@@ -130,6 +140,24 @@ export async function handleConnection(
                   error: new Error("Token subject mismatch"),
                 });
                 socket.close?.(4403, "Token subject mismatch");
+                return;
+              }
+              // Run the hook as part of the commit path: if it throws,
+              // the refreshed session must NOT be applied, otherwise the
+              // connection silently moves forward while the client thinks
+              // the refresh failed and the Core stays stale.
+              try {
+                options.onTokenRefresh?.(core, newUser);
+              } catch (hookErr) {
+                onEvent?.({
+                  type: "auth:refresh-failure",
+                  error: hookErr instanceof Error ? hookErr : new Error(String(hookErr)),
+                });
+                rawTransport.send({
+                  type: "throw",
+                  id: msg.id,
+                  error: { name: "Error", message: "Token refresh hook failed" },
+                });
                 return;
               }
               user = newUser;
@@ -233,6 +261,7 @@ export async function createAuthenticatedWSS(
           createCores: options.createCores,
           proxyOptions: options.proxyOptions,
           onEvent: options.onEvent,
+          onTokenRefresh: options.onTokenRefresh,
           sessionGraceMs: options.sessionGraceMs,
         },
       );

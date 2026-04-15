@@ -153,6 +153,15 @@ export interface AuthenticatedConnectionOptions {
   allowedOrigins?: string[];
   /** Core factory — generates Core(s) from verified user context. */
   createCores: (user: UserContext) => EventTarget;
+  /**
+   * Propagate a refreshed UserContext into the Core(s) after an in-band
+   * `auth:refresh`. Required when token claims (permissions, roles, ...)
+   * can change across refreshes and the Core exposes them — otherwise
+   * server-side bindable state goes stale relative to the latest token.
+   *
+   * For the reference `UserCore`, pass `(core, user) => core.updateUser(user)`.
+   */
+  onTokenRefresh?: (core: EventTarget, user: UserContext) => void;
   proxyOptions?: import("@wc-bindable/remote").RemoteShellProxyOptions;
 }
 

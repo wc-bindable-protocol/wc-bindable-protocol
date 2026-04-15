@@ -63,4 +63,73 @@ describe("UserCore", () => {
     expect(core.permissions).toEqual([]);
     expect(core.roles).toEqual([]);
   });
+
+  describe("updateUser", () => {
+    it("replaces the context and exposes new permissions/roles", () => {
+      const core = new UserCore(mockUser);
+      const next: UserContext = {
+        ...mockUser,
+        permissions: ["storage:upload", "storage:read"],
+        roles: ["admin", "auditor"],
+      };
+      core.updateUser(next);
+      expect(core.permissions).toEqual(["storage:upload", "storage:read"]);
+      expect(core.roles).toEqual(["admin", "auditor"]);
+    });
+
+    it("dispatches permissions-changed only when permissions differ", () => {
+      const core = new UserCore(mockUser);
+      const events: string[] = [];
+      core.addEventListener("hawc-auth0:permissions-changed", () => events.push("perm"));
+
+      core.updateUser({ ...mockUser });
+      expect(events).toEqual([]);
+
+      core.updateUser({ ...mockUser, permissions: ["storage:upload", "storage:delete", "extra"] });
+      expect(events).toEqual(["perm"]);
+    });
+
+    it("dispatches roles-changed only when roles differ", () => {
+      const core = new UserCore(mockUser);
+      const events: string[] = [];
+      core.addEventListener("hawc-auth0:roles-changed", () => events.push("role"));
+
+      core.updateUser({ ...mockUser });
+      expect(events).toEqual([]);
+
+      core.updateUser({ ...mockUser, roles: ["editor"] });
+      expect(events).toEqual(["role"]);
+    });
+
+    it("dispatches user-changed only when sub/email/name differ", () => {
+      const core = new UserCore(mockUser);
+      const events: Array<{ sub: string }> = [];
+      core.addEventListener("hawc-auth0:user-changed", (e) => {
+        events.push((e as CustomEvent).detail);
+      });
+
+      core.updateUser({ ...mockUser });
+      expect(events).toHaveLength(0);
+
+      core.updateUser({ ...mockUser, email: "new@example.com" });
+      expect(events).toHaveLength(1);
+      expect(events[0]).toEqual({
+        sub: "auth0|abc123",
+        email: "new@example.com",
+        name: "Test User",
+      });
+    });
+
+    it("event detail for permissions is a fresh copy (not the internal array)", () => {
+      const core = new UserCore(mockUser);
+      let detail: string[] | null = null;
+      core.addEventListener("hawc-auth0:permissions-changed", (e) => {
+        detail = (e as CustomEvent).detail;
+      });
+
+      core.updateUser({ ...mockUser, permissions: ["x", "y"] });
+      expect(detail).toEqual(["x", "y"]);
+      expect(detail).not.toBe(core.permissions);
+    });
+  });
 });

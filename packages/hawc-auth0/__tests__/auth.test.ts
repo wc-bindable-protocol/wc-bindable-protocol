@@ -165,13 +165,13 @@ describe("Auth (hawc-auth0)", () => {
       expect(el.cacheLocation).toBe("localstorage");
     });
 
-    it("useRefreshTokens属性を取得・設定できる", () => {
+    it("useRefreshTokens属性のデフォルト値はtrue（属性未指定時）", () => {
       const el = document.createElement("hawc-auth0") as Auth;
-      expect(el.useRefreshTokens).toBe(false);
-      el.useRefreshTokens = true;
       expect(el.useRefreshTokens).toBe(true);
       el.useRefreshTokens = false;
       expect(el.useRefreshTokens).toBe(false);
+      el.useRefreshTokens = true;
+      expect(el.useRefreshTokens).toBe(true);
     });
 
     it("popup属性を取得・設定できる", () => {

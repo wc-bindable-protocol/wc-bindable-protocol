@@ -204,6 +204,122 @@ describe("handleConnection", () => {
     expect(events.find((e) => e.type === "auth:refresh")).toBeDefined();
   });
 
+  it("invokes onTokenRefresh with the refreshed UserContext on successful refresh", async () => {
+    jwtVerify.mockResolvedValueOnce({
+      payload: { sub: "auth0|123", permissions: ["old"], roles: ["member"] },
+    });
+
+    const socket = createMockSocket();
+    const core = new EventTarget();
+    (core.constructor as any).wcBindable = {
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [],
+    };
+
+    const refreshed: Array<{ core: EventTarget; sub: string; permissions: string[] }> = [];
+
+    await handleConnection(
+      socket,
+      "hawc-auth0.bearer." + makeJwt({ sub: "auth0|123" }),
+      {
+        auth0Domain: "test.auth0.com",
+        auth0Audience: "https://api.example.com",
+        createCores: () => core,
+        onTokenRefresh: (c, user) => {
+          refreshed.push({ core: c, sub: user.sub, permissions: user.permissions });
+        },
+      },
+    );
+
+    jwtVerify.mockResolvedValueOnce({
+      payload: {
+        sub: "auth0|123",
+        permissions: ["new-perm-a", "new-perm-b"],
+        roles: ["admin"],
+        exp: Math.floor(Date.now() / 1000) + 300,
+      },
+    });
+
+    const messageHandlers = socket._listeners["message"];
+    messageHandlers[0]({
+      data: JSON.stringify({
+        type: "cmd",
+        name: "auth:refresh",
+        id: "refresh-hook",
+        args: [makeJwt({ sub: "auth0|123" })],
+      }),
+    });
+
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(refreshed).toHaveLength(1);
+    expect(refreshed[0].core).toBe(core);
+    expect(refreshed[0].sub).toBe("auth0|123");
+    expect(refreshed[0].permissions).toEqual(["new-perm-a", "new-perm-b"]);
+
+    const lastResponse = JSON.parse(
+      socket.send.mock.calls[socket.send.mock.calls.length - 1][0],
+    );
+    expect(lastResponse.type).toBe("return");
+    expect(lastResponse.id).toBe("refresh-hook");
+  });
+
+  it("emits auth:refresh-failure and sends throw when onTokenRefresh throws", async () => {
+    jwtVerify.mockResolvedValueOnce({
+      payload: { sub: "auth0|123", permissions: [] },
+    });
+
+    const socket = createMockSocket();
+    const core = new EventTarget();
+    (core.constructor as any).wcBindable = {
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [],
+    };
+
+    const events: AuthEvent[] = [];
+
+    await handleConnection(
+      socket,
+      "hawc-auth0.bearer." + makeJwt({ sub: "auth0|123" }),
+      {
+        auth0Domain: "test.auth0.com",
+        auth0Audience: "https://api.example.com",
+        createCores: () => core,
+        onEvent: (e) => events.push(e),
+        onTokenRefresh: () => {
+          throw new Error("hook exploded");
+        },
+      },
+    );
+
+    jwtVerify.mockResolvedValueOnce({
+      payload: { sub: "auth0|123", permissions: [], exp: Math.floor(Date.now() / 1000) + 300 },
+    });
+
+    const messageHandlers = socket._listeners["message"];
+    messageHandlers[0]({
+      data: JSON.stringify({
+        type: "cmd",
+        name: "auth:refresh",
+        id: "refresh-hook-err",
+        args: [makeJwt({ sub: "auth0|123" })],
+      }),
+    });
+
+    await new Promise((r) => setTimeout(r, 10));
+
+    const response = JSON.parse(
+      socket.send.mock.calls[socket.send.mock.calls.length - 1][0],
+    );
+    expect(response.type).toBe("throw");
+    expect(response.id).toBe("refresh-hook-err");
+    expect(response.error.message).toBe("Token refresh hook failed");
+    expect(events.find((e) => e.type === "auth:refresh")).toBeUndefined();
+    expect(events.find((e) => e.type === "auth:refresh-failure")).toBeDefined();
+  });
+
   it("returns throw when auth:refresh token argument is missing", async () => {
     jwtVerify.mockResolvedValue({
       payload: { sub: "auth0|123", permissions: [] },
@@ -499,6 +615,122 @@ describe("handleConnection", () => {
 
     (proxy as any).dispose?.();
     expect(events.some((e) => e.type === "connection:close")).toBe(true);
+  });
+
+  it("does not advance session expiry when onTokenRefresh throws", async () => {
+    vi.useFakeTimers();
+    try {
+      const originalExp = Math.floor(Date.now() / 1000) + 30;
+      jwtVerify.mockResolvedValueOnce({ payload: { sub: "auth0|123", permissions: [] } });
+
+      const socket = createMockSocket();
+      const core = new EventTarget();
+      (core.constructor as any).wcBindable = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+      };
+
+      await handleConnection(
+        socket,
+        "hawc-auth0.bearer." + makeJwt({ sub: "auth0|123", exp: originalExp }),
+        {
+          auth0Domain: "test.auth0.com",
+          auth0Audience: "https://api.example.com",
+          createCores: () => core,
+          sessionGraceMs: 1_000,
+          onTokenRefresh: () => {
+            throw new Error("hook exploded");
+          },
+        },
+      );
+
+      // New token claims a far-future exp; if the bug returns, the server
+      // will accept it and never close the socket at originalExp.
+      jwtVerify.mockResolvedValueOnce({
+        payload: {
+          sub: "auth0|123",
+          permissions: [],
+          exp: originalExp + 3600,
+        },
+      });
+
+      const messageHandlers = socket._listeners["message"];
+      messageHandlers[0]({
+        data: JSON.stringify({
+          type: "cmd",
+          name: "auth:refresh",
+          id: "refresh-hook-throw-exp",
+          args: [makeJwt({ sub: "auth0|123", exp: originalExp + 3600 })],
+        }),
+      });
+
+      await vi.advanceTimersByTimeAsync(10);
+      expect(socket.close).not.toHaveBeenCalledWith(4401, "Session expired");
+
+      // Advance past the ORIGINAL exp — the session must still close,
+      // because the hook-failed refresh must not extend it.
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(socket.close).toHaveBeenCalledWith(4401, "Session expired");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not invoke the core update side-effect when hook throws after its own mutation", async () => {
+    // Guard against regressions where state commit is moved back before the hook.
+    jwtVerify.mockResolvedValueOnce({ payload: { sub: "auth0|123", permissions: [] } });
+
+    const socket = createMockSocket();
+    const core = new EventTarget();
+    (core.constructor as any).wcBindable = {
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [],
+    };
+
+    let hookCalled = false;
+    let sawRefreshEvent = false;
+
+    const events: AuthEvent[] = [];
+
+    await handleConnection(
+      socket,
+      "hawc-auth0.bearer." + makeJwt({ sub: "auth0|123" }),
+      {
+        auth0Domain: "test.auth0.com",
+        auth0Audience: "https://api.example.com",
+        createCores: () => core,
+        onEvent: (e) => {
+          events.push(e);
+          if (e.type === "auth:refresh") sawRefreshEvent = true;
+        },
+        onTokenRefresh: () => {
+          hookCalled = true;
+          throw new Error("hook exploded");
+        },
+      },
+    );
+
+    jwtVerify.mockResolvedValueOnce({
+      payload: { sub: "auth0|123", permissions: [], exp: Math.floor(Date.now() / 1000) + 300 },
+    });
+
+    const messageHandlers = socket._listeners["message"];
+    messageHandlers[0]({
+      data: JSON.stringify({
+        type: "cmd",
+        name: "auth:refresh",
+        id: "refresh-order",
+        args: [makeJwt({ sub: "auth0|123" })],
+      }),
+    });
+
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(hookCalled).toBe(true);
+    expect(sawRefreshEvent).toBe(false);
+    expect(events.some((e) => e.type === "auth:refresh-failure")).toBe(true);
   });
 
   it("clears previous expiry timer when refresh updates exp", async () => {

@@ -242,9 +242,9 @@ Access tokens expire (typically 300–900 seconds). Two strategies exist for kee
 The WebSocket connection stays open. The client periodically obtains a fresh token from Auth0 and sends it to the server over the **existing** connection as a protocol-level command. The server re-verifies the token and updates the session's expiry without reconstructing Cores.
 
 **Why this is preferred:**
-- **Core state is fully continuous.** No re-sync, no property reset. An in-flight upload, a streaming AI response, or a multi-step wizard all survive the refresh.
+- **Core instance is continuous.** No destruction, no reconstruction. An in-flight upload, a streaming AI response, or a multi-step wizard all survive the refresh.
 - **No in-flight command loss.** Pending `invoke()` / `setWithAck()` calls are unaffected.
-- **No UI flicker.** `bind()` subscribers see no state change at all — the refresh is invisible to the application layer.
+- **No UI flicker from reconnection.** `bind()` subscribers only see property changes that the refreshed claims explicitly imply (see `onTokenRefresh` below); application-layer state is otherwise untouched.
 
 **Shell side:**
 
@@ -258,7 +258,7 @@ async refreshToken(): Promise<void> {
 }
 ```
 
-> `auth:refresh` is a reserved command name on the server-side connection handler, not on individual Cores. It updates the session's token/expiry without touching Core state.
+> `auth:refresh` is a reserved command name on the server-side connection handler, not on individual Cores. By default it only re-verifies the token and updates the session's expiry — Core instances are never reconstructed. However, **if token claims such as `permissions` or `roles` can change across refreshes and the Core exposes them as bindable state, the integrator must wire an `onTokenRefresh` hook to propagate the new claims into the Core**. Without the hook, server authorization and bindable state drift from the latest token.
 
 **Server side (connection handler):**
 
@@ -270,8 +270,18 @@ transport.onMessage((msg) => {
     const newToken = msg.args[0] as string;
     verifyAuth0Token(newToken, { domain, audience })
       .then((user) => {
+        // Commit path: run the hook FIRST so a failure does not leave
+        // the session extended while the Core stays stale.
+        try {
+          onTokenRefresh?.(core, user);
+        } catch (err) {
+          transport.send({ type: "throw", id: msg.id, error: { name: "Error", message: "Token refresh hook failed" } });
+          return;
+        }
         session.user = user;
-        session.expiresAt = Date.now() + tokenLifetimeMs;
+        // `exp` lives on the decoded JWT payload, not on UserContext.
+        // In the shipped impl this is `_getExpFromToken(newToken, sessionGraceMs)`.
+        session.expiresAt = _getExpFromToken(newToken, sessionGraceMs);
         transport.send({ type: "return", id: msg.id, value: undefined });
       })
       .catch(() => {
@@ -283,6 +293,12 @@ transport.onMessage((msg) => {
   shellProxy.handleMessage(msg);
 });
 ```
+
+**When to wire `onTokenRefresh`:**
+
+- **Required** when the Core surfaces any token-derived claim as bindable state (e.g. `UserCore.permissions`, `roles`) and those claims can change across refreshes. Omitting the hook leaves the Core holding the claims from the initial token indefinitely, even though the server session has advanced.
+- **Not required** when the Core only depends on the identity (`sub`) and the server only uses the token for session expiry enforcement. Identity mismatch between refreshes is already rejected (`4403 Token subject mismatch`).
+- For the reference `UserCore`, wire it as `(core, user) => core.updateUser(user)`. `updateUser` dispatches `hawc-auth0:permissions-changed` / `roles-changed` / `user-changed` only when the corresponding field actually changed, so the client sees exactly the deltas the new token implies and nothing more.
 
 **Usage pattern (exp-based scheduling):**
 
@@ -439,6 +455,18 @@ interface AuthenticatedConnectionOptions {
   auth0Audience: string;
   /** Core factory — generates Core(s) from verified user context */
   createCores: (user: UserContext) => EventTarget;
+  /**
+   * Propagate a refreshed UserContext into the Core(s) after an
+   * in-band `auth:refresh`. Required when token claims
+   * (permissions, roles, ...) can change across refreshes and the
+   * Core exposes them as bindable state — otherwise the Core
+   * keeps serving the initial token's claims.
+   *
+   * For the reference `UserCore`, pass `(core, user) => core.updateUser(user)`.
+   * Invoked before session expiry is advanced; if it throws, the
+   * refresh is rejected and no session state is committed.
+   */
+  onTokenRefresh?: (core: EventTarget, user: UserContext) => void;
   /** Allowed Origin list (CSRF prevention) */
   allowedOrigins?: string[];
   /** RemoteShellProxy options */
@@ -796,13 +824,16 @@ The declarative layer handles the common case (80%+). The imperative layer handl
 2. Server side
    └─ Connection handler intercepts "auth:refresh" command
    └─ Verify new token via JWKS
+   └─ If onTokenRefresh is wired: propagate refreshed claims into Core(s)
+      (throw here → respond failure, do NOT advance session expiry)
    └─ Update session expiry
    └─ Return success
 
 3. Result
    └─ WebSocket connection unchanged
-   └─ Core state unchanged — no re-sync, no property reset
-   └─ bind() subscribers see nothing — refresh is invisible
+   └─ Core instance unchanged — no destruction, no reconstruction
+   └─ Bindable state sees only the deltas implied by refreshed claims
+      (or nothing at all when no hook is wired and claims don't change)
    └─ In-flight commands continue uninterrupted
 ```
 
@@ -909,6 +940,9 @@ export interface AuthenticatedConnectionOptions {
   auth0Audience: string;
   allowedOrigins?: string[];
   createCores: (user: UserContext) => EventTarget;
+  /** Propagate refreshed claims into the Core after `auth:refresh`.
+   *  Required when claims the Core exposes can change across refreshes. */
+  onTokenRefresh?: (core: EventTarget, user: UserContext) => void;
   proxyOptions?: import("@wc-bindable/remote").RemoteShellProxyOptions;
 }
 

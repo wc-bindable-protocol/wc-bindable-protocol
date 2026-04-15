@@ -81,15 +81,12 @@ export class Auth extends HTMLElement {
   }
 
   get useRefreshTokens(): boolean {
-    return this.hasAttribute("use-refresh-tokens");
+    const v = this.getAttribute("use-refresh-tokens");
+    return v === null ? true : v !== "false";
   }
 
   set useRefreshTokens(value: boolean) {
-    if (value) {
-      this.setAttribute("use-refresh-tokens", "");
-    } else {
-      this.removeAttribute("use-refresh-tokens");
-    }
+    this.setAttribute("use-refresh-tokens", value ? "true" : "false");
   }
 
   get popup(): boolean {
