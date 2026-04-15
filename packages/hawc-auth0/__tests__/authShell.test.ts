@@ -256,6 +256,81 @@ describe("AuthShell", () => {
       );
     });
 
+    it("preserves the error contract when getTokenSilently rejects during connect", async () => {
+      // Auth0 SDK rejects during connect()'s token fetch.
+      // The contract from the pre-fetchToken era must hold:
+      //   1. core.error is updated to the SDK error
+      //   2. hawc-auth0:error event fires
+      //   3. connect() rejects with the domain-specific message
+      //      "Failed to obtain access token.", not the raw SDK message
+      const sdkError = new Error("login_required");
+      const mockClient = createMockAuth0Client({
+        getTokenSilently: vi.fn().mockRejectedValue(sdkError),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const shell = new AuthShell();
+      await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+
+      const errorEvents: any[] = [];
+      shell.addEventListener("hawc-auth0:error", (e) => {
+        errorEvents.push((e as CustomEvent).detail);
+      });
+
+      await expect(shell.connect("ws://localhost:3000")).rejects.toThrow(
+        "[@wc-bindable/hawc-auth0] Failed to obtain access token.",
+      );
+
+      expect(shell.error).toBe(sdkError);
+      // error event sequence: cleared (null) at start, then SDK error
+      expect(errorEvents).toEqual([null, sdkError]);
+    });
+
+    it("clears connected to false when a follow-up connect handshake fails", async () => {
+      const mockClient = createMockAuth0Client({
+        getTokenSilently: vi.fn().mockResolvedValue("token"),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const originalWS = globalThis.WebSocket;
+      let socketCount = 0;
+      (globalThis as any).WebSocket = class extends MockWebSocket {
+        private _failOpen: boolean;
+        constructor(url: string, protocols?: string | string[]) {
+          super(url, protocols);
+          socketCount += 1;
+          // 1st socket opens; 2nd socket fails.
+          this._failOpen = socketCount === 2;
+          if (this._failOpen) {
+            queueMicrotask(() => this._emit("error"));
+          }
+        }
+        addEventListener(type: string, listener: (...args: any[]) => void, opts?: any): void {
+          if (this._failOpen && type === "open") return;
+          super.addEventListener(type, listener, opts);
+        }
+      };
+
+      try {
+        const shell = new AuthShell();
+        await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+
+        await shell.connect("ws://localhost:3000");
+        expect(shell.connected).toBe(true);
+
+        await expect(shell.connect("ws://localhost:3001")).rejects.toThrow(
+          "WebSocket connection failed",
+        );
+
+        // Same regression as the reconnect path: a failed follow-up
+        // connect must clear `connected` to false instead of leaving
+        // the previous `true` value visible after the transport is gone.
+        expect(shell.connected).toBe(false);
+      } finally {
+        (globalThis as any).WebSocket = originalWS;
+      }
+    });
+
     it("rejects when websocket emits error during connect", async () => {
       const mockClient = createMockAuth0Client({
         getTokenSilently: vi.fn().mockResolvedValue("token"),
@@ -400,6 +475,57 @@ describe("AuthShell", () => {
       await expect(shell.reconnect()).rejects.toThrow(
         "[@wc-bindable/hawc-auth0] Failed to refresh access token.",
       );
+    });
+
+    it("clears connected to false when reconnect handshake fails", async () => {
+      const mockClient = createMockAuth0Client({
+        getTokenSilently: vi.fn().mockResolvedValue("token"),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const originalWS = globalThis.WebSocket;
+      let socketCount = 0;
+      (globalThis as any).WebSocket = class extends MockWebSocket {
+        private _failOpen: boolean;
+        constructor(url: string, protocols?: string | string[]) {
+          super(url, protocols);
+          socketCount += 1;
+          // 1st socket (connect) opens; 2nd socket (reconnect) fails.
+          this._failOpen = socketCount === 2;
+          if (this._failOpen) {
+            queueMicrotask(() => this._emit("error"));
+          }
+        }
+        addEventListener(type: string, listener: (...args: any[]) => void, opts?: any): void {
+          if (this._failOpen && type === "open") return;
+          super.addEventListener(type, listener, opts);
+        }
+      };
+
+      try {
+        const shell = new AuthShell();
+        await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+
+        await shell.connect("ws://localhost:3000");
+        expect(shell.connected).toBe(true);
+
+        const events: boolean[] = [];
+        shell.addEventListener("hawc-auth0:connected-changed", (e: Event) => {
+          events.push((e as CustomEvent).detail);
+        });
+
+        await expect(shell.reconnect()).rejects.toThrow("WebSocket reconnection failed");
+
+        // The reviewer's exact regression: after a failed reconnect,
+        // `connected` must NOT remain stuck at true.
+        expect(shell.connected).toBe(false);
+        // And subscribers to `hawc-auth0:connected-changed` must learn
+        // about the transition, otherwise UI / retry logic that keys
+        // off `connected` will not react.
+        expect(events).toContain(false);
+      } finally {
+        (globalThis as any).WebSocket = originalWS;
+      }
     });
 
     it("rejects when websocket emits error during reconnect", async () => {
@@ -569,6 +695,51 @@ describe("AuthShell", () => {
       expect(refreshMsg).toBeDefined();
       expect(refreshMsg.type).toBe("cmd");
       expect(refreshMsg.args[0]).toBe("token"); // the refreshed token
+    });
+
+    it("does not forward auth:refresh replies to the transport consumer", async () => {
+      const mockClient = createMockAuth0Client({
+        isAuthenticated: vi.fn().mockResolvedValue(true),
+        getUser: vi.fn().mockResolvedValue({ sub: "u" }),
+        getTokenSilently: vi.fn().mockResolvedValue("token"),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      let capturedWs: MockWebSocket;
+      const originalWS = globalThis.WebSocket;
+      (globalThis as any).WebSocket = class extends MockWebSocket {
+        constructor(url: string, protocols?: string | string[]) {
+          super(url, protocols);
+          capturedWs = this;
+        }
+      };
+
+      try {
+        const shell = new AuthShell();
+        await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+        const transport = await shell.connect("ws://localhost:3000");
+
+        const forwarded: any[] = [];
+        transport.onMessage((message) => {
+          forwarded.push(message);
+        });
+
+        capturedWs!.onSend = (data: string) => {
+          const msg = JSON.parse(data);
+          if (msg.name === "auth:refresh") {
+            queueMicrotask(() => {
+              capturedWs!._receiveMessage({ type: "return", id: "unrelated", value: 1 });
+              capturedWs!._receiveMessage({ type: "return", id: msg.id, value: undefined });
+            });
+          }
+        };
+
+        await shell.refreshToken();
+
+        expect(forwarded).toEqual([{ type: "return", id: "unrelated", value: 1 }]);
+      } finally {
+        (globalThis as any).WebSocket = originalWS;
+      }
     });
 
     it("rejects when server returns throw", async () => {
@@ -824,6 +995,331 @@ describe("AuthShell", () => {
       } finally {
         (globalThis as any).WebSocket = originalWS;
       }
+    });
+
+    it("cleans up timer and listeners when ws.send throws synchronously", async () => {
+      const mockClient = createMockAuth0Client({
+        isAuthenticated: vi.fn().mockResolvedValue(true),
+        getUser: vi.fn().mockResolvedValue({ sub: "u" }),
+        getTokenSilently: vi.fn().mockResolvedValue("token"),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const originalWS = globalThis.WebSocket;
+      let capturedWs: MockWebSocket | null = null;
+      (globalThis as any).WebSocket = class extends MockWebSocket {
+        constructor(url: string, protocols?: string | string[]) {
+          super(url, protocols);
+          capturedWs = this;
+        }
+      };
+
+      try {
+        const shell = new AuthShell();
+        await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+        await shell.connect("ws://localhost:3000");
+
+        // Make ws.send throw synchronously to simulate a socket that
+        // transitioned out of OPEN between readyState check and send.
+        capturedWs!.onSend = () => {
+          throw new Error("send failed synchronously");
+        };
+
+        // Snapshot listeners that pre-exist refreshToken (e.g. the
+        // connect()-installed long-lived close handler), so we can
+        // assert refreshToken's three listeners were removed without
+        // accidentally requiring removal of unrelated handlers.
+        const listenersBefore = {
+          message: (capturedWs as any)._listeners["message"]?.length ?? 0,
+          close: (capturedWs as any)._listeners["close"]?.length ?? 0,
+          error: (capturedWs as any)._listeners["error"]?.length ?? 0,
+        };
+
+        const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+        const clearTimeoutSpy = vi.spyOn(globalThis, "clearTimeout");
+        const setTimeoutsBefore = setTimeoutSpy.mock.calls.length;
+
+        await expect(shell.refreshToken()).rejects.toThrow("send failed synchronously");
+
+        // The 30-second refresh timer must have been cleared, not left pending.
+        const newTimers = setTimeoutSpy.mock.results.slice(setTimeoutsBefore);
+        for (const result of newTimers) {
+          expect(clearTimeoutSpy).toHaveBeenCalledWith(result.value);
+        }
+
+        // refreshToken's three listeners must have been removed too,
+        // otherwise an unrelated future frame could be misattributed.
+        const listenersAfter = {
+          message: (capturedWs as any)._listeners["message"]?.length ?? 0,
+          close: (capturedWs as any)._listeners["close"]?.length ?? 0,
+          error: (capturedWs as any)._listeners["error"]?.length ?? 0,
+        };
+        expect(listenersAfter).toEqual(listenersBefore);
+
+        setTimeoutSpy.mockRestore();
+        clearTimeoutSpy.mockRestore();
+      } finally {
+        (globalThis as any).WebSocket = originalWS;
+      }
+    });
+  });
+
+  describe("getTokenExpiry stays in sync across refresh / reconnect", () => {
+    function makeJwt(payload: Record<string, unknown>): string {
+      const toBase64Url = (s: string) =>
+        Buffer.from(s).toString("base64")
+          .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+      const header = toBase64Url(JSON.stringify({ alg: "RS256" }));
+      const body = toBase64Url(JSON.stringify(payload));
+      return `${header}.${body}.sig`;
+    }
+
+    it("refreshToken() updates the token source read by getTokenExpiry()", async () => {
+      const originalExp = Math.floor(Date.now() / 1000) + 60;
+      const refreshedExp = originalExp + 3600;
+
+      const originalToken = makeJwt({ sub: "u", exp: originalExp });
+      const refreshedToken = makeJwt({ sub: "u", exp: refreshedExp });
+
+      const getTokenSilently = vi.fn()
+        .mockResolvedValueOnce(originalToken) // for _syncState at init
+        .mockResolvedValueOnce(originalToken) // for connect()
+        .mockResolvedValueOnce(refreshedToken); // for refreshToken()
+
+      const mockClient = createMockAuth0Client({
+        isAuthenticated: vi.fn().mockResolvedValue(true),
+        getUser: vi.fn().mockResolvedValue({ sub: "u" }),
+        getTokenSilently,
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const originalWS = globalThis.WebSocket;
+      let capturedWs: MockWebSocket | null = null;
+      (globalThis as any).WebSocket = class extends MockWebSocket {
+        constructor(url: string, protocols?: string | string[]) {
+          super(url, protocols);
+          capturedWs = this;
+        }
+      };
+
+      try {
+        const shell = new AuthShell();
+        await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+        await shell.connect("ws://localhost:3000");
+
+        // Before refresh: getTokenExpiry reflects original token.
+        expect(shell.getTokenExpiry()).toBe(originalExp * 1000);
+
+        capturedWs!.onSend = (data: string) => {
+          const msg = JSON.parse(data);
+          if (msg.name === "auth:refresh") {
+            queueMicrotask(() => {
+              capturedWs!._receiveMessage({ type: "return", id: msg.id, value: undefined });
+            });
+          }
+        };
+
+        await shell.refreshToken();
+
+        // After refresh: getTokenExpiry MUST reflect the refreshed token.
+        // Otherwise exp-based schedulers see a past-due exp and busy-loop.
+        expect(shell.getTokenExpiry()).toBe(refreshedExp * 1000);
+      } finally {
+        (globalThis as any).WebSocket = originalWS;
+      }
+    });
+
+    it("connect() does NOT advance getTokenExpiry() when the WebSocket fails to open", async () => {
+      const candidateExp = Math.floor(Date.now() / 1000) + 60;
+      const candidateToken = makeJwt({ sub: "u", exp: candidateExp });
+
+      // Only one fetch should happen — connect()'s — and we want it to
+      // produce a token whose exp must NOT leak into AuthCore on failure.
+      const getTokenSilently = vi.fn().mockResolvedValue(candidateToken);
+
+      const mockClient = createMockAuth0Client({
+        // isAuthenticated=false so initialize() does NOT itself sync a token
+        // via _syncState — that way the only candidate for _token is the one
+        // connect() fetches.
+        isAuthenticated: vi.fn().mockResolvedValue(false),
+        getUser: vi.fn().mockResolvedValue(null),
+        getTokenSilently,
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const originalWS = globalThis.WebSocket;
+      (globalThis as any).WebSocket = class extends MockWebSocket {
+        private _failOpen = true;
+        constructor(url: string, protocols?: string | string[]) {
+          super(url, protocols);
+          // First and only socket: refuse to open.
+          queueMicrotask(() => this._emit("error"));
+        }
+        addEventListener(type: string, listener: (...args: any[]) => void, opts?: any): void {
+          if (this._failOpen && type === "open") return;
+          super.addEventListener(type, listener, opts);
+        }
+      };
+
+      try {
+        const shell = new AuthShell();
+        await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+
+        // Sanity: nothing committed yet.
+        expect(shell.getTokenExpiry()).toBeNull();
+
+        await expect(shell.connect("ws://localhost:3000")).rejects.toThrow();
+
+        // Connection failed — `_token` must not have been published,
+        // otherwise schedulers would see a future `exp` even though
+        // the server never accepted the token.
+        expect(shell.getTokenExpiry()).toBeNull();
+      } finally {
+        (globalThis as any).WebSocket = originalWS;
+      }
+    });
+
+    it("refreshToken() does NOT advance getTokenExpiry() when the server rejects", async () => {
+      const originalExp = Math.floor(Date.now() / 1000) + 60;
+      const refreshedExp = originalExp + 3600;
+
+      const originalToken = makeJwt({ sub: "u", exp: originalExp });
+      const refreshedToken = makeJwt({ sub: "u", exp: refreshedExp });
+
+      const getTokenSilently = vi.fn()
+        .mockResolvedValueOnce(originalToken) // _syncState
+        .mockResolvedValueOnce(originalToken) // connect()
+        .mockResolvedValueOnce(refreshedToken); // refreshToken() — will be rejected by server
+
+      const mockClient = createMockAuth0Client({
+        isAuthenticated: vi.fn().mockResolvedValue(true),
+        getUser: vi.fn().mockResolvedValue({ sub: "u" }),
+        getTokenSilently,
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const originalWS = globalThis.WebSocket;
+      let capturedWs: MockWebSocket | null = null;
+      (globalThis as any).WebSocket = class extends MockWebSocket {
+        constructor(url: string, protocols?: string | string[]) {
+          super(url, protocols);
+          capturedWs = this;
+        }
+      };
+
+      try {
+        const shell = new AuthShell();
+        await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+        await shell.connect("ws://localhost:3000");
+
+        expect(shell.getTokenExpiry()).toBe(originalExp * 1000);
+
+        capturedWs!.onSend = (data: string) => {
+          const msg = JSON.parse(data);
+          if (msg.name === "auth:refresh") {
+            queueMicrotask(() => {
+              capturedWs!._receiveMessage({
+                type: "throw",
+                id: msg.id,
+                error: { name: "Error", message: "Token refresh hook failed" },
+              });
+            });
+          }
+        };
+
+        await expect(shell.refreshToken()).rejects.toThrow();
+
+        // Server rejected — `_token` (and therefore getTokenExpiry)
+        // must still reflect the token the server previously accepted,
+        // not the one we speculatively fetched from Auth0.
+        expect(shell.getTokenExpiry()).toBe(originalExp * 1000);
+      } finally {
+        (globalThis as any).WebSocket = originalWS;
+      }
+    });
+
+    it("reconnect() does NOT advance getTokenExpiry() when the new WebSocket fails to open", async () => {
+      const originalExp = Math.floor(Date.now() / 1000) + 60;
+      const refreshedExp = originalExp + 7200;
+
+      const originalToken = makeJwt({ sub: "u", exp: originalExp });
+      const refreshedToken = makeJwt({ sub: "u", exp: refreshedExp });
+
+      const getTokenSilently = vi.fn()
+        .mockResolvedValueOnce(originalToken)
+        .mockResolvedValueOnce(originalToken)
+        .mockResolvedValueOnce(refreshedToken);
+
+      const mockClient = createMockAuth0Client({
+        isAuthenticated: vi.fn().mockResolvedValue(true),
+        getUser: vi.fn().mockResolvedValue({ sub: "u" }),
+        getTokenSilently,
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const originalWS = globalThis.WebSocket;
+      let newSocketCount = 0;
+      (globalThis as any).WebSocket = class extends MockWebSocket {
+        private _failOpen: boolean;
+        constructor(url: string, protocols?: string | string[]) {
+          super(url, protocols);
+          newSocketCount += 1;
+          // The reconnect() socket — the second one — must fail to open.
+          this._failOpen = newSocketCount === 2;
+          if (this._failOpen) {
+            queueMicrotask(() => this._emit("error"));
+          }
+        }
+        addEventListener(type: string, listener: (...args: any[]) => void, opts?: any): void {
+          if (this._failOpen && type === "open") return; // drop the open handler so it cannot resolve
+          super.addEventListener(type, listener, opts);
+        }
+      };
+
+      try {
+        const shell = new AuthShell();
+        await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+        await shell.connect("ws://localhost:3000");
+
+        expect(shell.getTokenExpiry()).toBe(originalExp * 1000);
+
+        await expect(shell.reconnect()).rejects.toThrow();
+
+        // Reconnection failed — `_token` must not have been published.
+        expect(shell.getTokenExpiry()).toBe(originalExp * 1000);
+      } finally {
+        (globalThis as any).WebSocket = originalWS;
+      }
+    });
+
+    it("reconnect() updates the token source read by getTokenExpiry()", async () => {
+      const originalExp = Math.floor(Date.now() / 1000) + 60;
+      const refreshedExp = originalExp + 7200;
+
+      const originalToken = makeJwt({ sub: "u", exp: originalExp });
+      const refreshedToken = makeJwt({ sub: "u", exp: refreshedExp });
+
+      const getTokenSilently = vi.fn()
+        .mockResolvedValueOnce(originalToken) // _syncState at init
+        .mockResolvedValueOnce(originalToken) // connect()
+        .mockResolvedValueOnce(refreshedToken); // reconnect()
+
+      const mockClient = createMockAuth0Client({
+        isAuthenticated: vi.fn().mockResolvedValue(true),
+        getUser: vi.fn().mockResolvedValue({ sub: "u" }),
+        getTokenSilently,
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const shell = new AuthShell();
+      await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+      await shell.connect("ws://localhost:3000");
+
+      expect(shell.getTokenExpiry()).toBe(originalExp * 1000);
+
+      await shell.reconnect();
+
+      expect(shell.getTokenExpiry()).toBe(refreshedExp * 1000);
     });
   });
 

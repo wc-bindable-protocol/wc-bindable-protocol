@@ -1,11 +1,12 @@
 import { WebSocketClientTransport } from "@wc-bindable/remote";
-import type { ClientTransport } from "@wc-bindable/remote";
+import type { ClientTransport, ClientMessage, ServerMessage } from "@wc-bindable/remote";
 import { AuthCore } from "../core/AuthCore.js";
 import { raiseError } from "../raiseError.js";
 import { IWcBindable, AuthShellOptions } from "../types.js";
 
 const PROTOCOL_PREFIX = "hawc-auth0.bearer.";
 let _nextRefreshId = 1;
+type RefreshResponseMessage = Extract<ServerMessage, { type: "return" | "throw" }>;
 
 /**
  * Remote-capable authentication shell.
@@ -33,6 +34,7 @@ export class AuthShell extends EventTarget {
   private _core: AuthCore;
   private _connected: boolean = false;
   private _ws: WebSocket | null = null;
+  private _transport: InterceptingClientTransport | null = null;
   private _url: string = "";
 
   constructor(target?: EventTarget) {
@@ -76,6 +78,16 @@ export class AuthShell extends EventTarget {
 
   get initPromise(): Promise<void> | null {
     return this._core.initPromise;
+  }
+
+  /**
+   * Current access token's expiry as a millisecond epoch, or `null`
+   * if no token is held. Does NOT expose the token material —
+   * intended for refresh schedulers in remote deployments where
+   * `token` is deliberately kept inside AuthShell.
+   */
+  getTokenExpiry(): number | null {
+    return this._core.getTokenExpiry();
   }
 
   // --- Lifecycle ------------------------------------------------------------
@@ -136,7 +148,12 @@ export class AuthShell extends EventTarget {
       raiseError("Auth0 client is not initialized. Call initialize() first.");
     }
 
-    const token = await this._core.getToken();
+    // Fetch-then-commit: same invariant as refreshToken / reconnect.
+    // The token is published to AuthCore only after the server accepts
+    // it via the WebSocket handshake (`open`). If the initial connection
+    // fails, `_token` and `getTokenExpiry()` stay aligned with the last
+    // server-accepted state (typically null on first attempt).
+    const token = await this._core.fetchToken();
     if (!token) {
       raiseError("Failed to obtain access token.");
     }
@@ -153,16 +170,30 @@ export class AuthShell extends EventTarget {
       }
     });
 
-    // Wait for the connection to open before returning the transport
-    await new Promise<void>((resolve, reject) => {
-      ws.addEventListener("open", () => resolve(), { once: true });
-      ws.addEventListener("error", () => {
-        reject(new Error(`[@wc-bindable/hawc-auth0] WebSocket connection failed: ${url}`));
-      }, { once: true });
-    });
+    // Wait for the connection to open before returning the transport.
+    // If the handshake fails we MUST drop `connected` back to false:
+    // _closeWebSocket() above nulled `_ws` before close()-ing the
+    // previous socket, so the previous socket's close handler became
+    // a no-op (its `this._ws === ws` guard fails), and without this
+    // explicit clear `connected` would stay true even though no live
+    // transport remains. This corrupts any UI / retry logic keyed off
+    // `connected`.
+    try {
+      await new Promise<void>((resolve, reject) => {
+        ws.addEventListener("open", () => resolve(), { once: true });
+        ws.addEventListener("error", () => {
+          reject(new Error(`[@wc-bindable/hawc-auth0] WebSocket connection failed: ${url}`));
+        }, { once: true });
+      });
+    } catch (err) {
+      this._setConnected(false);
+      throw err;
+    }
 
+    // Server accepted the token at handshake — safe to commit.
+    this._core.commitToken(token);
     this._setConnected(true);
-    return new WebSocketClientTransport(ws);
+    return this._createTransport(ws);
   }
 
   /**
@@ -173,10 +204,10 @@ export class AuthShell extends EventTarget {
    * The server re-verifies the token and updates the session expiry
    * without reconstructing Cores — Core state is fully continuous.
    *
-   * Sends and receives directly on the raw WebSocket to avoid
-   * interfering with RemoteCoreProxy's single-handler transport.
-   * The server intercepts `auth:refresh` before RemoteShellProxy
-   * sees it, so the proxy never receives the response either.
+  * Sends directly on the raw WebSocket, but registers a one-shot
+  * response interceptor on the returned ClientTransport so the
+  * matching `return` / `throw` frame is consumed before downstream
+  * consumers such as RemoteCoreProxy see it.
    */
   async refreshToken(): Promise<void> {
     if (!this._core.client) {
@@ -186,32 +217,39 @@ export class AuthShell extends EventTarget {
       raiseError("No active connection. Call connect() first.");
     }
 
-    const token = await this._core.client.getTokenSilently({ cacheMode: "off" });
+    // Fetch the new token WITHOUT committing it. We only publish it
+    // into AuthCore once the server has confirmed acceptance, otherwise
+    // `getTokenExpiry()` would advance ahead of the session the server
+    // is actually enforcing, and exp-based schedulers would delay the
+    // next refresh past the server-side deadline.
+    const token = await this._core.fetchFreshToken();
     if (!token) {
       raiseError("Failed to refresh access token.");
     }
 
     const id = `auth-refresh-${_nextRefreshId++}`;
     const ws = this._ws;
+    const transport = this._transport;
+    if (!transport) {
+      raiseError("No active connection. Call connect() first.");
+    }
 
-    return new Promise<void>((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
       let settled = false;
+      let releaseIntercept = () => {};
       const cleanup = () => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        ws.removeEventListener("message", onMessage);
+        releaseIntercept();
         ws.removeEventListener("close", onClose);
         ws.removeEventListener("error", onError);
       };
 
-      const onMessage = (event: MessageEvent) => {
-        let msg: any;
-        try { msg = JSON.parse(event.data); } catch { return; }
-        if (msg.id !== id) return;
+      const onMessage = (msg: RefreshResponseMessage) => {
         cleanup();
         if (msg.type === "return") resolve();
-        else reject(new Error(msg.error?.message ?? "Token refresh failed"));
+        else reject(new Error(_getErrorMessage(msg.error)));
       };
 
       const onClose = () => {
@@ -229,16 +267,29 @@ export class AuthShell extends EventTarget {
         reject(new Error("Token refresh timed out"));
       }, 30_000);
 
-      ws.addEventListener("message", onMessage);
+      releaseIntercept = transport.interceptResponse(id, onMessage);
       ws.addEventListener("close", onClose, { once: true });
       ws.addEventListener("error", onError, { once: true });
-      ws.send(JSON.stringify({
-        type: "cmd",
-        name: "auth:refresh",
-        id,
-        args: [token],
-      }));
+      try {
+        transport.send({
+          type: "cmd",
+          name: "auth:refresh",
+          id,
+          args: [token],
+        });
+      } catch (sendErr) {
+        // ws.send can throw synchronously if the socket transitioned out
+        // of OPEN between the readyState check and this call. Without an
+        // explicit cleanup the 30-second timer, response interceptor, and
+        // close/error listeners would survive, leaking an unhandled rejection
+        // at timeout and risking misattribution of unrelated future frames.
+        cleanup();
+        reject(sendErr instanceof Error ? sendErr : new Error(String(sendErr)));
+      }
     });
+
+    // Server has returned success — safe to publish the new token.
+    this._core.commitToken(token);
   }
 
   /**
@@ -257,8 +308,11 @@ export class AuthShell extends EventTarget {
       raiseError("No previous connection URL. Call connect() first.");
     }
 
-    // Force a fresh token (bypass cache)
-    const token = await this._core.client.getTokenSilently({ cacheMode: "off" });
+    // Fetch-then-commit: the new token is published to AuthCore only
+    // after the server accepts it via the WebSocket handshake (`open`).
+    // If the reconnection fails, `_token` and `getTokenExpiry()` stay
+    // aligned with the last session the server actually honoured.
+    const token = await this._core.fetchFreshToken();
     if (!token) {
       raiseError("Failed to refresh access token.");
     }
@@ -274,15 +328,25 @@ export class AuthShell extends EventTarget {
       }
     });
 
-    await new Promise<void>((resolve, reject) => {
-      ws.addEventListener("open", () => resolve(), { once: true });
-      ws.addEventListener("error", () => {
-        reject(new Error(`[@wc-bindable/hawc-auth0] WebSocket reconnection failed: ${this._url}`));
-      }, { once: true });
-    });
+    // See connect(): the previous socket's close handler is now a no-op,
+    // so a handshake failure here would leave `connected` stuck at true
+    // unless we explicitly clear it on the failure path.
+    try {
+      await new Promise<void>((resolve, reject) => {
+        ws.addEventListener("open", () => resolve(), { once: true });
+        ws.addEventListener("error", () => {
+          reject(new Error(`[@wc-bindable/hawc-auth0] WebSocket reconnection failed: ${this._url}`));
+        }, { once: true });
+      });
+    } catch (err) {
+      this._setConnected(false);
+      throw err;
+    }
 
+    // Server accepted the new token at handshake — safe to commit.
+    this._core.commitToken(token);
     this._setConnected(true);
-    return new WebSocketClientTransport(ws);
+    return this._createTransport(ws);
   }
 
   // --- Private helpers ------------------------------------------------------
@@ -302,5 +366,78 @@ export class AuthShell extends EventTarget {
       this._ws = null;
       ws.close();
     }
+    if (this._transport) {
+      this._transport.dispose();
+      this._transport = null;
+    }
   }
+
+  private _createTransport(ws: WebSocket): InterceptingClientTransport {
+    const transport = new InterceptingClientTransport(ws);
+    this._transport = transport;
+    return transport;
+  }
+}
+
+class InterceptingClientTransport implements ClientTransport {
+  private _base: WebSocketClientTransport;
+  private _handler: ((message: ServerMessage) => void) | null = null;
+  private _responseInterceptors = new Map<string, (message: RefreshResponseMessage) => void>();
+
+  constructor(ws: WebSocket) {
+    this._base = new WebSocketClientTransport(ws);
+    this._base.onMessage((message) => {
+      if ((message.type === "return" || message.type === "throw") && this._maybeIntercept(message)) {
+        return;
+      }
+      this._handler?.(message);
+    });
+  }
+
+  send(message: ClientMessage): void {
+    this._base.send(message);
+  }
+
+  onMessage(handler: (message: ServerMessage) => void): void {
+    this._handler = handler;
+  }
+
+  onClose(handler: () => void): void {
+    this._base.onClose?.(handler);
+  }
+
+  dispose(): void {
+    this._responseInterceptors.clear();
+    this._handler = null;
+    this._base.dispose?.();
+  }
+
+  interceptResponse(id: string, handler: (message: RefreshResponseMessage) => void): () => void {
+    this._responseInterceptors.set(id, handler);
+    return () => {
+      if (this._responseInterceptors.get(id) === handler) {
+        this._responseInterceptors.delete(id);
+      }
+    };
+  }
+
+  private _maybeIntercept(message: RefreshResponseMessage): boolean {
+    const handler = this._responseInterceptors.get(message.id);
+    if (!handler) return false;
+    this._responseInterceptors.delete(message.id);
+    handler(message);
+    return true;
+  }
+}
+
+function _getErrorMessage(error: unknown): string {
+  if (
+    error &&
+    typeof error === "object" &&
+    "message" in error &&
+    typeof (error as { message: unknown }).message === "string"
+  ) {
+    return (error as { message: string }).message;
+  }
+  return "Token refresh failed";
 }

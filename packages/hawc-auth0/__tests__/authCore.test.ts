@@ -526,4 +526,53 @@ describe("AuthCore", () => {
       expect(core.error).toBeNull();
     });
   });
+
+  describe("getTokenExpiry", () => {
+    function makeJwt(payload: Record<string, unknown>): string {
+      const toBase64Url = (s: string) =>
+        Buffer.from(s).toString("base64")
+          .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+      const header = toBase64Url(JSON.stringify({ alg: "RS256" }));
+      const body = toBase64Url(JSON.stringify(payload));
+      return `${header}.${body}.sig`;
+    }
+
+    it("no token → null", () => {
+      const core = new AuthCore();
+      expect(core.getTokenExpiry()).toBeNull();
+    });
+
+    it("token without exp claim → null", async () => {
+      const mockClient = createMockAuth0Client({
+        isAuthenticated: vi.fn().mockResolvedValue(true),
+        getUser: vi.fn().mockResolvedValue({ sub: "auth0|1" }),
+        getTokenSilently: vi.fn().mockResolvedValue(makeJwt({ sub: "auth0|1" })),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+      const core = new AuthCore();
+      await core.initialize({ domain: "d", clientId: "c" });
+      expect(core.getTokenExpiry()).toBeNull();
+    });
+
+    it("token with exp → ms epoch", async () => {
+      const expSeconds = Math.floor(Date.now() / 1000) + 300;
+      const mockClient = createMockAuth0Client({
+        isAuthenticated: vi.fn().mockResolvedValue(true),
+        getUser: vi.fn().mockResolvedValue({ sub: "auth0|1" }),
+        getTokenSilently: vi.fn().mockResolvedValue(
+          makeJwt({ sub: "auth0|1", exp: expSeconds }),
+        ),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+      const core = new AuthCore();
+      await core.initialize({ domain: "d", clientId: "c" });
+      expect(core.getTokenExpiry()).toBe(expSeconds * 1000);
+    });
+
+    it("malformed token → null", () => {
+      const core = new AuthCore();
+      (core as any)._token = "not.a.valid.jwt.at.all";
+      expect(core.getTokenExpiry()).toBeNull();
+    });
+  });
 });

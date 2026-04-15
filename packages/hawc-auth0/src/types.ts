@@ -35,7 +35,7 @@ export interface IWcBindable {
 /**
  * Auth0 user profile returned after authentication.
  */
-export interface WcsAuthUser {
+export interface AuthUser {
   sub: string;
   name?: string;
   email?: string;
@@ -46,7 +46,7 @@ export interface WcsAuthUser {
 /**
  * Auth0 authentication error.
  */
-export interface WcsAuthError {
+export interface AuthError {
   error: string;
   error_description?: string;
   [key: string]: any;
@@ -55,20 +55,44 @@ export interface WcsAuthError {
 /**
  * Value types for AuthCore (headless) — the async state properties.
  */
-export interface WcsAuthCoreValues {
+export interface AuthCoreValues {
   authenticated: boolean;
-  user: WcsAuthUser | null;
+  user: AuthUser | null;
   token: string | null;
   loading: boolean;
-  error: WcsAuthError | Error | null;
+  error: AuthError | Error | null;
 }
 
 /**
- * Value types for the Shell (`<wcs-auth>`) — extends Core with `trigger`.
+ * Value types for the `<hawc-auth0>` custom element — the bindable
+ * surface seen by `data-wcs`-style binding systems.
+ *
+ * This intentionally does NOT include `token`: the access token is
+ * deliberately kept out of the bindable surface (security — see the
+ * remote spec) and is exposed only as a JS-only getter / `getToken()`
+ * method on the element. `connected` is included instead, and the
+ * element adds `trigger` on top of the Shell's bindable properties.
  */
-export interface WcsAuthValues extends WcsAuthCoreValues {
+export interface AuthValues extends AuthShellValues {
   trigger: boolean;
 }
+
+// ---------------------------------------------------------------------------
+// Deprecated legacy aliases (Wcs* prefix is a `@wcstack` artifact).
+// Kept for backward compatibility — schedule removal in a future major.
+// ---------------------------------------------------------------------------
+
+/** @deprecated Renamed to {@link AuthUser}. The `Wcs` prefix was a legacy `@wcstack` artifact. */
+export type WcsAuthUser = AuthUser;
+
+/** @deprecated Renamed to {@link AuthError}. The `Wcs` prefix was a legacy `@wcstack` artifact. */
+export type WcsAuthError = AuthError;
+
+/** @deprecated Renamed to {@link AuthCoreValues}. The `Wcs` prefix was a legacy `@wcstack` artifact. */
+export type WcsAuthCoreValues = AuthCoreValues;
+
+/** @deprecated Renamed to {@link AuthValues}. The `Wcs` prefix was a legacy `@wcstack` artifact. */
+export type WcsAuthValues = AuthValues;
 
 /**
  * Auth0 client configuration options passed to createAuth0Client.
@@ -93,13 +117,13 @@ export interface Auth0ClientOptions {
 
 /**
  * Value types for AuthShell — the remote-capable authentication shell.
- * Unlike WcsAuthCoreValues, this omits `token` (security) and adds `connected`.
+ * Unlike AuthCoreValues, this omits `token` (security) and adds `connected`.
  */
 export interface AuthShellValues {
   authenticated: boolean;
-  user: WcsAuthUser | null;
+  user: AuthUser | null;
   loading: boolean;
-  error: WcsAuthError | Error | null;
+  error: AuthError | Error | null;
   connected: boolean;
 }
 
@@ -159,9 +183,13 @@ export interface AuthenticatedConnectionOptions {
    * can change across refreshes and the Core exposes them — otherwise
    * server-side bindable state goes stale relative to the latest token.
    *
+   * May be sync or async; the handler is awaited and the refresh
+   * commit only proceeds if it resolves. A sync throw or async rejection
+   * rolls back the refresh and is reported as `auth:refresh-failure`.
+   *
    * For the reference `UserCore`, pass `(core, user) => core.updateUser(user)`.
    */
-  onTokenRefresh?: (core: EventTarget, user: UserContext) => void;
+  onTokenRefresh?: (core: EventTarget, user: UserContext) => void | Promise<void>;
   proxyOptions?: import("@wc-bindable/remote").RemoteShellProxyOptions;
 }
 

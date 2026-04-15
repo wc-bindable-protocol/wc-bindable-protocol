@@ -201,6 +201,14 @@ export class Auth extends HTMLElement {
   }
 
   /**
+   * Current access token's expiry as a millisecond epoch, or `null`.
+   * Exposes only the `exp` claim; the token material stays inside the Shell.
+   */
+  getTokenExpiry(): number | null {
+    return this._shell.getTokenExpiry();
+  }
+
+  /**
    * Establish an authenticated WebSocket connection.
    * If no URL is provided, uses the `remote-url` attribute.
    */

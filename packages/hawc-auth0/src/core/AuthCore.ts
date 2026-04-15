@@ -1,5 +1,5 @@
 import { raiseError } from "../raiseError.js";
-import { IWcBindable, Auth0ClientOptions, WcsAuthUser } from "../types.js";
+import { IWcBindable, Auth0ClientOptions, AuthUser } from "../types.js";
 
 /**
  * Headless authentication core based on Auth0 SPA SDK.
@@ -21,7 +21,7 @@ export class AuthCore extends EventTarget {
   private _target: EventTarget;
   private _client: any = null;
   private _authenticated: boolean = false;
-  private _user: WcsAuthUser | null = null;
+  private _user: AuthUser | null = null;
   private _token: string | null = null;
   private _loading: boolean = false;
   private _error: any = null;
@@ -36,7 +36,7 @@ export class AuthCore extends EventTarget {
     return this._authenticated;
   }
 
-  get user(): WcsAuthUser | null {
+  get user(): AuthUser | null {
     return this._user;
   }
 
@@ -58,6 +58,30 @@ export class AuthCore extends EventTarget {
 
   get initPromise(): Promise<void> | null {
     return this._initPromise;
+  }
+
+  /**
+   * Return the current access token's expiry as a millisecond epoch,
+   * or `null` if no token is held or the token has no `exp` claim.
+   *
+   * Exposes the `exp` claim only — the raw token material never leaves
+   * AuthCore. Intended for refresh schedulers that need to know when
+   * to call `refreshToken()` without touching the token string.
+   */
+  getTokenExpiry(): number | null {
+    const token = this._token;
+    if (!token) return null;
+    const parts = token.split(".");
+    if (parts.length < 2) return null;
+    try {
+      const payload = JSON.parse(_base64UrlDecode(parts[1]));
+      if (typeof payload.exp === "number") {
+        return payload.exp * 1000;
+      }
+    } catch {
+      // Fall through
+    }
+    return null;
   }
 
   private _setLoading(loading: boolean): void {
@@ -84,7 +108,7 @@ export class AuthCore extends EventTarget {
     }));
   }
 
-  private _setUser(user: WcsAuthUser | null): void {
+  private _setUser(user: AuthUser | null): void {
     this._user = user;
     this._target.dispatchEvent(new CustomEvent("hawc-auth0:user-changed", {
       detail: user,
@@ -257,4 +281,71 @@ export class AuthCore extends EventTarget {
       return null;
     }
   }
+
+  /**
+   * Obtain an access token from Auth0 SPA SDK and return it
+   * **without** updating `_token`. The caller is responsible for
+   * handing the token to whatever downstream system must accept it —
+   * typically the server — and only then calling `commitToken(token)`
+   * to publish the new value to `_token` / `getTokenExpiry()` and
+   * fire `token-changed`.
+   *
+   * Splitting fetch from commit keeps the invariant that `_token`
+   * (and therefore `getTokenExpiry()`) reflects the token the
+   * **server** has accepted, so that refresh schedulers cannot be
+   * misled by a locally-obtained token that a downstream actor later
+   * rejected. Use this in every connection establishment / refresh
+   * path; only call `commitToken` after the server confirms acceptance.
+   *
+   * `options` is forwarded to `getTokenSilently` (e.g. pass
+   * `{ cacheMode: "off" }` to force a network refresh).
+   *
+   * Mirrors `getToken`'s error semantics: when the Auth0 SDK rejects,
+   * `_error` is set and `hawc-auth0:error` is dispatched, then `null`
+   * is returned. This keeps the observable error contract consistent
+   * across `connect` / `refreshToken` / `reconnect` so callers can
+   * uniformly translate `null` into a domain-specific message
+   * (e.g. "Failed to obtain access token.").
+   */
+  async fetchToken(options?: Record<string, any>): Promise<string | null> {
+    if (!this._client) {
+      raiseError("Auth0 client is not initialized. Call initialize() first.");
+    }
+
+    this._setError(null);
+
+    try {
+      const token = await this._client.getTokenSilently(options);
+      return token ?? null;
+    } catch (e: any) {
+      this._setError(e);
+      return null;
+    }
+  }
+
+  /**
+   * Convenience wrapper for `fetchToken({ cacheMode: "off" })` —
+   * forces Auth0 to issue a fresh access token instead of returning
+   * a cached one. Same fetch-without-commit semantics as `fetchToken`.
+   */
+  async fetchFreshToken(): Promise<string | null> {
+    return this.fetchToken({ cacheMode: "off" });
+  }
+
+  /**
+   * Commit a token that has already been accepted by the downstream
+   * system (server handshake, in-band `auth:refresh`, or a fresh
+   * WebSocket `open`). Updates `_token` and dispatches `token-changed`.
+   */
+  commitToken(token: string | null): void {
+    this._setToken(token);
+  }
+}
+
+function _base64UrlDecode(input: string): string {
+  const padded = input + "=".repeat((4 - (input.length % 4)) % 4);
+  const base64 = padded.replace(/-/g, "+").replace(/_/g, "/");
+  if (typeof atob === "function") return atob(base64);
+  // Node fallback for environments without atob.
+  return Buffer.from(base64, "base64").toString("binary");
 }

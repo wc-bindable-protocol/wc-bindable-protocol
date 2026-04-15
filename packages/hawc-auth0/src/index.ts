@@ -7,8 +7,10 @@ export { AuthLogout as HawcAuth0Logout } from "./components/AuthLogout.js";
 
 export type {
   IWritableConfig, IWritableTagNames,
-  WcsAuthUser, WcsAuthError, WcsAuthCoreValues, WcsAuthValues,
+  AuthUser, AuthError, AuthCoreValues, AuthValues,
   Auth0ClientOptions,
   AuthShellValues, AuthShellOptions,
   UserContext, AuthenticatedConnectionOptions, VerifyTokenOptions,
+  // Deprecated — kept for backward compatibility, see types.ts
+  WcsAuthUser, WcsAuthError, WcsAuthCoreValues, WcsAuthValues,
 } from "./types.js";

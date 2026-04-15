@@ -8,7 +8,7 @@ Adapt `hawc-auth0` to the remote HAWC architecture. Map the inherent two-layer s
 
 - **Shell (browser)**: Auth0 SPA SDK calls, redirect navigation, token acquisition, login UI control
 - **Core (server)**: Token verification, user context retention, permission/role evaluation, session management
-- **Junction point**: Access token handoff during WebSocket handshake (single point only)
+- **Junction points**: Access token handoff at the WebSocket handshake, plus in-band `auth:refresh` messages on the existing connection (§3.4.1). No application-level frame carries the token.
 
 ### Fundamental Difference from hawc-s3
 
@@ -137,7 +137,7 @@ export class AuthShell extends EventTarget {
 | `error`        | `AuthError \| null`     | Most recent error                              |
 | `connected`    | `boolean`               | WebSocket connection is open (transport layer ready) |
 
-> **Note**: The `token` property present in the local version is **intentionally not exposed** externally. The token is held only within the browser and used solely during the WebSocket handshake, minimizing the risk of token leakage via XSS.
+> **Note**: The `token` property present in the local version is **intentionally not exposed** externally. The token is held only within the browser and is sent on the wire only at the WebSocket handshake and during in-band `auth:refresh` (§3.4.1) — application-level frames never carry it. This minimizes the risk of token leakage via XSS.
 
 #### Semantics of `connected`
 
@@ -178,6 +178,8 @@ If `<hawc-auth0 remote-url="...">` auto-connects, the element emits `connected=t
 | `logout(options?)`    | `LogoutOptions?`               | `Promise<void>`          | Logout + close WebSocket                        |
 | `connect(url)`        | `string`                       | `Promise<ClientTransport>` | Establish authenticated WebSocket connection  |
 | `reconnect()`         | none                           | `Promise<ClientTransport>` | Refresh token and establish new connection     |
+| `refreshToken()`      | none                           | `Promise<void>`          | In-band refresh over the existing WebSocket     |
+| `getTokenExpiry()`    | none                           | `number \| null`         | Current token's `exp` in ms epoch (no token material exposed) |
 
 ### 3.2 AuthShellOptions (initialize argument)
 
@@ -212,14 +214,25 @@ async connect(url: string): Promise<ClientTransport> {
   // 2. Open WebSocket with token in Sec-WebSocket-Protocol
   const ws = new WebSocket(url, [`hawc-auth0.bearer.${token}`]);
 
-  // 3. Wrap with WebSocketClientTransport and return
-  const transport = new WebSocketClientTransport(ws);
-  
-  // 4. Track connection state
-  this._setConnected(true);
-  ws.addEventListener("close", () => this._setConnected(false));
+  // 3. Track close events up front (covers failure paths too)
+  ws.addEventListener("close", () => {
+    if (this._ws === ws) this._setConnected(false);
+  });
 
-  return transport;
+  // 4. Wait for the transport to actually be ready.
+  //    `connected` reflects the WebSocket `open` event (§3.1) — it must
+  //    NOT be set true on construction, otherwise subscribers observe
+  //    a window in which `connected === true` while no bytes can flow.
+  await new Promise<void>((resolve, reject) => {
+    ws.addEventListener("open", () => resolve(), { once: true });
+    ws.addEventListener("error", () => {
+      reject(new Error(`[@wc-bindable/hawc-auth0] WebSocket connection failed: ${url}`));
+    }, { once: true });
+  });
+
+  // 5. open confirmed → publish connected=true and hand back the transport
+  this._setConnected(true);
+  return new WebSocketClientTransport(ws);
 }
 ```
 
@@ -248,15 +261,60 @@ The WebSocket connection stays open. The client periodically obtains a fresh tok
 
 **Shell side:**
 
+`AuthShell` is a gatekeeper and does **not** own a `RemoteCoreProxy` (§3.1). It therefore cannot and must not go through `proxy.invoke(...)`. Instead, the transport `AuthShell` returns from `connect()` is an `InterceptingClientTransport` that wraps the WebSocket: the proxy uses it as its normal `ClientTransport`, and `AuthShell` additionally registers a one-shot, id-keyed **response interceptor** for `auth:refresh`. When the matching `return` / `throw` frame arrives, the interceptor consumes it and the proxy's `onMessage` handler is **never called for that frame**, so the proxy's unknown-id warning is not triggered.
+
+Two invariants of this code are load-bearing — copy them as-is:
+
+1. The new token is fetched via `_core.fetchFreshToken()` so it is **not** committed to `AuthCore` until the server returns success (otherwise `getTokenExpiry()` would advance ahead of the session the server actually enforces).
+2. The cleanup runs on every exit path — server reply, socket close, socket error, timeout, **and** synchronous `transport.send` failure — so the timer and the response interceptor never outlive the request.
+
 ```typescript
 async refreshToken(): Promise<void> {
-  const token = await this._core.client.getTokenSilently({ cacheMode: "off" });
+  const token = await this._core.fetchFreshToken();
   if (!token) raiseError("Failed to refresh access token.");
-  // Send the fresh token over the existing WebSocket via the proxy
-  // The server handles re-verification transparently
-  await this._proxy.invoke("auth:refresh", token);
+
+  const id = `auth-refresh-${nextId++}`;
+  const ws = this._ws;
+  const transport = this._transport; // the InterceptingClientTransport from connect()
+
+  await new Promise<void>((resolve, reject) => {
+    let releaseIntercept = () => {};
+    const cleanup = () => {
+      clearTimeout(timer);
+      releaseIntercept();
+      ws.removeEventListener("close", onClose);
+      ws.removeEventListener("error", onError);
+    };
+
+    const onResponse = (msg: { type: "return" | "throw"; error?: { message?: string } }) => {
+      cleanup();
+      if (msg.type === "return") resolve();
+      else reject(new Error(msg.error?.message ?? "Token refresh failed"));
+    };
+    const onClose = () => { cleanup(); reject(new Error("WebSocket closed before token refresh completed")); };
+    const onError = () => { cleanup(); reject(new Error("WebSocket error during token refresh")); };
+    const timer = setTimeout(() => { cleanup(); reject(new Error("Token refresh timed out")); }, 30_000);
+
+    // Register the id-keyed interceptor BEFORE sending so the response cannot race past us.
+    releaseIntercept = transport.interceptResponse(id, onResponse);
+    ws.addEventListener("close", onClose, { once: true });
+    ws.addEventListener("error", onError, { once: true });
+
+    try {
+      transport.send({ type: "cmd", name: "auth:refresh", id, args: [token] });
+    } catch (sendErr) {
+      // ws.send can throw synchronously if the socket transitioned out of OPEN.
+      cleanup();
+      reject(sendErr instanceof Error ? sendErr : new Error(String(sendErr)));
+    }
+  });
+
+  // Server returned success — safe to publish the new token to AuthCore.
+  this._core.commitToken(token);
 }
 ```
+
+This keeps the gatekeeper / proxy split clean: `AuthShell` owns only the transport and the auth-level commands that travel over it. The `auth:refresh` reply still arrives on the same WebSocket, but the `InterceptingClientTransport` consumes that specific `return` / `throw` frame before the application's `RemoteCoreProxy` sees it, so the proxy's unknown-id warning path is not triggered.
 
 > `auth:refresh` is a reserved command name on the server-side connection handler, not on individual Cores. By default it only re-verifies the token and updates the session's expiry — Core instances are never reconstructed. However, **if token claims such as `permissions` or `roles` can change across refreshes and the Core exposes them as bindable state, the integrator must wire an `onTokenRefresh` hook to propagate the new claims into the Core**. Without the hook, server authorization and bindable state drift from the latest token.
 
@@ -269,19 +327,31 @@ transport.onMessage((msg) => {
   if (msg.type === "cmd" && msg.name === "auth:refresh") {
     const newToken = msg.args[0] as string;
     verifyAuth0Token(newToken, { domain, audience })
-      .then((user) => {
-        // Commit path: run the hook FIRST so a failure does not leave
-        // the session extended while the Core stays stale.
+      .then(async (user) => {
+        // Pre-extend session expiry BEFORE awaiting the hook —
+        // verification + sub match already prove the new token is
+        // acceptable, so the connection is allowed to live to the new
+        // exp. Without this, a slow async hook (external I/O, policy
+        // lookup) can be killed mid-execution by the old expiry timer
+        // firing 4401 against a legitimate refresh. Roll back if the
+        // hook fails so the previously honoured deadline still applies.
+        const prevExpiresAt = session.expiresAt;
+        // `exp` lives on the decoded JWT payload, not on UserContext.
+        // In the shipped impl this is `_getExpFromToken(newToken, sessionGraceMs)`.
+        session.expiresAt = _getExpFromToken(newToken, sessionGraceMs);
+        rescheduleExpiryTimer();
+
         try {
-          onTokenRefresh?.(core, user);
+          await onTokenRefresh?.(core, user);
         } catch (err) {
+          // Rollback: restore the deadline the server actually honoured.
+          session.expiresAt = prevExpiresAt;
+          rescheduleExpiryTimer();
           transport.send({ type: "throw", id: msg.id, error: { name: "Error", message: "Token refresh hook failed" } });
           return;
         }
         session.user = user;
-        // `exp` lives on the decoded JWT payload, not on UserContext.
-        // In the shipped impl this is `_getExpFromToken(newToken, sessionGraceMs)`.
-        session.expiresAt = _getExpFromToken(newToken, sessionGraceMs);
+        // session.expiresAt + timer are already at the new value.
         transport.send({ type: "return", id: msg.id, value: undefined });
       })
       .catch(() => {
@@ -299,6 +369,7 @@ transport.onMessage((msg) => {
 - **Required** when the Core surfaces any token-derived claim as bindable state (e.g. `UserCore.permissions`, `roles`) and those claims can change across refreshes. Omitting the hook leaves the Core holding the claims from the initial token indefinitely, even though the server session has advanced.
 - **Not required** when the Core only depends on the identity (`sub`) and the server only uses the token for session expiry enforcement. Identity mismatch between refreshes is already rejected (`4403 Token subject mismatch`).
 - For the reference `UserCore`, wire it as `(core, user) => core.updateUser(user)`. `updateUser` dispatches `hawc-auth0:permissions-changed` / `roles-changed` / `user-changed` only when the corresponding field actually changed, so the client sees exactly the deltas the new token implies and nothing more.
+- **Async hooks are supported.** The handler may return `Promise<void>` (e.g. to consult an external authorization service before publishing new claims). The connection handler awaits it; commit only proceeds on resolve. A rejection rolls the refresh back exactly like a sync throw and is reported as `auth:refresh-failure`.
 
 **Usage pattern (exp-based scheduling):**
 
@@ -331,14 +402,14 @@ function scheduleTokenRefresh(
 
   function scheduleNext() {
     if (disposed) return;
-    const token = authShell.token;
-    if (!token) return;
 
-    // Decode the JWT payload (no verification — we trust our own token)
-    const payload = JSON.parse(atob(token.split(".")[1]));
-    const expiresAt = payload.exp * 1000; // seconds → ms
+    // Only read the `exp` claim — do NOT touch the raw token string.
+    // The remote deployment's policy is that the access token stays
+    // inside AuthShell (§3.1, token is intentionally not exposed).
+    const expiresAt = authShell.getTokenExpiry();
+    if (expiresAt === null) return;
+
     const delay = Math.max(0, expiresAt - Date.now() - marginMs);
-
     timerId = setTimeout(refresh, delay);
   }
 
@@ -466,7 +537,7 @@ interface AuthenticatedConnectionOptions {
    * Invoked before session expiry is advanced; if it throws, the
    * refresh is rejected and no session state is committed.
    */
-  onTokenRefresh?: (core: EventTarget, user: UserContext) => void;
+  onTokenRefresh?: (core: EventTarget, user: UserContext) => void | Promise<void>;
   /** Allowed Origin list (CSRF prevention) */
   allowedOrigins?: string[];
   /** RemoteShellProxy options */
@@ -819,7 +890,9 @@ The declarative layer handles the common case (80%+). The imperative layer handl
 1. Token expiry approaches (detected client-side via timer)
    └─ AuthShell.refreshToken()
       └─ getTokenSilently({ cacheMode: "off" })  → fresh access token
-      └─ proxy.invoke("auth:refresh", token)      → sent over existing WebSocket
+      └─ transport.send({ type:"cmd", name:"auth:refresh", id, args:[token] })
+        (AuthShell registers a one-shot interceptor so the matching reply
+         is consumed before application-level transport consumers see it)
 
 2. Server side
    └─ Connection handler intercepts "auth:refresh" command
@@ -942,7 +1015,7 @@ export interface AuthenticatedConnectionOptions {
   createCores: (user: UserContext) => EventTarget;
   /** Propagate refreshed claims into the Core after `auth:refresh`.
    *  Required when claims the Core exposes can change across refreshes. */
-  onTokenRefresh?: (core: EventTarget, user: UserContext) => void;
+  onTokenRefresh?: (core: EventTarget, user: UserContext) => void | Promise<void>;
   proxyOptions?: import("@wc-bindable/remote").RemoteShellProxyOptions;
 }
 
@@ -1027,7 +1100,7 @@ This section defines what this specification's security measures **do and do not
 | Accidental token exposure via `bind()` / framework state | `token` not in wcBindable — never appears in React state, Vue reactive data, etc. | **Effective.** Eliminates the most common accidental leakage vector in SPA frameworks. |
 | Token in DevTools component tree | Token not a public property on `<hawc-auth0>` — won't show in React DevTools, Vue Devtools property panels | **Effective** for casual inspection. The Auth0 SDK still holds it internally. |
 | Token persisted across sessions | `cacheLocation: "memory"` (default) — token is lost on page reload | **Effective.** Prevents token surviving in `localStorage` across tabs/sessions. |
-| Token sent repeatedly over the wire | Token used once (handshake only); subsequent messages carry no credentials | **Effective.** Reduces the window of interception compared to per-request `Authorization` headers. |
+| Token sent repeatedly over the wire | Token sent only at the WebSocket handshake; the only documented exception is the in-band `auth:refresh` command (§3.4.1), which carries a fresh token as a single message at refresh time. Application-level frames never carry the token. | **Effective.** Reduces interception surface to handshake + occasional refresh, versus per-request `Authorization` headers. |
 
 #### What this design does NOT protect against
 
@@ -1077,7 +1150,7 @@ The `Sec-WebSocket-Protocol` header is **visible in browser DevTools** (Network 
 **Mitigations:**
 - Keep access token lifetime **short** (300–900 seconds). Even if captured, the token expires quickly.
 - Use `cacheLocation: "memory"` (default) so tokens are not persisted to `localStorage`/`sessionStorage`, reducing the window for XSS-based extraction.
-- The token is used **once** (during the handshake) and is not stored or re-sent on subsequent WebSocket messages. Post-handshake, the connection itself is the session — no bearer token is attached to individual frames.
+- The token is sent **only at the WebSocket handshake**, with one documented exception: the in-band `auth:refresh` command (§3.4.1) carries a fresh token as a single message at refresh time so the server can extend the session without reconstructing the connection. Application-level frames never carry the token, and post-handshake the connection itself is the session.
 
 #### 9.3.3 Infrastructure Logging
 

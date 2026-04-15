@@ -44,9 +44,15 @@ export interface HandleConnectionOptions {
    * Core(s) returned by `createCores`. The library does not presume any
    * particular Core shape.
    *
+   * May be sync or async. When async, the handler is awaited and the
+   * commit only proceeds if it resolves; any rejection (or sync throw)
+   * rolls back the refresh exactly like a sync failure — the client
+   * receives `throw`, no session state advances, and an
+   * `auth:refresh-failure` event fires.
+   *
    * For the reference `UserCore`, pass `(core, user) => core.updateUser(user)`.
    */
-  onTokenRefresh?: (core: EventTarget, user: UserContext) => void;
+  onTokenRefresh?: (core: EventTarget, user: UserContext) => void | Promise<void>;
   /**
    * Grace period (ms) after token `exp` before the server forcefully
    * closes the connection. Set to 0 to disable server-side expiry
@@ -113,6 +119,24 @@ export async function handleConnection(
   const rawTransport: ServerTransport = new WebSocketServerTransport(socket as any);
   let proxyMessageHandler: ((msg: any) => void) | null = null;
 
+  // `rawTransport.send()` can throw synchronously once the peer has
+  // already closed (e.g. `ws` throws on a CLOSING/CLOSED socket).
+  // The refresh chain has no realistic recovery — the client is gone,
+  // delivery cannot succeed — and an unguarded throw in the success
+  // path would propagate into the chain's `.catch`, which would then
+  // call send() a *second* time and either re-throw or emit a
+  // protocol-violating duplicate response (a `throw` after a `return`
+  // for the same id). The transport's own close path will fire the
+  // server-side `dispose()` cycle and emit `connection:close`, so
+  // swallowing here is safe and keeps the handler stable.
+  function _safeSend(message: any): void {
+    try {
+      rawTransport.send(message);
+    } catch {
+      // intentionally ignored — see comment above
+    }
+  }
+
   const interceptingTransport: ServerTransport = {
     send: rawTransport.send.bind(rawTransport),
     onMessage(handler) {
@@ -122,7 +146,7 @@ export async function handleConnection(
         if (msg.type === "cmd" && msg.name === "auth:refresh") {
           const newToken = msg.args?.[0] as string;
           if (!newToken) {
-            rawTransport.send({
+            _safeSend({
               type: "throw",
               id: msg.id,
               error: { name: "Error", message: "Missing token argument" },
@@ -133,7 +157,7 @@ export async function handleConnection(
             domain: options.auth0Domain,
             audience: options.auth0Audience,
           })
-            .then((newUser) => {
+            .then(async (newUser) => {
               if (newUser.sub !== initialSub) {
                 onEvent?.({
                   type: "auth:refresh-failure",
@@ -142,18 +166,40 @@ export async function handleConnection(
                 socket.close?.(4403, "Token subject mismatch");
                 return;
               }
-              // Run the hook as part of the commit path: if it throws,
-              // the refreshed session must NOT be applied, otherwise the
-              // connection silently moves forward while the client thinks
-              // the refresh failed and the Core stays stale.
+              // Pre-extend the session expiry BEFORE awaiting the hook.
+              // The token has already passed JWT verification and the sub
+              // check, so it is provably acceptable; the hook only decides
+              // whether to publish the new claims into the Core, not
+              // whether the connection is allowed to live longer. Without
+              // this pre-extension, a slow async hook (external I/O,
+              // policy lookup) can be killed mid-execution by the old
+              // expiry timer firing 4401 against a legitimate refresh.
+              // On hook failure we roll the expiry back so the deadline
+              // the server actually honoured still applies.
+              const oldExpiresAt = sessionExpiresAt;
+              sessionExpiresAt = _getExpFromToken(newToken, sessionGraceMs);
+              scheduleExpiryCheck();
+
+              // Run the hook as part of the commit path: if it throws
+              // (sync) or rejects (async), the refreshed session must
+              // NOT be applied, otherwise the connection silently moves
+              // forward while the client thinks the refresh failed and
+              // the Core stays stale. `await` covers both cases — sync
+              // throws are converted to a rejected microtask by async,
+              // and `await undefined` is a no-op when no hook is wired.
               try {
-                options.onTokenRefresh?.(core, newUser);
+                await options.onTokenRefresh?.(core, newUser);
               } catch (hookErr) {
+                // Roll back the session expiry so the connection still
+                // respects the previously honoured deadline, matching
+                // the rollback of `user` / refresh event publication.
+                sessionExpiresAt = oldExpiresAt;
+                scheduleExpiryCheck();
                 onEvent?.({
                   type: "auth:refresh-failure",
                   error: hookErr instanceof Error ? hookErr : new Error(String(hookErr)),
                 });
-                rawTransport.send({
+                _safeSend({
                   type: "throw",
                   id: msg.id,
                   error: { name: "Error", message: "Token refresh hook failed" },
@@ -161,17 +207,16 @@ export async function handleConnection(
                 return;
               }
               user = newUser;
-              sessionExpiresAt = _getExpFromToken(newToken, sessionGraceMs);
-              scheduleExpiryCheck();
+              // sessionExpiresAt + timer are already at the new value.
               onEvent?.({ type: "auth:refresh", user: newUser });
-              rawTransport.send({ type: "return", id: msg.id, value: undefined });
+              _safeSend({ type: "return", id: msg.id, value: undefined });
             })
             .catch((err) => {
               onEvent?.({
                 type: "auth:refresh-failure",
                 error: err instanceof Error ? err : new Error(String(err)),
               });
-              rawTransport.send({
+              _safeSend({
                 type: "throw",
                 id: msg.id,
                 error: { name: "Error", message: "Token refresh failed" },

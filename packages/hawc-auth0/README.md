@@ -8,7 +8,9 @@ It is an **I/O node** that connects Auth0 authentication to reactive state.
 With `@wcstack/state`, `<hawc-auth0>` can be bound directly through path contracts:
 
 - **input / command surface**: `domain`, `client-id`, `trigger`
-- **output state surface**: `authenticated`, `user`, `token`, `loading`, `error`
+- **output state surface**: `authenticated`, `user`, `loading`, `error`, `connected`
+
+> The access token is **not** part of the bindable surface (deliberate, for security). Retrieve it imperatively when needed via `await authEl.getToken()`.
 
 This means authentication state can be expressed declaratively in HTML, without writing OAuth flows, token management, or login/logout glue code in your UI layer.
 
@@ -29,8 +31,8 @@ With `@wcstack/state`, the flow becomes:
 
 1. `<hawc-auth0>` initializes the Auth0 client on connect
 2. redirect callback is handled automatically
-3. auth results return as `authenticated`, `user`, `token`, `loading`, `error`
-4. UI binds to those paths with `data-wcs`
+3. auth results return as `authenticated`, `user`, `loading`, `error`, `connected`
+4. UI binds to those paths with `data-wcs` (access token is JS-only — see note above)
 
 This turns authentication into **state transitions**, not imperative UI code.
 
@@ -63,7 +65,6 @@ When `<hawc-auth0>` connects to the DOM, it initializes the Auth0 client, handle
     export default {
       isLoggedIn: false,
       currentUser: null,
-      accessToken: null,
       authLoading: true,
     };
   </script>
@@ -77,7 +78,6 @@ When `<hawc-auth0>` connects to the DOM, it initializes the Auth0 client, handle
     data-wcs="
       authenticated: isLoggedIn;
       user: currentUser;
-      token: accessToken;
       loading: authLoading
     ">
   </hawc-auth0>
@@ -155,46 +155,38 @@ Use the `popup` attribute to open a popup window instead of redirecting:
 </hawc-auth0>
 ```
 
-### 4. Authenticated API requests with `@wcstack/fetch`
+### 4. Authenticated API requests
 
-Combine `<hawc-auth0>` with `<wcs-fetch>` for authenticated data fetching:
+The access token is intentionally **not** part of the bindable surface (security — see §State Surface). To attach it to outbound requests, drive a small imperative bridge from APIs this package guarantees: the `hawc-auth0:authenticated-changed` event (declared in `wcBindable`) and the `getToken()` method (Methods table).
 
 ```html
-<wcs-state>
-  <script type="module">
-    export default {
-      isLoggedIn: false,
-      accessToken: null,
-      users: [],
+<hawc-auth0
+  id="auth"
+  domain="example.auth0.com"
+  client-id="your-client-id"
+  audience="https://api.example.com">
+</hawc-auth0>
 
-      get usersUrl() {
-        return this.isLoggedIn ? "/api/users" : "";
-      },
-    };
-  </script>
+<script type="module">
+  const auth = document.getElementById("auth");
+  await auth.connectedCallbackPromise;
 
-  <hawc-auth0
-    domain="example.auth0.com"
-    client-id="your-client-id"
-    audience="https://api.example.com"
-    data-wcs="authenticated: isLoggedIn; token: accessToken">
-  </hawc-auth0>
-
-  <wcs-fetch
-    data-wcs="url: usersUrl; value: users">
-    <wcs-fetch-header
-      name="Authorization"
-      data-wcs="value: accessToken|prepend('Bearer ')">
-    </wcs-fetch-header>
-  </wcs-fetch>
-
-  <ul>
-    <template data-wcs="for: users">
-      <li data-wcs="textContent: users.*.name"></li>
-    </template>
-  </ul>
-</wcs-state>
+  // Re-run on every login / logout transition.
+  auth.addEventListener("hawc-auth0:authenticated-changed", async (e) => {
+    if (!e.detail) return; // logged out — nothing to fetch
+    const token = await auth.getToken();
+    const res = await fetch("/api/users", {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    // ... render res into your UI / framework state of choice
+  });
+</script>
 ```
+
+Two things this example deliberately does NOT do, because no public contract of this package supports it today:
+
+- It does not bind `token` through `data-wcs` — the bindable surface omits `token` by design.
+- It does not invoke a state method from a bindable property change. If you wire this through a state-binding system, surface `getToken()` from a button-driven `onclick:` handler (the convention shown in §2 above) or from your own listener registered on the auth element.
 
 ## State Surface vs Command Surface
 
@@ -207,10 +199,12 @@ These properties represent the current authentication state and are the main HAW
 | Property | Type | Description |
 |----------|------|-------------|
 | `authenticated` | `boolean` | `true` when the user is logged in |
-| `user` | `WcsAuthUser \| null` | User profile from Auth0 |
-| `token` | `string \| null` | Access token |
+| `user` | `AuthUser \| null` | User profile from Auth0 |
 | `loading` | `boolean` | `true` during initialization or login |
-| `error` | `WcsAuthError \| Error \| null` | Authentication error |
+| `error` | `AuthError \| Error \| null` | Authentication error |
+| `connected` | `boolean` | `true` while the remote WebSocket transport is open (remote deployments only — see SPEC-REMOTE) |
+
+The access **token** is intentionally NOT in the bindable surface. It is exposed as a JS-only getter (`authEl.token`) and via `await authEl.getToken()` for code paths that genuinely need to attach it to outbound requests.
 
 ### Input / command surface
 
@@ -352,15 +346,16 @@ In wc-bindable applications, **state-driven triggering via `trigger`** is usuall
 | `use-refresh-tokens` | `boolean` | `true` | Use refresh tokens for silent renewal. Set `use-refresh-tokens="false"` to opt out |
 | `popup` | `boolean` | `false` | Use popup instead of redirect for login |
 
-| Property | Type | Description |
-|----------|------|-------------|
-| `authenticated` | `boolean` | `true` when logged in |
-| `user` | `WcsAuthUser \| null` | User profile |
-| `token` | `string \| null` | Access token |
-| `loading` | `boolean` | `true` during initialization or login |
-| `error` | `WcsAuthError \| Error \| null` | Error info |
-| `trigger` | `boolean` | Set to `true` to execute login |
-| `client` | `Auth0Client` | Underlying Auth0 client instance |
+| Property | Type | Bindable? | Description |
+|----------|------|-----------|-------------|
+| `authenticated` | `boolean` | yes | `true` when logged in |
+| `user` | `AuthUser \| null` | yes | User profile |
+| `loading` | `boolean` | yes | `true` during initialization or login |
+| `error` | `AuthError \| Error \| null` | yes | Error info |
+| `connected` | `boolean` | yes | Remote WebSocket transport open (remote deployments) |
+| `trigger` | `boolean` | yes | Set to `true` to execute login |
+| `token` | `string \| null` | **no — JS only** | Access token. Reachable as `authEl.token`; absent from the `data-wcs` bindable surface for security |
+| `client` | `Auth0Client` | no — JS only | Underlying Auth0 client instance |
 
 | Method | Description |
 |--------|-------------|
@@ -408,13 +403,28 @@ Headless consumers call `core.login()` / `core.logout()` directly — no `trigge
 
 ### Shell (`<hawc-auth0>`)
 
-The Shell extends the Core declaration with `trigger` so binding systems can execute login declaratively:
+The Shell deliberately **omits `token`** from the bindable surface (security) and **adds `connected`** for remote-transport state. The custom element extends that with `trigger` so binding systems can execute login declaratively:
 
 ```typescript
+// AuthShell.wcBindable — the shape exposed to remote / DOM binding.
+// Note: no `token`; instead `connected` is included.
 static wcBindable = {
-  ...AuthCore.wcBindable,
+  protocol: "wc-bindable",
+  version: 1,
   properties: [
-    ...AuthCore.wcBindable.properties,
+    { name: "authenticated", event: "hawc-auth0:authenticated-changed" },
+    { name: "user",          event: "hawc-auth0:user-changed" },
+    { name: "loading",       event: "hawc-auth0:loading-changed" },
+    { name: "error",         event: "hawc-auth0:error" },
+    { name: "connected",     event: "hawc-auth0:connected-changed" },
+  ],
+};
+
+// <hawc-auth0> custom element extends the Shell with `trigger`.
+static wcBindable = {
+  ...AuthShell.wcBindable,
+  properties: [
+    ...AuthShell.wcBindable.properties,
     { name: "trigger", event: "hawc-auth0:trigger-changed" },
   ],
 };
@@ -424,13 +434,15 @@ static wcBindable = {
 
 ```typescript
 import type {
-  WcsAuthUser, WcsAuthError, WcsAuthCoreValues, WcsAuthValues, Auth0ClientOptions
+  AuthUser, AuthError,
+  AuthCoreValues, AuthShellValues, AuthValues,
+  Auth0ClientOptions,
 } from "@wc-bindable/hawc-auth0";
 ```
 
 ```typescript
 // User profile
-interface WcsAuthUser {
+interface AuthUser {
   sub: string;
   name?: string;
   email?: string;
@@ -439,23 +451,34 @@ interface WcsAuthUser {
 }
 
 // Auth error
-interface WcsAuthError {
+interface AuthError {
   error: string;
   error_description?: string;
   [key: string]: any;
 }
 
-// Core (headless) — 5 auth state properties
-interface WcsAuthCoreValues {
+// Core (headless) — includes `token` because the Core is the local-only
+// JS API; consumers are expected to read it directly.
+interface AuthCoreValues {
   authenticated: boolean;
-  user: WcsAuthUser | null;
+  user: AuthUser | null;
   token: string | null;
   loading: boolean;
-  error: WcsAuthError | Error | null;
+  error: AuthError | Error | null;
 }
 
-// Shell (<hawc-auth0>) — extends Core with trigger
-interface WcsAuthValues extends WcsAuthCoreValues {
+// Shell — the bindable surface exposed to remote / DOM binding.
+// Token is intentionally absent; `connected` is included.
+interface AuthShellValues {
+  authenticated: boolean;
+  user: AuthUser | null;
+  loading: boolean;
+  error: AuthError | Error | null;
+  connected: boolean;
+}
+
+// <hawc-auth0> custom element — extends the Shell with `trigger`.
+interface AuthValues extends AuthShellValues {
   trigger: boolean;
 }
 ```
@@ -466,7 +489,7 @@ interface WcsAuthValues extends WcsAuthCoreValues {
 `<hawc-auth0>` fits this model naturally:
 
 - `<hawc-auth0>` initializes and manages the Auth0 lifecycle
-- auth results return as `authenticated`, `user`, `token`, `loading`, `error`
+- auth results return as `authenticated`, `user`, `loading`, `error`, `connected` (token is JS-only — use `getToken()`)
 - UI binds to those paths without writing auth glue code
 
 This makes authentication look like ordinary state updates.
@@ -479,11 +502,11 @@ Since `<hawc-auth0>` is HAWC + `wc-bindable-protocol`, it works with any framewo
 
 ```tsx
 import { useWcBindable } from "@wc-bindable/react";
-import type { WcsAuthValues } from "@wc-bindable/hawc-auth0";
+import type { AuthValues } from "@wc-bindable/hawc-auth0";
 
 function AuthGuard() {
   const [ref, { authenticated, user, loading }] =
-    useWcBindable<HTMLElement, WcsAuthValues>();
+    useWcBindable<HTMLElement, AuthValues>();
 
   return (
     <>
@@ -506,9 +529,9 @@ function AuthGuard() {
 ```vue
 <script setup lang="ts">
 import { useWcBindable } from "@wc-bindable/vue";
-import type { WcsAuthValues } from "@wc-bindable/hawc-auth0";
+import type { AuthValues } from "@wc-bindable/hawc-auth0";
 
-const { ref, values } = useWcBindable<HTMLElement, WcsAuthValues>();
+const { ref, values } = useWcBindable<HTMLElement, AuthValues>();
 </script>
 
 <template>
@@ -552,10 +575,10 @@ let loading = $state(true);
 
 ```tsx
 import { createWcBindable } from "@wc-bindable/solid";
-import type { WcsAuthValues } from "@wc-bindable/hawc-auth0";
+import type { AuthValues } from "@wc-bindable/hawc-auth0";
 
 function AuthGuard() {
-  const [values, directive] = createWcBindable<WcsAuthValues>();
+  const [values, directive] = createWcBindable<AuthValues>();
 
   return (
     <>
@@ -602,7 +625,8 @@ bootstrapAuth({
 
 ## Design Notes
 
-- `authenticated`, `user`, `token`, `loading`, and `error` are **output state**
+- `authenticated`, `user`, `loading`, `error`, and `connected` are **bindable output state**
+- `token` is **JS-only** (`authEl.token` / `await authEl.getToken()`) and is intentionally absent from the bindable surface for security
 - `domain`, `client-id`, `trigger` are **input / command surface**
 - `trigger` is intentionally one-way: writing `true` executes login, reset emits completion
 - initialization happens once on `connectedCallback` — changing `domain` or `client-id` after connect does not re-initialize
