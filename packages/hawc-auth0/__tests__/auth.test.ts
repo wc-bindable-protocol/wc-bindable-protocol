@@ -344,6 +344,82 @@ describe("Auth (hawc-auth0)", () => {
       expect(mockClient.loginWithRedirect).not.toHaveBeenCalled();
       expect(el.trigger).toBe(false);
     });
+
+    it("login()がrejectしてもunhandled rejectionにならず、_triggerリセットとイベント発火が行われる", async () => {
+      const mockClient = createMockAuth0Client({
+        loginWithRedirect: vi.fn().mockRejectedValue(new Error("auth0 login failed")),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const el = document.createElement("hawc-auth0") as Auth;
+      el.setAttribute("domain", "test.auth0.com");
+      el.setAttribute("client-id", "client-id");
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      const unhandled: unknown[] = [];
+      const handler = (e: PromiseRejectionEvent) => {
+        unhandled.push(e.reason);
+        e.preventDefault();
+      };
+      window.addEventListener("unhandledrejection", handler);
+
+      const triggerEvents: boolean[] = [];
+      el.addEventListener("hawc-auth0:trigger-changed", (e: Event) => {
+        triggerEvents.push((e as CustomEvent).detail);
+      });
+
+      try {
+        el.trigger = true;
+        // microtask/macrotaskを複数回待ってrejection伝搬を確実にする
+        await new Promise(resolve => setTimeout(resolve, 0));
+        await new Promise(resolve => setTimeout(resolve, 0));
+
+        expect(mockClient.loginWithRedirect).toHaveBeenCalled();
+        expect(el.trigger).toBe(false);
+        expect(triggerEvents).toContain(false);
+        expect(unhandled).toHaveLength(0);
+      } finally {
+        window.removeEventListener("unhandledrejection", handler);
+      }
+    });
+
+    it("initialize(connectedCallbackPromise)失敗時もunhandled rejectionにならず、_triggerがリセットされる", async () => {
+      // createAuth0Client自体がrejectするケース
+      createAuth0Client.mockRejectedValue(new Error("auth0 init failed"));
+
+      const el = document.createElement("hawc-auth0") as Auth;
+      el.setAttribute("domain", "test.auth0.com");
+      el.setAttribute("client-id", "client-id");
+      document.body.appendChild(el);
+
+      // connectedCallbackPromiseはrejectするが、ここで捕捉して先に進む
+      await el.connectedCallbackPromise.catch(() => { /* expected */ });
+
+      const unhandled: unknown[] = [];
+      const handler = (e: PromiseRejectionEvent) => {
+        unhandled.push(e.reason);
+        e.preventDefault();
+      };
+      window.addEventListener("unhandledrejection", handler);
+
+      const triggerEvents: boolean[] = [];
+      el.addEventListener("hawc-auth0:trigger-changed", (e: Event) => {
+        triggerEvents.push((e as CustomEvent).detail);
+      });
+
+      try {
+        el.trigger = true;
+        await new Promise(resolve => setTimeout(resolve, 0));
+        await new Promise(resolve => setTimeout(resolve, 0));
+
+        expect(el.trigger).toBe(false);
+        expect(triggerEvents).toContain(false);
+        expect(unhandled).toHaveLength(0);
+      } finally {
+        window.removeEventListener("unhandledrejection", handler);
+      }
+    });
   });
 
   describe("_buildClientOptions", () => {
@@ -574,6 +650,19 @@ describe("Auth (hawc-auth0)", () => {
     it("remote-url が指定されると暗黙的に remote", () => {
       const el = document.createElement("hawc-auth0") as Auth;
       el.setAttribute("remote-url", "ws://example.com");
+      expect(el.mode).toBe("remote");
+    });
+
+    it("remote-url が空文字列なら暗黙 remote にならない (local)", () => {
+      const el = document.createElement("hawc-auth0") as Auth;
+      el.setAttribute("remote-url", "");
+      expect(el.mode).toBe("local");
+    });
+
+    it("remote-url が空文字列でも mode=remote が明示されれば remote", () => {
+      const el = document.createElement("hawc-auth0") as Auth;
+      el.setAttribute("remote-url", "");
+      el.setAttribute("mode", "remote");
       expect(el.mode).toBe("remote");
     });
 

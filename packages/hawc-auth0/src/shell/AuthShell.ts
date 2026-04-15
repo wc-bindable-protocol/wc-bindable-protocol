@@ -208,7 +208,8 @@ export class AuthShell extends EventTarget {
     // a no-op (its `this._ws === ws` guard fails), and without this
     // explicit clear `connected` would stay true even though no live
     // transport remains. This corrupts any UI / retry logic keyed off
-    // `connected`.
+    // `connected`. Also null the failed socket reference so `_ws` does
+    // not linger as a dangling reference to a dead socket between calls.
     try {
       await new Promise<void>((resolve, reject) => {
         ws.addEventListener("open", () => resolve(), { once: true });
@@ -217,6 +218,9 @@ export class AuthShell extends EventTarget {
         }, { once: true });
       });
     } catch (err) {
+      if (this._ws === ws) {
+        this._ws = null;
+      }
       this._setConnected(false);
       throw err;
     }
@@ -361,7 +365,9 @@ export class AuthShell extends EventTarget {
 
     // See connect(): the previous socket's close handler is now a no-op,
     // so a handshake failure here would leave `connected` stuck at true
-    // unless we explicitly clear it on the failure path.
+    // unless we explicitly clear it on the failure path. Also null the
+    // failed socket reference so `_ws` does not linger as a dangling
+    // reference to a dead socket between calls.
     try {
       await new Promise<void>((resolve, reject) => {
         ws.addEventListener("open", () => resolve(), { once: true });
@@ -370,6 +376,9 @@ export class AuthShell extends EventTarget {
         }, { once: true });
       });
     } catch (err) {
+      if (this._ws === ws) {
+        this._ws = null;
+      }
       this._setConnected(false);
       throw err;
     }

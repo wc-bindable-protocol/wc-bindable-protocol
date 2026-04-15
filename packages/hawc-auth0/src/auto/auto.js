@@ -1,3 +1,3 @@
-import { bootstrapAuth } from "./index.esm.js";
+import { bootstrapAuth } from "../../dist/index.js";
 
 bootstrapAuth();

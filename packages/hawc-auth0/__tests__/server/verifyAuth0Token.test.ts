@@ -48,4 +48,64 @@ describe("verifyAuth0Token", () => {
     expect(result.permissions).toEqual([]);
     expect(result.roles).toEqual([]);
   });
+
+  it("normalizes string-typed permissions/roles to empty arrays (fail-closed)", async () => {
+    // Misconfigured Auth0 rule / legacy claim: a bare string instead of
+    // an array. Without runtime validation, downstream
+    // `roles.includes("admin")` would substring-match e.g. "admin_readonly"
+    // and grant admin by accident. Verify fail-closed normalization.
+    jwtVerify.mockResolvedValue({
+      payload: {
+        sub: "auth0|789",
+        permissions: "admin_readonly",
+        roles: "admin_readonly",
+      },
+    });
+
+    const result = await verifyAuth0Token("token-4", {
+      domain: `strarray-${Date.now()}.auth0.com`,
+      audience: "aud",
+    });
+
+    expect(result.permissions).toEqual([]);
+    expect(result.roles).toEqual([]);
+    expect(result.roles.includes("admin")).toBe(false);
+  });
+
+  it("filters non-string elements out of permissions/roles arrays", async () => {
+    // Mixed-type array — keep strings, drop nulls / numbers / objects.
+    jwtVerify.mockResolvedValue({
+      payload: {
+        sub: "auth0|abc",
+        permissions: ["read", 42, null, "write", { role: "admin" }],
+        roles: ["user", undefined, "staff"],
+      },
+    });
+
+    const result = await verifyAuth0Token("token-5", {
+      domain: `mixed-${Date.now()}.auth0.com`,
+      audience: "aud",
+    });
+
+    expect(result.permissions).toEqual(["read", "write"]);
+    expect(result.roles).toEqual(["user", "staff"]);
+  });
+
+  it("normalizes null / object-typed permissions/roles to empty arrays", async () => {
+    jwtVerify.mockResolvedValue({
+      payload: {
+        sub: "auth0|def",
+        permissions: null,
+        roles: { admin: true },
+      },
+    });
+
+    const result = await verifyAuth0Token("token-6", {
+      domain: `nullobj-${Date.now()}.auth0.com`,
+      audience: "aud",
+    });
+
+    expect(result.permissions).toEqual([]);
+    expect(result.roles).toEqual([]);
+  });
 });

@@ -10,7 +10,7 @@ For the protocol / server-side details of the remote variant, see [SPEC-REMOTE.m
 
 Local mode is the default. It is selected when:
 
-- no `mode` attribute is set **and** no `remote-url` attribute is set, or
+- no `mode` attribute is set **and** `remote-url` is absent **or** the empty string `""` (empty is treated as unset — see [README-REMOTE.md §Mode](README-REMOTE.md#mode)), or
 - `mode="local"` is set explicitly.
 
 In local mode:
@@ -219,6 +219,40 @@ These properties control authentication from HTML, JS, or `@wcstack/state` bindi
 | `trigger` | `boolean` | One-way login trigger |
 | `popup` | `boolean` | Use popup instead of redirect |
 
+## Error contract
+
+`@wc-bindable/hawc-auth0` follows an **observable error** contract: errors raised by the Auth0 SDK surface as state you bind to, not as rejected promises. This keeps UI code declarative — you render from `error` / `loading`, rather than wrapping every call in `try / catch`.
+
+### Default: Auth0 SDK failures resolve, not reject
+
+`await` on the following methods **resolves** even when the underlying Auth0 SDK call fails. The error is published to the `error` property and dispatched as `hawc-auth0:error`, and `loading` is reliably cleared:
+
+| Method | On Auth0 SDK failure |
+|--------|----------------------|
+| `authEl.initialize()` | resolves; `error` set, `loading` cleared |
+| `authEl.login(options?)` | resolves; `error` set, `loading` cleared |
+| `authEl.logout(options?)` | resolves; `error` set |
+| `authEl.getToken(options?)` | resolves with `null`; `error` set |
+
+```js
+await authEl.login();          // does NOT throw on Auth0 errors
+if (authEl.error) { ... }      // observe via state instead
+```
+
+The `trigger` one-way command follows the same contract — triggering a failed login leaves the failure in `authEl.error` and still resets `trigger` / dispatches `hawc-auth0:trigger-changed`.
+
+### Exceptions: these paths DO reject
+
+A small set of failures are programmer / I/O errors that cannot be meaningfully represented as UI state, so they reject:
+
+- **Precondition violations** (synchronous throw): calling `getToken()` before `initialize()`, calling `getToken()` in remote mode, missing `domain` / `client-id`, missing `remote-url` for `connect()`.
+- **WebSocket I/O** (remote mode only): `connect()` / `reconnect()` reject on handshake failure; `refreshToken()` rejects on timeout, close, or send error. See [README-REMOTE.md](README-REMOTE.md).
+
+### Practical rule
+
+- Binding to UI → read `error` / `loading` / `authenticated`. Never rely on `await authEl.login()` throwing.
+- Calling `connect()` / `reconnect()` / `refreshToken()` directly → wrap in `try / catch` or `.catch()`. The same error is also visible via `error`, so UI and caller-side handling can co-exist without double-reporting (pick one as authoritative in your code).
+
 ## Architecture
 
 `@wc-bindable/hawc-auth0` follows the HAWC architecture.
@@ -341,7 +375,7 @@ This is a convenience feature. In wc-bindable applications, **state-driven trigg
 | `cache-location` | `"memory" \| "localstorage"` | `memory` | Token cache location |
 | `use-refresh-tokens` | `boolean` | `true` | Use refresh tokens for silent renewal. Set `use-refresh-tokens="false"` to opt out |
 | `popup` | `boolean` | `false` | Use popup instead of redirect for login |
-| `mode` | `"local" \| "remote"` | inferred | Explicit deployment mode. Defaults to `local` unless `remote-url` is set (see [README-REMOTE.md](README-REMOTE.md)) |
+| `mode` | `"local" \| "remote"` | inferred | Explicit deployment mode. Defaults to `local` unless `remote-url` is set to a non-empty value (empty `remote-url=""` is treated as unset — see [README-REMOTE.md](README-REMOTE.md)) |
 
 | Property | Type | Bindable? | Description |
 |----------|------|-----------|-------------|

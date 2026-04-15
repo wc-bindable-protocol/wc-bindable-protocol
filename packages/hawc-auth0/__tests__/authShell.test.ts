@@ -399,6 +399,10 @@ describe("AuthShell", () => {
         // connect must clear `connected` to false instead of leaving
         // the previous `true` value visible after the transport is gone.
         expect(shell.connected).toBe(false);
+        // And the failed socket reference must not linger in `_ws` —
+        // otherwise subsequent refreshToken()/inspection would see a
+        // dead-but-not-null socket.
+        expect((shell as any)._ws).toBeNull();
       } finally {
         (globalThis as any).WebSocket = originalWS;
       }
@@ -596,6 +600,8 @@ describe("AuthShell", () => {
         // about the transition, otherwise UI / retry logic that keys
         // off `connected` will not react.
         expect(events).toContain(false);
+        // The failed socket reference must not linger in `_ws`.
+        expect((shell as any)._ws).toBeNull();
       } finally {
         (globalThis as any).WebSocket = originalWS;
       }

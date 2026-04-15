@@ -85,7 +85,12 @@ describe("handleConnection", () => {
 
     await handleConnection(
       socket,
-      "hawc-auth0.bearer." + makeJwt({ sub: "auth0|123" }),
+      // Include `exp` so we don't also emit `auth:exp-parse-failure` and
+      // perturb this strict event-sequence assertion.
+      "hawc-auth0.bearer." + makeJwt({
+        sub: "auth0|123",
+        exp: Math.floor(Date.now() / 1000) + 3600,
+      }),
       {
         auth0Domain: "test.auth0.com",
         auth0Audience: "https://api.example.com",
@@ -923,6 +928,352 @@ describe("handleConnection", () => {
 
     const event = events.find((e) => e.type === "auth:refresh-failure");
     expect(event?.error).toBeInstanceOf(Error);
+  });
+
+  it("decodes JWT exp via atob (runtime-agnostic) and enforces expiry", async () => {
+    // Simulate a non-Node runtime where `Buffer` is not defined. The
+    // implementation must fall through to `atob` (globally available on
+    // browsers, Deno, Bun, Workers, Node 16+) and still extract `exp`,
+    // otherwise session expiry enforcement is silently disabled.
+    const originalBuffer = (globalThis as any).Buffer;
+    const jwt = "hawc-auth0.bearer." + makeJwt({
+      sub: "auth0|123",
+      exp: Math.floor(Date.now() / 1000) - 1,
+    });
+    (globalThis as any).Buffer = undefined;
+
+    vi.useFakeTimers();
+    try {
+      jwtVerify.mockResolvedValue({
+        payload: { sub: "auth0|123", permissions: [] },
+      });
+
+      const socket = createMockSocket();
+      const core = new EventTarget();
+      (core.constructor as any).wcBindable = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+      };
+
+      const events: AuthEvent[] = [];
+
+      await handleConnection(
+        socket,
+        jwt,
+        {
+          auth0Domain: "test.auth0.com",
+          auth0Audience: "https://api.example.com",
+          createCores: () => core,
+          sessionGraceMs: 1,
+          onEvent: (e) => events.push(e),
+        },
+      );
+
+      await vi.runAllTimersAsync();
+
+      // exp was decodable → 4401 fires, expiry enforcement is alive.
+      expect(socket.close).toHaveBeenCalledWith(4401, "Session expired");
+      // And no parse-failure event was emitted on the happy path.
+      expect(events.some((e) => e.type === "auth:exp-parse-failure")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+      (globalThis as any).Buffer = originalBuffer;
+    }
+  });
+
+  it("emits auth:exp-parse-failure when the JWT payload has no exp claim", async () => {
+    jwtVerify.mockResolvedValue({
+      payload: { sub: "auth0|123", permissions: [] },
+    });
+
+    const socket = createMockSocket();
+    const core = new EventTarget();
+    (core.constructor as any).wcBindable = {
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [],
+    };
+
+    const events: AuthEvent[] = [];
+
+    await handleConnection(
+      socket,
+      // JWT without exp claim — initial parse still succeeds but returns Infinity.
+      "hawc-auth0.bearer." + makeJwt({ sub: "auth0|123" }),
+      {
+        auth0Domain: "test.auth0.com",
+        auth0Audience: "https://api.example.com",
+        createCores: () => core,
+        sessionGraceMs: 1_000,
+        onEvent: (e) => events.push(e),
+      },
+    );
+
+    const parseFailure = events.find((e) => e.type === "auth:exp-parse-failure");
+    expect(parseFailure).toBeDefined();
+    expect(parseFailure?.error).toBeInstanceOf(Error);
+    expect(parseFailure?.error?.message).toMatch(/exp/);
+  });
+
+  it("emits auth:exp-parse-failure when the JWT payload cannot be decoded", async () => {
+    jwtVerify.mockResolvedValue({
+      payload: { sub: "auth0|123", permissions: [] },
+    });
+
+    const socket = createMockSocket();
+    const core = new EventTarget();
+    (core.constructor as any).wcBindable = {
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [],
+    };
+
+    const events: AuthEvent[] = [];
+
+    await handleConnection(
+      socket,
+      // Malformed token: no payload segment.
+      "hawc-auth0.bearer.onlyonepart",
+      {
+        auth0Domain: "test.auth0.com",
+        auth0Audience: "https://api.example.com",
+        createCores: () => core,
+        sessionGraceMs: 1_000,
+        onEvent: (e) => events.push(e),
+      },
+    );
+
+    const parseFailure = events.find((e) => e.type === "auth:exp-parse-failure");
+    expect(parseFailure).toBeDefined();
+    expect(parseFailure?.error).toBeInstanceOf(Error);
+  });
+
+  describe("expParseFailurePolicy: 'close'", () => {
+    it("rejects the initial handshake when exp is missing", async () => {
+      jwtVerify.mockResolvedValue({
+        payload: { sub: "auth0|123", permissions: [] },
+      });
+
+      const socket = createMockSocket();
+      const createCores = vi.fn(() => {
+        const core = new EventTarget();
+        (core.constructor as any).wcBindable = {
+          protocol: "wc-bindable",
+          version: 1,
+          properties: [],
+        };
+        return core;
+      });
+      const events: AuthEvent[] = [];
+
+      await expect(
+        handleConnection(
+          socket,
+          // Token has no exp claim.
+          "hawc-auth0.bearer." + makeJwt({ sub: "auth0|123" }),
+          {
+            auth0Domain: "test.auth0.com",
+            auth0Audience: "https://api.example.com",
+            createCores,
+            sessionGraceMs: 1_000,
+            expParseFailurePolicy: "close",
+            onEvent: (e) => events.push(e),
+          },
+        ),
+      ).rejects.toThrow(/'close' policy/);
+
+      // Parse failure event fires.
+      expect(events.find((e) => e.type === "auth:exp-parse-failure")).toBeDefined();
+      // Followed by auth:failure so the outer wrapper knows to close 1008.
+      expect(events.find((e) => e.type === "auth:failure")).toBeDefined();
+      // Handshake was rejected BEFORE commit: createCores must not run,
+      // and auth:success / connection:open must NOT be emitted.
+      expect(createCores).not.toHaveBeenCalled();
+      expect(events.some((e) => e.type === "auth:success")).toBe(false);
+      expect(events.some((e) => e.type === "connection:open")).toBe(false);
+    });
+
+    it("rejects the initial handshake when the JWT payload is malformed", async () => {
+      jwtVerify.mockResolvedValue({
+        payload: { sub: "auth0|123", permissions: [] },
+      });
+
+      const socket = createMockSocket();
+      const core = new EventTarget();
+      (core.constructor as any).wcBindable = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+      };
+
+      await expect(
+        handleConnection(
+          socket,
+          "hawc-auth0.bearer.onlyonepart",
+          {
+            auth0Domain: "test.auth0.com",
+            auth0Audience: "https://api.example.com",
+            createCores: () => core,
+            sessionGraceMs: 1_000,
+            expParseFailurePolicy: "close",
+          },
+        ),
+      ).rejects.toThrow(/'close' policy/);
+    });
+
+    it("allows the initial handshake when exp parses successfully", async () => {
+      // Happy path under strict policy: valid exp should not trigger rejection.
+      jwtVerify.mockResolvedValue({
+        payload: { sub: "auth0|123", permissions: [] },
+      });
+
+      const socket = createMockSocket();
+      const core = new EventTarget();
+      (core.constructor as any).wcBindable = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+      };
+
+      const events: AuthEvent[] = [];
+
+      await handleConnection(
+        socket,
+        "hawc-auth0.bearer." + makeJwt({
+          sub: "auth0|123",
+          exp: Math.floor(Date.now() / 1000) + 3600,
+        }),
+        {
+          auth0Domain: "test.auth0.com",
+          auth0Audience: "https://api.example.com",
+          createCores: () => core,
+          sessionGraceMs: 1_000,
+          expParseFailurePolicy: "close",
+          onEvent: (e) => events.push(e),
+        },
+      );
+
+      expect(events.find((e) => e.type === "auth:success")).toBeDefined();
+      expect(events.find((e) => e.type === "connection:open")).toBeDefined();
+      expect(events.some((e) => e.type === "auth:exp-parse-failure")).toBe(false);
+      expect(events.some((e) => e.type === "auth:failure")).toBe(false);
+    });
+
+    it("rejects auth:refresh when the new token's exp is unparseable, keeps old deadline", async () => {
+      vi.useFakeTimers();
+      try {
+        const originalExp = Math.floor(Date.now() / 1000) + 30;
+        jwtVerify.mockResolvedValueOnce({
+          payload: { sub: "auth0|123", permissions: [] },
+        });
+
+        const socket = createMockSocket();
+        const core = new EventTarget();
+        (core.constructor as any).wcBindable = {
+          protocol: "wc-bindable",
+          version: 1,
+          properties: [],
+        };
+
+        const events: AuthEvent[] = [];
+
+        await handleConnection(
+          socket,
+          "hawc-auth0.bearer." + makeJwt({
+            sub: "auth0|123",
+            exp: originalExp,
+          }),
+          {
+            auth0Domain: "test.auth0.com",
+            auth0Audience: "https://api.example.com",
+            createCores: () => core,
+            sessionGraceMs: 1_000,
+            expParseFailurePolicy: "close",
+            onEvent: (e) => events.push(e),
+          },
+        );
+
+        // Second verify: refresh path, no exp claim.
+        jwtVerify.mockResolvedValueOnce({
+          payload: { sub: "auth0|123", permissions: [] },
+        });
+
+        // Simulate the refresh cmd via the WebSocketServerTransport's
+        // message handler (same pattern as the happy-path refresh test).
+        const refreshMsg = JSON.stringify({
+          type: "cmd",
+          name: "auth:refresh",
+          id: "r-1",
+          args: [makeJwt({ sub: "auth0|123" /* no exp */ })],
+        });
+        const messageHandlers = socket._listeners["message"];
+        expect(messageHandlers?.length).toBeGreaterThan(0);
+        messageHandlers[0]({ data: refreshMsg });
+
+        // Let the refresh chain resolve.
+        await vi.advanceTimersByTimeAsync(0);
+        await vi.advanceTimersByTimeAsync(0);
+
+        // Refresh was rejected.
+        expect(events.find((e) => e.type === "auth:refresh-failure")).toBeDefined();
+        expect(events.some((e) => e.type === "auth:refresh")).toBe(false);
+
+        // Client got a `throw` frame, not `return`.
+        const sent = socket.send.mock.calls
+          .map((call: any[]) => {
+            try { return JSON.parse(call[0]); } catch { return null; }
+          })
+          .filter(Boolean);
+        const refreshResp = sent.find((m: any) => m.id === "r-1");
+        expect(refreshResp).toMatchObject({ type: "throw", id: "r-1" });
+
+        // Old deadline still fires 4401 when it arrives — refresh did
+        // not extend the session.
+        await vi.advanceTimersByTimeAsync(35_000);
+        expect(socket.close).toHaveBeenCalledWith(4401, "Session expired");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  it("default 'allow' policy continues the handshake on exp parse failure", async () => {
+    // Regression: without expParseFailurePolicy set, parse failure must
+    // still fall through to Infinity and let the connection live (the
+    // pre-existing observable-error behaviour).
+    jwtVerify.mockResolvedValue({
+      payload: { sub: "auth0|123", permissions: [] },
+    });
+
+    const socket = createMockSocket();
+    const core = new EventTarget();
+    (core.constructor as any).wcBindable = {
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [],
+    };
+
+    const events: AuthEvent[] = [];
+
+    const proxy = await handleConnection(
+      socket,
+      // No exp claim.
+      "hawc-auth0.bearer." + makeJwt({ sub: "auth0|123" }),
+      {
+        auth0Domain: "test.auth0.com",
+        auth0Audience: "https://api.example.com",
+        createCores: () => core,
+        sessionGraceMs: 1_000,
+        onEvent: (e) => events.push(e),
+      },
+    );
+
+    expect(proxy).toBeDefined();
+    expect(events.find((e) => e.type === "auth:exp-parse-failure")).toBeDefined();
+    expect(events.find((e) => e.type === "auth:success")).toBeDefined();
+    expect(events.find((e) => e.type === "connection:open")).toBeDefined();
+    expect(events.some((e) => e.type === "auth:failure")).toBe(false);
   });
 
   it("closes socket when session expires", async () => {

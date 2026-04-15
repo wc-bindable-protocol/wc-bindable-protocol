@@ -27,7 +27,7 @@ Auth0 runs in the browser. Your application reads the token from the element to 
 - `await authEl.getToken()` returns a fresh token.
 - Token is still omitted from the wcBindable surface (not reachable via `data-wcs` / `bind()`).
 
-Selected when no `mode` attribute is set and no `remote-url` attribute is set, or explicitly via `mode="local"`. This is the default.
+Selected when no `mode` attribute is set and `remote-url` is either absent or the empty string `""`, or explicitly via `mode="local"`. This is the default.
 
 ### Remote mode — [README-REMOTE.md](README-REMOTE.md) · [SPEC-REMOTE.md](SPEC-REMOTE.md)
 
@@ -38,7 +38,7 @@ Selected when no `mode` attribute is set and no `remote-url` attribute is set, o
 - `authEl.getTokenExpiry()` returns the `exp` claim for refresh scheduling without exposing token material.
 - `connected` is added to the wcBindable surface (WebSocket transport state).
 
-Selected by `mode="remote"` or implicitly by setting `remote-url`.
+Selected by `mode="remote"`, or implicitly by setting `remote-url` to a **non-empty** value. An empty `remote-url=""` is treated as unset (see "Empty vs unset `remote-url`" in [README-REMOTE.md](README-REMOTE.md#mode)), so dynamic bindings that initially resolve to an empty string do not flip the element into remote mode prematurely. `mode="remote"` overrides this and forces remote mode even when `remote-url` is empty.
 
 Paired with `<hawc-auth0-session target="auth" core="app-core">`, which owns the three-stage readiness sequence (authenticated → connected → initial sync) and exposes a single `ready` signal for `data-wcs`. Core declarations are looked up via `registerCoreDeclaration("app-core", decl)` at bootstrap.
 
@@ -57,3 +57,11 @@ Remote deployments additionally need `@wc-bindable/remote`.
 | Call `fetch('/api/...')` from browser JS with a Bearer token | [README-LOCAL.md](README-LOCAL.md) |
 | Connect to a WebSocket backend that constructs server-side Cores after auth | [README-REMOTE.md](README-REMOTE.md) |
 | Need the full remote protocol / server handler / error codes / threat model | [SPEC-REMOTE.md](SPEC-REMOTE.md) |
+
+## Error contract (at a glance)
+
+- Auth0 SDK failures (`initialize` / `login` / `logout` / `getToken`) **do not reject** — they publish to `error` / `hawc-auth0:error` and clear `loading`. Bind the state; do not `try / catch` these.
+- WebSocket I/O failures in remote mode (`connect` / `reconnect` / `refreshToken`) **do reject**. Wrap these calls, or use `<hawc-auth0-session>` which surfaces failures through its own state.
+- Precondition violations (missing `domain` / `client-id`, `getToken()` in remote mode, etc.) throw synchronously.
+
+See [README-LOCAL.md §Error contract](README-LOCAL.md#error-contract) and [README-REMOTE.md §Error contract](README-REMOTE.md#error-contract) for details.

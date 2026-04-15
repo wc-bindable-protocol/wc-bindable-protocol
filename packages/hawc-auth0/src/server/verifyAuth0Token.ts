@@ -41,9 +41,23 @@ export async function verifyAuth0Token(
     sub: payload.sub,
     email: payload.email as string | undefined,
     name: payload.name as string | undefined,
-    permissions: (payload.permissions as string[]) ?? [],
-    roles: (payload as Record<string, unknown>)["roles"] as string[] ?? [],
+    // `permissions` / `roles` drive authorization decisions downstream
+    // (e.g. `user.roles.includes("admin")`). Auth0 rules / actions can
+    // in principle emit them as non-arrays (misconfigured template,
+    // custom claim shape, legacy scope-as-string). A bare `as string[]`
+    // cast would let a string like `"admin"` through unchecked, and
+    // `"admin_readonly".includes("admin")` would then silently grant
+    // admin access via substring match. Normalize fail-closed: only
+    // accept arrays of strings; any other shape collapses to `[]` so
+    // downstream authorization falls through to its default deny path.
+    permissions: _normalizeStringArray((payload as Record<string, unknown>).permissions),
+    roles: _normalizeStringArray((payload as Record<string, unknown>).roles),
     orgId: payload.org_id as string | undefined,
     raw: payload as Record<string, unknown>,
   };
+}
+
+function _normalizeStringArray(claim: unknown): string[] {
+  if (!Array.isArray(claim)) return [];
+  return claim.filter((x): x is string => typeof x === "string");
 }

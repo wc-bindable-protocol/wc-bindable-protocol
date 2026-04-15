@@ -113,7 +113,8 @@ export class Auth extends HTMLElement {
    * Deployment mode. Resolved from:
    *
    * 1. `mode` attribute, if set to `"local"` or `"remote"` (wins).
-   * 2. Otherwise, implicit: `"remote"` when `remote-url` is set, else `"local"`.
+   * 2. Otherwise, implicit: `"remote"` when `remote-url` has a non-empty value,
+   *    else `"local"`. An empty `remote-url=""` is treated as unset.
    *
    * In `"remote"` mode the access token is not reachable from JS —
    * `.token` returns `null` and `getToken()` throws.
@@ -121,7 +122,7 @@ export class Auth extends HTMLElement {
   get mode(): AuthMode {
     const attr = this.getAttribute("mode");
     if (attr === "remote" || attr === "local") return attr;
-    return this.hasAttribute("remote-url") ? "remote" : "local";
+    return this.remoteUrl ? "remote" : "local";
   }
 
   set mode(value: AuthMode) {
@@ -184,13 +185,16 @@ export class Auth extends HTMLElement {
     const v = !!value;
     if (v) {
       this._trigger = true;
-      this._connectedCallbackPromise.then(() => this.login()).finally(() => {
-        this._trigger = false;
-        this.dispatchEvent(new CustomEvent("hawc-auth0:trigger-changed", {
-          detail: false,
-          bubbles: true,
-        }));
-      });
+      this._connectedCallbackPromise
+        .then(() => this.login())
+        .catch(() => { /* error surfaces via this.error (AuthShell state); avoid unhandled rejection */ })
+        .finally(() => {
+          this._trigger = false;
+          this.dispatchEvent(new CustomEvent("hawc-auth0:trigger-changed", {
+            detail: false,
+            bubbles: true,
+          }));
+        });
     }
   }
 

@@ -17,6 +17,26 @@ interface WebSocketLike {
 
 /**
  * Observability event emitted by the connection handler.
+ *
+ * `auth:exp-parse-failure` fires when the JWT payload cannot be decoded
+ * or lacks a numeric `exp` claim. What happens next depends on
+ * `expParseFailurePolicy`:
+ *
+ * - `"allow"` (default): the connection proceeds, but server-side session
+ *   expiry enforcement is effectively disabled for that connection
+ *   (`sessionExpiresAt` falls back to `Infinity`). The event is the only
+ *   signal — subscribe to log, alert, or close the socket imperatively.
+ * - `"close"`: the connection is rejected.
+ *   - On the initial handshake, `auth:exp-parse-failure` is followed by
+ *     `auth:failure` and `handleConnection` throws; the caller
+ *     (e.g. `createAuthenticatedWSS`) closes the socket with
+ *     `1008 Unauthorized`. `createCores` is **not** called.
+ *   - On in-band `auth:refresh`, the refresh is rejected with a `throw`
+ *     response and `auth:refresh-failure`; the previously honoured
+ *     deadline stays in effect and the connection closes at the
+ *     original `exp + sessionGraceMs`.
+ *
+ * See `HandleConnectionOptions.expParseFailurePolicy` for the knob.
  */
 export interface AuthEvent {
   type:
@@ -24,6 +44,7 @@ export interface AuthEvent {
     | "auth:failure"
     | "auth:refresh"
     | "auth:refresh-failure"
+    | "auth:exp-parse-failure"
     | "connection:open"
     | "connection:close";
   user?: UserContext;
@@ -59,6 +80,27 @@ export interface HandleConnectionOptions {
    * enforcement. Default: 60000 (60 seconds).
    */
   sessionGraceMs?: number;
+  /**
+   * Policy for handling JWT `exp` claim parse failures.
+   *
+   * - `"allow"` (default): parse failure falls back to `Infinity`, so
+   *   server-side expiry enforcement is disabled **for that connection**.
+   *   The failure is still observable via `auth:exp-parse-failure`.
+   *   Preserves backward compatibility and lets operators decide policy
+   *   out-of-band by subscribing to `onEvent`.
+   * - `"close"`: parse failure rejects the connection.
+   *   - **Initial handshake:** `auth:exp-parse-failure` is emitted,
+   *     then `auth:failure` fires and `handleConnection` throws — the
+   *     caller (e.g. `createAuthenticatedWSS`) closes the socket.
+   *   - **In-band `auth:refresh`:** the refresh is rejected with a
+   *     `throw` response and `auth:refresh-failure`. The previously
+   *     honoured deadline stays in effect, so the connection still
+   *     closes at the original expiry and never runs unbounded.
+   *
+   * Choose `"close"` for deployments that must guarantee bounded
+   * session lifetime even when IdP claim shapes drift unexpectedly.
+   */
+  expParseFailurePolicy?: "allow" | "close";
 }
 
 /**
@@ -78,7 +120,11 @@ export async function handleConnection(
   protocolHeader: string | string[] | undefined,
   options: HandleConnectionOptions,
 ): Promise<RemoteShellProxy> {
-  const { onEvent, sessionGraceMs = 60_000 } = options;
+  const {
+    onEvent,
+    sessionGraceMs = 60_000,
+    expParseFailurePolicy = "allow",
+  } = options;
 
   const token = extractTokenFromProtocol(protocolHeader);
   let user: UserContext;
@@ -92,14 +138,32 @@ export async function handleConnection(
     throw err;
   }
 
+  // Parse initial token expiry BEFORE emitting auth:success /
+  // connection:open and before calling createCores. Under
+  // expParseFailurePolicy "close" a parse failure aborts the
+  // handshake; doing the parse here avoids leaking the operator's
+  // createCores side effects for a connection we're about to reject.
+  let initialExpParseFailed = false;
+  const initialExpiresAt = _getExpFromToken(token, sessionGraceMs, (e) => {
+    if (e.type === "auth:exp-parse-failure") initialExpParseFailed = true;
+    onEvent?.(e);
+  });
+
+  if (initialExpParseFailed && expParseFailurePolicy === "close") {
+    const err = new Error(
+      "[@wc-bindable/hawc-auth0] JWT exp claim unparseable under 'close' policy; rejecting connection.",
+    );
+    onEvent?.({ type: "auth:failure", error: err });
+    throw err;
+  }
+
   onEvent?.({ type: "auth:success", user });
   onEvent?.({ type: "connection:open", user });
 
   const initialSub = user.sub;
   const core = options.createCores(user);
 
-  // Parse initial token expiry for session enforcement
-  let sessionExpiresAt = _getExpFromToken(token, sessionGraceMs);
+  let sessionExpiresAt = initialExpiresAt;
 
   // Set up session expiry timer
   let expiryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -177,7 +241,41 @@ export async function handleConnection(
               // On hook failure we roll the expiry back so the deadline
               // the server actually honoured still applies.
               const oldExpiresAt = sessionExpiresAt;
-              sessionExpiresAt = _getExpFromToken(newToken, sessionGraceMs);
+              let refreshExpParseFailed = false;
+              sessionExpiresAt = _getExpFromToken(newToken, sessionGraceMs, (e) => {
+                if (e.type === "auth:exp-parse-failure") refreshExpParseFailed = true;
+                onEvent?.(e);
+              });
+
+              if (refreshExpParseFailed && expParseFailurePolicy === "close") {
+                // Reject the refresh and keep the previously honoured
+                // deadline. We deliberately do NOT close the whole
+                // socket here — the old deadline is finite and will
+                // still fire (the existing timer was not cleared,
+                // because _getExpFromToken returned Infinity and
+                // scheduleExpiryCheck early-returned on Infinity).
+                // That preserves the "no unbounded session" invariant
+                // that `expParseFailurePolicy: "close"` is meant to
+                // uphold, without tearing down a session that was
+                // otherwise still legitimate up to its original exp.
+                sessionExpiresAt = oldExpiresAt;
+                onEvent?.({
+                  type: "auth:refresh-failure",
+                  error: new Error(
+                    "JWT exp claim unparseable under 'close' policy; refresh rejected.",
+                  ),
+                });
+                _safeSend({
+                  type: "throw",
+                  id: msg.id,
+                  error: {
+                    name: "Error",
+                    message: "Token refresh failed: exp claim unparseable",
+                  },
+                });
+                return;
+              }
+
               scheduleExpiryCheck();
 
               // Run the hook as part of the commit path: if it throws
@@ -240,20 +338,66 @@ export async function handleConnection(
 }
 
 /**
- * Extract exp from a JWT and add grace period.
+ * Extract `exp` from a JWT payload and add the configured grace period.
+ *
+ * Returns `Infinity` when the payload cannot be decoded or has no numeric
+ * `exp` claim, and reports the failure through `onEvent` as
+ * `auth:exp-parse-failure`. How the caller reacts to that event is
+ * governed by `expParseFailurePolicy`: `"allow"` keeps the connection
+ * alive with expiry enforcement effectively disabled, while `"close"`
+ * rejects the initial handshake (and rejects in-band refreshes) — see
+ * `HandleConnectionOptions.expParseFailurePolicy` and the `AuthEvent`
+ * doc. The regression this observability hook prevents: before it was
+ * wired up, any non-Node runtime without global `Buffer` would throw
+ * inside the decoder, hit the catch, and disable expiry silently.
+ *
+ * The decoder is runtime-agnostic: `atob` (available in browsers, Deno,
+ * Bun, Cloudflare Workers, and Node 16+) is preferred; `Buffer` is only
+ * used as a fallback for older Node where `atob` is absent.
  */
-function _getExpFromToken(token: string, graceMs: number): number {
+function _getExpFromToken(
+  token: string,
+  graceMs: number,
+  onEvent?: (event: AuthEvent) => void,
+): number {
   try {
-    const payload = JSON.parse(
-      Buffer.from(token.split(".")[1], "base64url").toString(),
-    );
+    const parts = token.split(".");
+    if (parts.length < 2) {
+      onEvent?.({
+        type: "auth:exp-parse-failure",
+        error: new Error("Invalid JWT format: missing payload segment"),
+      });
+      return Infinity;
+    }
+    const payload = JSON.parse(_base64UrlDecode(parts[1]));
     if (typeof payload.exp === "number") {
       return payload.exp * 1000 + graceMs;
     }
-  } catch {
-    // Fall through
+    onEvent?.({
+      type: "auth:exp-parse-failure",
+      error: new Error("JWT payload has no numeric `exp` claim"),
+    });
+  } catch (err) {
+    onEvent?.({
+      type: "auth:exp-parse-failure",
+      error: err instanceof Error ? err : new Error(String(err)),
+    });
   }
   return Infinity;
+}
+
+/**
+ * Runtime-agnostic base64url decoder. Returns a binary string suitable
+ * for `JSON.parse` when the payload is ASCII-compatible JSON (JWT `exp`
+ * extraction only reads a numeric claim, so binary-string decoding is
+ * sufficient here).
+ */
+function _base64UrlDecode(input: string): string {
+  const padded = input + "=".repeat((4 - (input.length % 4)) % 4);
+  const base64 = padded.replace(/-/g, "+").replace(/_/g, "/");
+  if (typeof atob === "function") return atob(base64);
+  // Node ≤ 15 fallback (Node 16+ exposes a global `atob`).
+  return Buffer.from(base64, "base64").toString("binary");
 }
 
 const PROTOCOL_PREFIX = "hawc-auth0.bearer.";
@@ -270,6 +414,7 @@ export async function createAuthenticatedWSS(
     port?: number;
     onEvent?: (event: AuthEvent) => void;
     sessionGraceMs?: number;
+    expParseFailurePolicy?: "allow" | "close";
   },
 ) {
   const { WebSocketServer } = await import("ws");
@@ -308,6 +453,7 @@ export async function createAuthenticatedWSS(
           onEvent: options.onEvent,
           onTokenRefresh: options.onTokenRefresh,
           sessionGraceMs: options.sessionGraceMs,
+          expParseFailurePolicy: options.expParseFailurePolicy,
         },
       );
     } catch (_err) {

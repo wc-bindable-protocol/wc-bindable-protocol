@@ -648,7 +648,7 @@ export class Auth extends HTMLElement {
 
 | Attribute     | Description                            | Example                        |
 |---------------|----------------------------------------|--------------------------------|
-| `remote-url`  | WebSocket URL of the Core server. **Setting this does NOT make `<hawc-auth0>` auto-connect** — it only provides the default URL used by `connect()` / `<hawc-auth0-session>`. See §3.7. | `wss://api.example.com/hawc` |
+| `remote-url`  | WebSocket URL of the Core server. **Setting this does NOT make `<hawc-auth0>` auto-connect** — it only provides the default URL used by `connect()` / `<hawc-auth0-session>`. See §3.7. For mode inference, only a **non-empty** value implies `mode="remote"`; `remote-url=""` is treated as unset so a transient empty binding does not flip the element into a broken remote state (use explicit `mode="remote"` to override). | `wss://api.example.com/hawc` |
 
 ### 3.7 Connection Ownership (mutual exclusion)
 

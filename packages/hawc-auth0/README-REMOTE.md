@@ -11,9 +11,24 @@ For the protocol / server-side / threat-model details, see [SPEC-REMOTE.md](SPEC
 Remote mode is selected when either:
 
 - `mode="remote"` is set explicitly, or
-- `remote-url="..."` is set (implicit — the element has a WebSocket endpoint to talk to).
+- `remote-url` is set to a **non-empty** value (implicit — the element has a WebSocket endpoint to talk to).
 
 `mode="local"` overrides the `remote-url` inference if you need to force local behavior.
+
+### Empty vs unset `remote-url`
+
+`remote-url=""` (empty string) is treated the same as **unset** for mode inference — it does **not** flip the element into remote mode. The element resolves to `local` unless `mode="remote"` is set explicitly.
+
+This rule exists so that dynamic bindings whose initial value resolves to an empty string (template placeholders, state bound before data is loaded, framework prop defaults, etc.) do not accidentally put the element into a broken remote state where `getToken()` throws and `connect()` fails because the URL is empty.
+
+| `mode` attr | `remote-url` attr    | Resolved `mode` |
+|-------------|----------------------|-----------------|
+| `"remote"`  | any (including `""`) | `remote`        |
+| `"local"`   | any                  | `local`         |
+| unset       | non-empty string     | `remote`        |
+| unset       | `""` or absent       | `local`         |
+
+If you want to force remote mode even while `remote-url` is temporarily empty (e.g. the URL is wired up after `connectedCallback`), set `mode="remote"` explicitly. `connect()` will still reject without a URL — use `authEl.connect(explicitUrl)` or set `remote-url` before calling it.
 
 ### Token visibility in remote mode
 
@@ -211,9 +226,47 @@ See [SPEC-REMOTE.md §3.4](SPEC-REMOTE.md) for the full refresh model including 
 | `domain` | `string` | Auth0 tenant domain |
 | `client-id` | `string` | Auth0 application client ID |
 | `audience` | `string` | API audience identifier (required — picks the API access token) |
-| `remote-url` | `string` | WebSocket endpoint. Setting this infers `mode="remote"`. |
+| `remote-url` | `string` | WebSocket endpoint. Setting this to a **non-empty** value infers `mode="remote"`. An empty `remote-url=""` is treated as unset for mode inference (see [§Empty vs unset `remote-url`](#empty-vs-unset-remote-url)). |
 | `mode` | `"local" \| "remote"` | Explicit deployment mode |
 | `trigger` | `boolean` | One-way login trigger |
+
+## Error contract
+
+Remote mode keeps the same **observable error** default as local mode: Auth0 SDK failures resolve and surface via the `error` property / `hawc-auth0:error` event, not as rejected promises. Remote mode adds one layer on top — WebSocket I/O failures — which **do** reject so callers can branch on reconnect / retry logic.
+
+### Resolve (observable via `error`)
+
+| Method | On Auth0 SDK failure |
+|--------|----------------------|
+| `authEl.initialize()` | resolves; `error` set, `loading` cleared |
+| `authEl.login(options?)` | resolves; `error` set, `loading` cleared |
+| `authEl.logout(options?)` | resolves; `error` set |
+
+The `trigger` one-way command follows the same contract.
+
+### Reject (catch-and-observe)
+
+| Method | Rejects on |
+|--------|------------|
+| `authEl.connect(url?)` | missing URL, missing token, WebSocket handshake failure |
+| `authEl.reconnect()` | no prior URL, token fetch failure, WebSocket handshake failure |
+| `authEl.refreshToken()` | no active connection, token fetch failure, server `throw` frame, timeout (30 s), transport close / error |
+| `authEl.getToken()` | always throws in remote mode (token is not reachable from JS by design) |
+
+```js
+try {
+  transport = await authEl.connect();
+} catch (err) {
+  // Also observable via `authEl.error` — pick one as authoritative
+  // (caller-side branching here vs. declarative UI from `error`).
+}
+```
+
+Both the rejected error and `authEl.error` carry the same failure. To avoid double-handling, decide per call site which channel is authoritative — typically `connect` / `reconnect` / `refreshToken` in retry orchestration use the caller-side branch, while passive UI binds `error` for display.
+
+### Interaction with `<hawc-auth0-session>`
+
+`<hawc-auth0-session>` internally awaits `connect()` and forwards failures through its own `error` / `ready` state. Application code binding to the session element should treat its `error` as authoritative and does not need to wrap session-managed connections in `try / catch`.
 
 ## `<hawc-auth0-session>` reference
 
@@ -286,6 +339,37 @@ createAuthenticatedWSS({
 ```
 
 For handler options, protocol error codes, `verifyAuth0Token()` utility, and RBAC propagation on refresh, see [SPEC-REMOTE.md §5 Server Side](SPEC-REMOTE.md) and §3.6 onwards.
+
+### Session expiry hardening
+
+The server extracts `exp` from the verified JWT and enforces a hard close (code `4401 Session expired`) once `exp + sessionGraceMs` elapses. Two knobs control this:
+
+| Option | Default | Effect |
+|--------|---------|--------|
+| `sessionGraceMs` | `60_000` | Milliseconds added to `exp` before the forced close. Set to `0` to disable expiry enforcement. |
+| `expParseFailurePolicy` | `"allow"` | How to handle tokens whose `exp` cannot be parsed (missing claim, malformed payload, non-numeric `exp`). `"allow"` falls back to `Infinity` (unbounded, but emits `auth:exp-parse-failure`). `"close"` rejects the handshake and rejects in-band refreshes, keeping sessions bounded. |
+
+Recommended for production deployments that require a bounded session lifetime even under IdP misconfiguration:
+
+```ts
+createAuthenticatedWSS({
+  auth0Domain: "...",
+  auth0Audience: "...",
+  createCores: (user) => new AppCore(user),
+  sessionGraceMs: 30_000,
+  expParseFailurePolicy: "close",
+  onEvent: (e) => {
+    if (e.type === "auth:exp-parse-failure") {
+      logger.warn("JWT exp unparseable — connection rejected under strict policy", e.error);
+    }
+  },
+});
+```
+
+Under `"close"`:
+
+- **Initial handshake:** the socket is rejected before `createCores` runs (no server-side side effects), `auth:exp-parse-failure` fires followed by `auth:failure`, and the caller closes with `1008 Unauthorized`.
+- **In-band `auth:refresh`:** the refresh is rejected with a `throw` response and `auth:refresh-failure`. The previously honoured deadline stays in effect — the connection still closes at the original `exp + sessionGraceMs` and does not become unbounded.
 
 ## TypeScript Types
 
