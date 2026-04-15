@@ -695,7 +695,11 @@ describe("Auth (hawc-auth0)", () => {
 
       const connectSpy = vi.spyOn((el as any)._shell, "connect").mockResolvedValue({} as any);
       await el.connect("ws://example.com");
-      expect(connectSpy).toHaveBeenCalledWith("ws://example.com");
+      // Auth.connect() forwards an optional second `options` arg (may
+      // be undefined when the caller does not request the ownership
+      // guard). Assert by URL only so the test stays resilient to
+      // future option additions.
+      expect(connectSpy.mock.calls[0][0]).toBe("ws://example.com");
     });
 
     it("connect()はURL未指定時にremote-url属性を使う", async () => {
@@ -711,7 +715,22 @@ describe("Auth (hawc-auth0)", () => {
 
       const connectSpy = vi.spyOn((el as any)._shell, "connect").mockResolvedValue({} as any);
       await el.connect();
-      expect(connectSpy).toHaveBeenCalledWith("ws://attr-url");
+      expect(connectSpy.mock.calls[0][0]).toBe("ws://attr-url");
+    });
+
+    it("connect()はoptions.failIfConnectedをShellに委譲する", async () => {
+      const mockClient = createMockAuth0Client();
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const el = document.createElement("hawc-auth0") as Auth;
+      el.setAttribute("domain", "test.auth0.com");
+      el.setAttribute("client-id", "client-id");
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      const connectSpy = vi.spyOn((el as any)._shell, "connect").mockResolvedValue({} as any);
+      await el.connect("ws://example.com", { failIfConnected: true });
+      expect(connectSpy).toHaveBeenCalledWith("ws://example.com", { failIfConnected: true });
     });
 
     it("refreshToken()を呼び出せる", async () => {

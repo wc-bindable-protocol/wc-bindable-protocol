@@ -300,7 +300,11 @@ describe("AuthSession (hawc-auth0-session)", () => {
       document.body.appendChild(el);
       await el.connectedCallbackPromise;
 
-      expect(connectSpy).toHaveBeenCalledWith("wss://override.example.com/ws");
+      // Session also forwards `failIfConnected: true` as the atomic
+      // ownership guard — see the SPEC-REMOTE §3.7 regression test in
+      // "mutual exclusion". Assert by URL only here to keep this
+      // signature check focused on URL resolution.
+      expect(connectSpy.mock.calls[0][0]).toBe("wss://override.example.com/ws");
     });
 
     it("falls back to target's remote-url when `url` is not set", async () => {
@@ -313,7 +317,7 @@ describe("AuthSession (hawc-auth0-session)", () => {
       document.body.appendChild(el);
       await el.connectedCallbackPromise;
 
-      expect(connectSpy).toHaveBeenCalledWith("wss://fallback.example.com/ws");
+      expect(connectSpy.mock.calls[0][0]).toBe("wss://fallback.example.com/ws");
     });
 
     it("dispatches ready-changed and connecting-changed events", async () => {
@@ -451,6 +455,45 @@ describe("AuthSession (hawc-auth0-session)", () => {
       expect(el.error).toBeInstanceOf(Error);
       expect(el.error?.message).toContain("target is already connected");
       expect(el.error?.message).toContain("§3.7");
+    });
+
+    it("passes failIfConnected:true through to AuthShell.connect (TOCTOU guard)", async () => {
+      // Regression: the outer `auth.connected` check in AuthSession is
+      // a fast path, not an atomic guard. A concurrent caller could
+      // take the connection between that check and the `await
+      // auth.connect()` microtask boundary. The session must pass
+      // `failIfConnected: true` so AuthShell.connect() synchronously
+      // claims ownership before any await — rejecting racing callers
+      // instead of tearing down their sockets.
+      const mockClient = createMockAuth0Client({
+        isAuthenticated: vi.fn().mockResolvedValue(true),
+        getUser: vi.fn().mockResolvedValue({ sub: "u" }),
+        getTokenSilently: vi.fn().mockResolvedValue("jwt-token"),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const authEl = document.createElement("hawc-auth0") as Auth;
+      authEl.id = "auth";
+      authEl.setAttribute("domain", "d.auth0.com");
+      authEl.setAttribute("client-id", "c");
+      authEl.setAttribute("remote-url", "wss://example.com/ws");
+      document.body.appendChild(authEl);
+      await authEl.connectedCallbackPromise;
+
+      const shell = (authEl as any)._shell;
+      const connectSpy = vi.spyOn(shell, "connect")
+        .mockResolvedValue({ send: vi.fn(), onMessage: vi.fn(), onClose: vi.fn() });
+
+      const el = document.createElement("hawc-auth0-session") as AuthSession;
+      el.target = "auth";
+      el.core = "app-core";
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      expect(connectSpy).toHaveBeenCalledTimes(1);
+      const [url, options] = connectSpy.mock.calls[0];
+      expect(url).toBe("wss://example.com/ws");
+      expect(options).toEqual({ failIfConnected: true });
     });
   });
 

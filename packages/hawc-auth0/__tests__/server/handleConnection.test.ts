@@ -1326,6 +1326,83 @@ describe("handleConnection", () => {
     expect(events.some((e) => e.type === "auth:failure")).toBe(false);
   });
 
+  it("'allow' policy: refresh with unparseable exp clears the old timer (connection runs unbounded)", async () => {
+    // Regression: scheduleExpiryCheck() used to early-return on
+    // sessionExpiresAt === Infinity WITHOUT clearing the previously
+    // scheduled timer, so an allow-policy refresh whose new exp was
+    // unparseable would still fire 4401 at the OLD deadline — the
+    // exact opposite of what the JSDoc promised ("enforcement is
+    // effectively disabled"). Lock down the fix: under allow policy,
+    // after a parse-failing refresh, the old timer must be cleared
+    // and no 4401 may fire at the original deadline.
+    vi.useFakeTimers();
+    try {
+      const originalExp = Math.floor(Date.now() / 1000) + 5;
+      jwtVerify.mockResolvedValueOnce({
+        payload: { sub: "auth0|123", permissions: [] },
+      });
+
+      const socket = createMockSocket();
+      const core = new EventTarget();
+      (core.constructor as any).wcBindable = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+      };
+
+      const events: AuthEvent[] = [];
+
+      await handleConnection(
+        socket,
+        "hawc-auth0.bearer." + makeJwt({
+          sub: "auth0|123",
+          exp: originalExp,
+        }),
+        {
+          auth0Domain: "test.auth0.com",
+          auth0Audience: "https://api.example.com",
+          createCores: () => core,
+          sessionGraceMs: 1_000,
+          // expParseFailurePolicy defaults to "allow".
+          onEvent: (e) => events.push(e),
+        },
+      );
+
+      // Second verify: refresh with a token that has no exp claim.
+      jwtVerify.mockResolvedValueOnce({
+        payload: { sub: "auth0|123", permissions: [] },
+      });
+
+      const refreshMsg = JSON.stringify({
+        type: "cmd",
+        name: "auth:refresh",
+        id: "r-allow-1",
+        args: [makeJwt({ sub: "auth0|123" /* no exp */ })],
+      });
+      const messageHandlers = socket._listeners["message"];
+      expect(messageHandlers?.length).toBeGreaterThan(0);
+      messageHandlers[0]({ data: refreshMsg });
+
+      // Let the refresh chain resolve.
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(0);
+
+      // Allow policy: refresh succeeds as a `return` frame even
+      // though exp was unparseable (only the event flags it).
+      expect(events.some((e) => e.type === "auth:exp-parse-failure")).toBe(true);
+      expect(events.some((e) => e.type === "auth:refresh")).toBe(true);
+      expect(events.some((e) => e.type === "auth:refresh-failure")).toBe(false);
+
+      // Advance past the original deadline + grace. No 4401 must fire —
+      // allow-policy's "enforcement disabled after parse failure"
+      // contract requires the old timer to have been cleared.
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(socket.close).not.toHaveBeenCalledWith(4401, "Session expired");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("closes socket when session expires", async () => {
     vi.useFakeTimers();
     try {

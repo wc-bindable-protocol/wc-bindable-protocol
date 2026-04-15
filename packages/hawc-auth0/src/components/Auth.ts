@@ -257,10 +257,21 @@ export class Auth extends HTMLElement {
   /**
    * Establish an authenticated WebSocket connection.
    * If no URL is provided, uses the `remote-url` attribute.
+   *
+   * `options.failIfConnected` forwards an atomic ownership guard to
+   * `AuthShell.connect()` — it rejects fast when another connection is
+   * already open or a handshake is in flight, instead of closing the
+   * other owner's socket. Used by `<hawc-auth0-session>` to close the
+   * TOCTOU between its `auth.connected` check and this method's
+   * `await connectedCallbackPromise` microtask hop
+   * (SPEC-REMOTE §3.7 — Connection Ownership).
    */
-  async connect(url?: string): Promise<ClientTransport> {
+  async connect(
+    url?: string,
+    options?: { failIfConnected?: boolean },
+  ): Promise<ClientTransport> {
     await this._connectedCallbackPromise;
-    return this._shell.connect(url || this.remoteUrl);
+    return this._shell.connect(url || this.remoteUrl, options);
   }
 
   /**

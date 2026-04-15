@@ -170,8 +170,19 @@ export async function handleConnection(
   let expiryTimer: ReturnType<typeof setTimeout> | null = null;
 
   function scheduleExpiryCheck() {
+    // Always drop the previous timer BEFORE checking whether to schedule
+    // a new one. Otherwise a transition from a finite `sessionExpiresAt`
+    // to `Infinity` (e.g. `allow` policy + refresh with an unparseable
+    // `exp`) would leave the old deadline's timer live, so the
+    // connection would be closed with 4401 at the old deadline even
+    // though the JSDoc contract for `allow` says enforcement is
+    // effectively disabled after parse failure. Clearing first keeps
+    // `sessionExpiresAt` the single source of truth for enforcement.
+    if (expiryTimer !== null) {
+      clearTimeout(expiryTimer);
+      expiryTimer = null;
+    }
     if (sessionGraceMs <= 0 || sessionExpiresAt === Infinity) return;
-    if (expiryTimer !== null) clearTimeout(expiryTimer);
     const delay = Math.max(0, sessionExpiresAt - Date.now());
     expiryTimer = setTimeout(() => {
       socket.close?.(4401, "Session expired");
@@ -250,9 +261,9 @@ export async function handleConnection(
                 // Reject the refresh and keep the previously honoured
                 // deadline. We deliberately do NOT close the whole
                 // socket here — the old deadline is finite and will
-                // still fire (the existing timer was not cleared,
-                // because _getExpFromToken returned Infinity and
-                // scheduleExpiryCheck early-returned on Infinity).
+                // still fire because we `return` BEFORE calling
+                // `scheduleExpiryCheck()`, so the original timer
+                // scheduled at connection setup remains untouched.
                 // That preserves the "no unbounded session" invariant
                 // that `expParseFailurePolicy: "close"` is meant to
                 // uphold, without tearing down a session that was

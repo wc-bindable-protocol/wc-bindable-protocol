@@ -37,6 +37,12 @@ export class AuthShell extends EventTarget {
   private _transport: InterceptingClientTransport | null = null;
   private _url: string = "";
   private _mode: AuthMode = "local";
+  // Synchronous in-flight claim used by the atomic `failIfConnected`
+  // ownership guard in `connect()`. Flipped to `true` BEFORE the first
+  // `await` and reset in `finally`, so concurrent callers — including
+  // the race across `Auth.connect()`'s `await connectedCallbackPromise`
+  // microtask — observe an existing handshake synchronously.
+  private _connectInFlight: boolean = false;
 
   constructor(target?: EventTarget) {
     super();
@@ -168,8 +174,22 @@ export class AuthShell extends EventTarget {
    * The access token is sent in the `Sec-WebSocket-Protocol` header as
    * `hawc-auth0.bearer.{JWT}`. Returns a `ClientTransport` that can be
    * passed to `createRemoteCoreProxy()`.
+   *
+   * `options.failIfConnected` opts into an atomic ownership guard: the
+   * call rejects fast when another connection is open OR another
+   * handshake is already in flight, instead of silently closing the
+   * other party's socket via `_closeWebSocket()`. `<hawc-auth0-session>`
+   * passes this flag to stop a race between its synchronous
+   * `auth.connected` check and the subsequent `await auth.connect()`
+   * microtask hop (SPEC-REMOTE §3.7 — Connection Ownership).
+   * Direct callers that explicitly want to take over an existing
+   * transport omit the flag and fall back to the legacy
+   * `_closeWebSocket()`-then-reconnect behaviour.
    */
-  async connect(url: string): Promise<ClientTransport> {
+  async connect(
+    url: string,
+    options?: { failIfConnected?: boolean },
+  ): Promise<ClientTransport> {
     if (!this._core.client) {
       raiseError("Auth0 client is not initialized. Call initialize() first.");
     }
@@ -179,56 +199,88 @@ export class AuthShell extends EventTarget {
       );
     }
 
-    // Fetch-then-commit: same invariant as refreshToken / reconnect.
-    // The token is published to AuthCore only after the server accepts
-    // it via the WebSocket handshake (`open`). If the initial connection
-    // fails, `_token` and `getTokenExpiry()` stay aligned with the last
-    // server-accepted state (typically null on first attempt).
-    const token = await this._core.fetchToken();
-    if (!token) {
-      raiseError("Failed to obtain access token.");
+    // Atomic ownership claim. Both the existence check and the flag
+    // toggle run BEFORE the first await, so a concurrent caller crossing
+    // `Auth.connect()`'s `await connectedCallbackPromise` boundary
+    // observes `_connectInFlight` and bails out instead of racing into
+    // `_closeWebSocket()` and tearing down the first owner's socket.
+    if (
+      options?.failIfConnected &&
+      (this._connectInFlight || this._ws !== null || this._connected)
+    ) {
+      raiseError(
+        "connect(): target already owns a connection or a handshake is in flight. " +
+        "Another path (<hawc-auth0-session>, direct authEl.connect(), or an in-flight call) " +
+        "is managing the transport — see SPEC-REMOTE §3.7 (Connection Ownership).",
+      );
     }
+    this._connectInFlight = true;
 
-    this._closeWebSocket();
-
-    this._url = url;
-    const ws = new WebSocket(url, [`${PROTOCOL_PREFIX}${token}`]);
-    this._ws = ws;
-
-    ws.addEventListener("close", () => {
-      if (this._ws === ws) {
-        this._setConnected(false);
-      }
-    });
-
-    // Wait for the connection to open before returning the transport.
-    // If the handshake fails we MUST drop `connected` back to false:
-    // _closeWebSocket() above nulled `_ws` before close()-ing the
-    // previous socket, so the previous socket's close handler became
-    // a no-op (its `this._ws === ws` guard fails), and without this
-    // explicit clear `connected` would stay true even though no live
-    // transport remains. This corrupts any UI / retry logic keyed off
-    // `connected`. Also null the failed socket reference so `_ws` does
-    // not linger as a dangling reference to a dead socket between calls.
     try {
-      await new Promise<void>((resolve, reject) => {
-        ws.addEventListener("open", () => resolve(), { once: true });
-        ws.addEventListener("error", () => {
-          reject(new Error(`[@wc-bindable/hawc-auth0] WebSocket connection failed: ${url}`));
-        }, { once: true });
-      });
-    } catch (err) {
-      if (this._ws === ws) {
-        this._ws = null;
+      // Fetch-then-commit: same invariant as refreshToken / reconnect.
+      // The token is published to AuthCore only after the server accepts
+      // it via the WebSocket handshake (`open`). If the initial connection
+      // fails, `_token` and `getTokenExpiry()` stay aligned with the last
+      // server-accepted state (typically null on first attempt).
+      const token = await this._core.fetchToken();
+      if (!token) {
+        raiseError("Failed to obtain access token.");
       }
-      this._setConnected(false);
-      throw err;
-    }
 
-    // Server accepted the token at handshake — safe to commit.
-    this._core.commitToken(token);
-    this._setConnected(true);
-    return this._createTransport(ws);
+      this._closeWebSocket();
+
+      this._url = url;
+      const ws = new WebSocket(url, [`${PROTOCOL_PREFIX}${token}`]);
+      this._ws = ws;
+
+      ws.addEventListener("close", () => {
+        if (this._ws === ws) {
+          // Null the reference so `_ws` reflects "live connection", not
+          // "last connection that ever existed". Otherwise the
+          // `failIfConnected` ownership guard (`_ws !== null`) would
+          // keep rejecting subsequent reconnects by <hawc-auth0-session>
+          // after any server-side close (network blip, token expiry,
+          // server restart), stranding the session in an unrecoverable
+          // state. `_ws === ws` guards against stomping on a newer
+          // socket that already replaced this one.
+          this._ws = null;
+          this._setConnected(false);
+        }
+      });
+
+      // Wait for the connection to open before returning the transport.
+      // If the handshake fails we MUST drop `connected` back to false:
+      // _closeWebSocket() above nulled `_ws` before close()-ing the
+      // previous socket, so the previous socket's close handler became
+      // a no-op (its `this._ws === ws` guard fails), and without this
+      // explicit clear `connected` would stay true even though no live
+      // transport remains. This corrupts any UI / retry logic keyed off
+      // `connected`. Also null the failed socket reference so `_ws` does
+      // not linger as a dangling reference to a dead socket between calls.
+      try {
+        await new Promise<void>((resolve, reject) => {
+          ws.addEventListener("open", () => resolve(), { once: true });
+          ws.addEventListener("error", () => {
+            reject(new Error(`[@wc-bindable/hawc-auth0] WebSocket connection failed: ${url}`));
+          }, { once: true });
+        });
+      } catch (err) {
+        if (this._ws === ws) {
+          this._ws = null;
+        }
+        this._setConnected(false);
+        throw err;
+      }
+
+      // Server accepted the token at handshake — safe to commit.
+      this._core.commitToken(token);
+      this._setConnected(true);
+      return this._createTransport(ws);
+    } finally {
+      // Always release the ownership claim, whether we succeeded,
+      // threw from a precondition, or rejected at handshake.
+      this._connectInFlight = false;
+    }
   }
 
   /**
@@ -334,6 +386,13 @@ export class AuthShell extends EventTarget {
    * Returns a new `ClientTransport`. Use with `proxy.reconnect(transport)`
    * to swap the underlying connection. Note: server-side Core state is
    * rebuilt from scratch — property values may change.
+   *
+   * Shares the `_connectInFlight` ownership claim with `connect()`:
+   * a concurrent `reconnect()` / `connect({ failIfConnected: true })`
+   * fails fast instead of racing two `_closeWebSocket()` + handshake
+   * pairs. Without this, a second reconnect call would close the
+   * first reconnect's in-flight socket, leaving the first caller with
+   * a broken transport while `_ws` pointed at the second's socket.
    */
   async reconnect(): Promise<ClientTransport> {
     if (!this._core.client) {
@@ -343,50 +402,73 @@ export class AuthShell extends EventTarget {
       raiseError("No previous connection URL. Call connect() first.");
     }
 
-    // Fetch-then-commit: the new token is published to AuthCore only
-    // after the server accepts it via the WebSocket handshake (`open`).
-    // If the reconnection fails, `_token` and `getTokenExpiry()` stay
-    // aligned with the last session the server actually honoured.
-    const token = await this._core.fetchFreshToken();
-    if (!token) {
-      raiseError("Failed to refresh access token.");
+    // Atomic ownership claim shared with connect(). Set BEFORE any
+    // await so a concurrent connect() / reconnect() observes it
+    // synchronously. A parallel reconnect bails out with the same
+    // ownership error as a racing connect(failIfConnected), and the
+    // first caller proceeds to completion without being torn down.
+    if (this._connectInFlight) {
+      raiseError(
+        "reconnect(): another handshake (connect or reconnect) is already in flight. " +
+        "See SPEC-REMOTE §3.7 (Connection Ownership).",
+      );
     }
+    this._connectInFlight = true;
 
-    this._closeWebSocket();
-
-    const ws = new WebSocket(this._url, [`${PROTOCOL_PREFIX}${token}`]);
-    this._ws = ws;
-
-    ws.addEventListener("close", () => {
-      if (this._ws === ws) {
-        this._setConnected(false);
-      }
-    });
-
-    // See connect(): the previous socket's close handler is now a no-op,
-    // so a handshake failure here would leave `connected` stuck at true
-    // unless we explicitly clear it on the failure path. Also null the
-    // failed socket reference so `_ws` does not linger as a dangling
-    // reference to a dead socket between calls.
     try {
-      await new Promise<void>((resolve, reject) => {
-        ws.addEventListener("open", () => resolve(), { once: true });
-        ws.addEventListener("error", () => {
-          reject(new Error(`[@wc-bindable/hawc-auth0] WebSocket reconnection failed: ${this._url}`));
-        }, { once: true });
-      });
-    } catch (err) {
-      if (this._ws === ws) {
-        this._ws = null;
+      // Fetch-then-commit: the new token is published to AuthCore only
+      // after the server accepts it via the WebSocket handshake (`open`).
+      // If the reconnection fails, `_token` and `getTokenExpiry()` stay
+      // aligned with the last session the server actually honoured.
+      const token = await this._core.fetchFreshToken();
+      if (!token) {
+        raiseError("Failed to refresh access token.");
       }
-      this._setConnected(false);
-      throw err;
-    }
 
-    // Server accepted the new token at handshake — safe to commit.
-    this._core.commitToken(token);
-    this._setConnected(true);
-    return this._createTransport(ws);
+      this._closeWebSocket();
+
+      const ws = new WebSocket(this._url, [`${PROTOCOL_PREFIX}${token}`]);
+      this._ws = ws;
+
+      ws.addEventListener("close", () => {
+        if (this._ws === ws) {
+          // Mirror connect(): null the stale reference so subsequent
+          // `failIfConnected: true` calls are not rejected against a
+          // dead socket. See connect()'s close handler for rationale.
+          this._ws = null;
+          this._setConnected(false);
+        }
+      });
+
+      // See connect(): the previous socket's close handler is now a no-op,
+      // so a handshake failure here would leave `connected` stuck at true
+      // unless we explicitly clear it on the failure path. Also null the
+      // failed socket reference so `_ws` does not linger as a dangling
+      // reference to a dead socket between calls.
+      try {
+        await new Promise<void>((resolve, reject) => {
+          ws.addEventListener("open", () => resolve(), { once: true });
+          ws.addEventListener("error", () => {
+            reject(new Error(`[@wc-bindable/hawc-auth0] WebSocket reconnection failed: ${this._url}`));
+          }, { once: true });
+        });
+      } catch (err) {
+        if (this._ws === ws) {
+          this._ws = null;
+        }
+        this._setConnected(false);
+        throw err;
+      }
+
+      // Server accepted the new token at handshake — safe to commit.
+      this._core.commitToken(token);
+      this._setConnected(true);
+      return this._createTransport(ws);
+    } finally {
+      // Always release the ownership claim so the next connect /
+      // reconnect can proceed (including post-failure retries).
+      this._connectInFlight = false;
+    }
   }
 
   // --- Private helpers ------------------------------------------------------

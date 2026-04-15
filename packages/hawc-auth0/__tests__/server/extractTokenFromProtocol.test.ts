@@ -17,6 +17,19 @@ describe("extractTokenFromProtocol", () => {
     expect(token).toBe("my-jwt");
   });
 
+  it("trims leading/trailing whitespace on array entries", () => {
+    // Regression: comma-separated string input was trimmed, but array
+    // input was not — entries arriving with whitespace from upstream
+    // proxies / non-`ws` servers would fail `startsWith(PROTOCOL_PREFIX)`
+    // and surface as the generic "no entry" authentication failure
+    // even when the client sent a valid subprotocol.
+    const token = extractTokenFromProtocol([
+      " other ",
+      "  hawc-auth0.bearer.my-jwt  ",
+    ]);
+    expect(token).toBe("my-jwt");
+  });
+
   it("throws on undefined header", () => {
     expect(() => extractTokenFromProtocol(undefined)).toThrow(
       "Missing Sec-WebSocket-Protocol header",

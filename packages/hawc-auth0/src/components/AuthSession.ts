@@ -283,7 +283,15 @@ export class AuthSession extends HTMLElement {
     this._setConnecting(true);
     const myGen = this._generation;
     try {
-      const transport = await auth.connect(url);
+      // Pass `failIfConnected: true` so AuthShell.connect() atomically
+      // rejects when another owner claimed the transport during the
+      // `await connectedCallbackPromise` microtask hop inside
+      // Auth.connect(). Without this flag the outer `auth.connected`
+      // fast-path check (above) has a TOCTOU: a concurrent caller
+      // could open a socket between the check and this call, and the
+      // subsequent AuthShell.connect() would `_closeWebSocket()` it,
+      // violating the Connection Ownership contract (SPEC-REMOTE §3.7).
+      const transport = await auth.connect(url, { failIfConnected: true });
 
       // Race guard: a teardown (logout, element removal) fired during the
       // handshake. The freshly opened WebSocket is owned by AuthShell —

@@ -16,10 +16,19 @@ export function extractTokenFromProtocol(
     throw new Error("[@wc-bindable/hawc-auth0] Missing Sec-WebSocket-Protocol header.");
   }
 
-  // The header may be a comma-separated string or an array.
-  const protocols: string[] = Array.isArray(protocolHeader)
-    ? protocolHeader
-    : protocolHeader.split(",").map((s) => s.trim());
+  // The header may be a comma-separated string or an array. Trim each
+  // entry in BOTH branches — the `ws` library normalises whitespace
+  // for us, but other server environments (undici, custom proxies,
+  // reverse-proxy-forwarded arrays) can hand over entries with
+  // leading/trailing spaces. Without trim, `startsWith(PROTOCOL_PREFIX)`
+  // would miss a legitimate token and the handshake would fail with
+  // the generic "no ... entry" error even though the client sent a
+  // perfectly valid subprotocol.
+  const protocols: string[] = (
+    Array.isArray(protocolHeader)
+      ? protocolHeader
+      : protocolHeader.split(",")
+  ).map((s) => s.trim());
 
   for (const proto of protocols) {
     if (proto.startsWith(PROTOCOL_PREFIX)) {

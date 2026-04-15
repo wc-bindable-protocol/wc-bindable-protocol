@@ -359,6 +359,165 @@ describe("AuthShell", () => {
       expect(errorEvents).toEqual([null, sdkError]);
     });
 
+    describe("failIfConnected (atomic ownership guard)", () => {
+      it("rejects fast when an open connection already exists", async () => {
+        const mockClient = createMockAuth0Client({
+          getTokenSilently: vi.fn().mockResolvedValue("token"),
+        });
+        createAuth0Client.mockResolvedValue(mockClient);
+
+        const shell = new AuthShell();
+        await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+
+        await shell.connect("ws://localhost:3000");
+        expect(shell.connected).toBe(true);
+
+        await expect(
+          shell.connect("ws://localhost:3001", { failIfConnected: true }),
+        ).rejects.toThrow(/Connection Ownership/);
+      });
+
+      it("rejects fast when a handshake is already in flight (TOCTOU guard)", async () => {
+        // Regression: without `failIfConnected`, a synchronous
+        // `auth.connected === false` check followed by `await
+        // auth.connect()` was non-atomic — a concurrent connect()
+        // could slip into `_closeWebSocket()` and tear down the
+        // first caller's socket. The flag now claims ownership
+        // synchronously before the first `await`.
+        const mockClient = createMockAuth0Client({
+          getTokenSilently: vi.fn().mockResolvedValue("token"),
+        });
+        createAuth0Client.mockResolvedValue(mockClient);
+
+        const shell = new AuthShell();
+        await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+
+        // Caller A: kicks off the first connect but does NOT await yet.
+        const pA = shell.connect("ws://localhost:3000");
+        // Caller B: runs synchronously BEFORE caller A's microtask
+        // boundary. Without the guard, caller B's `_closeWebSocket()`
+        // would kill caller A's socket. With the guard, caller B fails
+        // fast because `_connectInFlight` is already true.
+        await expect(
+          shell.connect("ws://localhost:3001", { failIfConnected: true }),
+        ).rejects.toThrow(/Connection Ownership/);
+
+        // Caller A still finishes cleanly.
+        await expect(pA).resolves.toBeDefined();
+        expect(shell.connected).toBe(true);
+      });
+
+      it("releases the ownership claim after a successful handshake", async () => {
+        const mockClient = createMockAuth0Client({
+          getTokenSilently: vi.fn().mockResolvedValue("token"),
+        });
+        createAuth0Client.mockResolvedValue(mockClient);
+
+        const shell = new AuthShell();
+        await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+
+        await shell.connect("ws://localhost:3000");
+        // A second connect WITHOUT the flag is still allowed
+        // (take-over semantics for direct callers).
+        await expect(
+          shell.connect("ws://localhost:3000"),
+        ).resolves.toBeDefined();
+      });
+
+      it("allows reconnect after the live socket closes (stale _ws must not strand the session)", async () => {
+        // Regression: close handler used to leave `_ws` pointing at the
+        // already-closed socket. The ownership guard then saw
+        // `_ws !== null` and rejected every subsequent
+        // `failIfConnected: true` call — which is exactly what
+        // <hawc-auth0-session> uses, so any server-side close (network
+        // blip, server restart, idle timeout) left the session stuck
+        // in an unrecoverable error state.
+        const mockClient = createMockAuth0Client({
+          getTokenSilently: vi.fn().mockResolvedValue("token"),
+        });
+        createAuth0Client.mockResolvedValue(mockClient);
+
+        // Capture the WebSocket instance so we can emit close manually.
+        let wsRef: MockWebSocket | null = null;
+        const originalWS = (globalThis as any).WebSocket;
+        (globalThis as any).WebSocket = class extends MockWebSocket {
+          constructor(url: string, protocols?: string | string[]) {
+            super(url, protocols);
+            wsRef = this;
+          }
+        };
+
+        try {
+          const shell = new AuthShell();
+          await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+
+          await shell.connect("ws://localhost:3000", { failIfConnected: true });
+          expect(shell.connected).toBe(true);
+          expect((shell as any)._ws).not.toBeNull();
+
+          // Server-side close — fires the close event on the live socket.
+          wsRef!.close();
+          expect(shell.connected).toBe(false);
+          // The stale reference must have been cleared; otherwise the
+          // guard below will falsely report "already owns a connection".
+          expect((shell as any)._ws).toBeNull();
+
+          // Reconnect must succeed with the ownership guard enabled.
+          const transport = await shell.connect(
+            "ws://localhost:3000",
+            { failIfConnected: true },
+          );
+          expect(transport).toBeDefined();
+          expect(shell.connected).toBe(true);
+        } finally {
+          (globalThis as any).WebSocket = originalWS;
+        }
+      });
+
+      it("releases the ownership claim after a failed handshake", async () => {
+        // Regression: if `_connectInFlight` were not reset on error,
+        // a subsequent retry with `failIfConnected: true` would falsely
+        // report another handshake as in flight.
+        const mockClient = createMockAuth0Client({
+          getTokenSilently: vi.fn().mockResolvedValue("token"),
+        });
+        createAuth0Client.mockResolvedValue(mockClient);
+
+        // Install a WebSocket that errors on open.
+        const originalWS = (globalThis as any).WebSocket;
+        (globalThis as any).WebSocket = class extends MockWebSocket {
+          constructor(url: string, protocols?: string | string[]) {
+            super(url, protocols);
+            queueMicrotask(() => this._emit("error"));
+          }
+          addEventListener(type: string, listener: (...args: any[]) => void, opts?: any): void {
+            // Silently drop "open" so only "error" wins.
+            if (type === "open") return;
+            super.addEventListener(type, listener, opts);
+          }
+        };
+
+        try {
+          const shell = new AuthShell();
+          await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+
+          await expect(
+            shell.connect("ws://localhost:3000", { failIfConnected: true }),
+          ).rejects.toThrow(/WebSocket connection failed/);
+
+          // Restore working WS so the retry can succeed.
+          (globalThis as any).WebSocket = originalWS;
+
+          await expect(
+            shell.connect("ws://localhost:3000", { failIfConnected: true }),
+          ).resolves.toBeDefined();
+          expect(shell.connected).toBe(true);
+        } finally {
+          (globalThis as any).WebSocket = originalWS;
+        }
+      });
+    });
+
     it("clears connected to false when a follow-up connect handshake fails", async () => {
       const mockClient = createMockAuth0Client({
         getTokenSilently: vi.fn().mockResolvedValue("token"),
@@ -552,6 +711,82 @@ describe("AuthShell", () => {
       await expect(shell.reconnect()).rejects.toThrow(
         "[@wc-bindable/hawc-auth0] Failed to refresh access token.",
       );
+    });
+
+    describe("ownership guard (shared with connect)", () => {
+      it("rejects a second concurrent reconnect() while the first is in flight", async () => {
+        // Regression: reconnect() used to skip the in-flight claim, so
+        // two parallel calls would both run `_closeWebSocket()` +
+        // `new WebSocket(...)`, last-write-wins on `_ws`. The first
+        // caller's handshake socket would then be torn down mid-await
+        // and its returned transport would be broken while internal
+        // state pointed at the second caller's socket.
+        const mockClient = createMockAuth0Client({
+          getTokenSilently: vi.fn().mockResolvedValue("token"),
+        });
+        createAuth0Client.mockResolvedValue(mockClient);
+
+        const shell = new AuthShell();
+        await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+        await shell.connect("ws://localhost:3000");
+
+        // Start two reconnects simultaneously; the second must bail
+        // out synchronously (before any await inside reconnect) so
+        // the first can complete cleanly.
+        const pA = shell.reconnect();
+        await expect(shell.reconnect()).rejects.toThrow(/Connection Ownership/);
+        await expect(pA).resolves.toBeDefined();
+
+        // After settling, a subsequent reconnect is allowed again
+        // (the ownership claim was released in finally).
+        await expect(shell.reconnect()).resolves.toBeDefined();
+      });
+
+      it("rejects connect(failIfConnected) while a reconnect is in flight", async () => {
+        // Cross-op race: AuthSession's reconnection path may call
+        // connect(failIfConnected: true) while application code or an
+        // internal retry has started a reconnect(). The atomic claim
+        // must block both sides from racing _closeWebSocket().
+        const mockClient = createMockAuth0Client({
+          getTokenSilently: vi.fn().mockResolvedValue("token"),
+        });
+        createAuth0Client.mockResolvedValue(mockClient);
+
+        const shell = new AuthShell();
+        await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+        await shell.connect("ws://localhost:3000");
+
+        const reconnectP = shell.reconnect();
+        await expect(
+          shell.connect("ws://localhost:3000", { failIfConnected: true }),
+        ).rejects.toThrow(/Connection Ownership/);
+        await expect(reconnectP).resolves.toBeDefined();
+      });
+
+      it("releases the ownership claim after a failed reconnect", async () => {
+        // Regression: if reconnect() threw without clearing
+        // `_connectInFlight` a subsequent connect(failIfConnected:true)
+        // or reconnect() would falsely report an in-flight handshake.
+        const mockClient = createMockAuth0Client({
+          getTokenSilently: vi.fn()
+            .mockResolvedValueOnce("token") // initial connect
+            .mockResolvedValueOnce(null),   // reconnect's fetchFreshToken fails
+        });
+        createAuth0Client.mockResolvedValue(mockClient);
+
+        const shell = new AuthShell();
+        await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+        await shell.connect("ws://localhost:3000");
+
+        await expect(shell.reconnect()).rejects.toThrow(
+          /Failed to refresh access token/,
+        );
+
+        // Subsequent reconnect must be admitted now that the flag was
+        // released in finally.
+        mockClient.getTokenSilently.mockResolvedValueOnce("token2");
+        await expect(shell.reconnect()).resolves.toBeDefined();
+      });
     });
 
     it("clears connected to false when reconnect handshake fails", async () => {
