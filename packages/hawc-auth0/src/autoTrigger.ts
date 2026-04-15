@@ -26,7 +26,18 @@ function handleClick(event: Event): void {
   if (!authElement || authElement.tagName.toLowerCase() !== config.tagNames.auth) return;
 
   event.preventDefault();
-  (authElement as any).login();
+  // `login()` is async and can reject (e.g. click fires before the
+  // element's `domain` / `client-id` attributes are set, or during
+  // an init failure). Swallow the rejection here so we don't leak
+  // an unhandled-rejection into the host page's global handler —
+  // the failure is still observable via `authEl.error` /
+  // `hawc-auth0:error`, matching the trigger setter's contract.
+  const result = (authElement as any).login();
+  if (result && typeof result.then === "function") {
+    result.catch(() => {
+      /* error surfaces via authEl.error (AuthShell state) */
+    });
+  }
 }
 
 export function registerAutoTrigger(): void {

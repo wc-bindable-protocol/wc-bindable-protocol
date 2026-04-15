@@ -982,6 +982,55 @@ describe("AuthLogout (hawc-auth0-logout)", () => {
     // エラーが発生しないことを確認
     expect(() => logoutEl.click()).not.toThrow();
   });
+
+  it("logout()がrejectしてもunhandled rejectionにならない", async () => {
+    // Regression: AuthLogout's click handler previously did
+    // `authElement.logout(options)` with no .catch(). Same reject
+    // path as login(): initialize() fails → `_client` stays null →
+    // logout() hits `raiseError("Auth0 client is not
+    // initialized...")` and the async function rejects.
+    const { Auth } = await import("../src/components/Auth");
+    const mod = await import("@auth0/auth0-spa-js");
+    const createAuth0Client = (mod as any).createAuth0Client as ReturnType<typeof vi.fn>;
+    createAuth0Client.mockRejectedValue(new Error("auth0 init failed"));
+
+    const authEl = document.createElement("hawc-auth0") as Auth;
+    authEl.id = "auth-logout-reject";
+    authEl.setAttribute("domain", "test.auth0.com");
+    authEl.setAttribute("client-id", "client-id");
+    document.body.appendChild(authEl);
+    await authEl.connectedCallbackPromise;
+    expect((authEl as any)._shell.client).toBeNull();
+
+    const logoutEl = document.createElement("hawc-auth0-logout") as AuthLogout;
+    logoutEl.target = "auth-logout-reject";
+    document.body.appendChild(logoutEl);
+
+    // Listen on both window (jsdom) and process (node) — see the
+    // matching autoTrigger-side test for rationale.
+    const unhandled: unknown[] = [];
+    const winHandler = (e: PromiseRejectionEvent) => {
+      unhandled.push(e.reason);
+      e.preventDefault();
+    };
+    const procHandler = (reason: unknown) => {
+      unhandled.push(reason);
+    };
+    window.addEventListener("unhandledrejection", winHandler);
+    process.on("unhandledRejection", procHandler);
+
+    try {
+      logoutEl.click();
+      await new Promise((r) => setTimeout(r, 0));
+      await new Promise((r) => setTimeout(r, 0));
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(unhandled).toHaveLength(0);
+    } finally {
+      window.removeEventListener("unhandledrejection", winHandler);
+      process.off("unhandledRejection", procHandler);
+    }
+  });
 });
 
 describe("autoTrigger", () => {
@@ -1236,5 +1285,64 @@ describe("autoTrigger", () => {
 
     // data-authtarget属性なしのクリック
     expect(() => button.click()).not.toThrow();
+  });
+
+  it("autoTrigger経由のlogin()がrejectしてもunhandled rejectionにならない", async () => {
+    // Regression: the click handler previously did
+    // `(authElement as any).login()` with no .catch(). The concrete
+    // reject path is: initialize() fails → `_client` stays null →
+    // next `login()` hits `raiseError("Auth0 client is not
+    // initialized...")` and the async function rejects. Previously
+    // that rejection leaked into the host page's global handler.
+    createAuth0Client.mockRejectedValue(new Error("auth0 init failed"));
+
+    registerAutoTrigger();
+
+    const authEl = document.createElement("hawc-auth0") as Auth;
+    authEl.id = "auth-reject-1";
+    authEl.setAttribute("domain", "test.auth0.com");
+    authEl.setAttribute("client-id", "client-id");
+    document.body.appendChild(authEl);
+    await authEl.connectedCallbackPromise;
+    // init failed — client stays null so subsequent login() will
+    // reject at the raiseError() precondition.
+    expect((authEl as any)._shell.client).toBeNull();
+
+    const button = document.createElement("button");
+    button.setAttribute("data-authtarget", "auth-reject-1");
+    document.body.appendChild(button);
+
+    // Listen on BOTH window (jsdom path) and process (node path) —
+    // vitest's jsdom environment reports unhandled rejections through
+    // the node-level `process` hook, and `window.addEventListener`
+    // does not always observe them before the test body finishes.
+    // Registering both makes the test fail deterministically when
+    // the click handler omits its `.catch()`.
+    const unhandled: unknown[] = [];
+    const winHandler = (e: PromiseRejectionEvent) => {
+      unhandled.push(e.reason);
+      e.preventDefault();
+    };
+    const procHandler = (reason: unknown) => {
+      unhandled.push(reason);
+    };
+    window.addEventListener("unhandledrejection", winHandler);
+    process.on("unhandledRejection", procHandler);
+
+    try {
+      button.click();
+      // Give the microtask + task queues time to drain the rejection
+      // event. Multiple hops are needed because the reject travels
+      // through several async boundaries
+      // (Auth.login → AuthShell.login → AuthCore.login).
+      await new Promise((r) => setTimeout(r, 0));
+      await new Promise((r) => setTimeout(r, 0));
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(unhandled).toHaveLength(0);
+    } finally {
+      window.removeEventListener("unhandledrejection", winHandler);
+      process.off("unhandledRejection", procHandler);
+    }
   });
 });

@@ -46,7 +46,15 @@ export class AuthLogout extends HTMLElement {
       options.logoutParams = { returnTo: this.returnTo };
     }
 
-    authElement.logout(options);
+    // `logout()` is async and can reject (e.g. click fires before the
+    // target <hawc-auth0> has finished initialising). Swallow the
+    // rejection so we don't leak an unhandled-rejection into the host
+    // page's global handler — the failure is still observable via
+    // `authEl.error` / `hawc-auth0:error`, matching the trigger
+    // setter's contract.
+    authElement.logout(options).catch(() => {
+      /* error surfaces via authEl.error (AuthShell state) */
+    });
   };
 
   private _findAuth(): Auth | null {
