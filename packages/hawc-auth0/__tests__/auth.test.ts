@@ -250,6 +250,125 @@ describe("Auth (hawc-auth0)", () => {
       // 2回目のcreateAuth0Client呼び出しがないことを確認
       expect(createAuth0Client).toHaveBeenCalledTimes(1);
     });
+
+    it("初期化未完了中に切断→再接続してもcreateAuth0Clientが二重起動しない", async () => {
+      // Regression: previously connectedCallback's guard only checked
+      // `_shell.client`, which stays null during the in-flight await
+      // for createAuth0Client. A disconnect→reconnect in that window
+      // re-entered initialize() and raced two Auth0 client constructions.
+      const mockClient = createMockAuth0Client();
+      // Hold createAuth0Client pending so the first initialize() is
+      // still mid-await when we disconnect / reconnect.
+      let resolveFirst!: (v: unknown) => void;
+      const pending = new Promise((resolve) => {
+        resolveFirst = resolve;
+      });
+      createAuth0Client.mockReturnValue(pending);
+
+      const el = document.createElement("hawc-auth0") as Auth;
+      el.setAttribute("domain", "test.auth0.com");
+      el.setAttribute("client-id", "client-id");
+
+      document.body.appendChild(el);
+      // Flush the dynamic import() microtask so createAuth0Client is
+      // actually invoked; still do NOT await connectedCallbackPromise —
+      // we want to race inside the pending createAuth0Client() window.
+      await new Promise((r) => setTimeout(r, 0));
+      expect(createAuth0Client).toHaveBeenCalledTimes(1);
+
+      el.remove();
+      document.body.appendChild(el);
+      await new Promise((r) => setTimeout(r, 0));
+
+      // Guard must have suppressed the second initialize().
+      expect(createAuth0Client).toHaveBeenCalledTimes(1);
+
+      // Resolve the pending call and ensure the element finishes init
+      // exactly once without the reconnect producing a second race.
+      resolveFirst(mockClient);
+      await el.connectedCallbackPromise;
+      expect(createAuth0Client).toHaveBeenCalledTimes(1);
+    });
+
+    it("初期化失敗後にremove→appendすると自動で再初期化が走る", async () => {
+      // Regression: the in-flight double-init guard added
+      // `!_shell.initPromise` to the connectedCallback gate. Without
+      // clearing `_initPromise` on failure, that gate would stay
+      // permanently false after a transient Auth0 / network failure,
+      // so the element could not auto-recover on reconnect — users
+      // would be stuck unless they called `initialize()` imperatively.
+      const failure = new Error("transient auth0 outage");
+      createAuth0Client.mockRejectedValueOnce(failure);
+
+      const el = document.createElement("hawc-auth0") as Auth;
+      el.setAttribute("domain", "test.auth0.com");
+      el.setAttribute("client-id", "client-id");
+
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      // First attempt failed — error is published, client stays null.
+      expect(el.error).toBe(failure);
+      expect((el as any)._shell.client).toBeNull();
+      expect(createAuth0Client).toHaveBeenCalledTimes(1);
+
+      // Reconnect should re-arm initialize() with a fresh Auth0 client.
+      const mockClient = createMockAuth0Client();
+      createAuth0Client.mockResolvedValueOnce(mockClient);
+
+      el.remove();
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      expect(createAuth0Client).toHaveBeenCalledTimes(2);
+      expect((el as any)._shell.client).toBe(mockClient);
+    });
+
+    it("AuthCore.initializeの並走呼び出しは同じPromiseを返す（in-flight coalescing）", async () => {
+      // Defense-in-depth: programmatic callers (or a racing lifecycle
+      // path bypassing the outer guard) must not produce two parallel
+      // createAuth0Client() attempts.
+      const { AuthCore } = await import("../src/core/AuthCore");
+      const mockClient = createMockAuth0Client();
+      let resolveFirst!: (v: unknown) => void;
+      createAuth0Client.mockReturnValueOnce(new Promise((resolve) => {
+        resolveFirst = resolve;
+      }));
+
+      const core = new AuthCore();
+      const p1 = core.initialize({
+        domain: "test.auth0.com",
+        clientId: "client-id",
+        authorizationParams: {},
+      });
+      const p2 = core.initialize({
+        domain: "test.auth0.com",
+        clientId: "client-id",
+        authorizationParams: {},
+      });
+
+      // Same promise, single underlying init.
+      expect(p1).toBe(p2);
+
+      // Flush the dynamic import() microtask so the mock registers the
+      // single createAuth0Client() call.
+      await new Promise((r) => setTimeout(r, 0));
+      expect(createAuth0Client).toHaveBeenCalledTimes(1);
+
+      resolveFirst(mockClient);
+      await p1;
+
+      // After settle, a new initialize() is allowed again (retry
+      // semantics preserved).
+      createAuth0Client.mockResolvedValueOnce(mockClient);
+      const p3 = core.initialize({
+        domain: "test.auth0.com",
+        clientId: "client-id",
+        authorizationParams: {},
+      });
+      expect(p3).not.toBe(p1);
+      await p3;
+    });
   });
 
   describe("出力状態（Coreへの委譲）", () => {

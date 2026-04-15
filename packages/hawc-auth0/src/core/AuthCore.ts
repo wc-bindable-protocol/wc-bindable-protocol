@@ -26,6 +26,7 @@ export class AuthCore extends EventTarget {
   private _loading: boolean = false;
   private _error: any = null;
   private _initPromise: Promise<void> | null = null;
+  private _initInFlight: boolean = false;
 
   constructor(target?: EventTarget) {
     super();
@@ -126,6 +127,15 @@ export class AuthCore extends EventTarget {
 
   /**
    * Initialize the Auth0 client and handle redirect callback if needed.
+   *
+   * Coalesces concurrent calls: while a previous `_doInitialize` is
+   * still awaiting `createAuth0Client` / `handleRedirectCallback` /
+   * `_syncState`, a second `initialize()` returns the same in-flight
+   * promise instead of racing a parallel Auth0 client construction.
+   * Defense-in-depth against lifecycle paths (e.g. disconnect→reconnect
+   * landing inside the init microtask gap); programmatic retry after
+   * the previous attempt has settled is still supported — `_initInFlight`
+   * clears in `finally`, so a post-failure retry starts a fresh attempt.
    */
   initialize(options: Auth0ClientOptions): Promise<void> {
     if (!options.domain) {
@@ -135,12 +145,17 @@ export class AuthCore extends EventTarget {
       raiseError("client-id attribute is required.");
     }
 
+    if (this._initInFlight && this._initPromise) {
+      return this._initPromise;
+    }
+
     const p = this._doInitialize(options);
     this._initPromise = p;
     return p;
   }
 
   private async _doInitialize(options: Auth0ClientOptions): Promise<void> {
+    this._initInFlight = true;
     this._setLoading(true);
     this._setError(null);
 
@@ -170,6 +185,17 @@ export class AuthCore extends EventTarget {
     } catch (e: any) {
       this._setError(e);
       this._setLoading(false);
+      // Clear the settled promise on failure so that <hawc-auth0>'s
+      // connectedCallback guard (`!_shell.client && !_shell.initPromise`)
+      // can fire a fresh attempt on a subsequent connect (e.g. a
+      // disconnect→reconnect retry after a transient network / Auth0
+      // outage). Leaving the resolved promise in place would make the
+      // guard permanently false while `_client` stays null, stranding
+      // the element in an unrecoverable error state without an
+      // imperative `initialize()` call.
+      this._initPromise = null;
+    } finally {
+      this._initInFlight = false;
     }
   }
 

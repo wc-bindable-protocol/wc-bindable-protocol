@@ -225,7 +225,7 @@ See [SPEC-REMOTE.md §3.4](SPEC-REMOTE.md) for the full refresh model including 
 |----------|------|-------------|
 | `domain` | `string` | Auth0 tenant domain |
 | `client-id` | `string` | Auth0 application client ID |
-| `audience` | `string` | API audience identifier (required — picks the API access token) |
+| `audience` | `string` | API audience identifier. Technically optional on `<hawc-auth0>`, but **effectively required in remote mode** — the server's `verifyAuth0Token` enforces an `aud` match and rejects the handshake when it is missing. Set this to the API identifier registered in your Auth0 tenant. |
 | `remote-url` | `string` | WebSocket endpoint. Setting this to a **non-empty** value infers `mode="remote"`. An empty `remote-url=""` is treated as unset for mode inference (see [§Empty vs unset `remote-url`](#empty-vs-unset-remote-url)). |
 | `mode` | `"local" \| "remote"` | Explicit deployment mode |
 | `trigger` | `boolean` | One-way login trigger |

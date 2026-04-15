@@ -214,7 +214,7 @@ These properties control authentication from HTML, JS, or `@wcstack/state` bindi
 | `domain` | `string` | Auth0 tenant domain |
 | `client-id` | `string` | Auth0 application client ID |
 | `redirect-uri` | `string` | Redirect URI after login |
-| `audience` | `string` | API audience identifier |
+| `audience` | `string` | API audience identifier. Optional; when omitted, Auth0 issues an opaque access token usable only for the ID-token flow. Set this whenever application code attaches `Authorization: Bearer` headers to a backend, or when RBAC `permissions` / `roles` are needed. |
 | `scope` | `string` | OAuth scopes (default: `openid profile email`) |
 | `trigger` | `boolean` | One-way login trigger |
 | `popup` | `boolean` | Use popup instead of redirect |
@@ -370,7 +370,7 @@ This is a convenience feature. In wc-bindable applications, **state-driven trigg
 | `domain` | `string` | — | Auth0 tenant domain |
 | `client-id` | `string` | — | Auth0 application client ID |
 | `redirect-uri` | `string` | — | Redirect URI after login |
-| `audience` | `string` | — | API audience identifier |
+| `audience` | `string` | — | API audience identifier (optional — omit for ID-token-only flows; required for Bearer-token API calls and for remote mode) |
 | `scope` | `string` | `openid profile email` | OAuth scopes |
 | `cache-location` | `"memory" \| "localstorage"` | `memory` | Token cache location |
 | `use-refresh-tokens` | `boolean` | `true` | Use refresh tokens for silent renewal. Set `use-refresh-tokens="false"` to opt out |

@@ -204,7 +204,12 @@ export class Auth extends HTMLElement {
     return {
       domain: this.domain,
       clientId: this.clientId,
-      audience: this.audience,
+      // Normalise empty attribute (`audience=""` or unset) to undefined
+      // to match AuthShellOptions' optional contract — AuthShell
+      // already skips `audience` when falsy, this keeps the types and
+      // the runtime aligned instead of passing `""` under an optional
+      // `string` type.
+      audience: this.audience || undefined,
       scope: this.scope,
       redirectUri: this.redirectUri || undefined,
       cacheLocation: this.cacheLocation,
@@ -277,7 +282,22 @@ export class Auth extends HTMLElement {
     if (config.autoTrigger) {
       registerAutoTrigger();
     }
-    if (!this._shell.client && this.domain && this.clientId) {
+    // Guard against double-init during the in-flight window.
+    // `_shell.client` alone is not sufficient: it is set only after
+    // `createAuth0Client()` resolves, so a disconnect→reconnect that
+    // lands between `initialize()` start and that resolution would
+    // see `client === null` and fire a second `initialize()`,
+    // racing two `createAuth0Client()` calls and producing
+    // nondeterministic state. Also checking `_shell.initPromise`
+    // closes that window — the shell has already started, and
+    // `_connectedCallbackPromise` still points at the first in-flight
+    // promise so callers awaiting it see the same completion.
+    if (
+      !this._shell.client &&
+      !this._shell.initPromise &&
+      this.domain &&
+      this.clientId
+    ) {
       this._connectedCallbackPromise = this.initialize();
     }
   }

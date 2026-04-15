@@ -149,8 +149,19 @@ export type AuthMode = "local" | "remote";
 export interface AuthShellOptions {
   domain: string;
   clientId: string;
-  /** Auth0 API identifier (audience for the access token). */
-  audience: string;
+  /**
+   * Auth0 API identifier (audience for the access token).
+   *
+   * Optional: when omitted (or passed as an empty string) the Auth0 SPA
+   * SDK issues an opaque access token tied only to the ID token flow.
+   * Set this to the API identifier whenever the application either
+   * (a) attaches `Authorization: Bearer` headers to a backend,
+   * (b) runs in remote mode (server-side `verifyAuth0Token` enforces
+   *     an `aud` match — missing audience causes handshake rejection),
+   * or (c) relies on RBAC `permissions` / `roles` claims.
+   * In those cases, treat it as effectively required.
+   */
+  audience?: string;
   /** OAuth scope (default: "openid profile email"). */
   scope?: string;
   /** Redirect URI (default: window.location.origin). */
