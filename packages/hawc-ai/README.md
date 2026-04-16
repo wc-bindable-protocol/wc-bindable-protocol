@@ -568,7 +568,7 @@ import "@wc-bindable/hawc-ai/auto/remoteEnv";
 | Value | Resolution order for `remoteCoreUrl` |
 |-------|--------------------------------------|
 | `"config"` (default) | Uses the literal `remoteCoreUrl` string you pass in. |
-| `"env"` | `globalThis.process?.env?.AI_REMOTE_CORE_URL` → `globalThis.AI_REMOTE_CORE_URL` → `""`. Good for Node bundler replacement (Vite `define`, webpack `DefinePlugin`) or `<script>window.AI_REMOTE_CORE_URL = "..."</script>` prior to module load. |
+| `"env"` | `globalThis.process?.env?.AI_REMOTE_CORE_URL` → `globalThis.AI_REMOTE_CORE_URL` → `""`. Good for Node bundler replacement (Vite `define`, webpack `DefinePlugin`) or `<script>window.AI_REMOTE_CORE_URL = "..."</script>` before the first `<hawc-ai>` connects. |
 
 ### Error surface
 
@@ -579,14 +579,14 @@ Remote-mode failures are exposed through the same `hawc-ai:error` event and `el.
 
 ### `remoteCoreUrl` is required when enabled
 
-Setting `enableRemote: true` with an empty URL raises a synchronous `Error` from `connectedCallback` and fires `hawc-ai:error` on the element (the element does not throw out of `appendChild`).
+Setting `enableRemote: true` with an empty URL does not throw out of `appendChild`. Instead, `connectedCallback` catches the initialization error, fires `hawc-ai:error`, and exposes the same `Error` through `el.error`.
 
 ### Auto entrypoints
 
 | Entrypoint | Behavior |
 |------------|----------|
 | `@wc-bindable/hawc-ai/auto` | Registers the custom elements with default (local) config. |
-| `@wc-bindable/hawc-ai/auto/remoteEnv` | Registers the custom elements and enables remote mode with `remoteSettingType: "env"` — resolves `AI_REMOTE_CORE_URL` at import time. |
+| `@wc-bindable/hawc-ai/auto/remoteEnv` | Registers the custom elements and enables remote mode with `remoteSettingType: "env"`. `AI_REMOTE_CORE_URL` is resolved when a `<hawc-ai>` element initializes its remote connection. |
 
 ## Configuration
 
