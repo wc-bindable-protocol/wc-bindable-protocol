@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "lib": ["ES2020", "DOM"],
+    "paths": {
+      "@wc-bindable/core": ["../core/src/index.ts"],
+      "@wc-bindable/remote": ["../remote/src/index.ts"]
+    }
+  },
+  "include": ["src"],
+  "exclude": ["src/auto"],
+  "references": [
+    { "path": "../core" },
+    { "path": "../remote" }
+  ]
+}
