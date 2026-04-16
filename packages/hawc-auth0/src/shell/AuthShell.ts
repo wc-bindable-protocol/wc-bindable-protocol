@@ -83,6 +83,10 @@ export class AuthShell extends EventTarget {
     return this._mode;
   }
 
+  set mode(value: AuthMode) {
+    this._mode = value;
+  }
+
   /**
    * Access token.
    *

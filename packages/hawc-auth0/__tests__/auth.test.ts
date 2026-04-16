@@ -118,7 +118,8 @@ describe("Auth (hawc-auth0)", () => {
 
   it("observedAttributesが正しい", () => {
     expect(Auth.observedAttributes).toEqual([
-      "domain", "client-id", "redirect-uri", "audience", "scope", "remote-url", "mode"
+      "domain", "client-id", "redirect-uri", "audience", "scope",
+      "remote-url", "mode", "cache-location", "use-refresh-tokens",
     ]);
   });
 
@@ -879,16 +880,43 @@ describe("Auth (hawc-auth0)", () => {
       expect(createAuth0Client).not.toHaveBeenCalled();
 
       el.setAttribute("domain", "late.auth0.com");
-      // domain alone is not enough.
+      // domain alone is not enough (microtask hasn't fired yet either).
       expect(createAuth0Client).not.toHaveBeenCalled();
 
       el.setAttribute("client-id", "late-client");
+      // attributeChangedCallback defers via microtask — await the
+      // connectedCallbackPromise which wraps the deferred init.
       await el.connectedCallbackPromise;
 
       expect(createAuth0Client).toHaveBeenCalledTimes(1);
       expect(createAuth0Client).toHaveBeenCalledWith(expect.objectContaining({
         domain: "late.auth0.com",
         clientId: "late-client",
+      }));
+    });
+
+    it("mount後に全属性を同期的にstampするとcache-locationも反映される", async () => {
+      // Regression: cache-location / use-refresh-tokens were not in
+      // observedAttributes, and the old attributeChangedCallback started
+      // init eagerly on domain + client-id arrival — before later attrs
+      // in the same synchronous batch could land. Microtask coalescing
+      // now defers init so all attrs are present.
+      const mockClient = createMockAuth0Client();
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const el = document.createElement("hawc-auth0") as Auth;
+      document.body.appendChild(el);
+
+      el.setAttribute("domain", "d.auth0.com");
+      el.setAttribute("client-id", "c");
+      el.setAttribute("cache-location", "localstorage");
+      el.setAttribute("use-refresh-tokens", "false");
+      await el.connectedCallbackPromise;
+
+      expect(createAuth0Client).toHaveBeenCalledTimes(1);
+      expect(createAuth0Client).toHaveBeenCalledWith(expect.objectContaining({
+        cacheLocation: "localstorage",
+        useRefreshTokens: false,
       }));
     });
 
@@ -911,6 +939,87 @@ describe("Auth (hawc-auth0)", () => {
       await Promise.resolve();
 
       expect(createAuth0Client).toHaveBeenCalledTimes(1);
+    });
+
+    it("localモード初期化後にmode=remoteを設定するとtokenアクセスがブロックされる", async () => {
+      const mockClient = createMockAuth0Client({
+        isAuthenticated: vi.fn().mockResolvedValue(true),
+        getUser: vi.fn().mockResolvedValue({ sub: "u" }),
+        getTokenSilently: vi.fn().mockResolvedValue("secret-token"),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const el = document.createElement("hawc-auth0") as Auth;
+      el.setAttribute("domain", "test.auth0.com");
+      el.setAttribute("client-id", "client-id");
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      expect(el.mode).toBe("local");
+      expect(el.token).toBe("secret-token");
+
+      el.setAttribute("mode", "remote");
+      expect(el.mode).toBe("remote");
+      expect(el.token).toBeNull();
+      await expect(el.getToken()).rejects.toThrow(
+        "getToken() is disabled in remote mode",
+      );
+    });
+
+    it("remoteモード初期化後にmode=localを設定するとtokenアクセスが復帰する", async () => {
+      const mockClient = createMockAuth0Client({
+        isAuthenticated: vi.fn().mockResolvedValue(true),
+        getUser: vi.fn().mockResolvedValue({ sub: "u" }),
+        getTokenSilently: vi.fn().mockResolvedValue("local-token"),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const el = document.createElement("hawc-auth0") as Auth;
+      el.setAttribute("domain", "test.auth0.com");
+      el.setAttribute("client-id", "client-id");
+      el.setAttribute("mode", "remote");
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      expect(el.mode).toBe("remote");
+      expect(el.token).toBeNull();
+      await expect(el.getToken()).rejects.toThrow(
+        "getToken() is disabled in remote mode",
+      );
+
+      el.setAttribute("mode", "local");
+      expect(el.mode).toBe("local");
+      expect(el.token).toBe("local-token");
+      await expect(el.getToken()).resolves.toBe("local-token");
+    });
+
+    it("detach中にmodeを変更してもreattach時にshellへ同期される", async () => {
+      const mockClient = createMockAuth0Client({
+        isAuthenticated: vi.fn().mockResolvedValue(true),
+        getUser: vi.fn().mockResolvedValue({ sub: "u" }),
+        getTokenSilently: vi.fn().mockResolvedValue("secret-token"),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const el = document.createElement("hawc-auth0") as Auth;
+      el.setAttribute("domain", "test.auth0.com");
+      el.setAttribute("client-id", "client-id");
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      expect(el.mode).toBe("local");
+      expect(el.token).toBe("secret-token");
+
+      // Detach → change mode while disconnected → reattach.
+      el.remove();
+      el.setAttribute("mode", "remote");
+      document.body.appendChild(el);
+
+      expect(el.mode).toBe("remote");
+      expect(el.token).toBeNull();
+      await expect(el.getToken()).rejects.toThrow(
+        "getToken() is disabled in remote mode",
+      );
     });
   });
 });

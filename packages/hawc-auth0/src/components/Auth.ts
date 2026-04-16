@@ -16,13 +16,14 @@ export class Auth extends HTMLElement {
   static get observedAttributes(): string[] {
     return [
       "domain", "client-id", "redirect-uri", "audience", "scope",
-      "remote-url", "mode",
+      "remote-url", "mode", "cache-location", "use-refresh-tokens",
     ];
   }
 
   private _shell: AuthShell;
   private _trigger: boolean = false;
   private _connectedCallbackPromise: Promise<void> = Promise.resolve();
+  private _initScheduled = false;
   // Track whether THIS instance called registerAutoTrigger(), so that
   // disconnectedCallback can pair it with a single unregisterAutoTrigger().
   // Required because `config.autoTrigger` may toggle between connect
@@ -300,18 +301,46 @@ export class Auth extends HTMLElement {
       registerAutoTrigger();
       this._autoTriggerRegistered = true;
     }
+    // Catch mode / remote-url changes that occurred while detached
+    // (attributeChangedCallback bails on !isConnected).
+    this._shell.mode = this.mode;
     this._tryInitialize();
   }
 
   attributeChangedCallback(_name: string, _oldValue: string | null, _newValue: string | null): void {
-    // "Initialise once only" still holds — `_tryInitialize()` bails if a
-    // client exists or an init is in flight. This hook exists so that
-    // framework / declarative integrations which mount the element first
-    // and feed `domain` / `client-id` afterwards still auto-initialise
-    // when the attributes finally arrive.
-    if (this.isConnected) {
-      this._tryInitialize();
+    if (!this.isConnected) return;
+
+    // Keep the shell's mode in sync with the live attribute so that
+    // token / getToken() / connect() honour post-init mode changes in
+    // both directions (local→remote AND remote→local).
+    if (_name === "mode" || _name === "remote-url") {
+      this._shell.mode = this.mode;
     }
+
+    // Coalesce synchronous attribute stamps (frameworks that set domain,
+    // client-id, cache-location, … in sequence) into a single init
+    // attempt. Without the microtask, init fires as soon as domain +
+    // client-id arrive, potentially before cache-location or
+    // use-refresh-tokens are stamped.
+    if (this._shell.client || this._shell.initPromise) return;
+    if (this._initScheduled) return;
+    this._initScheduled = true;
+    this._connectedCallbackPromise = new Promise<void>((resolve) => {
+      queueMicrotask(() => {
+        this._initScheduled = false;
+        if (
+          !this.isConnected ||
+          this._shell.client ||
+          this._shell.initPromise ||
+          !this.domain ||
+          !this.clientId
+        ) {
+          resolve();
+          return;
+        }
+        this.initialize().then(resolve, resolve);
+      });
+    });
   }
 
   private _tryInitialize(): void {
