@@ -3,7 +3,8 @@
     "allow": [
       "Bash(npm install:*)",
       "Bash(npx vitest:*)",
-      "Bash(npx playwright:*)"
+      "Bash(npx playwright:*)",
+      "Read(//c/Users/kikuzawa/Documents/git/**)"
     ]
   }
 }

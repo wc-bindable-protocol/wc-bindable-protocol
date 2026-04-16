@@ -1,0 +1,3 @@
+import { bootstrapAuth } from "../../dist/index.js";
+
+bootstrapAuth();
