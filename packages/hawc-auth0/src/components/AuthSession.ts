@@ -55,6 +55,7 @@ export class AuthSession extends HTMLElement {
   private _authEl: Auth | null = null;
   private _coreDecl: WcBindableDeclaration | null = null;
   private _authListener: ((e: Event) => void) | null = null;
+  private _connectedListener: ((e: Event) => void) | null = null;
   private _connectedCallbackPromise: Promise<void> = Promise.resolve();
   // Coalesce bursts of attribute changes (frameworks often stamp
   // target/core/url/auto-connect in quick succession) into a single
@@ -248,6 +249,34 @@ export class AuthSession extends HTMLElement {
     this._authListener = listener;
     auth.addEventListener("hawc-auth0:authenticated-changed", listener);
 
+    // Notice transport loss. The WebSocket can die independently of
+    // Auth0 authentication — server-forced close at token expiry
+    // (4401 "Session expired"), `sub` mismatch on refresh (4403),
+    // server restart, transient network blip, or a post-upgrade 1008
+    // (exp-parse-failure under "close" policy) — in which case
+    // AuthShell dispatches `connected-changed: false` but the Auth0
+    // SDK's `authenticated` stays true. Without this listener, `ready`
+    // would linger at `true` pointing at a dead proxy whose next call
+    // rejects with `_disposedError`.
+    //
+    // `_teardown()` (rather than a manual partial clear) is used so
+    // that `_generation` is bumped. That bump is what lets an
+    // in-flight `_connect()` — which may have ALREADY resolved its
+    // `await auth.connect(...)` on `open` but not yet resumed — see
+    // a generation mismatch on resume and skip installing its
+    // (already-dead) transport. A manual clear without a generation
+    // bump would silently let the resumed `_connect()` wire a
+    // `RemoteCoreProxy` onto the closed socket, leaving a
+    // half-dead session in `ready=true`.
+    const connectedListener = (e: Event): void => {
+      const next = (e as CustomEvent).detail;
+      if (next === false && (this._transport || this._ready || this._connecting)) {
+        this._teardown();
+      }
+    };
+    this._connectedListener = connectedListener;
+    auth.addEventListener("hawc-auth0:connected-changed", connectedListener);
+
     if (auth.authenticated) {
       await this._connect();
     }
@@ -257,7 +286,11 @@ export class AuthSession extends HTMLElement {
     if (this._authEl && this._authListener) {
       this._authEl.removeEventListener("hawc-auth0:authenticated-changed", this._authListener);
     }
+    if (this._authEl && this._connectedListener) {
+      this._authEl.removeEventListener("hawc-auth0:connected-changed", this._connectedListener);
+    }
     this._authListener = null;
+    this._connectedListener = null;
     // Note: `_authEl` is intentionally NOT cleared here so a subsequent
     // `_startWatching` can re-resolve to (typically) the same target via
     // `_resolveAuth()`. `disconnectedCallback` clears it.
@@ -313,12 +346,19 @@ export class AuthSession extends HTMLElement {
       // violating the Connection Ownership contract (SPEC-REMOTE §3.7).
       const transport = await auth.connect(url, { failIfConnected: true });
 
-      // Race guard: a teardown (logout, element removal) fired during the
-      // handshake. The freshly opened WebSocket is owned by AuthShell —
-      // if the teardown was triggered by logout, AuthShell already closed
-      // it; if the element was merely removed while the user stayed
-      // logged in, the socket is still authEl's to keep. Either way the
-      // session must NOT install a proxy or flip `ready`.
+      // Race guard: a teardown (logout, element removal, or a
+      // `connected-changed: false` that fired AFTER `auth.connect`
+      // resolved but BEFORE this microtask resumed) moved the
+      // generation forward while we were awaiting. That covers both:
+      //   (a) the explicit `_teardown()` paths (logout /
+      //       disconnectedCallback / authenticated flipping false),
+      //   (b) the server closing the freshly-opened socket with 1008
+      //       between `open` and our resume — e.g. exp-parse-failure
+      //       under "close" policy, or the defense-in-depth origin
+      //       close in `wss.on("connection")` — where our
+      //       `connected-changed` listener bumps the generation so
+      //       this guard trips and we never wire a `RemoteCoreProxy`
+      //       onto a dead socket.
       if (this._generation !== myGen) return;
 
       this._transport = transport;

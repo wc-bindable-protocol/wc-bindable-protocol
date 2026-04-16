@@ -161,6 +161,23 @@ export class AuthShell extends EventTarget {
     return this._core.logout(options);
   }
 
+  /**
+   * Close the authenticated WebSocket without logging out of Auth0.
+   *
+   * Used by `<hawc-auth0>`'s `disconnectedCallback` so that removing
+   * the element from the DOM (SPA route change, conditional render)
+   * releases the server-side session instead of leaking an ownerless
+   * authenticated connection. Also callable imperatively when an
+   * application wants to drop the remote session while keeping the
+   * user signed in for a future reconnect.
+   *
+   * Idempotent when no connection is open.
+   */
+  disconnect(): void {
+    this._closeWebSocket();
+    this._setConnected(false);
+  }
+
   async getToken(options?: Record<string, any>): Promise<string | null> {
     if (this._mode === "remote") {
       raiseError(
@@ -231,13 +248,21 @@ export class AuthShell extends EventTarget {
         raiseError("Failed to obtain access token.");
       }
 
+      // Capture the last server-accepted token BEFORE we close the
+      // previous socket / open a new one. If the new token ends up being
+      // rejected by the server (verification runs async AFTER the 101
+      // handshake — see close handler below), we roll `_token` back to
+      // this value so `getTokenExpiry()` and `token-changed` subscribers
+      // never advertise a token the server never accepted.
+      const priorToken = this._core.token;
+
       this._closeWebSocket();
 
       this._url = url;
       const ws = new WebSocket(url, [`${PROTOCOL_PREFIX}${token}`]);
       this._ws = ws;
 
-      ws.addEventListener("close", () => {
+      ws.addEventListener("close", (event: CloseEvent) => {
         if (this._ws === ws) {
           // Null the reference so `_ws` reflects "live connection", not
           // "last connection that ever existed". Otherwise the
@@ -249,6 +274,22 @@ export class AuthShell extends EventTarget {
           // socket that already replaced this one.
           this._ws = null;
           this._setConnected(false);
+          if (event?.code === 1008 && this._core.token !== priorToken) {
+            // Close code 1008 (Policy Violation) is the exact signal
+            // `createAuthenticatedWSS` emits when Auth0 verification
+            // fails or origin is rejected — both strictly pre-accept
+            // paths (`socket.close(1008, "Unauthorized" | "Forbidden
+            // origin")`). Post-accept close paths use 4401 / 4403 / 1000
+            // / 1006, so gating rollback on 1008 restores `_token` ONLY
+            // for tokens the server provably never accepted. An
+            // idle-but-accepted session closing later — network loss,
+            // server restart, intentional disconnect before any client
+            // traffic — keeps the committed token, because a "first
+            // inbound frame" proxy signal would spuriously roll back
+            // those valid sessions (no frame is guaranteed before
+            // `RemoteCoreProxy` sends `{type:"sync"}`).
+            this._core.commitToken(priorToken);
+          }
         }
       });
 
@@ -276,7 +317,11 @@ export class AuthShell extends EventTarget {
         throw err;
       }
 
-      // Server accepted the token at handshake — safe to commit.
+      // 101 handshake completed — commit provisionally. Auth0 token
+      // verification on the server runs AFTER the upgrade response, so
+      // `open` is NOT proof of server acceptance. The close handler
+      // above rolls `_token` back if the server closes without ever
+      // sending a frame (its unauthorized-rejection path).
       this._core.commitToken(token);
       this._setConnected(true);
       return this._createTransport(ws);
@@ -429,18 +474,31 @@ export class AuthShell extends EventTarget {
         raiseError("Failed to refresh access token.");
       }
 
+      // See connect(): capture the last server-accepted token so we can
+      // roll `_token` back if the server rejects this reconnection's
+      // token (verification is async, happens AFTER `open`).
+      const priorToken = this._core.token;
+
       this._closeWebSocket();
 
       const ws = new WebSocket(this._url, [`${PROTOCOL_PREFIX}${token}`]);
       this._ws = ws;
 
-      ws.addEventListener("close", () => {
+      ws.addEventListener("close", (event: CloseEvent) => {
         if (this._ws === ws) {
           // Mirror connect(): null the stale reference so subsequent
           // `failIfConnected: true` calls are not rejected against a
           // dead socket. See connect()'s close handler for rationale.
           this._ws = null;
           this._setConnected(false);
+          if (event?.code === 1008 && this._core.token !== priorToken) {
+            // Mirror connect(): rollback only on the server's explicit
+            // pre-accept rejection signal (close code 1008). Any other
+            // code (4401 expired, 4403 sub mismatch, 1000 normal, 1006
+            // abnormal) means the session was accepted at some point,
+            // so advancing `_token` was correct and must stand.
+            this._core.commitToken(priorToken);
+          }
         }
       });
 
@@ -464,7 +522,10 @@ export class AuthShell extends EventTarget {
         throw err;
       }
 
-      // Server accepted the new token at handshake — safe to commit.
+      // 101 handshake completed — commit provisionally. See connect():
+      // Auth0 verification on the server runs AFTER the upgrade, so
+      // a later unauthorized close triggers the close handler's
+      // rollback of `_token` to the prior server-accepted value.
       this._core.commitToken(token);
       this._setConnected(true);
       return this._createTransport(ws);

@@ -920,6 +920,22 @@ describe("Auth (hawc-auth0)", () => {
       }));
     });
 
+    it("属性変更で初期化を予約したあとに detach されると初期化を中止する", async () => {
+      const mockClient = createMockAuth0Client();
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const el = document.createElement("hawc-auth0") as Auth;
+      document.body.appendChild(el);
+
+      el.setAttribute("domain", "late.auth0.com");
+      el.setAttribute("client-id", "late-client");
+      el.remove();
+
+      await el.connectedCallbackPromise;
+
+      expect(createAuth0Client).not.toHaveBeenCalled();
+    });
+
     it("初期化済みの要素は以降の属性変更で再初期化されない", async () => {
       // Regression: the late-bind fix must preserve the "initialise once"
       // rule — once an Auth0 client exists, attribute mutations must not
@@ -1461,6 +1477,22 @@ describe("autoTrigger", () => {
 
     // data-authtarget属性なしのクリック
     expect(() => button.click()).not.toThrow();
+  });
+
+  it("autoTrigger経由のlogin()がPromiseを返さなくても処理できる", () => {
+    registerAutoTrigger();
+
+    const authEl = document.createElement("hawc-auth0") as Auth;
+    authEl.id = "auth-sync-login";
+    document.body.appendChild(authEl);
+    const loginSpy = vi.spyOn(authEl, "login").mockImplementation(() => undefined as any);
+
+    const button = document.createElement("button");
+    button.setAttribute("data-authtarget", "auth-sync-login");
+    document.body.appendChild(button);
+
+    expect(() => button.click()).not.toThrow();
+    expect(loginSpy).toHaveBeenCalledTimes(1);
   });
 
   it("autoTrigger経由のlogin()がrejectしてもunhandled rejectionにならない", async () => {

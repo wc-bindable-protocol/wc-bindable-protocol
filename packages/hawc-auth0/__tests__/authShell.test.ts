@@ -1617,6 +1617,82 @@ describe("AuthShell", () => {
         (globalThis as any).WebSocket = originalWS;
       }
     });
+    it("connect() rejects cleanly when the socket closes before the error event", async () => {
+      const candidateToken = makeJwt({ sub: "u", exp: Math.floor(Date.now() / 1000) + 60 });
+      const mockClient = createMockAuth0Client({
+        isAuthenticated: vi.fn().mockResolvedValue(false),
+        getUser: vi.fn().mockResolvedValue(null),
+        getTokenSilently: vi.fn().mockResolvedValue(candidateToken),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const originalWS = globalThis.WebSocket;
+      (globalThis as any).WebSocket = class extends MockWebSocket {
+        constructor(url: string, protocols?: string | string[]) {
+          super(url, protocols);
+          queueMicrotask(() => {
+            this._emit("close");
+            this._emit("error");
+          });
+        }
+        addEventListener(type: string, listener: (...args: any[]) => void, opts?: any): void {
+          if (type === "open") return;
+          super.addEventListener(type, listener, opts);
+        }
+      };
+
+      try {
+        const shell = new AuthShell();
+        await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+        await expect(shell.connect("ws://localhost:3000")).rejects.toThrow();
+        expect(shell.connected).toBe(false);
+      } finally {
+        (globalThis as any).WebSocket = originalWS;
+      }
+    });
+
+    it("connect() rolls getTokenExpiry() back when the server closes with 1008 after open", async () => {
+      const originalExp = Math.floor(Date.now() / 1000) + 60;
+      const rejectedExp = originalExp + 3600;
+
+      const originalToken = makeJwt({ sub: "u", exp: originalExp });
+      const rejectedToken = makeJwt({ sub: "u", exp: rejectedExp });
+
+      const getTokenSilently = vi.fn()
+        .mockResolvedValueOnce(originalToken)
+        .mockResolvedValueOnce(rejectedToken);
+
+      const mockClient = createMockAuth0Client({
+        isAuthenticated: vi.fn().mockResolvedValue(true),
+        getUser: vi.fn().mockResolvedValue({ sub: "u" }),
+        getTokenSilently,
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const originalWS = globalThis.WebSocket;
+      let capturedWs: MockWebSocket | null = null;
+      (globalThis as any).WebSocket = class extends MockWebSocket {
+        constructor(url: string, protocols?: string | string[]) {
+          super(url, protocols);
+          capturedWs = this;
+        }
+      };
+
+      try {
+        const shell = new AuthShell();
+        await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+
+        expect(shell.getTokenExpiry()).toBe(originalExp * 1000);
+
+        await shell.connect("ws://localhost:3000");
+        expect(shell.getTokenExpiry()).toBe(rejectedExp * 1000);
+
+        capturedWs!._emit("close", { code: 1008 });
+        expect(shell.getTokenExpiry()).toBe(originalExp * 1000);
+      } finally {
+        (globalThis as any).WebSocket = originalWS;
+      }
+    });
 
     it("refreshToken() does NOT advance getTokenExpiry() when the server rejects", async () => {
       const originalExp = Math.floor(Date.now() / 1000) + 60;
@@ -1759,6 +1835,96 @@ describe("AuthShell", () => {
       await shell.reconnect();
 
       expect(shell.getTokenExpiry()).toBe(refreshedExp * 1000);
+    });
+
+    it("reconnect() rolls getTokenExpiry() back when the replacement socket closes with 1008", async () => {
+      const originalExp = Math.floor(Date.now() / 1000) + 60;
+      const replacementExp = originalExp + 7200;
+
+      const originalToken = makeJwt({ sub: "u", exp: originalExp });
+      const replacementToken = makeJwt({ sub: "u", exp: replacementExp });
+
+      const getTokenSilently = vi.fn()
+        .mockResolvedValueOnce(originalToken)
+        .mockResolvedValueOnce(originalToken)
+        .mockResolvedValueOnce(replacementToken);
+
+      const mockClient = createMockAuth0Client({
+        isAuthenticated: vi.fn().mockResolvedValue(true),
+        getUser: vi.fn().mockResolvedValue({ sub: "u" }),
+        getTokenSilently,
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const originalWS = globalThis.WebSocket;
+      const sockets: MockWebSocket[] = [];
+      (globalThis as any).WebSocket = class extends MockWebSocket {
+        constructor(url: string, protocols?: string | string[]) {
+          super(url, protocols);
+          sockets.push(this);
+        }
+      };
+
+      try {
+        const shell = new AuthShell();
+        await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+        await shell.connect("ws://localhost:3000");
+
+        expect(shell.getTokenExpiry()).toBe(originalExp * 1000);
+
+        await shell.reconnect();
+        expect(shell.getTokenExpiry()).toBe(replacementExp * 1000);
+
+        sockets[1]!._emit("close", { code: 1008 });
+        expect(shell.getTokenExpiry()).toBe(originalExp * 1000);
+      } finally {
+        (globalThis as any).WebSocket = originalWS;
+      }
+    });
+    it("reconnect() rejects cleanly when the replacement socket closes before the error event", async () => {
+      const originalToken = makeJwt({ sub: "u", exp: Math.floor(Date.now() / 1000) + 60 });
+      const replacementToken = makeJwt({ sub: "u", exp: Math.floor(Date.now() / 1000) + 120 });
+
+      const getTokenSilently = vi.fn()
+        .mockResolvedValueOnce(originalToken)
+        .mockResolvedValueOnce(originalToken)
+        .mockResolvedValueOnce(replacementToken);
+
+      const mockClient = createMockAuth0Client({
+        isAuthenticated: vi.fn().mockResolvedValue(true),
+        getUser: vi.fn().mockResolvedValue({ sub: "u" }),
+        getTokenSilently,
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const originalWS = globalThis.WebSocket;
+      let socketCount = 0;
+      (globalThis as any).WebSocket = class extends MockWebSocket {
+        constructor(url: string, protocols?: string | string[]) {
+          super(url, protocols);
+          socketCount += 1;
+          if (socketCount === 2) {
+            queueMicrotask(() => {
+              this._emit("close");
+              this._emit("error");
+            });
+          }
+        }
+        addEventListener(type: string, listener: (...args: any[]) => void, opts?: any): void {
+          if (socketCount === 2 && type === "open") return;
+          super.addEventListener(type, listener, opts);
+        }
+      };
+
+      try {
+        const shell = new AuthShell();
+        await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+        await shell.connect("ws://localhost:3000");
+        await expect(shell.reconnect()).rejects.toThrow();
+        expect(shell.connected).toBe(false);
+      } finally {
+        (globalThis as any).WebSocket = originalWS;
+      }
     });
   });
 

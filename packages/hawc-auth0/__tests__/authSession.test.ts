@@ -226,6 +226,126 @@ describe("AuthSession (hawc-auth0-session)", () => {
       expect(connectSpy).toHaveBeenCalledTimes(1);
       expect(el.proxy).toBe(firstProxy);
     });
+
+    it("does not schedule an attribute-driven restart while detached", async () => {
+      const el = document.createElement("hawc-auth0-session") as AuthSession;
+      el.setAttribute("auto-connect", "");
+      const startSpy = vi.spyOn(el as any, "_startWatching").mockResolvedValue(undefined);
+
+      el.attributeChangedCallback("url", "ws://before", "ws://after");
+      await Promise.resolve();
+
+      expect(startSpy).not.toHaveBeenCalled();
+    });
+
+    it("does not schedule an attribute-driven restart when auto-connect is already false", async () => {
+      const mockClient = createMockAuth0Client();
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const authEl = document.createElement("hawc-auth0") as Auth;
+      authEl.id = "auth-attr-disabled";
+      authEl.setAttribute("domain", "d.auth0.com");
+      authEl.setAttribute("client-id", "c");
+      document.body.appendChild(authEl);
+      await authEl.connectedCallbackPromise;
+
+      const el = document.createElement("hawc-auth0-session") as AuthSession;
+      el.target = "auth-attr-disabled";
+      el.core = "app-core";
+      el.autoConnect = false;
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      const startSpy = vi.spyOn(el as any, "_startWatching").mockResolvedValue(undefined);
+
+      el.attributeChangedCallback("url", "ws://before", "ws://after");
+      await Promise.resolve();
+
+      expect(startSpy).not.toHaveBeenCalled();
+    });
+
+    it("cancels a scheduled attribute-driven restart when auto-connect becomes false before the microtask", async () => {
+      const mockClient = createMockAuth0Client();
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const authEl = document.createElement("hawc-auth0") as Auth;
+      authEl.id = "auth-attr-auto-flip";
+      authEl.setAttribute("domain", "d.auth0.com");
+      authEl.setAttribute("client-id", "c");
+      document.body.appendChild(authEl);
+      await authEl.connectedCallbackPromise;
+
+      const el = document.createElement("hawc-auth0-session") as AuthSession;
+      el.target = "auth-attr-auto-flip";
+      el.core = "app-core";
+      el.setAttribute("auto-connect", "");
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      const startSpy = vi.spyOn(el as any, "_startWatching").mockResolvedValue(undefined);
+      vi.spyOn(el, "autoConnect", "get")
+        .mockReturnValueOnce(true)
+        .mockReturnValue(false);
+
+      el.attributeChangedCallback("url", "ws://before", "ws://after");
+      await Promise.resolve();
+
+      expect(startSpy).not.toHaveBeenCalled();
+    });
+
+    it("cancels a scheduled attribute-driven restart when a connect begins before the microtask", async () => {
+      const mockClient = createMockAuth0Client();
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const authEl = document.createElement("hawc-auth0") as Auth;
+      authEl.id = "auth-attr-connecting";
+      authEl.setAttribute("domain", "d.auth0.com");
+      authEl.setAttribute("client-id", "c");
+      document.body.appendChild(authEl);
+      await authEl.connectedCallbackPromise;
+
+      const el = document.createElement("hawc-auth0-session") as AuthSession;
+      el.target = "auth-attr-connecting";
+      el.core = "app-core";
+      el.setAttribute("auto-connect", "");
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      const startSpy = vi.spyOn(el as any, "_startWatching").mockResolvedValue(undefined);
+
+      el.attributeChangedCallback("url", "ws://before", "ws://after");
+      (el as any)._connecting = true;
+      await Promise.resolve();
+
+      expect(startSpy).not.toHaveBeenCalled();
+    });
+
+    it("cancels a scheduled attribute-driven restart when the element disconnects before the microtask", async () => {
+      const mockClient = createMockAuth0Client();
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const authEl = document.createElement("hawc-auth0") as Auth;
+      authEl.id = "auth-attr-disconnect";
+      authEl.setAttribute("domain", "d.auth0.com");
+      authEl.setAttribute("client-id", "c");
+      document.body.appendChild(authEl);
+      await authEl.connectedCallbackPromise;
+
+      const el = document.createElement("hawc-auth0-session") as AuthSession;
+      el.target = "auth-attr-disconnect";
+      el.core = "app-core";
+      el.setAttribute("auto-connect", "");
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      const startSpy = vi.spyOn(el as any, "_startWatching").mockResolvedValue(undefined);
+
+      el.attributeChangedCallback("url", "ws://before", "ws://after");
+      el.remove();
+      await Promise.resolve();
+
+      expect(startSpy).not.toHaveBeenCalled();
+    });
   });
 
   describe("error cases", () => {
@@ -431,6 +551,25 @@ describe("AuthSession (hawc-auth0-session)", () => {
       expect(connectingEvents).toEqual([true, false]);
       expect(readyEvents).toEqual([true]);
     });
+
+    it("does not flip ready when the proxy is torn down before the queued ready microtask runs", async () => {
+      const { authEl } = await setupAuthenticated();
+
+      const el = document.createElement("hawc-auth0-session") as AuthSession;
+      el.target = "auth";
+      el.core = "app-core";
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      (el.proxy as any)._simulateSync({ currentUser: { sub: "u" }, items: [] });
+      authEl.dispatchEvent(new CustomEvent("hawc-auth0:authenticated-changed", {
+        detail: false,
+      }));
+      await Promise.resolve();
+
+      expect(el.ready).toBe(false);
+      expect(el.proxy).toBeNull();
+    });
   });
 
   describe("auth state transitions", () => {
@@ -470,6 +609,49 @@ describe("AuthSession (hawc-auth0-session)", () => {
       expect(el.proxy).not.toBeNull();
     });
 
+    it("does not install a proxy when connected=false fires before _connect resumes", async () => {
+      const mockClient = createMockAuth0Client({
+        isAuthenticated: vi.fn().mockResolvedValue(true),
+        getUser: vi.fn().mockResolvedValue({ sub: "u" }),
+        getTokenSilently: vi.fn().mockResolvedValue("jwt-token"),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const authEl = document.createElement("hawc-auth0") as Auth;
+      authEl.id = "auth-race";
+      authEl.setAttribute("domain", "d.auth0.com");
+      authEl.setAttribute("client-id", "c");
+      authEl.setAttribute("remote-url", "wss://example.com/ws");
+      document.body.appendChild(authEl);
+      await authEl.connectedCallbackPromise;
+
+      const fakeTransport = { send: vi.fn(), onMessage: vi.fn(), onClose: vi.fn() };
+      vi.spyOn(authEl, "connect").mockImplementation(async () => {
+        // Simulate the server closing the just-opened socket in the
+        // microtask gap between `await auth.connect(...)` resolving and
+        // AuthSession's `_connect()` resuming.
+        queueMicrotask(() => {
+          authEl.dispatchEvent(new CustomEvent("hawc-auth0:connected-changed", {
+            detail: false,
+          }));
+        });
+        return fakeTransport as any;
+      });
+
+      const el = document.createElement("hawc-auth0-session") as AuthSession;
+      el.target = "auth-race";
+      el.core = "app-core";
+      document.body.appendChild(el);
+
+      await el.connectedCallbackPromise;
+      await Promise.resolve();
+
+      expect(el.proxy).toBeNull();
+      expect(el.transport).toBeNull();
+      expect(el.ready).toBe(false);
+      expect(el.connecting).toBe(false);
+    });
+
     it("tears down proxy + clears ready when authenticated flips back to false", async () => {
       const mockClient = createMockAuth0Client({
         isAuthenticated: vi.fn().mockResolvedValue(true),
@@ -504,6 +686,32 @@ describe("AuthSession (hawc-auth0-session)", () => {
       expect(el.ready).toBe(false);
       expect(el.proxy).toBeNull();
       expect(el.transport).toBeNull();
+    });
+    it("ignores connected-changed(false) when no session state is active", async () => {
+      const mockClient = createMockAuth0Client();
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const authEl = document.createElement("hawc-auth0") as Auth;
+      authEl.id = "auth-idle";
+      authEl.setAttribute("domain", "d.auth0.com");
+      authEl.setAttribute("client-id", "c");
+      document.body.appendChild(authEl);
+      await authEl.connectedCallbackPromise;
+
+      const el = document.createElement("hawc-auth0-session") as AuthSession;
+      el.target = "auth-idle";
+      el.core = "app-core";
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      authEl.dispatchEvent(new CustomEvent("hawc-auth0:connected-changed", {
+        detail: false,
+      }));
+
+      expect(el.proxy).toBeNull();
+      expect(el.transport).toBeNull();
+      expect(el.ready).toBe(false);
+      expect(el.connecting).toBe(false);
     });
   });
 
@@ -1031,6 +1239,45 @@ describe("AuthSession (hawc-auth0-session)", () => {
       expect(el.proxy).toBeNull();
       expect(el.ready).toBe(false);
     });
+    it("bails out before listener installation when generation changes during auth init wait", async () => {
+      const authEl = document.createElement("hawc-auth0") as Auth;
+
+      let resolveInit!: () => void;
+      const delayedInit = new Promise<void>((resolve) => {
+        resolveInit = resolve;
+      });
+      Object.defineProperty(authEl, "connectedCallbackPromise", {
+        configurable: true,
+        get: () => delayedInit,
+      });
+
+      const addSpy = vi.spyOn(authEl, "addEventListener");
+
+      const el = document.createElement("hawc-auth0-session") as AuthSession;
+      el.core = "app-core";
+
+      vi.spyOn(el as any, "_resolveAuth").mockReturnValue(authEl);
+
+      const pending = (el as any)._startWatching(1);
+      (el as any)._generation = 2;
+      resolveInit();
+      await pending;
+
+      expect(addSpy).not.toHaveBeenCalledWith("hawc-auth0:authenticated-changed", expect.any(Function));
+    });
+
+    it("_connect() is a no-op when auth or declaration is missing", async () => {
+      const el = document.createElement("hawc-auth0-session") as AuthSession;
+
+      await expect((el as any)._connect()).resolves.toBeUndefined();
+
+      (el as any)._authEl = document.createElement("hawc-auth0") as Auth;
+      await expect((el as any)._connect()).resolves.toBeUndefined();
+      (el as any)._authEl = document.createElement("hawc-auth0") as Auth;
+      (el as any)._coreDecl = SAMPLE_DECL;
+      (el as any)._connecting = true;
+      await expect((el as any)._connect()).resolves.toBeUndefined();
+    });
   });
 
   describe("disconnectedCallback", () => {
@@ -1071,6 +1318,29 @@ describe("AuthSession (hawc-auth0-session)", () => {
       }));
       await new Promise((r) => setTimeout(r, 0));
       expect(connectSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("private state guards", () => {
+    it("_setReady and _setConnecting do not dispatch duplicate events for the same value", () => {
+      const el = document.createElement("hawc-auth0-session") as AuthSession;
+      const readyEvents: boolean[] = [];
+      const connectingEvents: boolean[] = [];
+
+      el.addEventListener("hawc-auth0-session:ready-changed", (e) => {
+        readyEvents.push((e as CustomEvent).detail);
+      });
+      el.addEventListener("hawc-auth0-session:connecting-changed", (e) => {
+        connectingEvents.push((e as CustomEvent).detail);
+      });
+
+      (el as any)._setReady(true);
+      (el as any)._setReady(true);
+      (el as any)._setConnecting(true);
+      (el as any)._setConnecting(true);
+
+      expect(readyEvents).toEqual([true]);
+      expect(connectingEvents).toEqual([true]);
     });
   });
 });

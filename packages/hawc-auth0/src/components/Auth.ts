@@ -375,7 +375,21 @@ export class Auth extends HTMLElement {
       unregisterAutoTrigger();
       this._autoTriggerRegistered = false;
     }
-    // The Auth0 client itself is used singleton-style, so no further
-    // cleanup is needed here.
+    // Release the remote session the element owns, but DEFER the
+    // teardown one microtask so a same-task reconnect (React portal
+    // move, framework reconciliation reinserting the node, route
+    // transitions that preserve state) cancels it. Custom element
+    // detach → reattach within the same task is common for hidden
+    // controller elements; eager teardown here would drop the
+    // authenticated WebSocket on every such hop and fire a spurious
+    // `connected=false`. When the detach is a real removal (SPA route
+    // change to a different view, conditional render), the element is
+    // still disconnected by the time the microtask runs and we close
+    // the socket to release the server-side session. The Auth0 SDK
+    // itself is singleton and intentionally kept warm across mounts.
+    queueMicrotask(() => {
+      if (this.isConnected) return;
+      this._shell.disconnect();
+    });
   }
 }

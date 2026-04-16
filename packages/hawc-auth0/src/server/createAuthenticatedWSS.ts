@@ -76,6 +76,26 @@ export interface HandleConnectionOptions {
    */
   onTokenRefresh?: (core: EventTarget, user: UserContext) => void | Promise<void>;
   /**
+   * Optional pre-verified user context.
+   *
+   * Used by `createAuthenticatedWSS` to plumb the result of the
+   * pre-handshake `verifyClient` hook through to `handleConnection`,
+   * so that `handleConnection` does NOT re-run `verifyAuth0Token`
+   * after the upgrade has already completed. When this is set the
+   * client's `open` event is a true "server accepted the token"
+   * signal — verification happened BEFORE the `101 Switching
+   * Protocols` response — which is what keeps `token-changed`
+   * subscribers and `getTokenExpiry()` from observing a token the
+   * server never accepted.
+   *
+   * Direct callers of `handleConnection` that own their own HTTP
+   * upgrade handling should pre-verify the token in the equivalent
+   * of `verifyClient` and pass the result here; omitting it keeps
+   * the legacy post-upgrade verification path for backwards
+   * compatibility.
+   */
+  preVerifiedUser?: UserContext;
+  /**
    * Grace period (ms) after token `exp` before the server forcefully
    * closes the connection. Set to 0 to disable server-side expiry
    * enforcement. Default: 60000 (60 seconds).
@@ -104,6 +124,10 @@ export interface HandleConnectionOptions {
   expParseFailurePolicy?: "allow" | "close";
 }
 
+export function _normalizeError(err: unknown): Error {
+  return err instanceof Error ? err : new Error(String(err));
+}
+
 /**
  * Low-level primitive: verify the token from the protocol header,
  * construct the Core, and wrap it in a `RemoteShellProxy`.
@@ -125,18 +149,29 @@ export async function handleConnection(
     onEvent,
     sessionGraceMs = 60_000,
     expParseFailurePolicy = "allow",
+    preVerifiedUser,
   } = options;
 
   const token = extractTokenFromProtocol(protocolHeader);
   let user: UserContext;
-  try {
-    user = await verifyAuth0Token(token, {
-      domain: options.auth0Domain,
-      audience: options.auth0Audience,
-    });
-  } catch (err) {
-    onEvent?.({ type: "auth:failure", error: err instanceof Error ? err : new Error(String(err)) });
-    throw err;
+  if (preVerifiedUser) {
+    // Upstream (createAuthenticatedWSS' verifyClient) already ran
+    // verifyAuth0Token BEFORE the upgrade response, so the handshake
+    // we're now processing was ONLY allowed to reach this point
+    // because the token verified cleanly. Skipping re-verification
+    // closes the open→close race that otherwise leaks a token the
+    // server has not yet accepted to `token-changed` / `getTokenExpiry`.
+    user = preVerifiedUser;
+  } else {
+    try {
+      user = await verifyAuth0Token(token, {
+        domain: options.auth0Domain,
+        audience: options.auth0Audience,
+      });
+    } catch (err) {
+      onEvent?.({ type: "auth:failure", error: _normalizeError(err) });
+      throw err;
+    }
   }
 
   // Parse initial token expiry BEFORE emitting auth:success /
@@ -146,7 +181,7 @@ export async function handleConnection(
   // createCores side effects for a connection we're about to reject.
   let initialExpParseFailed = false;
   const initialExpiresAt = _getExpFromToken(token, sessionGraceMs, (e) => {
-    if (e.type === "auth:exp-parse-failure") initialExpParseFailed = true;
+    initialExpParseFailed = true;
     onEvent?.(e);
   });
 
@@ -253,7 +288,7 @@ export async function handleConnection(
               const oldExpiresAt = sessionExpiresAt;
               let refreshExpParseFailed = false;
               sessionExpiresAt = _getExpFromToken(newToken, sessionGraceMs, (e) => {
-                if (e.type === "auth:exp-parse-failure") refreshExpParseFailed = true;
+                refreshExpParseFailed = true;
                 onEvent?.(e);
               });
 
@@ -322,7 +357,7 @@ export async function handleConnection(
             .catch((err) => {
               onEvent?.({
                 type: "auth:refresh-failure",
-                error: err instanceof Error ? err : new Error(String(err)),
+                error: _normalizeError(err),
               });
               _safeSend({
                 type: "throw",
@@ -390,7 +425,7 @@ function _getExpFromToken(
   } catch (err) {
     onEvent?.({
       type: "auth:exp-parse-failure",
-      error: err instanceof Error ? err : new Error(String(err)),
+      error: _normalizeError(err),
     });
   }
   return Infinity;
@@ -436,9 +471,15 @@ export async function createAuthenticatedWSS(
 ) {
   const { WebSocketServer } = await import("ws");
 
+  // Plumb the pre-handshake Auth0 verify result to the connection
+  // handler. A WeakMap keyed on the request avoids mutating the
+  // HTTP IncomingMessage and lets GC reclaim entries if a request
+  // never reaches the `connection` event (e.g. upgrade aborted).
+  const preVerifiedUsers = new WeakMap<object, UserContext>();
+
   const wss = new WebSocketServer({
     port: options.port,
-    handleProtocols(protocols) {
+    handleProtocols(protocols: Set<string>) {
       for (const proto of protocols) {
         if (proto.startsWith(PROTOCOL_PREFIX)) {
           return proto;
@@ -446,10 +487,64 @@ export async function createAuthenticatedWSS(
       }
       return false;
     },
-  });
+    // Verify the Auth0 token (and origin) BEFORE the upgrade response
+    // is sent. ws runs `verifyClient` synchronously with the upgrade
+    // request: `cb(false, ...)` rejects with an HTTP error status
+    // BEFORE `101 Switching Protocols`, so the client never sees an
+    // `open` event for an unauthorized token. This closes the window
+    // where `AuthShell.connect()` would commit the new token at `open`
+    // only to learn via a 1008 close moments later that the server had
+    // not actually accepted it — `token-changed` / `getTokenExpiry()`
+    // subscribers no longer observe a token the server rejected.
+    //
+    // Origin check is inlined here so origin rejection is ALSO
+    // pre-handshake; the legacy `on("connection")` origin check is
+    // kept below as a defense-in-depth guard for direct users who
+    // might bypass `verifyClient` via their own upgrade plumbing.
+    verifyClient(info: { origin: string; secure: boolean; req: any }, cb: (result: boolean, code?: number, message?: string) => void): void {
+      if (options.allowedOrigins && options.allowedOrigins.length > 0) {
+        const origin = info.req.headers.origin;
+        if (!origin || !options.allowedOrigins.includes(origin)) {
+          cb(false, 403, "Forbidden origin");
+          return;
+        }
+      }
+      const protocolHeader = info.req.headers["sec-websocket-protocol"];
+      let token: string;
+      try {
+        token = extractTokenFromProtocol(protocolHeader);
+      } catch (err) {
+        options.onEvent?.({
+          type: "auth:failure",
+          error: _normalizeError(err),
+        });
+        cb(false, 401, "Unauthorized");
+        return;
+      }
+      verifyAuth0Token(token, {
+        domain: options.auth0Domain,
+        audience: options.auth0Audience,
+      })
+        .then((user) => {
+          preVerifiedUsers.set(info.req, user);
+          cb(true);
+        })
+        .catch((err) => {
+          options.onEvent?.({
+            type: "auth:failure",
+            error: _normalizeError(err),
+          });
+          cb(false, 401, "Unauthorized");
+        });
+    },
+  } as any);
 
   wss.on("connection", async (socket, req) => {
-    // Origin check
+    // Origin check retained as defense-in-depth. When verifyClient runs
+    // (the normal path under this factory), a disallowed origin has
+    // already been rejected pre-handshake, so this branch is a no-op.
+    // Direct users that compose `WebSocketServer` differently still
+    // get origin enforcement here.
     if (options.allowedOrigins && options.allowedOrigins.length > 0) {
       const origin = req.headers.origin;
       if (!origin || !options.allowedOrigins.includes(origin)) {
@@ -459,6 +554,8 @@ export async function createAuthenticatedWSS(
     }
 
     try {
+      const preVerifiedUser = preVerifiedUsers.get(req);
+      preVerifiedUsers.delete(req);
       await handleConnection(
         socket as unknown as WebSocketLike,
         req.headers["sec-websocket-protocol"],
@@ -471,6 +568,7 @@ export async function createAuthenticatedWSS(
           onTokenRefresh: options.onTokenRefresh,
           sessionGraceMs: options.sessionGraceMs,
           expParseFailurePolicy: options.expParseFailurePolicy,
+          preVerifiedUser,
         },
       );
     } catch (_err) {

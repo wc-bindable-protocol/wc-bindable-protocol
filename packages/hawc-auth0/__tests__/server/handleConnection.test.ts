@@ -1031,6 +1031,45 @@ describe("handleConnection", () => {
       (globalThis as any).Buffer = originalBuffer;
     }
   });
+  it("decodes JWT exp via Buffer fallback when atob is unavailable", async () => {
+    const savedAtob = globalThis.atob;
+    vi.stubGlobal("atob", undefined);
+    vi.useFakeTimers();
+    try {
+      jwtVerify.mockResolvedValue({
+        payload: { sub: "auth0|123", permissions: [] },
+      });
+
+      const socket = createMockSocket();
+      const core = new EventTarget();
+      (core.constructor as any).wcBindable = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+      };
+
+      await handleConnection(
+        socket,
+        "hawc-auth0.bearer." + makeJwt({
+          sub: "auth0|123",
+          exp: Math.floor(Date.now() / 1000) - 1,
+        }),
+        {
+          auth0Domain: "test.auth0.com",
+          auth0Audience: "https://api.example.com",
+          createCores: () => core,
+          sessionGraceMs: 1,
+        },
+      );
+
+      await vi.runAllTimersAsync();
+
+      expect(socket.close).toHaveBeenCalledWith(4401, "Session expired");
+    } finally {
+      vi.useRealTimers();
+      vi.stubGlobal("atob", savedAtob);
+    }
+  });
 
   it("emits auth:exp-parse-failure when the JWT payload has no exp claim", async () => {
     jwtVerify.mockResolvedValue({
@@ -1097,6 +1136,49 @@ describe("handleConnection", () => {
     const parseFailure = events.find((e) => e.type === "auth:exp-parse-failure");
     expect(parseFailure).toBeDefined();
     expect(parseFailure?.error).toBeInstanceOf(Error);
+  });
+
+  it("normalizes non-Error exp parse failures to Error instances", async () => {
+    const originalBuffer = (globalThis as any).Buffer;
+    const originalAtob = globalThis.atob;
+    (globalThis as any).Buffer = undefined;
+    vi.stubGlobal("atob", () => {
+      throw "boom";
+    });
+
+    try {
+      jwtVerify.mockResolvedValue({
+        payload: { sub: "auth0|123", permissions: [] },
+      });
+
+      const socket = createMockSocket();
+      const core = new EventTarget();
+      (core.constructor as any).wcBindable = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+      };
+
+      const events: AuthEvent[] = [];
+
+      await handleConnection(
+        socket,
+        "hawc-auth0.bearer.header.payload.sig",
+        {
+          auth0Domain: "test.auth0.com",
+          auth0Audience: "https://api.example.com",
+          createCores: () => core,
+          onEvent: (e) => events.push(e),
+        },
+      );
+
+      const parseFailure = events.find((e) => e.type === "auth:exp-parse-failure");
+      expect(parseFailure?.error).toBeInstanceOf(Error);
+      expect(parseFailure?.error.message).toContain("boom");
+    } finally {
+      (globalThis as any).Buffer = originalBuffer;
+      vi.stubGlobal("atob", originalAtob);
+    }
   });
 
   describe("expParseFailurePolicy: 'close'", () => {
