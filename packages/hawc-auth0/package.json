@@ -22,7 +22,6 @@
   "files": [
     "dist",
     "src/auto",
-    "LICENSE",
     "README.md",
     "README-LOCAL.md",
     "README-REMOTE.md",

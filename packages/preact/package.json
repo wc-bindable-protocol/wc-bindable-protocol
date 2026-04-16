@@ -12,9 +12,7 @@
     }
   },
   "files": [
-    "dist",
-    "LICENSE",
-    "README.md"
+    "dist"
   ],
   "scripts": {
     "build": "tsc",
@@ -28,7 +26,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/user/wc-bindable-protocol.git",
+    "url": "https://github.com/wc-bindable-protocol/wc-bindable-protocol.git",
     "directory": "packages/preact"
   },
   "license": "MIT"

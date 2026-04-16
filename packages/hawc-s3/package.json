@@ -1,6 +1,6 @@
 {
   "name": "@wc-bindable/hawc-s3",
-  "version": "0.1.0",
+  "version": "0.4.0",
   "description": "Declarative S3 (and S3-compatible) blob store component for Web Components. Server-side signing, browser-direct upload, no AWS SDK, via wc-bindable-protocol.",
   "type": "module",
   "main": "dist/index.js",
