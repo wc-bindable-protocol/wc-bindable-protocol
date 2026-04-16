@@ -23,9 +23,13 @@
     "dist",
     "src/auto",
     "LICENSE",
-    "README.md"
+    "README.md",
+    "README-LOCAL.md",
+    "README-REMOTE.md",
+    "SPEC-REMOTE.md"
   ],
   "scripts": {
+    "prepack": "npm run build",
     "build": "tsc",
     "dev": "tsc --watch",
     "test": "npm run test:unit",
