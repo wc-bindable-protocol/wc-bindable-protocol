@@ -300,6 +300,21 @@ export class Auth extends HTMLElement {
       registerAutoTrigger();
       this._autoTriggerRegistered = true;
     }
+    this._tryInitialize();
+  }
+
+  attributeChangedCallback(_name: string, _oldValue: string | null, _newValue: string | null): void {
+    // "Initialise once only" still holds — `_tryInitialize()` bails if a
+    // client exists or an init is in flight. This hook exists so that
+    // framework / declarative integrations which mount the element first
+    // and feed `domain` / `client-id` afterwards still auto-initialise
+    // when the attributes finally arrive.
+    if (this.isConnected) {
+      this._tryInitialize();
+    }
+  }
+
+  private _tryInitialize(): void {
     // Guard against double-init during the in-flight window.
     // `_shell.client` alone is not sufficient: it is set only after
     // `createAuth0Client()` resolves, so a disconnect→reconnect that
@@ -318,10 +333,6 @@ export class Auth extends HTMLElement {
     ) {
       this._connectedCallbackPromise = this.initialize();
     }
-  }
-
-  attributeChangedCallback(_name: string, _oldValue: string | null, _newValue: string | null): void {
-    // No re-initialisation on attribute changes (initialise once only)
   }
 
   disconnectedCallback(): void {

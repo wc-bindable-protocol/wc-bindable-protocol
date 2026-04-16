@@ -56,6 +56,10 @@ export class AuthSession extends HTMLElement {
   private _coreDecl: WcBindableDeclaration | null = null;
   private _authListener: ((e: Event) => void) | null = null;
   private _connectedCallbackPromise: Promise<void> = Promise.resolve();
+  // Coalesce bursts of attribute changes (frameworks often stamp
+  // target/core/url/auto-connect in quick succession) into a single
+  // `_startWatching()` run.
+  private _attrRestartScheduled = false;
 
   // Monotonic counter incremented on every teardown (logout listener or
   // disconnectedCallback). `_connect()` captures the value at entry and
@@ -156,8 +160,24 @@ export class AuthSession extends HTMLElement {
   }
 
   attributeChangedCallback(_name: string, _oldValue: string | null, _newValue: string | null): void {
-    // No re-initialisation on attribute changes — like <hawc-auth0>, the
-    // target/core/url are read once at connect time.
+    // Framework / declarative integrations that stamp target/core/url
+    // AFTER the element is connected (or flip auto-connect from false to
+    // true) would otherwise be stuck with whatever value `_startWatching`
+    // saw on the very first pass. Restart only when it is safe —
+    // i.e. no live transport or in-flight connect — and coalesce bursts
+    // of attribute mutations into a single restart via microtask.
+    if (!this.isConnected) return;
+    if (!this.autoConnect) return;
+    if (this._transport || this._connecting) return;
+    if (this._attrRestartScheduled) return;
+    this._attrRestartScheduled = true;
+    queueMicrotask(() => {
+      this._attrRestartScheduled = false;
+      if (!this.isConnected) return;
+      if (!this.autoConnect) return;
+      if (this._transport || this._connecting) return;
+      this._connectedCallbackPromise = this._startWatching();
+    });
   }
 
   // --- Public imperative API ------------------------------------------------

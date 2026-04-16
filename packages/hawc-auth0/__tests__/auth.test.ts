@@ -864,6 +864,54 @@ describe("Auth (hawc-auth0)", () => {
       expect(() => el.attributeChangedCallback("mode", "local", "remote")).not.toThrow();
       expect(() => el.disconnectedCallback()).not.toThrow();
     });
+
+    it("mount後にdomain/client-idを流し込むと遅延初期化が走る", async () => {
+      // Regression: observedAttributes declares domain / client-id, but
+      // the callback used to be a no-op. Framework / declarative
+      // integrations that mount the element first and stamp the config
+      // attributes afterwards must still auto-initialise.
+      const mockClient = createMockAuth0Client();
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const el = document.createElement("hawc-auth0") as Auth;
+      document.body.appendChild(el);
+      // Attributes absent at connect time → no init yet.
+      expect(createAuth0Client).not.toHaveBeenCalled();
+
+      el.setAttribute("domain", "late.auth0.com");
+      // domain alone is not enough.
+      expect(createAuth0Client).not.toHaveBeenCalled();
+
+      el.setAttribute("client-id", "late-client");
+      await el.connectedCallbackPromise;
+
+      expect(createAuth0Client).toHaveBeenCalledTimes(1);
+      expect(createAuth0Client).toHaveBeenCalledWith(expect.objectContaining({
+        domain: "late.auth0.com",
+        clientId: "late-client",
+      }));
+    });
+
+    it("初期化済みの要素は以降の属性変更で再初期化されない", async () => {
+      // Regression: the late-bind fix must preserve the "initialise once"
+      // rule — once an Auth0 client exists, attribute mutations must not
+      // spin up a second createAuth0Client() call.
+      const mockClient = createMockAuth0Client();
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const el = document.createElement("hawc-auth0") as Auth;
+      el.setAttribute("domain", "d.auth0.com");
+      el.setAttribute("client-id", "c");
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+      expect(createAuth0Client).toHaveBeenCalledTimes(1);
+
+      el.setAttribute("domain", "different.auth0.com");
+      el.setAttribute("audience", "https://api.example.com");
+      await Promise.resolve();
+
+      expect(createAuth0Client).toHaveBeenCalledTimes(1);
+    });
   });
 });
 

@@ -138,6 +138,94 @@ describe("AuthSession (hawc-auth0-session)", () => {
       // Just exercising the method — no observable side effect.
       el.attributeChangedCallback("target", null, "x");
     });
+
+    it("recovers when target/core are stamped AFTER connect (late-bound attrs)", async () => {
+      // Regression: declarative / framework integrations often mount the
+      // element before the attribute values are available. Previously the
+      // first `_startWatching()` would set a permanent "target not found"
+      // / missing-core error and never retry — attributes were observed
+      // but the callback was a no-op.
+      const mockClient = createMockAuth0Client({
+        isAuthenticated: vi.fn().mockResolvedValue(true),
+        getUser: vi.fn().mockResolvedValue({ sub: "u" }),
+        getTokenSilently: vi.fn().mockResolvedValue("jwt-token"),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const authEl = document.createElement("hawc-auth0") as Auth;
+      authEl.id = "auth-late";
+      authEl.setAttribute("domain", "d.auth0.com");
+      authEl.setAttribute("client-id", "c");
+      authEl.setAttribute("remote-url", "wss://example.com/ws");
+      document.body.appendChild(authEl);
+      await authEl.connectedCallbackPromise;
+      vi.spyOn((authEl as any)._shell, "connect")
+        .mockResolvedValue({ send: vi.fn(), onMessage: vi.fn(), onClose: vi.fn() });
+
+      // Mount without any attributes — the first `_startWatching()`
+      // captures a missing target and records an error.
+      const el = document.createElement("hawc-auth0-session") as AuthSession;
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+      // Missing attributes land on the target-not-found error first
+      // (empty `target` does not resolve to any element).
+      expect(el.error).toBeInstanceOf(Error);
+      expect(el.error?.message).toContain("not found");
+      expect(el.proxy).toBeNull();
+
+      // Now stamp the attributes — the late-bind hook must flush the
+      // previous error and re-enter `_startWatching()`.
+      el.setAttribute("target", "auth-late");
+      el.setAttribute("core", "app-core");
+
+      // Microtask coalescing: drain the scheduled restart, then its
+      // internal awaits (authEl.connectedCallbackPromise + connect()).
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(el.error).toBeNull();
+      expect(el.proxy).not.toBeNull();
+      expect(el.transport).not.toBeNull();
+    });
+
+    it("does not restart a live session on unrelated attribute changes", async () => {
+      // Regression: the late-bind hook must NOT re-enter `_startWatching()`
+      // once a transport is live — doing so would tear down the working
+      // proxy. Only restart when the session is idle (no transport, no
+      // connecting).
+      const mockClient = createMockAuth0Client({
+        isAuthenticated: vi.fn().mockResolvedValue(true),
+        getUser: vi.fn().mockResolvedValue({ sub: "u" }),
+        getTokenSilently: vi.fn().mockResolvedValue("jwt-token"),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const authEl = document.createElement("hawc-auth0") as Auth;
+      authEl.id = "auth-live";
+      authEl.setAttribute("domain", "d.auth0.com");
+      authEl.setAttribute("client-id", "c");
+      authEl.setAttribute("remote-url", "wss://example.com/ws");
+      document.body.appendChild(authEl);
+      await authEl.connectedCallbackPromise;
+      const connectSpy = vi.spyOn((authEl as any)._shell, "connect")
+        .mockResolvedValue({ send: vi.fn(), onMessage: vi.fn(), onClose: vi.fn() });
+
+      const el = document.createElement("hawc-auth0-session") as AuthSession;
+      el.target = "auth-live";
+      el.core = "app-core";
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+      const firstProxy = el.proxy;
+      expect(firstProxy).not.toBeNull();
+      expect(connectSpy).toHaveBeenCalledTimes(1);
+
+      // Mutate a monitored attribute while a transport is live — must
+      // NOT restart.
+      el.setAttribute("url", "wss://other.example.com/ws");
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(connectSpy).toHaveBeenCalledTimes(1);
+      expect(el.proxy).toBe(firstProxy);
+    });
   });
 
   describe("error cases", () => {
