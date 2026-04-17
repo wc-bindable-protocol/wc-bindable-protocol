@@ -11,6 +11,7 @@ import { AzureOpenAiProvider } from "../providers/AzureOpenAiProvider.js";
 import { GoogleProvider } from "../providers/GoogleProvider.js";
 import { getRegisteredTool, AiToolHandler } from "../toolRegistry.js";
 import { cloneMessage } from "./cloneMessage.js";
+import { validateMessages } from "./validateMessages.js";
 
 function resolveProvider(name: string): IAiProvider {
   switch (name) {
@@ -98,6 +99,7 @@ export class AiCore extends EventTarget {
   }
 
   set messages(value: AiMessage[]) {
+    validateMessages(value);
     this._messages = value.map(cloneMessage);
     this._emitMessages();
   }
@@ -293,9 +295,19 @@ export class AiCore extends EventTarget {
 
     pushMessage({ role: "user", content: prompt });
 
-    const tools = options.tools ?? [];
-    const toolsByName = new Map<string, AiTool>(tools.map(t => [t.name, t]));
     const maxRoundtrips = options.maxToolRoundtrips ?? DEFAULT_MAX_TOOL_ROUNDTRIPS;
+    // `maxToolRoundtrips: 0` is documented as "disables tool use even if
+    // tools is set". Honor that by stripping `tools` / `toolChoice` from the
+    // provider request: the model never sees the tool catalog, cannot emit
+    // tool calls, and send() returns a plain assistant response instead of
+    // rolling back with a "roundtrips exceeded" error. Callers who want the
+    // model to see tools but refuse to execute them should use
+    // `toolChoice: "none"` explicitly.
+    const effectiveOptions: AiRequestOptions = maxRoundtrips === 0
+      ? { ...options, tools: undefined, toolChoice: undefined }
+      : options;
+    const tools = effectiveOptions.tools ?? [];
+    const toolsByName = new Map<string, AiTool>(tools.map(t => [t.name, t]));
 
     let aggregateUsage: AiUsage | null = null;
     let roundtrips = 0;
@@ -317,7 +329,7 @@ export class AiCore extends EventTarget {
         this._content = "";
         this._setContent("");
 
-        const turn = await this._fetchTurn(apiMessages, options, abortController);
+        const turn = await this._fetchTurn(apiMessages, effectiveOptions, abortController);
         if (turn === null) {
           // HTTP error (error state set by _fetchTurn) or concurrent abort.
           rollback();
@@ -338,15 +350,25 @@ export class AiCore extends EventTarget {
           this._setUsage(aggregateUsage);
         }
 
+        // Defensive against a provider that returns tool_calls despite
+        // having no tool catalog in the request (maxToolRoundtrips === 0
+        // strips tools/toolChoice above). In that case the user explicitly
+        // opted out of tool use, so we drop the bogus tool_calls and treat
+        // the turn as terminal instead of throwing "roundtrips exceeded".
+        const hasToolCalls = !!(turn.toolCalls && turn.toolCalls.length > 0);
+        const treatAsTerminal = !hasToolCalls || maxRoundtrips === 0;
+
         const assistantMessage: AiMessage = { role: "assistant", content: turn.content };
-        if (turn.toolCalls && turn.toolCalls.length > 0) {
+        if (hasToolCalls && !treatAsTerminal) {
           assistantMessage.toolCalls = turn.toolCalls;
         }
         pushMessage(assistantMessage);
         lastAssistantContent = turn.content;
 
-        if (!turn.toolCalls || turn.toolCalls.length === 0) {
-          // Terminal turn: model did not request more tools.
+        if (treatAsTerminal) {
+          // Either model did not request more tools, or tool use is disabled
+          // for this call (maxToolRoundtrips === 0) and we are ignoring any
+          // tool_calls the provider returned out of contract.
           this._setLoading(false);
           return lastAssistantContent;
         }
@@ -361,7 +383,7 @@ export class AiCore extends EventTarget {
         // Execute all tool calls in parallel. Individual handler errors are
         // captured into the tool message payload so the model can recover;
         // only non-recoverable failures (abort) bubble out.
-        const toolResults = await Promise.all(turn.toolCalls.map(async (call) => {
+        const toolResults = await Promise.all(turn.toolCalls!.map(async (call) => {
           this._target.dispatchEvent(new CustomEvent("hawc-ai:tool-call-requested", {
             detail: { toolCall: { ...call } },
             bubbles: true,

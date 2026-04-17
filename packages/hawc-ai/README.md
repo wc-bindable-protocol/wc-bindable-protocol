@@ -429,7 +429,7 @@ interface AiTool {
 |---|---|---|---|
 | `tools` | `AiTool[]` | `undefined` | Tool declarations for this invocation. |
 | `toolChoice` | `"auto" \| "none" \| { name: string }` | provider default | Force the model toward no-tool / any-tool / a specific tool. |
-| `maxToolRoundtrips` | `number` | `10` | Upper bound on consecutive tool-use rounds before the loop errors out. `0` disables tool use even if `tools` is set (one round only). |
+| `maxToolRoundtrips` | `number` | `10` | Upper bound on consecutive tool-use rounds before the loop errors out. `0` disables tool use entirely — `tools` and `toolChoice` are stripped from the provider request, so a compliant model never sees the tool catalog and `send()` returns a plain assistant response in one round. If a non-compliant provider emits `tool_calls` regardless, those are dropped from the stored assistant message and the turn is still treated as terminal (no handler is invoked, no `maxToolRoundtrips exceeded` error). |
 
 `maxToolRoundtrips` exceeded throws an Error which is surfaced via `el.error` and rolls back the messages pushed by this `send()` call.
 

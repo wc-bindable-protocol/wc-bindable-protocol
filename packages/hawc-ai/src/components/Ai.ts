@@ -2,6 +2,7 @@ import { config, getRemoteCoreUrl } from "../config.js";
 import { IWcBindable, AiMessage } from "../types.js";
 import { AiCore } from "../core/AiCore.js";
 import { cloneMessage } from "../core/cloneMessage.js";
+import { validateMessages } from "../core/validateMessages.js";
 import { AiMessage as AiMessageElement } from "./AiMessage.js";
 import { registerAutoTrigger, unregisterAutoTrigger } from "../autoTrigger.js";
 import {
@@ -341,6 +342,10 @@ export class Ai extends HTMLElement {
   }
 
   set messages(value: AiMessage[]) {
+    // Validate client-side even in remote mode so malformed payloads do not
+    // travel over the WebSocket just to fail on the server (and so the
+    // client-side assertions are consistent with AiCore.messages =).
+    validateMessages(value);
     if (this._isRemote) {
       this._proxy!.setWithAck("messages", value)
         .then(() => this._clearErrorState())

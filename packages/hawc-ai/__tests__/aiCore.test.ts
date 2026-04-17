@@ -277,6 +277,125 @@ describe("AiCore", () => {
       expect(core.messages).toEqual([{ role: "user", content: "Hello" }]);
       expect(events).toEqual([]);
     });
+
+    describe("setterバリデーション", () => {
+      const core = () => {
+        const c = new AiCore();
+        return c;
+      };
+
+      it("未知のroleは setter で throw", () => {
+        expect(() => { core().messages = [{ role: "bot" as any, content: "x" }]; })
+          .toThrow(/\.role must be one of/);
+      });
+
+      it("content が string/配列 以外は throw", () => {
+        expect(() => { core().messages = [{ role: "user", content: 42 as any }]; })
+          .toThrow(/\.content must be a string or AiContentPart\[\]/);
+      });
+
+      it("未知の content part type は throw", () => {
+        expect(() => {
+          core().messages = [{
+            role: "user",
+            content: [{ type: "video" as any, url: "x" }],
+          }];
+        }).toThrow(/unknown content part type/);
+      });
+
+      it("image part で url が空は throw", () => {
+        expect(() => {
+          core().messages = [{
+            role: "user",
+            content: [{ type: "image", url: "" }],
+          }];
+        }).toThrow(/requires a non-empty `url` field/);
+      });
+
+      it("role tool で toolCallId が空は throw", () => {
+        expect(() => {
+          core().messages = [{ role: "tool", content: "{}", toolCallId: "" }];
+        }).toThrow(/requires a non-empty string toolCallId/);
+      });
+
+      it("role tool で toolCallId 未設定は throw", () => {
+        expect(() => {
+          core().messages = [{ role: "tool", content: "{}" } as any];
+        }).toThrow(/requires a non-empty string toolCallId/);
+      });
+
+      it("assistant.toolCalls 要素の shape を検証する", () => {
+        expect(() => {
+          core().messages = [{
+            role: "assistant",
+            content: "",
+            toolCalls: [{ id: "", name: "fn", arguments: "{}" }],
+          }];
+        }).toThrow(/\.toolCalls\[0\]\.id must be a non-empty string/);
+
+        expect(() => {
+          core().messages = [{
+            role: "assistant",
+            content: "",
+            toolCalls: [{ id: "c1", name: "", arguments: "{}" }],
+          }];
+        }).toThrow(/\.toolCalls\[0\]\.name must be a non-empty string/);
+
+        expect(() => {
+          core().messages = [{
+            role: "assistant",
+            content: "",
+            toolCalls: [{ id: "c1", name: "fn", arguments: {} as any }],
+          }];
+        }).toThrow(/\.toolCalls\[0\]\.arguments must be a string/);
+      });
+
+      it("非assistantでtoolCallsが存在すると throw", () => {
+        expect(() => {
+          core().messages = [{
+            role: "user",
+            content: "hi",
+            toolCalls: [{ id: "c1", name: "fn", arguments: "{}" }],
+          } as any];
+        }).toThrow(/\.toolCalls is only valid on assistant messages/);
+      });
+
+      it("非toolでtoolCallIdが存在すると throw", () => {
+        expect(() => {
+          core().messages = [{
+            role: "user",
+            content: "hi",
+            toolCallId: "c1",
+          } as any];
+        }).toThrow(/\.toolCallId is only valid on tool messages/);
+      });
+
+      it("非配列を渡すと throw", () => {
+        expect(() => { core().messages = "not-an-array" as any; })
+          .toThrow(/messages must be an array/);
+      });
+
+      it("有効な混在履歴（multimodal + tool use）は通る", () => {
+        const c = core();
+        expect(() => {
+          c.messages = [
+            { role: "system", content: "You are helpful." },
+            { role: "user", content: [
+              { type: "text", text: "What's in this image?" },
+              { type: "image", url: "https://x/y.png" },
+            ] },
+            {
+              role: "assistant",
+              content: "",
+              toolCalls: [{ id: "c1", name: "lookup", arguments: '{"q":"x"}' }],
+            },
+            { role: "tool", content: '{"result":"ok"}', toolCallId: "c1" },
+            { role: "assistant", content: "here you go" },
+          ];
+        }).not.toThrow();
+        expect(c.messages).toHaveLength(5);
+      });
+    });
   });
 
   describe("internal helpers", () => {
@@ -1789,6 +1908,84 @@ describe("AiCore", () => {
       expect(() => core.send("x", { model: "gpt-4o", maxToolRoundtrips: 1.5 })).toThrow(
         /maxToolRoundtrips must be a non-negative integer/,
       );
+    });
+
+    it("maxToolRoundtrips=0ではtools/toolChoiceが provider 送信から除外される", async () => {
+      fetchSpy.mockResolvedValueOnce(finalResponse("plain reply"));
+
+      const core = new AiCore();
+      core.provider = "openai";
+      const result = await core.send("hi", {
+        model: "gpt-4o",
+        stream: false,
+        maxToolRoundtrips: 0,
+        tools: [{ name: "never_called", description: "", parameters: {}, handler: () => "x" }],
+        toolChoice: "auto",
+      });
+
+      expect(result).toBe("plain reply");
+      expect(core.error).toBeNull();
+      const body = JSON.parse((fetchSpy.mock.calls[0][1] as RequestInit).body as string);
+      // README: "0 disables tool use entirely — tools and toolChoice are stripped".
+      expect(body.tools).toBeUndefined();
+      expect(body.tool_choice).toBeUndefined();
+    });
+
+    it("maxToolRoundtrips=0では通常応答が1ラウンドで返り履歴もassistantがterminal", async () => {
+      // Happy path: the provider honors the stripped request (no tools in
+      // body) and returns a plain assistant turn. The loop exits on the
+      // terminal check without ever incrementing roundtrips.
+      fetchSpy.mockResolvedValueOnce(finalResponse("ok"));
+
+      const core = new AiCore();
+      core.provider = "openai";
+      const result = await core.send("hi", {
+        model: "gpt-4o",
+        stream: false,
+        maxToolRoundtrips: 0,
+        tools: [{ name: "t", description: "", parameters: {}, handler: () => null }],
+      });
+
+      expect(result).toBe("ok");
+      expect(core.error).toBeNull();
+      expect(core.messages).toEqual([
+        { role: "user", content: "hi" },
+        { role: "assistant", content: "ok" },
+      ]);
+    });
+
+    it("maxToolRoundtrips=0でproviderが契約違反でtool_callsを返してもterminalとして扱う（rollbackエラーにしない）", async () => {
+      // Defensive scenario: some provider (or proxy) ignores the stripped
+      // tool catalog and emits tool_calls anyway. "0 disables tool use
+      // entirely" per the README, so we must not bounce the whole send()
+      // with a "roundtrips exceeded" error just because the wire response
+      // carried a stray tool_call block. The assistant message is stored
+      // with content but without the tool_calls, and the handler is never
+      // invoked.
+      const rogueHandler = vi.fn();
+      fetchSpy.mockResolvedValueOnce(toolCallResponse("call_x", "t", { bogus: true }));
+
+      const core = new AiCore();
+      core.provider = "openai";
+      const result = await core.send("hi", {
+        model: "gpt-4o",
+        stream: false,
+        maxToolRoundtrips: 0,
+        tools: [{ name: "t", description: "", parameters: {}, handler: rogueHandler }],
+      });
+
+      // Provider-returned content is preserved (empty string for a pure
+      // tool-call turn in OpenAI's shape).
+      expect(result).toBe("");
+      expect(core.error).toBeNull();
+      // Only user + assistant pushed; no tool message (handler was not run).
+      expect(core.messages).toHaveLength(2);
+      expect(core.messages[0]).toEqual({ role: "user", content: "hi" });
+      expect(core.messages[1].role).toBe("assistant");
+      // The stray tool_calls must not be attached to the stored assistant
+      // message — otherwise future sends would render them back on the wire.
+      expect(core.messages[1].toolCalls).toBeUndefined();
+      expect(rogueHandler).not.toHaveBeenCalled();
     });
 
     it("toolsが空なら通常の1ターン応答として振る舞う（後方互換）", async () => {
