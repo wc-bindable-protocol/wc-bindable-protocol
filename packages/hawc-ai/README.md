@@ -43,6 +43,7 @@ This means chat UIs and AI-powered features can be expressed declaratively, with
 - [TypeScript Types](#typescript-types)
 - [Provider Details](#provider-details)
 - [Security](#security)
+- [Error contract](#error-contract)
 - [Design Notes](#design-notes)
 - [License](#license)
 
@@ -273,8 +274,8 @@ These properties represent the current inference state and are the main HAWC sur
 | `messages` | `AiMessage[]` | Full conversation history (user + assistant). Updated on send and completion |
 | `usage` | `AiUsage \| null` | Token usage `{ promptTokens, completionTokens, totalTokens }` |
 | `loading` | `boolean` | `true` from send to completion or error |
-| `streaming` | `boolean` | `true` from stream start (after HTTP response headers) to stream completion |
-| `error` | `AiHttpError \| Error \| null` | Error info |
+| `streaming` | `boolean` | `true` from stream start (after HTTP response headers) to stream completion. Stays `false` for the entire call when `no-stream` is set, or when `responseSchema` is used on Anthropic (structured output forces non-streaming there — see [Structured output](#structured-output)). |
+| `error` | `AiHttpError \| Error \| null` | Error info. See [Error contract](#error-contract) for which failure classes surface here vs. via synchronous throw vs. via tool-message payload. |
 
 ### Input / command surface
 
@@ -1218,6 +1219,41 @@ interface WcsAiValues extends WcsAiCoreValues {
 <!-- Production (recommended) -->
 <hawc-ai provider="openai" model="gpt-4o" base-url="/api/ai" />
 ```
+
+## Error contract
+
+A cross-cutting summary of how each failure class surfaces, consolidated from the per-section notes above ([Input Validation](#input-validation), [Tool use §Error handling within the loop](#error-handling-within-the-loop), [Structured output §Constraints](#constraints), [Abort](#abort), [Remote Mode §Error surface](#error-surface)). Use this to decide where to `try / catch` vs. where to bind state.
+
+### Three channels
+
+| Channel | What reaches it |
+|---|---|
+| **Synchronous throw / promise rejection from `send()`** | Precondition violations the caller must fix: invalid `temperature` / `maxTokens` / `maxToolRoundtrips` / `provider`, empty or non-string/array `prompt`, `responseSchema` that is not a plain object, `responseSchema` + `tools` both set, Gemini + http(s) image URL. Also: remote-mode **server-side business errors** (provider 4xx/5xx, server validation) are re-thrown to match local-mode contract. Wrap `send()` in `try / catch` to react. |
+| **`el.error` state + `hawc-ai:error` event** | Failures that originate after the request is dispatched: provider HTTP 4xx/5xx, `maxToolRoundtrips` exceeded, remote WebSocket connect failure / drop, remote transport-layer failures during `send()` (timeouts, disposed proxy, raw `DOMException`). `send()` resolves to `null`; `loading` / `streaming` are reset. Bind `error` for UI — do **not** `try / catch`. |
+| **Tool message payload (`{ error: "<message>" }`)** | Handler throws and unknown tool names during the tool-use loop. The model sees the error in the next turn and typically recovers. `el.error` stays `null`; `send()` continues and resolves normally. Not directly observable from the caller — listen to `hawc-ai:tool-call-completed` if you need UI hooks. |
+
+### Per-failure reference
+
+| Failure | Channel | `send()` result | `messages` | `el.error` |
+|---|---|---|---|---|
+| Invalid `temperature` / `maxTokens` / `maxToolRoundtrips` / `provider` / `prompt` | Sync throw → Promise reject | rejects | unchanged | unchanged |
+| `responseSchema` not a plain object | Sync throw → Promise reject | rejects | unchanged | unchanged |
+| `responseSchema` + `tools` both set | Sync throw → Promise reject | rejects | unchanged | unchanged |
+| Gemini + http(s) image URL | Sync throw → Promise reject | rejects | unchanged | unchanged |
+| Tool handler throws | Tool message `{error}` | string (loop continues) | includes tool-error message | `null` |
+| Unknown tool name from model | Tool message `{error}` | string (loop continues) | includes tool-error message | `null` |
+| `maxToolRoundtrips` exceeded | `el.error` | `null` | rolled back for this send() | `Error` |
+| Provider HTTP 4xx / 5xx | `el.error` | `null` | user turn rolled back | `AiHttpError` |
+| Abort (`abort()` or new `send()`) | Neither (control signal) | `null` | rolled back | `null` (**not set**) |
+| Remote WebSocket connect / drop | `el.error` | (no in-flight send) / `null` | — | `Error` |
+| Remote transport failure during `send()` (timeout, disposed proxy, raw `DOMException`) | `el.error` | `null` | rolled back | `Error` |
+| Remote server-side business error (provider 4xx/5xx, server validation) | Promise reject | rejects | rolled back | populated |
+
+### Quick rule of thumb
+
+- **Bind `el.error`** for everything the user can't fix by changing call-site arguments — HTTP failures, roundtrip exhaustion, WebSocket drop, remote transport glitches.
+- **`try / catch`** around `send()` only if you're dispatching unvalidated options from UI, or you deploy in remote mode and want to distinguish server-side business errors (reject) from transport glitches (`el.error`, resolves `null`).
+- **Tool handler errors never reach your code.** They're scoped to the tool-use loop — the model sees them and recovers. If you need handler failures as a caller signal, either re-throw out of the loop yourself (by NOT using the built-in loop — invoke tools manually) or listen to `hawc-ai:tool-call-completed` for observability.
 
 ## Design Notes
 
