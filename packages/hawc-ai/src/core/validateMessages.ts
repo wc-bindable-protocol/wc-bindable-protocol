@@ -17,6 +17,22 @@ export function validateMessages(messages: AiMessage[]): void {
   if (!Array.isArray(messages)) {
     throw new Error("[@wc-bindable/hawc-ai] messages must be an array of AiMessage.");
   }
+  // Enforce the `AiMessage.toolCallId` contract ("correlates this message
+  // with *the* assistant tool call that produced it" — singular, one-to-one).
+  //
+  // - `pendingToolCallIds`: declared by a prior assistant turn but not yet
+  //   consumed by a tool message. A tool message must find its id here.
+  // - `seenToolCallIds`: every id we have ever seen, pending or retired.
+  //   A later assistant re-declaring the same id (or the same id appearing
+  //   twice inside one `toolCalls` array) is treated as a shape error.
+  // - On a matching tool message we delete from `pendingToolCallIds` so a
+  //   second tool message with the same id is rejected as a replay.
+  //
+  // The reverse direction (assistant toolCalls without a following tool
+  // response) is intentionally *not* enforced — restoring a history mid
+  // tool-use round is a legitimate use case.
+  const pendingToolCallIds = new Set<string>();
+  const seenToolCallIds = new Set<string>();
   for (let i = 0; i < messages.length; i++) {
     const m = messages[i];
     if (!m || typeof m !== "object") {
@@ -39,6 +55,14 @@ export function validateMessages(messages: AiMessage[]): void {
       if (typeof m.toolCallId !== "string" || m.toolCallId === "") {
         throw new Error(`[@wc-bindable/hawc-ai] messages[${i}] with role "tool" requires a non-empty string toolCallId.`);
       }
+      if (!pendingToolCallIds.has(m.toolCallId)) {
+        if (seenToolCallIds.has(m.toolCallId)) {
+          throw new Error(`[@wc-bindable/hawc-ai] messages[${i}] with role "tool" replays toolCallId "${m.toolCallId}" that was already consumed by an earlier tool message. Each tool call correlates to exactly one tool response.`);
+        }
+        throw new Error(`[@wc-bindable/hawc-ai] messages[${i}] with role "tool" references toolCallId "${m.toolCallId}" that does not correlate to any prior assistant tool call. Truncated or orphaned tool results break provider wire format.`);
+      }
+      // Retire the id so a subsequent tool message cannot reuse it.
+      pendingToolCallIds.delete(m.toolCallId);
     }
     if (m.role === "assistant" && m.toolCalls !== undefined) {
       if (!Array.isArray(m.toolCalls)) {
@@ -58,6 +82,11 @@ export function validateMessages(messages: AiMessage[]): void {
         if (typeof tc.arguments !== "string") {
           throw new Error(`[@wc-bindable/hawc-ai] messages[${i}].toolCalls[${j}].arguments must be a string (JSON-encoded arguments).`);
         }
+        if (seenToolCallIds.has(tc.id)) {
+          throw new Error(`[@wc-bindable/hawc-ai] messages[${i}].toolCalls[${j}].id "${tc.id}" duplicates an id already declared earlier. Tool call ids must be unique across the conversation.`);
+        }
+        seenToolCallIds.add(tc.id);
+        pendingToolCallIds.add(tc.id);
       }
     }
     if (m.role !== "assistant" && (m as any).toolCalls !== undefined) {

@@ -375,6 +375,116 @@ describe("AiCore", () => {
           .toThrow(/messages must be an array/);
       });
 
+      it("孤立した tool メッセージ（対応する assistant.toolCalls が無い）は throw", () => {
+        expect(() => {
+          core().messages = [
+            { role: "user", content: "hi" },
+            { role: "tool", content: '{"x":1}', toolCallId: "orphan" },
+          ];
+        }).toThrow(/references toolCallId "orphan" that does not correlate to any prior assistant tool call/);
+      });
+
+      it("先行assistantのtoolCallsと一致しないtoolCallIdは throw", () => {
+        expect(() => {
+          core().messages = [
+            { role: "user", content: "hi" },
+            {
+              role: "assistant",
+              content: "",
+              toolCalls: [{ id: "c_real", name: "fn", arguments: "{}" }],
+            },
+            { role: "tool", content: "{}", toolCallId: "c_typo" },
+          ];
+        }).toThrow(/references toolCallId "c_typo" that does not correlate/);
+      });
+
+      it("tool メッセージが対応する assistant より前にあると throw（時系列違反）", () => {
+        expect(() => {
+          core().messages = [
+            { role: "tool", content: "{}", toolCallId: "c1" },
+            {
+              role: "assistant",
+              content: "",
+              toolCalls: [{ id: "c1", name: "fn", arguments: "{}" }],
+            },
+          ];
+        }).toThrow(/references toolCallId "c1" that does not correlate to any prior assistant tool call/);
+      });
+
+      it("同一toolCallIdを2回消費する履歴は throw（replay検出）", () => {
+        expect(() => {
+          core().messages = [
+            { role: "user", content: "hi" },
+            {
+              role: "assistant",
+              content: "",
+              toolCalls: [{ id: "c1", name: "fn", arguments: "{}" }],
+            },
+            { role: "tool", content: '{"v":1}', toolCallId: "c1" },
+            { role: "tool", content: '{"v":2}', toolCallId: "c1" },
+          ];
+        }).toThrow(/replays toolCallId "c1" that was already consumed/);
+      });
+
+      it("assistant.toolCallsの重複idは throw", () => {
+        expect(() => {
+          core().messages = [
+            { role: "user", content: "hi" },
+            {
+              role: "assistant",
+              content: "",
+              toolCalls: [
+                { id: "c1", name: "fn", arguments: "{}" },
+                { id: "c1", name: "fn", arguments: "{}" },
+              ],
+            },
+          ];
+        }).toThrow(/id "c1" duplicates an id already declared earlier/);
+      });
+
+      it("後続assistantが過去idを再宣言すると throw", () => {
+        expect(() => {
+          core().messages = [
+            { role: "user", content: "q1" },
+            {
+              role: "assistant",
+              content: "",
+              toolCalls: [{ id: "c1", name: "fn", arguments: "{}" }],
+            },
+            { role: "tool", content: "{}", toolCallId: "c1" },
+            { role: "assistant", content: "partial" },
+            { role: "user", content: "q2" },
+            {
+              role: "assistant",
+              content: "",
+              // Re-using "c1" is a shape violation even though it was
+              // consumed — each call correlates to a unique id.
+              toolCalls: [{ id: "c1", name: "fn", arguments: "{}" }],
+            },
+          ];
+        }).toThrow(/id "c1" duplicates an id already declared earlier/);
+      });
+
+      it("異なるidでの複数tool responseは通る（並列tool call）", () => {
+        const c = core();
+        expect(() => {
+          c.messages = [
+            { role: "user", content: "hi" },
+            {
+              role: "assistant",
+              content: "",
+              toolCalls: [
+                { id: "c1", name: "a", arguments: "{}" },
+                { id: "c2", name: "b", arguments: "{}" },
+              ],
+            },
+            { role: "tool", content: "{}", toolCallId: "c1" },
+            { role: "tool", content: "{}", toolCallId: "c2" },
+          ];
+        }).not.toThrow();
+        expect(c.messages).toHaveLength(4);
+      });
+
       it("有効な混在履歴（multimodal + tool use）は通る", () => {
         const c = core();
         expect(() => {
@@ -1848,8 +1958,45 @@ describe("AiCore", () => {
       expect(result).toBe("handled");
       const toolMsg = core.messages.find(m => m.role === "tool")!;
       expect(toolMsg.content).toContain("not defined");
-      expect(completed[0].error).toContain("unknown tool");
+      // Event `error` carries the precise reason so consumers can tell a
+      // capability-boundary rejection from a missing-handler config bug.
+      expect(completed[0].error).toContain("is not defined on this send()");
       expect(core.error).toBeNull();
+    });
+
+    it("tool-call-completedイベントは capability-boundary と handler 不在を区別可能なerrorを載せる", async () => {
+      const { registerTool, clearToolRegistry } = await import("../src/toolRegistry");
+      clearToolRegistry();
+
+      // Scenario A: declared but handler omitted and not in any registry.
+      fetchSpy
+        .mockResolvedValueOnce(toolCallResponse("cA", "declared_no_handler", {}))
+        .mockResolvedValueOnce(finalResponse("ok-A"));
+      const eventsA: any[] = [];
+      const coreA = new AiCore();
+      coreA.addEventListener("hawc-ai:tool-call-completed", e => eventsA.push((e as CustomEvent).detail));
+      coreA.provider = "openai";
+      await coreA.send("a", {
+        model: "gpt-4o",
+        stream: false,
+        tools: [{ name: "declared_no_handler", description: "", parameters: {} }],
+      });
+      expect(eventsA[0].error).toContain("has no handler");
+
+      // Scenario B: undeclared on this send, even if registry has it.
+      registerTool("privileged", () => "should-not-run");
+      fetchSpy
+        .mockResolvedValueOnce(toolCallResponse("cB", "privileged", {}))
+        .mockResolvedValueOnce(finalResponse("ok-B"));
+      const eventsB: any[] = [];
+      const coreB = new AiCore();
+      coreB.addEventListener("hawc-ai:tool-call-completed", e => eventsB.push((e as CustomEvent).detail));
+      coreB.provider = "openai";
+      await coreB.send("b", { model: "gpt-4o", stream: false });
+      expect(eventsB[0].error).toContain("is not defined on this send()");
+      expect(eventsB[0].error).not.toContain("has no handler");
+
+      clearToolRegistry();
     });
 
     it("tool handlerが例外を投げてもエラーJSONをtool resultに積んでループ継続する", async () => {
@@ -2032,23 +2179,56 @@ describe("AiCore", () => {
       clearToolRegistry();
     });
 
-    it("options.tools にエントリが無くてもregisterToolがあれば呼ばれる", async () => {
+    it("options.tools に宣言が無いtoolは registry にhandlerがあっても呼ばれない（capability boundary）", async () => {
+      // Capability boundary: a hallucinated / replayed tool name from the
+      // model must not reach a registered handler that the caller never
+      // exposed on this send(). The registry fills in *handlers* for
+      // already-declared tools (remote mode), it does not widen the catalog.
       const { registerTool, clearToolRegistry } = await import("../src/toolRegistry");
       clearToolRegistry();
-      const handler = vi.fn().mockResolvedValue("ok");
-      registerTool("only_in_registry", handler);
+      const privileged = vi.fn().mockResolvedValue("should-not-run");
+      registerTool("privileged_tool", privileged);
 
       fetchSpy
-        .mockResolvedValueOnce(toolCallResponse("c1", "only_in_registry", {}))
-        .mockResolvedValueOnce(finalResponse("final"));
+        .mockResolvedValueOnce(toolCallResponse("c1", "privileged_tool", {}))
+        .mockResolvedValueOnce(finalResponse("done"));
 
       const core = new AiCore();
       core.provider = "openai";
       const result = await core.send("x", { model: "gpt-4o", stream: false });
 
-      expect(handler).toHaveBeenCalled();
-      expect(result).toBe("final");
+      // Handler must never fire — even though the registry had it.
+      expect(privileged).not.toHaveBeenCalled();
+      // The model's tool turn is answered with an "not defined on this send()"
+      // error JSON, the loop continues, and the next turn produces "done".
+      expect(result).toBe("done");
+      const toolMsg = core.messages.find(m => m.role === "tool")!;
+      expect(toolMsg.content).toContain("is not defined on this send()");
       clearToolRegistry();
+    });
+
+    it("core.registerTool でも options.tools 未宣言なら実行されない", async () => {
+      // Same boundary for the per-instance registry (the per-user auth
+      // scoping vehicle). Instance handlers are still gated by the
+      // per-request tools catalog.
+      const { clearToolRegistry } = await import("../src/toolRegistry");
+      clearToolRegistry();
+
+      fetchSpy
+        .mockResolvedValueOnce(toolCallResponse("c1", "instance_only", {}))
+        .mockResolvedValueOnce(finalResponse("done"));
+
+      const core = new AiCore();
+      core.provider = "openai";
+      const instanceHandler = vi.fn().mockResolvedValue("x");
+      core.registerTool("instance_only", instanceHandler);
+
+      const result = await core.send("x", { model: "gpt-4o", stream: false });
+
+      expect(instanceHandler).not.toHaveBeenCalled();
+      expect(result).toBe("done");
+      const toolMsg = core.messages.find(m => m.role === "tool")!;
+      expect(toolMsg.content).toContain("is not defined on this send()");
     });
 
     it("handlerが options にも registry にも無ければエラーJSONで継続する", async () => {

@@ -388,31 +388,44 @@ export class AiCore extends EventTarget {
             detail: { toolCall: { ...call } },
             bubbles: true,
           }));
+          // `options.tools` is the capability boundary for this send(). If
+          // the model emits a call for a name that was not declared, we
+          // refuse to invoke even when a handler exists in the instance /
+          // process registry — otherwise a hallucinated or replayed tool
+          // name could reach a registered handler that the caller never
+          // exposed on this request (e.g. a privileged handler registered
+          // for a different endpoint). The registries exist only to supply
+          // the *handler* for a declaration whose `handler` field was
+          // stripped (remote mode), not to widen the tool catalog.
           const tool = toolsByName.get(call.name);
-          // Handler resolution order: per-call `tool.handler`, then the
-          // instance registry (per-connection authorization boundary), then
-          // the process-wide registry. The instance registry is preferred on
-          // the server because concurrent connections in
-          // `createAuthenticatedWSS.createCores` need closures bound to a
-          // specific user; the process-wide registry is name-keyed and would
-          // let a later connection silently overwrite an earlier one.
-          const handler = tool?.handler
-            ?? this._toolHandlers.get(call.name)
-            ?? getRegisteredTool(call.name);
-          if (!handler) {
-            const reason = tool
-              ? `Tool "${call.name}" has no handler (neither on the options.tools entry, the core's instance registry, nor the process registry).`
-              : `Tool "${call.name}" is not defined on this send() invocation.`;
+          let handler: AiToolHandler | undefined;
+          let reason: string | null = null;
+          if (!tool) {
+            reason = `Tool "${call.name}" is not defined on this send() invocation.`;
+          } else {
+            handler = tool.handler
+              ?? this._toolHandlers.get(call.name)
+              ?? getRegisteredTool(call.name);
+            if (!handler) {
+              reason = `Tool "${call.name}" has no handler (neither on the options.tools entry, the core's instance registry, nor the process registry).`;
+            }
+          }
+          if (reason) {
             const content = JSON.stringify({ error: reason });
+            // Emit the specific reason so consumers can distinguish a
+            // capability-boundary rejection ("not defined on this send()")
+            // from a deployment/config bug ("has no handler"). Collapsing
+            // both into a generic "unknown tool" string hides a security-
+            // relevant signal from observers of the event surface.
             this._target.dispatchEvent(new CustomEvent("hawc-ai:tool-call-completed", {
-              detail: { toolCall: { ...call }, error: `unknown tool: ${call.name}` },
+              detail: { toolCall: { ...call }, error: reason },
               bubbles: true,
             }));
             return { toolCallId: call.id, content };
           }
           try {
             const args = call.arguments ? JSON.parse(call.arguments) : {};
-            const result = await handler(args);
+            const result = await handler!(args);
             const content = typeof result === "string" ? result : JSON.stringify(result ?? null);
             this._target.dispatchEvent(new CustomEvent("hawc-ai:tool-call-completed", {
               detail: { toolCall: { ...call }, result },

@@ -933,6 +933,8 @@ createCores: (user, ws) => {
 
 Resolution order at tool-call time is: per-call `tool.handler` → `core.registerTool()` instance registry → module-level `registerTool()` process registry. Keep the module-level registry for stateless, user-agnostic tools (a pure weather lookup that takes no user context); put anything gated on identity / permissions on the Core instance.
 
+**Both registries are gated by `AiRequestOptions.tools`.** The registry is a *handler* fallback — it never widens the per-request tool catalog. If a model hallucinates or replays a tool name that the current `send()` call did not declare in `options.tools`, the call is answered with a `"not defined on this send() invocation"` error tool message regardless of what is registered. This prevents a privileged registered handler (for example a `delete_account` bound to a different endpoint) from being reachable just because the model produced its name.
+
 #### Authenticated deployments (pair with `<hawc-auth0>`)
 
 A public WebSocket endpoint that dispenses LLM tokens is a direct cost vector. Production deployments should gate the Core on an authenticated handshake. The recommended pattern is to combine `<hawc-auth0>` in remote mode with `createAuthenticatedWSS` from `@wc-bindable/hawc-auth0/server`, and use its `createCores` hook to construct `ServerAiCore` only after token verification:

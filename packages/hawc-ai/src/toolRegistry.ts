@@ -13,6 +13,14 @@
  *
  * The registry is also consulted in local mode as a fallback when a tool
  * declaration omits `handler`, so the same code path works in both modes.
+ *
+ * **Capability boundary.** The registry supplies *handlers* for tools already
+ * declared on `AiRequestOptions.tools` for the current `send()` call — it does
+ * **not** widen the tool catalog. A model that hallucinates or replays a tool
+ * name that the caller did not declare is refused regardless of what the
+ * registry contains. Put another way: `options.tools` names what the model is
+ * allowed to call on this request; the registry only fills in the function
+ * bodies for those declarations when the wire payload could not carry them.
  */
 
 export type AiToolHandler = (args: any) => unknown | Promise<unknown>;
