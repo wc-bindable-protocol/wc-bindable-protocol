@@ -18,6 +18,34 @@ This means chat UIs and AI-powered features can be expressed declaratively, with
 
 **No provider SDK required.** All providers are implemented with `fetch` + `ReadableStream` + SSE parsing. The only runtime dependencies are `@wc-bindable/core` and `@wc-bindable/remote`.
 
+## Table of contents
+
+- [Why this exists](#why-this-exists)
+- [Install](#install)
+- [Supported Providers](#supported-providers)
+- [Quick Start](#quick-start)
+- [State Surface vs Command Surface](#state-surface-vs-command-surface)
+- [Architecture](#architecture)
+- [Headless Usage (Core only)](#headless-usage-core-only)
+- [Conversation History](#conversation-history)
+- [Tool use](#tool-use)
+- [Structured output](#structured-output)
+- [Multimodal](#multimodal)
+- [Abort](#abort)
+- [Programmatic Usage](#programmatic-usage)
+- [Input Validation](#input-validation)
+- [Optional DOM Triggering](#optional-dom-triggering)
+- [Elements](#elements)
+- [wc-bindable-protocol](#wc-bindable-protocol)
+- [Framework Integration](#framework-integration)
+- [Remote Mode](#remote-mode)
+- [Configuration](#configuration)
+- [TypeScript Types](#typescript-types)
+- [Provider Details](#provider-details)
+- [Security](#security)
+- [Design Notes](#design-notes)
+- [License](#license)
+
 ## Why this exists
 
 Building a chat UI requires significant plumbing:
@@ -303,11 +331,26 @@ Providers implement the `IAiProvider` interface, translating between the unified
 
 ```typescript
 interface IAiProvider {
-  buildRequest(messages, options): { url, headers, body };
-  parseResponse(data): { content, usage? };
-  parseStreamChunk(event, data): { delta?, usage?, done } | null;
+  buildRequest(messages: AiMessage[], options: AiRequestOptions): {
+    url: string;
+    headers: Record<string, string>;
+    body: string;
+  };
+  parseResponse(data: any): {
+    content: string;
+    toolCalls?: AiToolCall[];   // populated when the model requested tool use
+    usage?: AiUsage;
+  };
+  parseStreamChunk(event: string | undefined, data: string): {
+    delta?: string;
+    usage?: Partial<AiUsage>;
+    toolCallDeltas?: AiToolCallDelta[];   // accumulated by AiCore across chunks
+    done: boolean;
+  } | null;
 }
 ```
+
+Tool use, structured output, and multimodal input all flow through the same three methods — `buildRequest` reads the extra `AiRequestOptions` fields (`tools`, `toolChoice`, `responseSchema`, array `content` on user messages), `parseResponse` / `parseStreamChunk` emit `toolCalls` / `toolCallDeltas` when the provider returned them. Custom providers that only need plain text can leave the optional fields undefined.
 
 `AzureOpenAiProvider` extends `OpenAiProvider`, overriding only `buildRequest` for Azure-specific URL and header construction.
 
@@ -449,6 +492,22 @@ Tool-use events are dispatched on the element but are **not** part of the `wc-bi
 - **`maxToolRoundtrips` exceeded.** `send()` resolves to `null`, `el.error` is set to an `Error`, and the messages pushed by this call are rolled back. Subsequent calls start fresh.
 - **Abort.** `abort()` during a tool handler await or between turns rolls back this send's messages cleanly.
 
+### `content` state across tool-use rounds
+
+Each tool-use round resets `content` to `""` and streams the new assistant turn into it, so `content` only ever reflects the **current** round's text. Prior-round text lives in `messages` as `{ role: "assistant", content, toolCalls }` entries; consume `messages` if you need to render the full running transcript. At `send()` resolution `content` holds the final (terminal) assistant turn — tool-calling intermediary turns are only visible through `messages`.
+
+### Handler reentrance
+
+Tool handlers must **not** call `el.send()` / `core.send()` on the same instance. A new `send()` call aborts the in-flight request (same rule as everywhere else in the API), which on the same instance would tear down the very tool-use loop awaiting the handler's return. Use a **separate** `AiCore` / `<hawc-ai>` for nested inference from within a handler; plain `fetch` / non-AI work inside a handler is fine.
+
+### `AiToolCall.arguments` is the raw JSON string
+
+The unified `AiToolCall` shape preserves the wire JSON string (same as OpenAI's `tool_calls[].function.arguments`) rather than a parsed object, so the value is stable across providers and re-serializable. **The tool handler always receives parsed `args`** — the library calls `JSON.parse` before invoking the handler — but if you read `el.messages[*].toolCalls` directly (logging, audit), call `JSON.parse(toolCall.arguments)` yourself.
+
+### Why streaming differs between tool use and structured output
+
+Tool-call arguments are accumulated across `input_json_delta` / incremental `tool_calls` deltas and **parsed once** at the end of the turn, so streaming is safe. Structured output's final response is rendered into `content` chunk-by-chunk and the intermediate buffer is **invalid JSON** (`{"rating": 5, "summa...`), which is why the Anthropic emulation forces non-streaming: unwrapping a synthetic `tool_use` from streamed content blocks would produce exactly that mid-flight partial string with no clean completion signal for consumers. OpenAI/Azure/Google preserve streaming for structured output because the provider guarantees the accumulated text is valid JSON by stream end.
+
 ### Provider wire formats
 
 | Provider | Request | Response | Role for tool results |
@@ -481,7 +540,14 @@ Pass a JSON Schema via `AiRequestOptions.responseSchema` (or `el.responseSchema`
 - **Mutually exclusive with `tools`.** Both set → synchronous throw. Use either structured output *or* tool use in a single turn, not both. (Tool handlers returning schema-shaped objects cover the multi-step case.)
 - **`responseSchema` must be a plain object.** Arrays, strings, or null throw synchronously.
 - **Streaming semantics.** OpenAI/Azure/Google streaming works as usual — text deltas arrive as normal, the accumulated content is valid JSON at stream end. Anthropic forces non-streaming; the response arrives in one non-stream fetch.
+- **Intermediate `content` during streaming is NOT valid JSON.** Bindings that observe `content` on every delta will see fragments like `{"rating": 5, "summa` and must **not** call `JSON.parse()` until `streaming` transitions back to `false` (or `loading`, whichever you prefer) — only then is the accumulated buffer a complete JSON document. For UI that shows raw JSON streaming in, render as text until done; for UI that shows typed fields, wait for completion before parsing.
 - **No schema validation.** The library does not validate the returned content against `responseSchema`. Providers enforce it on their side; if they return invalid JSON, `JSON.parse()` will throw in your code. Pair with a validator (Zod, Ajv, etc.) if you need defensive parsing.
+- **Cross-provider schema portability is not guaranteed.** Each provider enforces a different subset of JSON Schema:
+  - **OpenAI / Azure** always send `strict: true`. In strict mode, every property must appear in `required`, `additionalProperties: false` is mandatory at every level, and features like `$ref`, `oneOf`, `anyOf`, `allOf`, `pattern`, and `format` are either forbidden or ignored. A schema that works without `strict` may return `400` here.
+  - **Google (Gemini)** accepts an OpenAPI 3.0 schema subset — `$ref`, `oneOf`, and some numeric/string format validators are not supported.
+  - **Anthropic** passes the schema through as a tool `input_schema`, which is looser (the model, not a validator, enforces shape).
+  The same `responseSchema` is not guaranteed to work unchanged across all four providers; validate on the provider you target, and keep schemas conservative if you plan to swap providers at runtime.
+- **`responseSchemaName` default.** When omitted or explicitly `undefined`, the library falls back to `"response"` for providers that require a name (OpenAI's `json_schema.name`). Passing an empty string is **not** special-cased — OpenAI will reject it.
 
 ## Multimodal
 
@@ -524,6 +590,33 @@ await el.send();
 | Anthropic | `{ type: "text", text }` | `{ type: "image", source: { type: "url", url } }` | `{ type: "image", source: { type: "base64", media_type, data } }` |
 | Google (Gemini) | `{ text }` | **Throws** at `buildRequest` — fetch + encode first | `{ inlineData: { mimeType, data } }` |
 
+### `mediaType` resolution
+
+| Input URL shape | How `mediaType` is resolved |
+|---|---|
+| `data:image/png;base64,...` | Parsed from the data: URL header. The optional `mediaType` field overrides when set. |
+| `https://...` on OpenAI / Azure | **Not used** — the URL is passed through to `image_url.url` as-is; the provider infers the media type from the URL / response headers. |
+| `https://...` on Anthropic | **Not used on the client** — sent as `source: { type: "url", url }` and the provider fetches and inspects the bytes server-side. Requires `anthropic-version: 2023-06-01` (the version this library pins) or newer; on older versions only base64 image sources were accepted. |
+| `https://...` on Google (Gemini) | **Rejected** at `buildRequest` — Gemini's `inlineData` takes bytes, not URLs. |
+
+You only need to supply `mediaType` explicitly when the URL alone cannot reveal it (rare — most CDNs serve images with a correct content type).
+
+### Provider size and count limits
+
+The library does **not** enforce provider-side image limits — a too-large or too-many image payload fails at request time with a provider 4xx. Rough current caps to size prompts against:
+
+| Provider | Per-image size | Count per request |
+|---|---|---|
+| OpenAI / Azure | ~20 MB (total request payload limit applies) | many, but request-size-bounded |
+| Anthropic | 5 MB per image | up to ~100 images |
+| Google (Gemini) | ~20 MB `inlineData` (base64 expansion factor included — the raw bytes must fit under the provider's total request payload cap) | many |
+
+Confirm on the provider's own documentation before relying on exact numbers; the limits above drift faster than library releases.
+
+### `detail` / image-cost tuning is not exposed in v1
+
+OpenAI's `image_url.detail` (`"low"` / `"high"` / `"auto"`) and equivalent knobs on other providers are not reachable through `AiContentPart`. If you need to control per-image token cost, wrap the proxy response / extend the provider — this surface may gain a `detail?: "low" | "high" | "auto"` field additively in a later minor release.
+
 ### Scope and constraints
 
 - **v1 = user-message images only.** Assistant/system/tool messages with array content are flattened to concatenated text; only `user` messages carry mixed parts on the wire.
@@ -541,6 +634,18 @@ aiEl.abort(); // Cancels streaming or pending request
 ```
 
 A new `send()` call automatically aborts any previous request.
+
+### What stays in state after abort
+
+- **`messages`** — rolled back. The `{ role: "user", ... }` push from the aborted `send()` (and any tool-result / intermediate assistant turns from a tool-use loop) is removed so retry sees a clean history.
+- **`content`** — **left as the partial assistant text accumulated up to the abort point.** It is not cleared. The next `send()` resets it on the first delta of the new turn. If you want abort to clear the visible response immediately, observe the `loading` → `false` transition and wipe the bound view yourself.
+- **`loading` / `streaming`** — both reset to `false`.
+- **`usage`** — kept at whatever the partial stream reported (it is reset to `null` at the start of the next `send()`).
+- **`error`** — not set. Aborts are treated as a normal control-flow signal, not a failure. `send()` resolves to `null`.
+
+### Retry and backoff
+
+`<hawc-ai>` does **not** retry failed requests, apply exponential backoff, or rate-limit on its own. Provider 4xx/5xx surface as `el.error` with the raw status — the consumer decides whether to retry, switch model, surface to the user, or queue for later. Retry policy belongs at the proxy layer (where you can apply per-tenant quotas) or in framework state (where you can debounce against UI intent), not inside the I/O primitive.
 
 ## Programmatic Usage
 
@@ -617,7 +722,7 @@ Event delegation is used — works with dynamically added elements.
 | `toolChoice` | `"auto" \| "none" \| { name } \| undefined` | Tool-use mode (JS property only) |
 | `maxToolRoundtrips` | `number \| undefined` | Roundtrip cap for tool-use loop (JS property only) |
 | `responseSchema` | `Record<string, any> \| null` | JSON Schema for structured output (JS property only) |
-| `responseSchemaName` | `string \| undefined` | Name tag for providers that accept one (JS property only) |
+| `responseSchemaName` | `string \| undefined` | Name tag for providers that accept one (default `"response"` when undefined; JS property only) |
 
 | Method | Description |
 |--------|-------------|
@@ -633,7 +738,15 @@ Declarative prompt content. Two use cases in a single element:
 | `system` (default) | Becomes `options.system` for every `send()`. If the `system` attribute is set on `<hawc-ai>`, that attribute wins and this element is ignored. Only the first such child is used. |
 | `user` / `assistant` | Seeded into `messages` at `connectedCallback` time as a **few-shot template**. All such children are collected in document order. Seeding is skipped if `messages` was set programmatically before connect, or in remote mode (the server owns conversation state). |
 
-The message content is taken from the element's text content. Shadow DOM suppresses rendering. Whitespace-only children are skipped during seeding.
+The message content is taken from the element's text content with `String.prototype.trim()` applied — leading/trailing whitespace and indentation newlines from HTML authoring are stripped, so `<hawc-ai-message>\n  Hello\n</hawc-ai-message>` seeds `"Hello"`. If you need literal trailing whitespace in a few-shot example, set `messages` programmatically instead. Shadow DOM suppresses rendering. Whitespace-only children are skipped during seeding.
+
+**Ordering contract.** On `connectedCallback`, children are walked once in **document order**. The first `role="system"` child (or a role-less child) becomes `options.system`; all `role="user"` / `role="assistant"` children are concatenated into the seed `messages` array in the order they appear. System and user/assistant children can therefore be interleaved in markup without affecting the seeded conversation — the system-prompt and history channels are independent.
+
+**Dynamic `<hawc-ai-message>` additions after connect are not re-seeded.** Seeding runs once, right after `connectedCallback` in a microtask (so children constructed imperatively before `appendChild` have time to upgrade). Children added after that point are ignored — to grow a few-shot template dynamically, push directly to `el.messages`:
+
+```js
+el.messages = [...el.messages, { role: "user", content: "..." }, { role: "assistant", content: "..." }];
+```
 
 ```html
 <!-- System prompt only -->
