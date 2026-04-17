@@ -40,6 +40,7 @@ No peer dependencies required.
 | OpenAI | `"openai"` | `https://api.openai.com` | [platform.openai.com/docs/models](https://platform.openai.com/docs/models) |
 | Anthropic | `"anthropic"` | `https://api.anthropic.com` | [docs.anthropic.com/en/docs/about-claude/models](https://docs.anthropic.com/en/docs/about-claude/models) |
 | Azure OpenAI | `"azure-openai"` | (required via `base-url`) | [learn.microsoft.com/.../openai/concepts/models](https://learn.microsoft.com/en-us/azure/ai-services/openai/concepts/models) |
+| Google (Gemini) | `"google"` | `https://generativelanguage.googleapis.com` | [ai.google.dev/gemini-api/docs/models](https://ai.google.dev/gemini-api/docs/models) |
 
 `<hawc-ai>` intentionally does **not** ship a default model per provider. Model identifiers drift faster than library releases, pricing tiers vary per account, and "latest" is not well-defined (e.g. `gpt-4o` vs `gpt-4.1` vs `o3` are different trade-offs, not versions of one thing). Pick the current model name from the catalog above for your target provider and set it via the `model` attribute or property.
 
@@ -126,7 +127,20 @@ Any OpenAI-compatible API works by setting `base-url`.
 
 The URL is constructed as `{base-url}/openai/deployments/{model}/chat/completions?api-version={api-version}`. In production, `base-url` points to your proxy, which forwards to `https://<resource>.openai.azure.com` with the server-held `api-key`. For local development only, you can point directly at the Azure resource and set `api-key="..."` — the same DOM-exposure caveat as any other provider applies.
 
-### 6. Development-only: API key on the element
+### 6. Google (Gemini)
+
+```html
+<hawc-ai
+  provider="google"
+  model="gemini-2.5-flash"
+  base-url="/api/gemini">
+  <hawc-ai-message role="system">You are a concise coding assistant.</hawc-ai-message>
+</hawc-ai>
+```
+
+System messages are extracted and placed in the top-level `systemInstruction` field. The assistant turn uses the role `model` on the wire — `<hawc-ai>` translates to/from `assistant` automatically so `messages` state stays consistent with the other providers. Gemini support is currently **text-only**; multi-modal `parts` (images, audio, video) are not exposed through `AiMessage`.
+
+### 7. Development-only: API key on the element
 
 For local prototyping you can put the key directly on the element. It is visible in the DOM, the network panel, and any framework state bound to the element. **Never ship this shape to production** — switch to section 1 (backend proxy) or [Remote Mode](#remote-mode) before deploying:
 
@@ -161,7 +175,7 @@ These properties control inference execution:
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `provider` | `"openai" \| "anthropic" \| "azure-openai"` | Provider selection |
+| `provider` | `"openai" \| "anthropic" \| "azure-openai" \| "google"` | Provider selection |
 | `model` | `string` | Model name (or Azure deployment name) |
 | `base-url` | `string` | API endpoint (for proxies, local models, Azure) |
 | `api-key` | `string` | API key (development only — use a backend proxy in production) |
@@ -344,7 +358,7 @@ console.log(aiEl.streaming);  // false
 |--------|----------|----------|
 | `temperature` | any finite `number` | `NaN`, `±Infinity` |
 | `max-tokens` / `maxTokens` | positive integer (`>= 1`) | `0`, negative, `NaN`, non-integer (e.g. `1.5`) |
-| `provider` (attribute) | `"openai" \| "anthropic" \| "azure-openai"` | anything else |
+| `provider` (attribute) | `"openai" \| "anthropic" \| "azure-openai" \| "google"` | anything else |
 
 Behavior on invalid input:
 
@@ -370,7 +384,7 @@ Event delegation is used — works with dynamically added elements.
 
 | Attribute | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `provider` | `string` | — | `"openai"`, `"anthropic"`, or `"azure-openai"` |
+| `provider` | `string` | — | `"openai"`, `"anthropic"`, `"azure-openai"`, or `"google"` |
 | `model` | `string` | — | Model name or Azure deployment name |
 | `base-url` | `string` | — | API endpoint URL |
 | `api-key` | `string` | — | API key (development only) |
@@ -775,6 +789,16 @@ interface WcsAiValues extends WcsAiCoreValues {
 - Auth: `api-key: {api-key}`
 - Request/response format: same as OpenAI (inherits `parseResponse` and `parseStreamChunk`)
 
+### Google (Gemini)
+
+- Endpoint: `{base-url}/v1beta/models/{model}:generateContent` (non-stream) or `:streamGenerateContent?alt=sse` (stream)
+- Auth: `x-goog-api-key: {api-key}`
+- Role translation: `assistant` → `model` on request; Gemini's `model` role is parsed back to `assistant` on response
+- System: extracted from messages and placed in top-level `systemInstruction.parts[].text`
+- Streaming: SSE with `data: {...}` JSON chunks; terminal chunk carries `candidates[0].finishReason` (e.g. `STOP`, `MAX_TOKENS`, `SAFETY`) and is signalled as `done`
+- Usage: `usageMetadata.promptTokenCount` / `candidatesTokenCount` / `totalTokenCount`
+- Scope: text-only. Multi-modal `parts` (images, audio, video) are not currently supported — `AiMessage.content` is `string`. Vertex AI (OAuth, region-specific endpoints) is out of scope; point `base-url` at a proxy if you need it.
+
 ## Security
 
 > The `api-key` attribute is exposed in the DOM and is intended for **development and prototyping only**.
@@ -799,6 +823,7 @@ interface WcsAiValues extends WcsAiCoreValues {
 - `messages` is both readable (output state) and writable (for history reset/restore)
 - `system` attribute takes priority over `<hawc-ai-message role="system">`
 - Anthropic's `max_tokens` defaults to 4096 if not specified
+- Google (Gemini) uses distinct endpoints for streaming (`:streamGenerateContent?alt=sse`) vs non-streaming (`:generateContent`); the `assistant` role is translated to `model` on the wire; stream end is signalled by `candidates[0].finishReason` rather than a `[DONE]` sentinel; currently text-only (no multi-modal `parts`)
 - no provider SDK required — all providers use `fetch` + `ReadableStream` + SSE parsing directly
 
 ## License

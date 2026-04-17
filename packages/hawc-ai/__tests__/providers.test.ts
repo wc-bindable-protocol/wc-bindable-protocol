@@ -2,6 +2,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { OpenAiProvider } from "../src/providers/OpenAiProvider";
 import { AnthropicProvider } from "../src/providers/AnthropicProvider";
 import { AzureOpenAiProvider } from "../src/providers/AzureOpenAiProvider";
+import { GoogleProvider } from "../src/providers/GoogleProvider";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -520,6 +521,249 @@ describe("AzureOpenAiProvider", () => {
     it("OpenAIと同じストリーム形式を処理する", () => {
       const result = provider.parseStreamChunk(undefined, "[DONE]");
       expect(result).toEqual({ done: true });
+    });
+  });
+});
+
+describe("GoogleProvider", () => {
+  const provider = new GoogleProvider();
+
+  describe("buildRequest", () => {
+    it("デフォルトbaseUrlとstreamGenerateContent?alt=sseを使う", () => {
+      const req = provider.buildRequest(
+        [{ role: "user", content: "Hello" }],
+        { model: "gemini-2.5-flash", apiKey: "goog-key" }
+      );
+      expect(req.url).toBe("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse");
+      expect(req.headers["x-goog-api-key"]).toBe("goog-key");
+      expect(req.headers["Content-Type"]).toBe("application/json");
+      const body = JSON.parse(req.body);
+      expect(body.contents).toEqual([{ role: "user", parts: [{ text: "Hello" }] }]);
+      expect(body.model).toBeUndefined();
+    });
+
+    it("stream=falseではgenerateContentエンドポイントを使う", () => {
+      const req = provider.buildRequest(
+        [{ role: "user", content: "Hi" }],
+        { model: "gemini-2.5-flash", stream: false }
+      );
+      expect(req.url).toBe("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent");
+    });
+
+    it("assistantロールをmodelに翻訳する", () => {
+      const req = provider.buildRequest(
+        [
+          { role: "user", content: "Hi" },
+          { role: "assistant", content: "Hello back" },
+          { role: "user", content: "How are you?" },
+        ],
+        { model: "gemini-2.5-flash" }
+      );
+      const body = JSON.parse(req.body);
+      expect(body.contents).toEqual([
+        { role: "user", parts: [{ text: "Hi" }] },
+        { role: "model", parts: [{ text: "Hello back" }] },
+        { role: "user", parts: [{ text: "How are you?" }] },
+      ]);
+    });
+
+    it("systemメッセージをsystemInstructionに分離する", () => {
+      const req = provider.buildRequest(
+        [
+          { role: "system", content: "You are helpful" },
+          { role: "user", content: "Hi" },
+        ],
+        { model: "gemini-2.5-flash" }
+      );
+      const body = JSON.parse(req.body);
+      expect(body.systemInstruction).toEqual({ parts: [{ text: "You are helpful" }] });
+      expect(body.contents).toEqual([{ role: "user", parts: [{ text: "Hi" }] }]);
+    });
+
+    it("複数のsystemメッセージを結合する", () => {
+      const req = provider.buildRequest(
+        [
+          { role: "system", content: "First" },
+          { role: "system", content: "Second" },
+          { role: "user", content: "Hi" },
+        ],
+        { model: "gemini-2.5-flash" }
+      );
+      const body = JSON.parse(req.body);
+      expect(body.systemInstruction).toEqual({ parts: [{ text: "First\n\nSecond" }] });
+    });
+
+    it("systemメッセージがない場合はsystemInstructionを含まない", () => {
+      const req = provider.buildRequest(
+        [{ role: "user", content: "Hi" }],
+        { model: "gemini-2.5-flash" }
+      );
+      const body = JSON.parse(req.body);
+      expect(body.systemInstruction).toBeUndefined();
+    });
+
+    it("temperature/maxTokensをgenerationConfigに格納する", () => {
+      const req = provider.buildRequest(
+        [{ role: "user", content: "Hi" }],
+        { model: "gemini-2.5-flash", temperature: 0.5, maxTokens: 1000 }
+      );
+      const body = JSON.parse(req.body);
+      expect(body.generationConfig).toEqual({ temperature: 0.5, maxOutputTokens: 1000 });
+    });
+
+    it("temperatureとmaxTokensが両方未設定ならgenerationConfigを含まない", () => {
+      const req = provider.buildRequest(
+        [{ role: "user", content: "Hi" }],
+        { model: "gemini-2.5-flash" }
+      );
+      const body = JSON.parse(req.body);
+      expect(body.generationConfig).toBeUndefined();
+    });
+
+    it("apiKey未設定時はx-goog-api-keyヘッダーを含まない", () => {
+      const req = provider.buildRequest(
+        [{ role: "user", content: "Hi" }],
+        { model: "gemini-2.5-flash" }
+      );
+      expect(req.headers["x-goog-api-key"]).toBeUndefined();
+    });
+
+    it("カスタムbaseUrlを使用できる", () => {
+      const req = provider.buildRequest(
+        [{ role: "user", content: "Hi" }],
+        { model: "gemini-2.5-flash", baseUrl: "/api/gemini", stream: false }
+      );
+      expect(req.url).toBe("/api/gemini/v1beta/models/gemini-2.5-flash:generateContent");
+    });
+
+    it("無効なtemperature/maxTokensはエラーをスローする", () => {
+      expect(() => provider.buildRequest(
+        [{ role: "user", content: "Hi" }],
+        { model: "gemini-2.5-flash", temperature: NaN }
+      )).toThrow(/temperature must be a finite number/);
+      for (const invalid of [0, -1, 1.5]) {
+        expect(() => provider.buildRequest(
+          [{ role: "user", content: "Hi" }],
+          { model: "gemini-2.5-flash", maxTokens: invalid }
+        )).toThrow(/maxTokens must be a positive integer/);
+      }
+    });
+  });
+
+  describe("parseResponse", () => {
+    it("candidatesからcontentとusageを抽出する", () => {
+      const result = provider.parseResponse({
+        candidates: [{
+          content: { role: "model", parts: [{ text: "Hello!" }] },
+          finishReason: "STOP",
+        }],
+        usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5, totalTokenCount: 15 },
+      });
+      expect(result.content).toBe("Hello!");
+      expect(result.usage).toEqual({ promptTokens: 10, completionTokens: 5, totalTokens: 15 });
+    });
+
+    it("複数のtext partsを結合する", () => {
+      const result = provider.parseResponse({
+        candidates: [{
+          content: { parts: [{ text: "Hello " }, { text: "world!" }] },
+        }],
+      });
+      expect(result.content).toBe("Hello world!");
+    });
+
+    it("text以外のpartsを無視する", () => {
+      const result = provider.parseResponse({
+        candidates: [{
+          content: { parts: [
+            { text: "Before " },
+            { inlineData: { mimeType: "image/png", data: "..." } },
+            { text: "after" },
+          ] },
+        }],
+      });
+      expect(result.content).toBe("Before after");
+    });
+
+    it("usageMetadataがない場合はusage=undefined", () => {
+      const result = provider.parseResponse({
+        candidates: [{ content: { parts: [{ text: "Hi" }] } }],
+      });
+      expect(result.usage).toBeUndefined();
+    });
+
+    it("空のレスポンスを処理できる", () => {
+      const result = provider.parseResponse({});
+      expect(result.content).toBe("");
+    });
+
+    it("usageの値が0の場合も処理する", () => {
+      const result = provider.parseResponse({
+        candidates: [{ content: { parts: [{ text: "Hi" }] } }],
+        usageMetadata: { promptTokenCount: 0, candidatesTokenCount: 0, totalTokenCount: 0 },
+      });
+      expect(result.usage).toEqual({ promptTokens: 0, completionTokens: 0, totalTokens: 0 });
+    });
+
+    it("totalTokenCountがない場合はprompt+completionから算出する", () => {
+      const result = provider.parseResponse({
+        candidates: [{ content: { parts: [{ text: "Hi" }] } }],
+        usageMetadata: { promptTokenCount: 7, candidatesTokenCount: 3 },
+      });
+      expect(result.usage).toEqual({ promptTokens: 7, completionTokens: 3, totalTokens: 10 });
+    });
+  });
+
+  describe("parseStreamChunk", () => {
+    it("通常チャンクからdeltaを抽出し、finishReasonなしならdone=false", () => {
+      const result = provider.parseStreamChunk(undefined,
+        '{"candidates":[{"content":{"parts":[{"text":"Hello"}]}}]}'
+      );
+      expect(result).toEqual({ delta: "Hello", usage: undefined, done: false });
+    });
+
+    it("finishReason付きチャンクでdone=trueを返す", () => {
+      const result = provider.parseStreamChunk(undefined,
+        '{"candidates":[{"content":{"parts":[{"text":"!"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}'
+      );
+      expect(result?.delta).toBe("!");
+      expect(result?.done).toBe(true);
+      expect(result?.usage).toEqual({ promptTokens: 10, completionTokens: 5, totalTokens: 15 });
+    });
+
+    it("MAX_TOKENSなどSTOP以外のfinishReasonでもdone=trueになる", () => {
+      const result = provider.parseStreamChunk(undefined,
+        '{"candidates":[{"content":{"parts":[]},"finishReason":"MAX_TOKENS"}]}'
+      );
+      expect(result?.done).toBe(true);
+    });
+
+    it("usageMetadata単独チャンクを処理する", () => {
+      const result = provider.parseStreamChunk(undefined,
+        '{"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}'
+      );
+      expect(result?.usage).toEqual({ promptTokens: 10, completionTokens: 5, totalTokens: 15 });
+      expect(result?.done).toBe(false);
+    });
+
+    it("不正なJSONでnullを返す", () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const result = provider.parseStreamChunk(undefined, "not json");
+      expect(result).toBeNull();
+      expect(warnSpy).toHaveBeenCalledWith(
+        "[@wc-bindable/hawc-ai] Failed to parse stream chunk.",
+        expect.objectContaining({
+          provider: "google",
+          event: undefined,
+          data: "not json",
+          error: expect.any(SyntaxError),
+        })
+      );
+    });
+
+    it("candidatesがない場合でもdeltaをundefinedにしてdone=false", () => {
+      const result = provider.parseStreamChunk(undefined, "{}");
+      expect(result).toEqual({ delta: undefined, usage: undefined, done: false });
     });
   });
 });

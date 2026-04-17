@@ -5,6 +5,7 @@ export { Ai as WcsAi } from "./components/Ai.js";
 export { OpenAiProvider } from "./providers/OpenAiProvider.js";
 export { AnthropicProvider } from "./providers/AnthropicProvider.js";
 export { AzureOpenAiProvider } from "./providers/AzureOpenAiProvider.js";
+export { GoogleProvider } from "./providers/GoogleProvider.js";
 
 export type {
   IWritableConfig, IWritableTagNames, IWritableRemoteConfig, IAiProvider,

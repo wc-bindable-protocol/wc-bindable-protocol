@@ -93,6 +93,12 @@ describe("AiCore", () => {
       expect(core.provider).not.toBeNull();
     });
 
+    it("文字列でプロバイダを設定できる (google)", () => {
+      const core = new AiCore();
+      core.provider = "google";
+      expect(core.provider).not.toBeNull();
+    });
+
     it("カスタムプロバイダオブジェクトを設定できる", () => {
       const core = new AiCore();
       const custom = {
@@ -936,6 +942,46 @@ describe("AiCore", () => {
 
       expect(result).toBe("Hello from Claude");
       expect(core.usage).toEqual({ promptTokens: 25, completionTokens: 10, totalTokens: 35 });
+    });
+
+    it("Googleプロバイダでストリーミングできる", async () => {
+      const chunks = [
+        sseData('{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]}}]}'),
+        sseData('{"candidates":[{"content":{"parts":[{"text":" from Gemini"}]}}]}'),
+        sseData('{"candidates":[{"content":{"parts":[]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":7,"totalTokenCount":19}}'),
+      ];
+      fetchSpy.mockResolvedValueOnce(createMockStreamResponse(chunks));
+
+      const core = new AiCore();
+      core.provider = "google";
+      const result = await core.send("Hi", { model: "gemini-2.5-flash" });
+
+      expect(result).toBe("Hello from Gemini");
+      expect(core.usage).toEqual({ promptTokens: 12, completionTokens: 7, totalTokens: 19 });
+
+      // buildRequest が streamGenerateContent?alt=sse を叩いていることも確認
+      const [url] = fetchSpy.mock.calls[0];
+      expect(url).toBe("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse");
+    });
+
+    it("Googleプロバイダで非ストリーミングリクエストを送信できる", async () => {
+      fetchSpy.mockResolvedValueOnce(createMockResponse({
+        candidates: [{
+          content: { role: "model", parts: [{ text: "Non-streamed reply" }] },
+          finishReason: "STOP",
+        }],
+        usageMetadata: { promptTokenCount: 4, candidatesTokenCount: 3, totalTokenCount: 7 },
+      }));
+
+      const core = new AiCore();
+      core.provider = "google";
+      const result = await core.send("Hi", { model: "gemini-2.5-flash", stream: false });
+
+      expect(result).toBe("Non-streamed reply");
+      expect(core.usage).toEqual({ promptTokens: 4, completionTokens: 3, totalTokens: 7 });
+
+      const [url] = fetchSpy.mock.calls[0];
+      expect(url).toBe("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent");
     });
 
     it("末尾の空行なしで閉じたストリームでも最後のdeltaが反映される", async () => {

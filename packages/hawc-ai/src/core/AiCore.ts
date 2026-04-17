@@ -6,13 +6,15 @@ import { SseParser } from "../streaming/SseParser.js";
 import { OpenAiProvider } from "../providers/OpenAiProvider.js";
 import { AnthropicProvider } from "../providers/AnthropicProvider.js";
 import { AzureOpenAiProvider } from "../providers/AzureOpenAiProvider.js";
+import { GoogleProvider } from "../providers/GoogleProvider.js";
 
 function resolveProvider(name: string): IAiProvider {
   switch (name) {
     case "openai": return new OpenAiProvider();
     case "anthropic": return new AnthropicProvider();
     case "azure-openai": return new AzureOpenAiProvider();
-    default: raiseError(`Unknown provider: "${name}". Use "openai", "anthropic", or "azure-openai".`);
+    case "google": return new GoogleProvider();
+    default: raiseError(`Unknown provider: "${name}". Use "openai", "anthropic", "azure-openai", or "google".`);
   }
 }
 
