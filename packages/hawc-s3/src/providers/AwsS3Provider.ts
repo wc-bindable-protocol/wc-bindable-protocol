@@ -230,7 +230,17 @@ export class AwsS3Provider implements IS3Provider {
       const message = extractTag(xml, "Message") ?? "";
       raiseError(`completeMultipart S3 error: ${code} ${message}`);
     }
-    const rawEtag = extractTag(xml, "ETag") ?? "";
+    const rawEtag = extractTag(xml, "ETag");
+    if (rawEtag === null || rawEtag === "") {
+      // The 200-without-<Error> path is the "success" path per the S3 spec,
+      // but an S3-compatible implementation or a misbehaving proxy can
+      // return a malformed body that neither signals an error nor contains
+      // an ETag. Treating that as success (etag: "") lets the upload pass
+      // completion, silently breaks any integrity check downstream, and
+      // corrupts the metadata the registerPostProcess hook hands to the
+      // database. Fail loudly instead; the caller can retry or abort.
+      raiseError(`completeMultipart returned no ETag: ${xml}`);
+    }
     const etag = rawEtag.replace(/^"|"$/g, "");
     return { etag };
   }

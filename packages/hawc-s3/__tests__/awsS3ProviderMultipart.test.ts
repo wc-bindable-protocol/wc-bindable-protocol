@@ -107,6 +107,30 @@ describe("AwsS3Provider multipart", () => {
       .rejects.toThrow(/at least one part/);
   });
 
+  it("completeMultipart rejects a 200 response with no <ETag> tag", async () => {
+    // An S3-compatible implementation (or a misbehaving proxy) can return
+    // 200 without an `<Error>` body AND without an `<ETag>` tag. The old
+    // code silently coerced the missing tag to "" and reported success,
+    // which let the upload pass completion with a blank ETag — corrupting
+    // every downstream integrity check and every post-process hook that
+    // trusts `ctx.etag`. The caller must see this as a failure.
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(mockResponse(
+      `<CompleteMultipartUploadResult><Bucket>b</Bucket><Key>k</Key></CompleteMultipartUploadResult>`
+    ));
+    await expect(newProvider().completeMultipart("k", "U", [{ partNumber: 1, etag: "a" }], { bucket: "b" }))
+      .rejects.toThrow(/no ETag/);
+  });
+
+  it("completeMultipart rejects a 200 response with an empty <ETag> tag", async () => {
+    // `extractTag` matches `<ETag></ETag>` and returns "". That degenerate
+    // form must fail for the same reason a missing tag does.
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(mockResponse(
+      `<CompleteMultipartUploadResult><ETag></ETag></CompleteMultipartUploadResult>`
+    ));
+    await expect(newProvider().completeMultipart("k", "U", [{ partNumber: 1, etag: "a" }], { bucket: "b" }))
+      .rejects.toThrow(/no ETag/);
+  });
+
   it("abortMultipart DELETEs <key>?uploadId=<id> and tolerates 404", async () => {
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(mockResponse("", 404));
     await expect(newProvider().abortMultipart("k", "U", { bucket: "b" })).resolves.toBeUndefined();

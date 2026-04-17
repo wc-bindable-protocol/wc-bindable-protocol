@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { retryWithBackoff, defaultPutRetryPolicy, PutHttpError } from "../src/retry";
+import { retryWithBackoff, defaultPutRetryPolicy, PutHttpError, MissingEtagError } from "../src/retry";
 
 describe("retryWithBackoff", () => {
   it("returns the result on first success without sleeping", async () => {
@@ -132,5 +132,13 @@ describe("defaultPutRetryPolicy", () => {
 
   it("retries network-level Errors (no status)", () => {
     expect(defaultPutRetryPolicy(new Error("network down"))).toBe(true);
+  });
+
+  it("does NOT retry MissingEtagError (configuration, not transient)", () => {
+    // A 2xx PUT with no ETag means either CORS is hiding the header or the
+    // server does not emit one. Both are configuration issues — retrying
+    // will not produce an ETag, so looping through the entire retry budget
+    // just delays the failure surface with no benefit.
+    expect(defaultPutRetryPolicy(new MissingEtagError("no ETag"))).toBe(false);
   });
 });

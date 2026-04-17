@@ -401,6 +401,15 @@ Browser-side PUTs hit `https://<bucket>.s3.<region>.amazonaws.com` directly, so 
 
 `ExposeHeaders: ["ETag"]` is required — both the single-PUT and multipart paths read each PUT's `ETag` header and forward it to the server. (Initiate / Complete / Abort happen server-side and do **not** need browser CORS.)
 
+A 2xx PUT whose response has no visible `ETag` is treated as a hard failure
+(`MissingEtagError`) and is **not** retried — the two realistic causes
+(missing `ExposeHeaders` on CORS, or an S3-compatible server that does not
+emit ETag) are both configuration issues that retrying cannot fix. This
+applies uniformly to both the single PUT path (failing before `complete()`)
+and the per-part PUT path (failing before `completeMultipart()`), so the
+completion call and the `registerPostProcess` hook never see an empty etag
+— silent data corruption is no longer possible.
+
 ## S3-compatible stores
 
 `AwsS3Provider` accepts `endpoint` and `forcePathStyle` for R2, MinIO, Wasabi, etc.:

@@ -4,7 +4,7 @@ import {
   MultipartInit, MultipartPart, MultipartPartUrl,
 } from "../types.js";
 import { S3Core } from "../core/S3Core.js";
-import { retryWithBackoff, defaultPutRetryPolicy, PutHttpError } from "../retry.js";
+import { retryWithBackoff, defaultPutRetryPolicy, PutHttpError, MissingEtagError } from "../retry.js";
 import {
   createRemoteCoreProxy,
   WebSocketClientTransport,
@@ -121,11 +121,42 @@ export class S3 extends HTMLElement {
         `[@wc-bindable/hawc-s3] WebSocket connection ${opened ? "lost" : "failed"}: ${url}`
       ));
       this._resetRemoteBusyState();
+      // Tear the remote machinery down in place. Without this, `_proxy`
+      // stays non-null — so `_isRemote` stays true, subsequent upload() calls
+      // route to the dead proxy with `timeoutMs: 0`, and the caller waits
+      // forever for an ack that will never come. Disposing here flips the
+      // element into a well-defined "remote unavailable" state; the next
+      // upload() throws immediately ("no core attached"), and a
+      // disconnect/reconnect DOM cycle cleanly re-enters `_initRemote()`.
+      this._disposeRemote();
     };
     ws.addEventListener("error", onFail, { once: true });
     ws.addEventListener("close", onFail, { once: true });
     const transport = new WebSocketClientTransport(ws);
     this._connectRemote(transport);
+  }
+
+  /**
+   * Tear down the remote proxy + bind subscription + WebSocket so `_isRemote`
+   * flips back to false. Safe to call when nothing is attached (no-op).
+   * Reached from both the failure handler (`onFail`) and the normal DOM
+   * teardown (`disconnectedCallback`).
+   */
+  private _disposeRemote(): void {
+    if (this._unbind) {
+      this._unbind();
+      this._unbind = null;
+    }
+    if (this._proxy) {
+      try { this._proxy.dispose(); } catch { /* already disposed */ }
+      this._proxy = null;
+    }
+    this._remoteValues = {};
+    if (this._ws) {
+      const ws = this._ws;
+      this._ws = null;
+      try { ws.close(); } catch { /* already closed */ }
+    }
   }
 
   private _resetRemoteBusyState(): void {
@@ -684,8 +715,23 @@ export class S3 extends HTMLElement {
       xhr.addEventListener("load", () => {
         this._xhrs.delete(xhr);
         if (xhr.status >= 200 && xhr.status < 300) {
+          const etag = xhr.getResponseHeader("ETag");
+          if (!etag) {
+            // 2xx with no ETag is a silent-data-corruption trap: we would
+            // resolve with "" and let `_complete()` / `completeMultipart()`
+            // stamp an empty etag into the post-process context and the
+            // download presign. The two realistic causes — missing
+            // `ExposeHeaders: ["ETag"]` on the bucket CORS, and an
+            // S3-compatible server that does not emit ETag at all — are
+            // both configuration issues that will not self-heal, so the
+            // retry policy also classifies this as non-retriable.
+            reject(new MissingEtagError(
+              `[@wc-bindable/hawc-s3] PUT succeeded (${xhr.status}) but response has no ETag header. Check bucket CORS 'ExposeHeaders: [\"ETag\"]' or verify the S3-compatible server emits ETag.`
+            ));
+            return;
+          }
           if (onLoad) onLoad();
-          resolve(xhr.getResponseHeader("ETag") || "");
+          resolve(etag);
         } else {
           reject(new PutHttpError(
             `[@wc-bindable/hawc-s3] PUT failed (${xhr.status}).`,
@@ -736,7 +782,15 @@ export class S3 extends HTMLElement {
     if (config.remote.enableRemote && !this._isRemote) {
       try {
         this._initRemote();
-        this._errorState = null;
+        // Clear any local error left over from a prior failed session. Just
+        // zeroing `_errorState` here (the previous behavior) left
+        // `_hasLocalError === true`, so the error getter's remote branch
+        // short-circuited to the (now null) local slot forever and hid real
+        // server-side errors. `_clearErrorState()` resets both flags and
+        // dispatches `hawc-s3:error` so subscribers see the transition to
+        // the clean state. It is a no-op on the very first connect (when no
+        // prior error has ever been set), so we do not spuriously dispatch.
+        this._clearErrorState();
       } catch (error) {
         this._setErrorState(error);
       }
@@ -764,17 +818,10 @@ export class S3 extends HTMLElement {
     this._aborted = true;
     this._cancelXhrs();
     if (this._isRemote) {
+      // Fire-and-forget server abort before dropping the channel — after
+      // `_disposeRemote()` the proxy is gone and this call is impossible.
       this._proxy!.invoke("abort").catch(() => {});
-      this._unbind?.();
-      this._unbind = null;
-      this._proxy!.dispose();
-      this._proxy = null;
-      this._remoteValues = {};
-      if (this._ws) {
-        const ws = this._ws;
-        this._ws = null;
-        ws.close();
-      }
+      this._disposeRemote();
     } else if (this._core) {
       this._core.abort();
     }
