@@ -62,6 +62,7 @@ export class S3Core extends EventTarget {
       { name: "deleteObject", async: true },
       { name: "abort" },
       { name: "requestMultipartUpload", async: true },
+      { name: "signMultipartPart", async: true },
       { name: "completeMultipart", async: true },
       { name: "abortMultipart", async: true },
     ],
@@ -523,7 +524,25 @@ export class S3Core extends EventTarget {
         const start = i * effectivePartSize;
         const end = Math.min(start + effectivePartSize, size);
         const presigned = await this._provider.presignPart(key, uploadId, partNumber, opts);
-        parts.push({ partNumber, url: presigned.url, range: [start, end] });
+        parts.push({
+          partNumber,
+          url: presigned.url,
+          range: [start, end],
+          // Pass the per-part expiry through to the Shell so it can refresh
+          // URLs for late parts before the PUT fires. For a large multipart
+          // over a slow link, the last parts can reach their turn well after
+          // the 900 s default window — without an expiresAt the Shell has no
+          // way to know whether to re-sign.
+          expiresAt: presigned.expiresAt,
+          // Forward provider-supplied per-part headers (SSE-C, custom auth,
+          // etc.). Symmetrical with single-PUT, which already threads
+          // `PresignedUpload.headers` through to the XHR. Dropping them here
+          // would silently break any non-default IS3Provider that requires
+          // extra headers on part PUTs.
+          ...(presigned.headers && Object.keys(presigned.headers).length > 0
+            ? { headers: presigned.headers }
+            : {}),
+        });
       }
     } catch (e: any) {
       // Roll back the just-initiated multipart so we do not leak.
@@ -543,6 +562,25 @@ export class S3Core extends EventTarget {
     this._setUploading(true);
     this._setProgress({ loaded: 0, total: size, phase: "uploading" });
     return { uploadId, partSize: effectivePartSize, parts, key };
+  }
+
+  /**
+   * Re-presign a single part URL for an already-initiated multipart upload.
+   * Used by the Shell to refresh near-expiry part URLs during long uploads,
+   * so a large file that runs past the initial presign window (default 900 s)
+   * does not fail the tail parts with 403. Uses the snapshotted options from
+   * init time, so the re-signed URL targets the same bucket/prefix as the
+   * original — mutating `this.bucket` / `this.prefix` between init and
+   * re-sign does not misroute the PUT.
+   */
+  async signMultipartPart(key: string, uploadId: string, partNumber: number): Promise<PresignedUpload> {
+    if (!key) raiseError("key is required.");
+    if (!uploadId) raiseError("uploadId is required.");
+    const mp = this._multipart;
+    if (!mp) raiseError("signMultipartPart() called without an active multipart upload.");
+    if (mp.uploadId !== uploadId) raiseError("signMultipartPart() uploadId mismatch.");
+    if (mp.key !== key) raiseError(`signMultipartPart() key mismatch: expected ${mp.key}, got ${key}.`);
+    return await this._provider.presignPart(key, uploadId, partNumber, mp.options);
   }
 
   /**

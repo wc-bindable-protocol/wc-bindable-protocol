@@ -133,10 +133,20 @@ function buildHost(bucket: string, region: string, endpoint: string | undefined,
   if (endpoint) {
     const u = new URL(endpoint);
     const host = u.host;
+    // Preserve any path component on the endpoint. A reverse-proxy setup like
+    // `https://example.com/storage` must route through `/storage/<bucket>/<key>`,
+    // and dropping `u.pathname` here (as an earlier revision did) built URLs
+    // that targeted the proxy root and 404'd for every object.
+    //
+    // `URL` normalises a bare origin to pathname `/`; strip both the leading
+    // and trailing slash so we can concatenate cleanly against the bucket /
+    // key segments we build below.
+    const rawPath = u.pathname.replace(/^\/+|\/+$/g, "");
+    const endpointPath = rawPath ? `/${rawPath}` : "";
     if (pathStyle) {
-      return { host, pathPrefix: `/${bucket}`, protocol: u.protocol };
+      return { host, pathPrefix: `${endpointPath}/${bucket}`, protocol: u.protocol };
     }
-    return { host: `${bucket}.${host}`, pathPrefix: "", protocol: u.protocol };
+    return { host: `${bucket}.${host}`, pathPrefix: endpointPath, protocol: u.protocol };
   }
   if (pathStyle) {
     return { host: `s3.${region}.amazonaws.com`, pathPrefix: `/${bucket}`, protocol: "https:" };

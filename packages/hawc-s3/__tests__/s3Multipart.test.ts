@@ -198,6 +198,97 @@ describe("S3Core multipart", () => {
     await core.requestMultipartUpload("k", 20 * MIB);
     expect(provider.abortCalls).toHaveLength(0);
   });
+
+  it("multipart parts carry the provider's expiresAt so the Shell can refresh near-expiry URLs", async () => {
+    const now = Date.now();
+    provider.presignPart = async (_k, _uid, partNumber, _o) => {
+      provider.partCalls.push({ partNumber });
+      // Deliberately short TTL: the Shell needs this value to decide whether
+      // to eagerly re-sign before PUTing. Without `expiresAt` propagating
+      // through `MultipartPartUrl`, a large multipart that spans past the
+      // initial window would 403 on its tail parts.
+      return { url: `https://part/${partNumber}`, method: "PUT", headers: {}, expiresAt: now + 5_000 };
+    };
+    const init = await core.requestMultipartUpload("big.bin", 20 * MIB);
+    expect(init.parts.every(p => typeof p.expiresAt === "number")).toBe(true);
+    expect(init.parts[0].expiresAt).toBeGreaterThan(now);
+    expect(init.parts[0].expiresAt).toBeLessThan(now + 10_000);
+  });
+
+  it("signMultipartPart re-presigns a single part against the active uploadId", async () => {
+    await core.requestMultipartUpload("k", 20 * MIB);
+    const before = provider.partCalls.length;
+    const refreshed = await core.signMultipartPart("k", "mp-1", 2);
+    expect(refreshed.url).toBe("https://part/2");
+    expect(provider.partCalls.length).toBe(before + 1);
+    expect(provider.partCalls[provider.partCalls.length - 1].partNumber).toBe(2);
+  });
+
+  it("signMultipartPart refuses when no multipart is active", async () => {
+    await expect(core.signMultipartPart("k", "mp-1", 1)).rejects.toThrow(/without an active/);
+  });
+
+  it("signMultipartPart refuses a mismatched uploadId or key", async () => {
+    await core.requestMultipartUpload("k", 20 * MIB);
+    await expect(core.signMultipartPart("k", "wrong-id", 1)).rejects.toThrow(/uploadId mismatch/);
+    await expect(core.signMultipartPart("other", "mp-1", 1)).rejects.toThrow(/key mismatch/);
+  });
+
+  it("forwards provider-supplied per-part headers through to MultipartPartUrl", async () => {
+    // Providers that need SSE-C / custom auth / anything beyond a plain PUT
+    // return per-part headers via PresignedUpload.headers. Dropping them at
+    // the Core/Shell boundary (as an earlier revision did) silently broke any
+    // non-default IS3Provider on the multipart path while single-PUT kept
+    // working, which is the exact asymmetry the review flagged.
+    provider.presignPart = async (_k, uid, partNumber, _o) => {
+      provider.partCalls.push({ partNumber });
+      return {
+        url: `https://part/${partNumber}`,
+        method: "PUT",
+        headers: {
+          "x-amz-server-side-encryption-customer-algorithm": "AES256",
+          "x-amz-server-side-encryption-customer-key-md5": `k-${partNumber}-${uid}`,
+        },
+        expiresAt: Date.now() + 60_000,
+      };
+    };
+    const init = await core.requestMultipartUpload("k", 20 * MIB);
+    expect(init.parts).toHaveLength(3);
+    for (const p of init.parts) {
+      expect(p.headers?.["x-amz-server-side-encryption-customer-algorithm"]).toBe("AES256");
+      expect(p.headers?.["x-amz-server-side-encryption-customer-key-md5"]).toBe(`k-${p.partNumber}-mp-1`);
+    }
+  });
+
+  it("omits the headers field when the provider returns no extra headers", async () => {
+    // Keep the wire payload minimal when there is nothing to forward. The
+    // Shell treats missing `headers` as "empty", so the init response should
+    // not carry an empty object for every part on the common AWS SigV4 path.
+    const init = await core.requestMultipartUpload("k", 20 * MIB);
+    for (const p of init.parts) {
+      expect(p.headers).toBeUndefined();
+    }
+  });
+
+  it("signMultipartPart surfaces refreshed headers to the Shell", async () => {
+    // Some providers rotate signed headers on every presign (e.g. SSE-C key
+    // material bound to the signature). The re-sign path in the Shell reads
+    // `refreshed.headers`, so the Core must expose the full PresignedUpload.
+    let calls = 0;
+    provider.presignPart = async (_k, _u, partNumber, _o) => {
+      provider.partCalls.push({ partNumber });
+      calls++;
+      return {
+        url: `https://part/${partNumber}`,
+        method: "PUT",
+        headers: { "x-custom-header": `v${calls}` },
+        expiresAt: Date.now() + 60_000,
+      };
+    };
+    await core.requestMultipartUpload("k", 20 * MIB);
+    const refreshed = await core.signMultipartPart("k", "mp-1", 2);
+    expect(refreshed.headers?.["x-custom-header"]).toMatch(/^v\d+$/);
+  });
 });
 
 describe("S3Core multipart — option snapshot semantics", () => {

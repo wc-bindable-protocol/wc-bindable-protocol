@@ -1,7 +1,7 @@
 import { config, getRemoteCoreUrl } from "../config.js";
 import {
   IWcBindable, S3Progress, S3ObjectMetadata, PresignedUpload,
-  MultipartInit, MultipartPart,
+  MultipartInit, MultipartPart, MultipartPartUrl,
 } from "../types.js";
 import { S3Core } from "../core/S3Core.js";
 import { retryWithBackoff, defaultPutRetryPolicy, PutHttpError } from "../retry.js";
@@ -164,11 +164,25 @@ export class S3 extends HTMLElement {
       }
       /* v8 ignore stop */
     });
-    // Push current attribute-derived inputs to the server so the Core knows
-    // which bucket/prefix/contentType to sign against.
-    if (this.bucket) this._proxy!.setWithAck("bucket", this.bucket).catch((e: unknown) => this._setErrorState(e));
-    if (this.prefix) this._proxy!.setWithAck("prefix", this.prefix).catch((e: unknown) => this._setErrorState(e));
-    if (this.contentType) this._proxy!.setWithAck("contentType", this.contentType).catch((e: unknown) => this._setErrorState(e));
+    // Push attribute-derived inputs to the server so the Core knows which
+    // bucket/prefix/contentType to sign against.
+    //
+    // Sync is gated on `hasAttribute`, NOT on the value being truthy. An
+    // explicit `prefix=""` is a legitimate way to override a server-side
+    // default (e.g. Core.prefix pre-seeded to "user/123/") back to empty,
+    // and silently skipping it would let the server's seeded prefix leak
+    // through after the client connects. `attributeChangedCallback` fires
+    // before `_proxy` exists (during upgrade), so the empty-string sync
+    // must happen here or not at all.
+    if (this.hasAttribute("bucket")) {
+      this._proxy!.setWithAck("bucket", this.bucket).catch((e: unknown) => this._setErrorState(e));
+    }
+    if (this.hasAttribute("prefix")) {
+      this._proxy!.setWithAck("prefix", this.prefix).catch((e: unknown) => this._setErrorState(e));
+    }
+    if (this.hasAttribute("content-type")) {
+      this._proxy!.setWithAck("contentType", this.contentType).catch((e: unknown) => this._setErrorState(e));
+    }
   }
 
   /** @internal — used by tests / advanced setups to inject a local Core */
@@ -367,6 +381,27 @@ export class S3 extends HTMLElement {
     return await this._core.completeMultipart(key, uploadId, parts);
   }
 
+  /**
+   * Number of seconds of remaining TTL below which we eagerly re-sign a part
+   * URL before using it. The default 900 s presign window is shorter than a
+   * single slow part can take on a thin link, so for upload runs that exceed
+   * the initial window the tail parts would 403 at PUT time. 60 s is enough
+   * margin for the PUT handshake + any clock skew between browser and S3.
+   */
+  private static readonly _PART_URL_REFRESH_MARGIN_MS = 60_000;
+
+  private async _signMultipartPart(key: string, uploadId: string, partNumber: number): Promise<PresignedUpload> {
+    if (this._isRemote) {
+      return await this._proxy!.invokeWithOptions(
+        "signMultipartPart",
+        [key, uploadId, partNumber],
+        { timeoutMs: 0 },
+      ) as PresignedUpload;
+    }
+    if (!this._core) throw new Error("[@wc-bindable/hawc-s3] no core attached.");
+    return await this._core.signMultipartPart(key, uploadId, partNumber);
+  }
+
   private _abortMultipartFireAndForget(key: string, uploadId: string): void {
     if (this._isRemote) {
       // `invoke(name, ...args)` is variadic; passing `[key, uploadId]` as a
@@ -485,7 +520,7 @@ export class S3 extends HTMLElement {
         const part = init.parts[idx];
         try {
           const blobSlice = file.slice(part.range[0], part.range[1]);
-          const etag = await this._putPart(part, blobSlice, totalSize);
+          const etag = await this._putPart(init.uploadId, init.key, part, blobSlice, totalSize);
           completed[idx] = { partNumber: part.partNumber, etag };
         } catch (e: any) {
           if (!firstError) firstError = e instanceof Error ? e : new Error(String(e));
@@ -536,29 +571,82 @@ export class S3 extends HTMLElement {
 
   /** One part PUT. Returns the raw quoted ETag (S3 needs it quoted in the Complete XML). */
   private async _putPart(
-    part: { partNumber: number; url: string },
+    uploadId: string,
+    key: string,
+    part: MultipartPartUrl,
     blob: Blob,
     totalSize: number,
   ): Promise<string> {
+    // Mutable copy of the URL + expiry + headers for this part. Refreshed
+    // lazily when its remaining TTL drops below the margin, or on a 403 from
+    // S3 (which is the only signal we get that the signature expired
+    // mid-flight — AWS returns 403 AccessDenied, not 401, for expired
+    // presigns). Headers are kept in lockstep with url/expiresAt because
+    // some providers rotate signed headers (e.g. SSE-C key material) on
+    // each presign call; reusing stale headers against a fresh URL would
+    // fail signature validation even though the URL itself is valid.
+    let url = part.url;
+    let expiresAt = part.expiresAt;
+    let headers = part.headers ?? {};
+    // Set once per outer retry attempt when we've already consumed our single
+    // "re-sign on 403" allowance. If the refreshed URL 403s again, it is a
+    // real deny — stop retrying and surface the error to the caller.
+    let refreshedOnce = false;
+
+    const refreshIfNearExpiry = async (): Promise<void> => {
+      const remaining = expiresAt - Date.now();
+      if (remaining > S3._PART_URL_REFRESH_MARGIN_MS) return;
+      const refreshed = await this._signMultipartPart(key, uploadId, part.partNumber);
+      url = refreshed.url;
+      expiresAt = refreshed.expiresAt;
+      headers = refreshed.headers ?? {};
+    };
+
+    const attemptOnce = (): Promise<string> =>
+      this._doPutOnce("PUT", url, headers, blob, (loaded) => {
+        this._multipartLoaded.set(part.partNumber, loaded);
+        let total = 0;
+        for (const v of this._multipartLoaded.values()) total += v;
+        this._reportProgress(total, totalSize);
+      }, () => {
+        // On success, force the per-part tally to the full slice size in
+        // case the browser batched the final progress event with `load`.
+        this._multipartLoaded.set(part.partNumber, blob.size);
+        let total = 0;
+        for (const v of this._multipartLoaded.values()) total += v;
+        this._reportProgress(total, totalSize);
+      });
+
     return await retryWithBackoff(
       async (attempt) => {
         // On retry, reset our tally for this part so progress does not double-count
         // bytes from the failed attempt. Fixes a UI glitch where the bar would
         // briefly show >100% during retry.
         if (attempt > 0) this._multipartLoaded.set(part.partNumber, 0);
-        return await this._doPutOnce("PUT", part.url, {}, blob, (loaded) => {
-          this._multipartLoaded.set(part.partNumber, loaded);
-          let total = 0;
-          for (const v of this._multipartLoaded.values()) total += v;
-          this._reportProgress(total, totalSize);
-        }, () => {
-          // On success, force the per-part tally to the full slice size in
-          // case the browser batched the final progress event with `load`.
-          this._multipartLoaded.set(part.partNumber, blob.size);
-          let total = 0;
-          for (const v of this._multipartLoaded.values()) total += v;
-          this._reportProgress(total, totalSize);
-        });
+        refreshedOnce = false;
+        await refreshIfNearExpiry();
+        try {
+          return await attemptOnce();
+        } catch (e: any) {
+          // 403 can mean either "signature expired" or "genuinely denied".
+          // defaultPutRetryPolicy does not retry 4xx (won't fix itself),
+          // so we handle the expiry case inline: re-sign once and retry
+          // immediately. Second 403 falls through to the retry policy,
+          // which correctly classifies it as terminal.
+          if (
+            e instanceof PutHttpError && e.status === 403
+            && !refreshedOnce && !this._aborted
+          ) {
+            refreshedOnce = true;
+            const refreshed = await this._signMultipartPart(key, uploadId, part.partNumber);
+            url = refreshed.url;
+            expiresAt = refreshed.expiresAt;
+            headers = refreshed.headers ?? {};
+            this._multipartLoaded.set(part.partNumber, 0);
+            return await attemptOnce();
+          }
+          throw e;
+        }
       },
       {
         maxRetries: this.putRetries,

@@ -97,6 +97,60 @@ describe("presignS3Url (SigV4)", () => {
     expect(url.pathname).toBe("/b/k");
   });
 
+  it("preserves endpoint pathname for reverse-proxy deployments (path-style)", async () => {
+    // A common S3-compatible deployment shape: the store is mounted behind a
+    // reverse proxy at `/storage`, and the SigV4 canonicalUri must include
+    // that prefix for the signature (and for the actual HTTP request) to hit
+    // the right URL. An earlier revision dropped `u.pathname`, so requests
+    // went to `/bucket/key` on the proxy root and 404'd.
+    const result = await presignS3Url(awsExample, {
+      method: "GET",
+      region: "auto",
+      bucket: "b",
+      key: "k",
+      now: 0,
+      expiresInSeconds: 60,
+      endpoint: "https://example.com/storage",
+    });
+    const url = new URL(result.url);
+    expect(url.host).toBe("example.com");
+    expect(url.pathname).toBe("/storage/b/k");
+  });
+
+  it("preserves endpoint pathname with virtual-hosted style", async () => {
+    // Less common but legal: a proxy that uses virtual-hosted addressing under
+    // a path prefix. The prefix still belongs between the host and the key.
+    const result = await presignS3Url(awsExample, {
+      method: "GET",
+      region: "auto",
+      bucket: "b",
+      key: "k",
+      now: 0,
+      expiresInSeconds: 60,
+      endpoint: "https://example.com/storage",
+      forcePathStyle: false,
+    });
+    const url = new URL(result.url);
+    expect(url.host).toBe("b.example.com");
+    expect(url.pathname).toBe("/storage/k");
+  });
+
+  it("treats a bare-origin endpoint (pathname '/') as having no prefix", async () => {
+    // `new URL("https://example.com").pathname` is `/`, not `""`. The
+    // pathname-preserving branch must not double-slash bucket URLs.
+    const result = await presignS3Url(awsExample, {
+      method: "GET",
+      region: "auto",
+      bucket: "b",
+      key: "k",
+      now: 0,
+      expiresInSeconds: 60,
+      endpoint: "https://example.com/",
+    });
+    const url = new URL(result.url);
+    expect(url.pathname).toBe("/b/k");
+  });
+
   it("clamps expiry to AWS limits", async () => {
     const result = await presignS3Url(awsExample, {
       method: "GET",

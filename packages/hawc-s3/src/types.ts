@@ -101,11 +101,18 @@ export interface S3RequestOptions {
 /**
  * One part of a multipart upload as exposed to the browser.
  * `range` is a [startByteInclusive, endByteExclusive) slice into the source blob.
+ * `expiresAt` lets the Shell refresh near-expiry URLs before the PUT.
+ * `headers` mirrors the single-PUT path: providers that require per-request
+ * headers (SSE-C, custom auth, etc.) return them via `IS3Provider.presignPart`
+ * and the Shell echoes them on the part PUT. Empty/absent means no extra
+ * headers, matching the default `AwsS3Provider` behavior.
  */
 export interface MultipartPartUrl {
   partNumber: number;
   url: string;
   range: [number, number];
+  expiresAt: number;
+  headers?: Record<string, string>;
 }
 
 /**
