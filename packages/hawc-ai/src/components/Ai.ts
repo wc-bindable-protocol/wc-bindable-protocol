@@ -1,6 +1,7 @@
 import { config, getRemoteCoreUrl } from "../config.js";
 import { IWcBindable, AiMessage } from "../types.js";
 import { AiCore } from "../core/AiCore.js";
+import { cloneMessage } from "../core/cloneMessage.js";
 import { AiMessage as AiMessageElement } from "./AiMessage.js";
 import { registerAutoTrigger, unregisterAutoTrigger } from "../autoTrigger.js";
 import {
@@ -334,7 +335,7 @@ export class Ai extends HTMLElement {
   get messages(): AiMessage[] {
     if (this._isRemote) {
       const msgs = this._remoteValues.messages as AiMessage[] | undefined;
-      return msgs ? msgs.map(m => ({ ...m })) : [];
+      return msgs ? msgs.map(cloneMessage) : [];
     }
     return this._core?.messages ?? [];
   }

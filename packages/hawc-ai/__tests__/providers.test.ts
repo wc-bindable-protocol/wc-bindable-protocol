@@ -104,6 +104,42 @@ describe("OpenAiProvider", () => {
         )).toThrow(/maxTokens must be a positive integer/);
       }
     });
+
+    it("responseSchemaとtoolsを同時指定するとbuildRequestが同期throwする（provider直呼び経路）", () => {
+      expect(() => provider.buildRequest(
+        [{ role: "user", content: "x" }],
+        {
+          model: "gpt-4o",
+          responseSchema: { type: "object", properties: { a: { type: "string" } } },
+          tools: [{ name: "t", description: "", parameters: {}, handler: () => null }],
+        },
+      )).toThrow(/responseSchema and tools cannot both be set/);
+    });
+
+    it("responseSchemaが非オブジェクトだとbuildRequestが同期throwする", () => {
+      expect(() => provider.buildRequest(
+        [{ role: "user", content: "x" }],
+        { model: "gpt-4o", responseSchema: "bad" as any },
+      )).toThrow(/responseSchema must be a JSON Schema object/);
+    });
+
+    it("assistantロールの配列contentはテキストにflattenされてwireに載る", () => {
+      const req = provider.buildRequest(
+        [
+          { role: "user", content: "hi" },
+          // AiContent contract: non-user array content is flattened.
+          { role: "assistant", content: [
+            { type: "text", text: "hello " },
+            { type: "text", text: "world" },
+            // Image parts on assistant are documented as invalid — flatten drops them.
+            { type: "image", url: "https://x/y.png" },
+          ] },
+        ],
+        { model: "gpt-4o" },
+      );
+      const body = JSON.parse(req.body);
+      expect(body.messages[1]).toEqual({ role: "assistant", content: "hello world" });
+    });
   });
 
   describe("parseResponse", () => {
@@ -292,6 +328,35 @@ describe("AnthropicProvider", () => {
         { model: "claude-sonnet-4-20250514", baseUrl: "http://localhost:8080" }
       );
       expect(req.url).toBe("http://localhost:8080/v1/messages");
+    });
+
+    it("responseSchemaとtoolsを同時指定するとbuildRequestが同期throwする（provider直呼び経路）", () => {
+      expect(() => provider.buildRequest(
+        [{ role: "user", content: "x" }],
+        {
+          model: "claude-sonnet-4-20250514",
+          responseSchema: { type: "object", properties: { a: { type: "string" } } },
+          tools: [{ name: "t", description: "", parameters: {}, handler: () => null }],
+        },
+      )).toThrow(/responseSchema and tools cannot both be set/);
+    });
+
+    it("assistantロールの配列contentはテキストにflattenされてwireに載る", () => {
+      const req = provider.buildRequest(
+        [
+          { role: "user", content: "hi" },
+          // AiContent contract: non-user array content is flattened.
+          { role: "assistant", content: [
+            { type: "text", text: "hello " },
+            { type: "text", text: "world" },
+            // Image parts on assistant are documented as invalid — flatten drops them.
+            { type: "image", url: "https://x/y.png" },
+          ] },
+        ],
+        { model: "claude-sonnet-4-20250514" },
+      );
+      const body = JSON.parse(req.body);
+      expect(body.messages[1]).toEqual({ role: "assistant", content: "hello world" });
     });
   });
 
@@ -1036,7 +1101,7 @@ describe("Provider — tool use", () => {
       });
     });
 
-    it("assistant+toolCallsをfunctionCallパートで直列化、toolをfunctionロールで送る", () => {
+    it("assistant+toolCallsをfunctionCallパートで直列化、toolをuserロール+functionResponseで送る", () => {
       const req = provider.buildRequest(
         [
           { role: "user", content: "weather?" },
@@ -1054,8 +1119,10 @@ describe("Provider — tool use", () => {
         role: "model",
         parts: [{ functionCall: { name: "get_weather", args: { loc: "Tokyo" } } }],
       });
+      // Gemini's Content.role is "user" | "model"; functionResponse parts go
+      // on a user-role Content per the official function-calling example.
       expect(body.contents[2]).toEqual({
-        role: "function",
+        role: "user",
         parts: [{ functionResponse: { name: "get_weather", response: { temp: 22 } } }],
       });
     });
@@ -1141,11 +1208,11 @@ describe("Provider — tool use", () => {
       ]);
       // tool → functionResponse.id echoed, name looked up via idToName map
       expect(body.contents[2]).toEqual({
-        role: "function",
+        role: "user",
         parts: [{ functionResponse: { name: "ping", response: { ok: 1 }, id: "call_A" } }],
       });
       expect(body.contents[3]).toEqual({
-        role: "function",
+        role: "user",
         parts: [{ functionResponse: { name: "ping", response: { ok: 2 }, id: "call_B" } }],
       });
     });

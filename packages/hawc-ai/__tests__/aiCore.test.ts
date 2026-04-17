@@ -229,6 +229,39 @@ describe("AiCore", () => {
       expect(core.messages).toHaveLength(1);
     });
 
+    it("content配列も防御コピーされ、外部からの破壊的変更が内部履歴に波及しない", () => {
+      const core = new AiCore();
+      const parts: import("../src/types").AiContentPart[] = [
+        { type: "text", text: "hello" },
+      ];
+      core.messages = [{ role: "user", content: parts }];
+      // Mutate the source array — must not affect internal state.
+      parts.push({ type: "text", text: "injected" });
+      expect((core.messages[0].content as any[]).length).toBe(1);
+
+      // Mutate the returned snapshot — must not affect internal state either.
+      const snapshot = core.messages;
+      (snapshot[0].content as any[]).push({ type: "text", text: "injected-2" });
+      expect((core.messages[0].content as any[]).length).toBe(1);
+    });
+
+    it("toolCalls配列も防御コピーされ、外部からの破壊的変更が内部履歴に波及しない", () => {
+      const core = new AiCore();
+      const toolCalls = [{ id: "c1", name: "fn", arguments: "{}" }];
+      core.messages = [
+        { role: "user", content: "hi" },
+        { role: "assistant", content: "", toolCalls },
+      ];
+      // Mutate source.
+      toolCalls.push({ id: "c2", name: "fn2", arguments: "{}" });
+      expect(core.messages[1].toolCalls).toHaveLength(1);
+
+      // Mutate snapshot.
+      const snapshot = core.messages;
+      snapshot[1].toolCalls!.push({ id: "c3", name: "fn3", arguments: "{}" });
+      expect(core.messages[1].toolCalls).toHaveLength(1);
+    });
+
     it("存在しないメッセージの削除は無視される", () => {
       const core = new AiCore();
       const coreAny = core as any;
@@ -1842,6 +1875,81 @@ describe("AiCore", () => {
       const toolMsg = core.messages.find(m => m.role === "tool")!;
       expect(toolMsg.content).toContain("has no handler");
     });
+
+    it("core単位のregisterToolは接続ごとに独立したhandlerを保持する", async () => {
+      const { clearToolRegistry } = await import("../src/toolRegistry");
+      clearToolRegistry();
+
+      const handlerA = vi.fn().mockResolvedValue({ user: "A" });
+      const handlerB = vi.fn().mockResolvedValue({ user: "B" });
+      const coreA = new AiCore();
+      const coreB = new AiCore();
+      coreA.provider = "openai";
+      coreB.provider = "openai";
+
+      // Both cores register a handler under the same tool name — simulates
+      // two concurrent WebSocket connections in createCores binding
+      // user-specific closures.
+      coreA.registerTool("lookup", handlerA);
+      coreB.registerTool("lookup", handlerB);
+
+      fetchSpy
+        .mockResolvedValueOnce(toolCallResponse("c1", "lookup", {}))
+        .mockResolvedValueOnce(finalResponse("A done"))
+        .mockResolvedValueOnce(toolCallResponse("c2", "lookup", {}))
+        .mockResolvedValueOnce(finalResponse("B done"));
+
+      await coreA.send("go", {
+        model: "gpt-4o",
+        stream: false,
+        tools: [{ name: "lookup", description: "", parameters: {} }],
+      });
+      await coreB.send("go", {
+        model: "gpt-4o",
+        stream: false,
+        tools: [{ name: "lookup", description: "", parameters: {} }],
+      });
+
+      expect(handlerA).toHaveBeenCalledTimes(1);
+      expect(handlerB).toHaveBeenCalledTimes(1);
+    });
+
+    it("インスタンスregistryは process-wide registry より優先される", async () => {
+      const { registerTool, clearToolRegistry } = await import("../src/toolRegistry");
+      clearToolRegistry();
+
+      const globalHandler = vi.fn().mockResolvedValue("global");
+      const instanceHandler = vi.fn().mockResolvedValue("instance");
+      registerTool("shared", globalHandler);
+
+      const core = new AiCore();
+      core.provider = "openai";
+      core.registerTool("shared", instanceHandler);
+
+      fetchSpy
+        .mockResolvedValueOnce(toolCallResponse("c1", "shared", {}))
+        .mockResolvedValueOnce(finalResponse("ok"));
+
+      await core.send("go", {
+        model: "gpt-4o",
+        stream: false,
+        tools: [{ name: "shared", description: "", parameters: {} }],
+      });
+
+      expect(instanceHandler).toHaveBeenCalledTimes(1);
+      expect(globalHandler).not.toHaveBeenCalled();
+      clearToolRegistry();
+    });
+
+    it("unregisterToolでインスタンスregistryから削除できる", () => {
+      const core = new AiCore();
+      const handler = () => null;
+      core.registerTool("t", handler);
+      expect(core.getRegisteredTool("t")).toBe(handler);
+      expect(core.unregisterTool("t")).toBe(true);
+      expect(core.getRegisteredTool("t")).toBeUndefined();
+      expect(core.unregisterTool("t")).toBe(false);
+    });
   });
 
   describe("structured output (responseSchema)", () => {
@@ -1950,6 +2058,30 @@ describe("AiCore", () => {
         [{ type: "image", url: "" }],
         { model: "gpt-4o" },
       )).toThrow(/requires a non-empty `url` field/);
+    });
+
+    it("send(parts)後に呼び出し側がpromptを変更しても内部履歴は影響を受けない", async () => {
+      fetchSpy.mockResolvedValueOnce(createMockResponse({
+        choices: [{ message: { content: "ok" } }],
+      }));
+
+      const core = new AiCore();
+      core.provider = "openai";
+      const parts: import("../src/types").AiContentPart[] = [
+        { type: "text", text: "original" },
+      ];
+      await core.send(parts, { model: "gpt-4o", stream: false });
+
+      // Mutate the caller's array AFTER send() has finished. If the send path
+      // stored the reference verbatim, core.messages[0].content would now
+      // contain the injected part.
+      parts.push({ type: "text", text: "injected-after-send" });
+      (parts[0] as any).text = "mutated-after-send";
+
+      const userMsg = core.messages[0];
+      expect(userMsg.role).toBe("user");
+      expect((userMsg.content as any[]).length).toBe(1);
+      expect((userMsg.content as any[])[0]).toEqual({ type: "text", text: "original" });
     });
 
     it("prompt引数でstringとAiContentPart[]を混在できる（連続send）", async () => {

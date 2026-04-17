@@ -125,8 +125,13 @@ export class GoogleProvider implements IAiProvider {
       if (id && !id.startsWith(GEMINI_ID_PREFIX)) {
         functionResponse.id = id;
       }
+      // Gemini's documented Content.role enum is "user" | "model" only; the
+      // official function-calling multi-turn example wraps functionResponse
+      // parts in a user-role Content. Role "function" was silently tolerated
+      // by some legacy SDKs but is rejected / ignored on Vertex and newer
+      // v1beta endpoints, so we normalize to "user" here.
       return {
-        role: "function",
+        role: "user",
         parts: [{ functionResponse }],
       };
     }

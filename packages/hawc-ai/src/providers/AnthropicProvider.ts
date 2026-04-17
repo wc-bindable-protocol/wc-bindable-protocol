@@ -96,7 +96,13 @@ export class AnthropicProvider implements IAiProvider {
         }],
       };
     }
-    // user / assistant (no tool calls): allow multimodal passthrough.
+    if (m.role === "assistant") {
+      // Assistant history is flattened to text per the AiContent contract:
+      // multimodal parts (images) belong to user turns only, and shipping an
+      // image block under an assistant role would be rejected by Anthropic.
+      return { role: "assistant", content: flattenContentToText(m.content) };
+    }
+    // user: allow multimodal passthrough.
     if (typeof m.content === "string") {
       return { role: m.role, content: m.content };
     }

@@ -78,7 +78,14 @@ export class OpenAiProvider implements IAiProvider {
     if (m.role === "system") {
       return { role: "system", content: flattenContentToText(m.content) };
     }
-    // user / assistant (without tool calls): allow multimodal array passthrough.
+    if (m.role === "assistant") {
+      // Assistant history is flattened to text per the AiContent contract:
+      // multimodal parts (images) are only valid on user turns. Passing an
+      // assistant array through verbatim risks shipping image_url blocks on
+      // a role that the provider does not accept them on.
+      return { role: "assistant", content: flattenContentToText(m.content) };
+    }
+    // user: allow multimodal array passthrough.
     return { role: m.role, content: this._serializeContent(m.content) };
   }
 

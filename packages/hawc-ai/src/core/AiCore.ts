@@ -1,7 +1,7 @@
 import { raiseError } from "../raiseError.js";
 import {
   IWcBindable, IAiProvider, AiMessage, AiUsage, AiRequestOptions, AiTool, AiToolCall,
-  AiContent, AiContentPart,
+  AiContentPart,
 } from "../types.js";
 import { assertKnownContentParts } from "../providers/contentHelpers.js";
 import { SseParser } from "../streaming/SseParser.js";
@@ -9,7 +9,8 @@ import { OpenAiProvider } from "../providers/OpenAiProvider.js";
 import { AnthropicProvider } from "../providers/AnthropicProvider.js";
 import { AzureOpenAiProvider } from "../providers/AzureOpenAiProvider.js";
 import { GoogleProvider } from "../providers/GoogleProvider.js";
-import { getRegisteredTool } from "../toolRegistry.js";
+import { getRegisteredTool, AiToolHandler } from "../toolRegistry.js";
+import { cloneMessage } from "./cloneMessage.js";
 
 function resolveProvider(name: string): IAiProvider {
   switch (name) {
@@ -75,6 +76,11 @@ export class AiCore extends EventTarget {
   private _abortController: AbortController | null = null;
   private _flushScheduled: boolean = false;
   private _rafId: any = 0;
+  // Instance-scoped tool handler registry. Takes precedence over the process-
+  // wide registry so authenticated deployments can bind handlers to a specific
+  // user/connection via `createCores` without the per-connection closures
+  // clobbering each other's `registerTool("same_name", ...)` calls.
+  private _toolHandlers: Map<string, AiToolHandler> = new Map();
 
   constructor(target?: EventTarget) {
     super();
@@ -88,12 +94,34 @@ export class AiCore extends EventTarget {
   get error(): any { return this._error; }
 
   get messages(): AiMessage[] {
-    return this._messages.map(m => ({ ...m }));
+    return this._messages.map(cloneMessage);
   }
 
   set messages(value: AiMessage[]) {
-    this._messages = value.map(m => ({ ...m }));
+    this._messages = value.map(cloneMessage);
     this._emitMessages();
+  }
+
+  /**
+   * Register a tool handler scoped to this Core instance. Resolution order at
+   * tool-call time: per-call `tool.handler` → this instance registry → the
+   * process-wide registry (see `registerTool` in index). Use the instance
+   * registry for per-user / per-connection authorization so concurrent
+   * connections in `createAuthenticatedWSS.createCores` do not overwrite each
+   * other's handlers.
+   */
+  registerTool(name: string, handler: AiToolHandler): void {
+    if (!name) raiseError("registerTool: name is required.");
+    if (typeof handler !== "function") raiseError("registerTool: handler must be a function.");
+    this._toolHandlers.set(name, handler);
+  }
+
+  unregisterTool(name: string): boolean {
+    return this._toolHandlers.delete(name);
+  }
+
+  getRegisteredTool(name: string): AiToolHandler | undefined {
+    return this._toolHandlers.get(name);
   }
 
   get provider(): IAiProvider | null { return this._provider; }
@@ -240,11 +268,15 @@ export class AiCore extends EventTarget {
     this._setUsage(null);
 
     // Track messages pushed by *this* invocation so concurrent sends rolling back
-    // don't touch each other's history.
+    // don't touch each other's history. Incoming messages are deep-copied so
+    // later mutation of the caller's prompt/tool-result objects (notably the
+    // `AiContentPart[]` array handed to send()) cannot silently rewrite
+    // internal history without firing a messages-changed event.
     const pushedMessages: AiMessage[] = [];
     const pushMessage = (m: AiMessage) => {
-      this._messages.push(m);
-      pushedMessages.push(m);
+      const cloned = cloneMessage(m);
+      this._messages.push(cloned);
+      pushedMessages.push(cloned);
       this._emitMessages();
     };
     const rollback = () => {
@@ -259,8 +291,7 @@ export class AiCore extends EventTarget {
       if (mutated) this._emitMessages();
     };
 
-    const userContent: AiContent = typeof prompt === "string" ? prompt : prompt;
-    pushMessage({ role: "user", content: userContent });
+    pushMessage({ role: "user", content: prompt });
 
     const tools = options.tools ?? [];
     const toolsByName = new Map<string, AiTool>(tools.map(t => [t.name, t]));
@@ -337,13 +368,18 @@ export class AiCore extends EventTarget {
           }));
           const tool = toolsByName.get(call.name);
           // Handler resolution order: per-call `tool.handler`, then the
-          // process-wide registry populated via `registerTool()`. The latter
-          // is how server-side deployments supply handlers when the Shell
-          // sends tool declarations over WebSocket without their functions.
-          const handler = tool?.handler ?? getRegisteredTool(call.name);
+          // instance registry (per-connection authorization boundary), then
+          // the process-wide registry. The instance registry is preferred on
+          // the server because concurrent connections in
+          // `createAuthenticatedWSS.createCores` need closures bound to a
+          // specific user; the process-wide registry is name-keyed and would
+          // let a later connection silently overwrite an earlier one.
+          const handler = tool?.handler
+            ?? this._toolHandlers.get(call.name)
+            ?? getRegisteredTool(call.name);
           if (!handler) {
             const reason = tool
-              ? `Tool "${call.name}" has no handler (neither on the options.tools entry nor in the process registry).`
+              ? `Tool "${call.name}" has no handler (neither on the options.tools entry, the core's instance registry, nor the process registry).`
               : `Tool "${call.name}" is not defined on this send() invocation.`;
             const content = JSON.stringify({ error: reason });
             this._target.dispatchEvent(new CustomEvent("hawc-ai:tool-call-completed", {

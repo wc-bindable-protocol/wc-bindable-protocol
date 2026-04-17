@@ -455,7 +455,7 @@ Tool-use events are dispatched on the element but are **not** part of the `wc-bi
 |---|---|---|---|
 | OpenAI / Azure | `tools: [{ type: "function", function: { name, description, parameters } }]` | `choices[0].message.tool_calls[]`; stream deltas under `choices[0].delta.tool_calls[].function.arguments` accumulated by index | `"tool"` with `tool_call_id` |
 | Anthropic | `tools: [{ name, description, input_schema }]` | `content[].type === "tool_use"`; stream via `content_block_start` (id, name) + `input_json_delta` (partial args) | `"user"` wrapping a `tool_result` content block with `tool_use_id` |
-| Google (Gemini) | `tools: [{ functionDeclarations: [{ name, description, parameters }] }]` | `parts[].functionCall: { name, args }` (no id — synthesized as `gemini:<name>:<counter>`) | `"function"` with `functionResponse: { name, response }` |
+| Google (Gemini) | `tools: [{ functionDeclarations: [{ name, description, parameters }] }]` | `parts[].functionCall: { name, args[, id] }` — server-supplied `id` (Vertex / newer v1beta) is preserved; when absent, synthesized as `gemini:<name>:<counter>` which is kept internal and never echoed on the wire | `"user"` with `functionResponse: { name, response[, id] }` (Gemini's `Content.role` is `"user" \| "model"`; the function-calling multi-turn spec places `functionResponse` on a user-role Content) |
 
 ## Structured output
 
@@ -917,7 +917,21 @@ registerTool("search_kb", async ({ query, limit }) => {
 
 Client side continues to pass full `AiTool` entries (including `handler` for local fallback); the Shell strips `handler` on send. If a client declares a tool that is not registered on the server, the loop inserts an error tool message and continues — the model typically backs off gracefully.
 
-This is also the correct place to enforce **per-tool authorization**: `registerTool("delete_account", async (args) => { if (!currentUser.canDelete) throw new Error("forbidden"); ... })`. Because the handler runs on the authenticated server, it can see the user context (via the closure established in `createCores`) that the browser cannot be trusted with.
+**Per-user authorization must use the per-Core registry, not the process-wide one.** The module-level `registerTool()` is a single `Map` keyed by tool name — a handler registered inside `createCores` with a user-specific closure will silently overwrite any earlier connection's handler of the same name, and subsequent `send()` calls from the older session will execute the newer user's handler. Use `core.registerTool()` for anything that depends on the authenticated principal:
+
+```ts
+createCores: (user, ws) => {
+  const core = new ServerAiCore();
+  // Bound to THIS connection's user — no cross-connection leakage.
+  core.registerTool("delete_account", async (args) => {
+    if (!user.canDelete) throw new Error("forbidden");
+    return deleteAccount(user.id, args);
+  });
+  // ...
+}
+```
+
+Resolution order at tool-call time is: per-call `tool.handler` → `core.registerTool()` instance registry → module-level `registerTool()` process registry. Keep the module-level registry for stateless, user-agnostic tools (a pure weather lookup that takes no user context); put anything gated on identity / permissions on the Core instance.
 
 #### Authenticated deployments (pair with `<hawc-auth0>`)
 
