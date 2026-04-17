@@ -174,7 +174,7 @@ export class AiCore extends EventTarget {
   send(prompt: string, options: AiRequestOptions): Promise<string | null> {
     if (!prompt) raiseError("prompt is required.");
     if (!this._provider) raiseError("provider is required. Set provider before calling send().");
-    if (!options.model) raiseError("model is required.");
+    if (!options.model) raiseError("model is required. See @wc-bindable/hawc-ai README §Supported Providers for each provider's model catalog (no default is shipped because model identifiers drift faster than library releases).");
     if (options.temperature !== undefined && !Number.isFinite(options.temperature)) {
       raiseError(`temperature must be a finite number, got ${options.temperature}.`);
     }

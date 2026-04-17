@@ -35,13 +35,15 @@ No peer dependencies required.
 
 ## Supported Providers
 
-| Provider | `provider` value | Default base URL |
-|----------|-----------------|------------------|
-| OpenAI | `"openai"` | `https://api.openai.com` |
-| Anthropic | `"anthropic"` | `https://api.anthropic.com` |
-| Azure OpenAI | `"azure-openai"` | (required via `base-url`) |
+| Provider | `provider` value | Default base URL | Model catalog |
+|----------|-----------------|------------------|---------------|
+| OpenAI | `"openai"` | `https://api.openai.com` | [platform.openai.com/docs/models](https://platform.openai.com/docs/models) |
+| Anthropic | `"anthropic"` | `https://api.anthropic.com` | [docs.anthropic.com/en/docs/about-claude/models](https://docs.anthropic.com/en/docs/about-claude/models) |
+| Azure OpenAI | `"azure-openai"` | (required via `base-url`) | [learn.microsoft.com/.../openai/concepts/models](https://learn.microsoft.com/en-us/azure/ai-services/openai/concepts/models) |
 
-OpenAI-compatible APIs (Ollama, vLLM, LiteLLM, etc.) work with `provider="openai"` and a custom `base-url`.
+`<hawc-ai>` intentionally does **not** ship a default model per provider. Model identifiers drift faster than library releases, pricing tiers vary per account, and "latest" is not well-defined (e.g. `gpt-4o` vs `gpt-4.1` vs `o3` are different trade-offs, not versions of one thing). Pick the current model name from the catalog above for your target provider and set it via the `model` attribute or property.
+
+OpenAI-compatible APIs (Ollama, vLLM, LiteLLM, etc.) work with `provider="openai"` and a custom `base-url`; consult each service's own model list (e.g. `ollama list`, your LiteLLM config) for valid `model` values.
 
 ## Quick Start
 
@@ -58,7 +60,21 @@ import { bootstrapAi } from "@wc-bindable/hawc-ai";
 bootstrapAi();
 ```
 
-### 1. Non-streaming request
+### 1. Backend proxy (recommended production pattern)
+
+Point `base-url` at your own endpoint. `<hawc-ai>` issues requests via the browser's standard `fetch`, so cookie/session credentials flow automatically — the proxy validates the user, injects the server-side API key, and forwards to the provider. **No API key in the browser, no custom auth header wiring.**
+
+```html
+<hawc-ai
+  provider="openai"
+  model="gpt-4o"
+  base-url="/api/ai">
+</hawc-ai>
+```
+
+This is the baseline shape used by the rest of the examples in this section and fits cleanly on top of existing HTTP proxy / API-gateway infrastructure. **If you are building the backend from scratch**, compare against [Remote Mode](#remote-mode) — the server-side implementation is often smaller there because `AiCore` provides provider abstraction, SSE parsing, and abort propagation out of the box.
+
+### 2. Non-streaming request
 
 Add `no-stream` to disable streaming and receive the complete response at once:
 
@@ -71,7 +87,7 @@ Add `no-stream` to disable streaming and receive the complete response at once:
 </hawc-ai>
 ```
 
-### 2. Anthropic provider
+### 3. Anthropic provider
 
 ```html
 <hawc-ai
@@ -85,20 +101,6 @@ Add `no-stream` to disable streaming and receive the complete response at once:
 
 Anthropic's system message format is handled automatically — the provider extracts system messages and places them in the top-level `system` field.
 
-### 3. Azure OpenAI
-
-```html
-<hawc-ai
-  provider="azure-openai"
-  model="gpt-4o"
-  base-url="https://myresource.openai.azure.com"
-  api-key="your-azure-key"
-  api-version="2024-02-01">
-</hawc-ai>
-```
-
-The URL is constructed as `{base-url}/openai/deployments/{model}/chat/completions?api-version={api-version}`.
-
 ### 4. Local model via Ollama
 
 ```html
@@ -111,19 +113,30 @@ The URL is constructed as `{base-url}/openai/deployments/{model}/chat/completion
 
 Any OpenAI-compatible API works by setting `base-url`.
 
-### 5. Authenticated requests via backend proxy
+### 5. Azure OpenAI
 
-`<hawc-ai>` sends requests to `base-url` using the browser's standard `fetch`. If your backend proxy uses cookie/session-based authentication, the browser includes credentials automatically:
+```html
+<hawc-ai
+  provider="azure-openai"
+  model="gpt-4o"
+  base-url="/api/azure"
+  api-version="2024-02-01">
+</hawc-ai>
+```
+
+The URL is constructed as `{base-url}/openai/deployments/{model}/chat/completions?api-version={api-version}`. In production, `base-url` points to your proxy, which forwards to `https://<resource>.openai.azure.com` with the server-held `api-key`. For local development only, you can point directly at the Azure resource and set `api-key="..."` — the same DOM-exposure caveat as any other provider applies.
+
+### 6. Development-only: API key on the element
+
+For local prototyping you can put the key directly on the element. It is visible in the DOM, the network panel, and any framework state bound to the element. **Never ship this shape to production** — switch to section 1 (backend proxy) or [Remote Mode](#remote-mode) before deploying:
 
 ```html
 <hawc-ai
   provider="openai"
   model="gpt-4o"
-  base-url="/api/ai">
+  api-key="sk-...">
 </hawc-ai>
 ```
-
-The backend proxy at `/api/ai` validates the user's session and forwards the request to the AI provider with the server-side API key. This is the recommended production pattern — no API key in the browser, no custom auth header injection needed.
 
 ## State Surface vs Command Surface
 
@@ -528,7 +541,18 @@ bind(aiEl, (name, value) => {
 
 ## Remote Mode
 
-`<hawc-ai>` can run its Core on a different host and drive the Shell in the browser over WebSocket. This keeps the provider API key entirely server-side (no `api-key` attribute in the DOM, no backend proxy path) and lets you centralize conversation state / rate limiting / audit logging.
+`<hawc-ai>` can run its Core on a different host and drive the Shell in the browser over WebSocket.
+
+Two independent reasons to choose this mode:
+
+1. **You need server-owned state.** Authoritative conversation history, protocol-level rate limiting and quotas, per-user audit logging, or cross-device session continuity. These are difficult to bolt onto a stateless backend proxy.
+2. **You are building the backend from scratch.** `AiCore` already implements provider abstraction, SSE parsing, streaming, abort propagation, and the `wc-bindable-protocol` wire format. A remote deployment reuses that on the server and needs ~15 lines of glue (see [Server setup](#server-setup)). Writing a backend proxy from scratch means reimplementing per-provider URL/header/streaming forwarding and abort handling yourself.
+
+### When to stay with a backend proxy instead
+
+- You already have HTTP proxy or API-gateway infrastructure and want `<hawc-ai>` to slot into it. WebSocket deployments have their own operational shape (sticky sessions, idle timeouts, separate scaling), which is only worth it if you gain something from (1) above.
+- Your deployment target cannot host long-lived WebSocket connections (some serverless platforms, CDN-fronted edge functions).
+- You only need to keep the API key out of the browser. Either mode does that — pick by infrastructure fit, not by the API-key requirement alone.
 
 ```
 browser                                         server
@@ -587,6 +611,83 @@ Setting `enableRemote: true` with an empty URL does not throw out of `appendChil
 |------------|----------|
 | `@wc-bindable/hawc-ai/auto` | Registers the custom elements with default (local) config. |
 | `@wc-bindable/hawc-ai/auto/remoteEnv` | Registers the custom elements and enables remote mode with `remoteSettingType: "env"`. `AI_REMOTE_CORE_URL` is resolved when a `<hawc-ai>` element initializes its remote connection. |
+
+### Server setup
+
+`@wc-bindable/hawc-ai` does **not** ship a server helper — `AiCore` itself runs unchanged on the server. Wire it to the browser by pairing it with `RemoteShellProxy` + `WebSocketServerTransport` from `@wc-bindable/remote`.
+
+#### Minimal example (Node + `ws`)
+
+```ts
+import { WebSocketServer } from "ws";
+import { RemoteShellProxy, WebSocketServerTransport } from "@wc-bindable/remote";
+import { AiCore } from "@wc-bindable/hawc-ai";
+
+const wss = new WebSocketServer({ port: 8080, path: "/hawc-ai" });
+
+wss.on("connection", (ws) => {
+  const core = new AiCore();
+  const transport = new WebSocketServerTransport(ws);
+  const shell = new RemoteShellProxy(core, transport);
+
+  ws.on("close", () => {
+    core.abort();      // cancel any in-flight inference
+    shell.dispose();   // unbind and release the Core
+  });
+});
+```
+
+Point the browser at `wss://<host>:8080/hawc-ai` via `remoteCoreUrl`. Instantiate `AiCore` **per connection** — `AiCore` owns conversation history, in-flight `AbortController`, and streaming state, and must not be shared across sessions.
+
+#### Injecting the provider API key server-side
+
+This is the whole reason to run remote. `<hawc-ai>.send()` in remote mode forwards `{ model, apiKey, baseUrl, apiVersion, ... }` from the DOM element to the server as `send` command arguments ([components/Ai.ts:383-392](src/components/Ai.ts#L383-L392)). In a hardened deployment the browser has no `api-key` attribute, so the incoming `apiKey` is `""` — the server must override it before calling the provider:
+
+```ts
+class ServerAiCore extends AiCore {
+  override async send(prompt: string, options: AiRequestOptions): Promise<string | null> {
+    return super.send(prompt, {
+      ...options,
+      apiKey: process.env.OPENAI_API_KEY!,
+      baseUrl: process.env.OPENAI_BASE_URL ?? "https://api.openai.com",
+    });
+  }
+}
+
+// wss.on("connection", ws => { const core = new ServerAiCore(); ... })
+```
+
+Also consider pinning `model` / `provider` / `maxTokens` server-side when the browser value is not trusted — the client can set any value it wants, and the server is the last line of defense for cost and quota controls.
+
+#### Authenticated deployments (pair with `<hawc-auth0>`)
+
+A public WebSocket endpoint that dispenses LLM tokens is a direct cost vector. Production deployments should gate the Core on an authenticated handshake. The recommended pattern is to combine `<hawc-auth0>` in remote mode with `createAuthenticatedWSS` from `@wc-bindable/hawc-auth0/server`, and use its `createCores` hook to construct `ServerAiCore` only after token verification:
+
+```ts
+import { createAuthenticatedWSS } from "@wc-bindable/hawc-auth0/server";
+import { RemoteShellProxy, WebSocketServerTransport } from "@wc-bindable/remote";
+
+createAuthenticatedWSS({
+  auth0Domain: "example.auth0.com",
+  auth0Audience: "https://api.example.com",
+  allowedOrigins: ["https://app.example.com"],
+  createCores: (user, ws) => {
+    const core = new ServerAiCore();  // user identity / quotas can be captured in closure
+    const transport = new WebSocketServerTransport(ws);
+    const shell = new RemoteShellProxy(core, transport);
+    ws.on("close", () => { core.abort(); shell.dispose(); });
+    return { core };
+  },
+});
+```
+
+See [@wc-bindable/hawc-auth0 README-REMOTE.md](../hawc-auth0/README-REMOTE.md#server-side) and [SPEC-REMOTE.md](../hawc-auth0/SPEC-REMOTE.md) for the `createAuthenticatedWSS` handler options, handshake error codes, and the `auth:refresh` contract used when Auth0 access tokens expire mid-session.
+
+#### Cleanup checklist
+
+- `ws.on("close", ...)` → `core.abort()` then `shell.dispose()`. Without `abort()`, an in-flight `fetch` keeps running until the provider responds and racks up token cost for a client who is already gone.
+- Do not reuse a `RemoteShellProxy` or `AiCore` across reconnects — the client's fresh WebSocket triggers a new `connection` event, and a new Core/proxy pair is cheap.
+- If you front the WebSocket with a reverse proxy (nginx, CloudFront, ALB), raise the idle timeout above your longest expected streaming response — provider completions can run for minutes under high `max_tokens`.
 
 ## Configuration
 

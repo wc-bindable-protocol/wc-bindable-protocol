@@ -630,7 +630,9 @@ describe("AiCore", () => {
     it("model未指定時にエラーをスローする", () => {
       const core = new AiCore();
       core.provider = "openai";
-      expect(() => core.send("Hello", { model: "" })).toThrow("[@wc-bindable/hawc-ai] model is required.");
+      expect(() => core.send("Hello", { model: "" })).toThrow(
+        "[@wc-bindable/hawc-ai] model is required. See @wc-bindable/hawc-ai README §Supported Providers for each provider's model catalog (no default is shipped because model identifiers drift faster than library releases).",
+      );
     });
 
     it("非ストリーミングリクエストを送信できる", async () => {

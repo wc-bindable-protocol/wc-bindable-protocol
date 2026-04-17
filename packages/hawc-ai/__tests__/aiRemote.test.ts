@@ -426,6 +426,7 @@ describe("Ai (remote mode)", () => {
 
       expect(caughtError).not.toBeNull();
       expect(caughtError.message).toContain("model is required");
+      expect(caughtError.message).toContain("README §Supported Providers");
 
       cleanup();
     });
