@@ -192,10 +192,14 @@ export class GoogleProvider implements IAiProvider {
       const delta = this._extractText(parts) || undefined;
       const usage = parsed?.usageMetadata ? this._parseUsage(parsed.usageMetadata) : undefined;
       const toolCallDeltas = this._extractStreamToolCallDeltas(parts);
-      // finishReason is set on the terminal chunk (STOP, MAX_TOKENS, SAFETY, etc.).
-      // Absence means more chunks follow.
-      const done = candidate?.finishReason != null;
-      return { delta, usage, toolCallDeltas, done };
+      // Gemini has no definitive end-of-stream sentinel comparable to
+      // OpenAI `[DONE]` or Anthropic `message_stop`: `finishReason` marks
+      // the end of the *content turn* but `usageMetadata` is emitted in a
+      // separate SSE event that arrives after it. Setting `done: true`
+      // here would cause AiCore to short-circuit the read loop and drop
+      // the trailing usage event. We always return `done: false` and let
+      // the stream loop exit when the server closes the connection.
+      return { delta, usage, toolCallDeltas, done: false };
     } catch (error) {
       warnStreamParseFailure("google", event, data, error);
       return null;

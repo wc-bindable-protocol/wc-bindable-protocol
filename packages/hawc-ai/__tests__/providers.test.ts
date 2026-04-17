@@ -787,20 +787,21 @@ describe("GoogleProvider", () => {
       expect(result).toEqual({ delta: "Hello", usage: undefined, done: false });
     });
 
-    it("finishReason付きチャンクでdone=trueを返す", () => {
+    it("finishReason付きチャンクはdelta/usageを返すがdone=falseのまま（Geminiは別イベントでusageを送るためAiCoreに早期終了させない）", () => {
       const result = provider.parseStreamChunk(undefined,
         '{"candidates":[{"content":{"parts":[{"text":"!"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}'
       );
       expect(result?.delta).toBe("!");
-      expect(result?.done).toBe(true);
+      // Gemini has no end-of-stream sentinel; AiCore exits on server close.
+      expect(result?.done).toBe(false);
       expect(result?.usage).toEqual({ promptTokens: 10, completionTokens: 5, totalTokens: 15 });
     });
 
-    it("MAX_TOKENSなどSTOP以外のfinishReasonでもdone=trueになる", () => {
+    it("MAX_TOKENSなどSTOP以外のfinishReasonでもdone=falseのまま", () => {
       const result = provider.parseStreamChunk(undefined,
         '{"candidates":[{"content":{"parts":[]},"finishReason":"MAX_TOKENS"}]}'
       );
-      expect(result?.done).toBe(true);
+      expect(result?.done).toBe(false);
     });
 
     it("usageMetadata単独チャンクを処理する", () => {

@@ -559,6 +559,23 @@ export class AiCore extends EventTarget {
     };
 
     try {
+      // Termination contract:
+      //
+      // - Providers that emit an explicit end-of-stream sentinel (OpenAI
+      //   `[DONE]`, Anthropic `message_stop`) set `result.done = true`.
+      //   We finish processing the *rest of the current batch* so
+      //   trailing metadata events packed in the same reader.read()
+      //   buffer are not discarded, then exit the outer loop so send()
+      //   returns even if an OpenAI-compatible proxy (Ollama / vLLM /
+      //   LiteLLM) keeps the HTTP stream open after the terminator.
+      //
+      // - Providers without a definitive sentinel (Gemini) must *not*
+      //   set `done: true` on `finishReason`, because usage metadata is
+      //   delivered in a separate SSE event that arrives after the
+      //   final-content event (sometimes in the same read buffer, often
+      //   in a later one). For those, the loop exits when the server
+      //   closes the stream naturally and `reader.read()` resolves with
+      //   `{ done: true }`.
       let streamDone = false;
       while (!streamDone) {
         const { done, value } = await reader.read();
@@ -584,10 +601,12 @@ export class AiCore extends EventTarget {
             for (const d of result.toolCallDeltas) applyToolCallDelta(d);
           }
 
-          if (result.done) {
-            streamDone = true;
-            break;
-          }
+          // Do NOT break the inner loop here: drain same-batch events
+          // (notably Gemini's usage-only event immediately following the
+          // finishReason-carrying content event when both parse out of
+          // one reader.read() buffer). The outer loop still exits on
+          // the next while-check.
+          if (result.done) streamDone = true;
         }
       }
       // Flush any incomplete multibyte sequence left in the TextDecoder, then
@@ -625,7 +644,18 @@ export class AiCore extends EventTarget {
         }
       }
     } finally {
-      reader.releaseLock();
+      // `reader.releaseLock()` alone would leave the response body stream
+      // alive — an OpenAI-compatible proxy (Ollama / vLLM / LiteLLM) that
+      // keeps the HTTP connection open after `[DONE]` / `message_stop`
+      // would then hold a socket and any buffered bytes until GC. Calling
+      // `reader.cancel()` propagates cancellation to the underlying source
+      // so `fetch` can free the socket immediately. Fire-and-forget with a
+      // swallowed rejection: awaiting would gate send()'s return on a
+      // potentially-slow cancel implementation, and any error here is
+      // irrelevant to the caller (the stream is already logically done on
+      // the happy path; on the error path the outer try/catch has already
+      // captured the failure).
+      reader.cancel().catch(() => {});
     }
 
     if (!isCurrent()) return null;

@@ -1229,6 +1229,281 @@ describe("AiCore", () => {
       expect(url).toBe("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse");
     });
 
+    it("sentinel終端後、held-openな response body に対しては cancel が伝播する（socket/メモリリーク防止）", async () => {
+      // releaseLock() alone would leave the underlying stream source open
+      // on proxies that keep the HTTP connection alive past [DONE]. We
+      // spy on the stream's `cancel` callback to confirm AiCore actually
+      // cancels the reader instead.
+      const cancelSpy = vi.fn();
+      const encoder = new TextEncoder();
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode(sseData('{"choices":[{"delta":{"content":"Hi"}}]}')));
+          controller.enqueue(encoder.encode(sseData("[DONE]")));
+          // No controller.close(): held-open proxy behaviour.
+        },
+        cancel: (reason) => { cancelSpy(reason); },
+      });
+      fetchSpy.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        headers: new Headers({ "Content-Type": "text/event-stream" }),
+        body: stream,
+        json: () => Promise.reject(new Error("streaming")),
+        text: () => Promise.reject(new Error("streaming")),
+      } as unknown as Response);
+
+      const core = new AiCore();
+      core.provider = "openai";
+      const result = await core.send("hi", { model: "gpt-4o" });
+
+      expect(result).toBe("Hi");
+      // Cancellation is dispatched asynchronously — wait a microtask turn.
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(cancelSpy).toHaveBeenCalledTimes(1);
+    }, 2000);
+
+    it("OpenAI [DONE] を受け取ると、サーバがHTTP streamを閉じなくても send が返る（プロキシ互換性）", async () => {
+      // Regression: Ollama / vLLM / LiteLLM proxies may keep the connection
+      // open for a while after emitting `data: [DONE]`. AiCore must short-
+      // circuit the read loop on the sentinel instead of waiting for the
+      // server to close, otherwise send() hangs.
+      const encoder = new TextEncoder();
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode(sseData('{"choices":[{"delta":{"content":"Hi"}}]}')));
+          controller.enqueue(encoder.encode(sseData("[DONE]")));
+          // Intentionally do NOT call controller.close() — proxy holds the
+          // socket open. The test will hit vitest's timeout if the loop
+          // does not exit on [DONE].
+        },
+      });
+      fetchSpy.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        headers: new Headers({ "Content-Type": "text/event-stream" }),
+        body: stream,
+        json: () => Promise.reject(new Error("streaming")),
+        text: () => Promise.reject(new Error("streaming")),
+      } as unknown as Response);
+
+      const core = new AiCore();
+      core.provider = "openai";
+      const result = await core.send("hi", { model: "gpt-4o" });
+      expect(result).toBe("Hi");
+    }, 2000);
+
+    it("Anthropic message_stop でも HTTP stream が閉じる前に send が返る", async () => {
+      const encoder = new TextEncoder();
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode(
+            'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}\n\n',
+          ));
+          controller.enqueue(encoder.encode(
+            'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+          ));
+          // No controller.close(): proxy may hold the socket.
+        },
+      });
+      fetchSpy.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        headers: new Headers({ "Content-Type": "text/event-stream" }),
+        body: stream,
+        json: () => Promise.reject(new Error("streaming")),
+        text: () => Promise.reject(new Error("streaming")),
+      } as unknown as Response);
+
+      const core = new AiCore();
+      core.provider = "anthropic";
+      const result = await core.send("hi", { model: "claude-sonnet-4-20250514" });
+      expect(result).toBe("Hello");
+    }, 2000);
+
+    it("Geminiの finishReason と usageMetadata が別チャンクで届いてもusageを取りこぼさない", async () => {
+      // Gemini frequently emits the usage metadata in a dedicated event
+      // *after* the content event that carries `finishReason`. Breaking the
+      // stream loop on the first `done: true` dropped that trailing usage.
+      const chunks = [
+        sseData('{"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]}}]}'),
+        sseData('{"candidates":[{"content":{"parts":[{"text":" trailing"}]},"finishReason":"STOP"}]}'),
+        // usage-only chunk, no content, no finishReason.
+        sseData('{"usageMetadata":{"promptTokenCount":11,"candidatesTokenCount":4,"totalTokenCount":15}}'),
+      ];
+      fetchSpy.mockResolvedValueOnce(createMockStreamResponse(chunks));
+
+      const core = new AiCore();
+      core.provider = "google";
+      const result = await core.send("Hi", { model: "gemini-2.5-flash" });
+
+      expect(result).toBe("Hello trailing");
+      expect(core.usage).toEqual({ promptTokens: 11, completionTokens: 4, totalTokens: 15 });
+    });
+
+    it("Geminiの finishReason 直後の同バッファ内 usage-only イベントも取り込む", async () => {
+      // Simulate both events arriving in the *same* reader.read() buffer by
+      // concatenating two SSE events into a single chunk. The inner-loop
+      // `break` on result.done used to discard everything after the first
+      // `done: true` event within this batch.
+      const sameBatch =
+        sseData('{"candidates":[{"content":{"parts":[{"text":"Bye"}]},"finishReason":"STOP"}]}') +
+        sseData('{"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":1,"totalTokenCount":3}}');
+      fetchSpy.mockResolvedValueOnce(createMockStreamResponse([sameBatch]));
+
+      const core = new AiCore();
+      core.provider = "google";
+      const result = await core.send("Hi", { model: "gemini-2.5-flash" });
+
+      expect(result).toBe("Bye");
+      expect(core.usage).toEqual({ promptTokens: 2, completionTokens: 1, totalTokens: 3 });
+    });
+
+    it("OpenAI: ツールコールdeltasを蓄積し、finish_reason=tool_calls + [DONE] + held-open で確実にloopへ抜ける", async () => {
+      // Combine: streaming tool_call accumulation across multiple SSE
+      // chunks, terminator [DONE], and a held-open connection (no
+      // controller.close() on the first fetch). The subsequent round-trip
+      // for the final assistant reply is a normal non-streamed response.
+      const encoder = new TextEncoder();
+      const firstStream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          // id + name emitted on first delta.
+          controller.enqueue(encoder.encode(sseData(
+            '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"get_weather","arguments":""}}]}}]}',
+          )));
+          // Arguments streamed in fragments.
+          controller.enqueue(encoder.encode(sseData(
+            '{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"loc\\":\\"To"}}]}}]}',
+          )));
+          controller.enqueue(encoder.encode(sseData(
+            '{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"kyo\\"}"}}]}}]}',
+          )));
+          // finish_reason=tool_calls + [DONE] sentinel. Explicit held-open:
+          // NO controller.close() call. The send() must still return.
+          controller.enqueue(encoder.encode(sseData(
+            '{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+          )));
+          controller.enqueue(encoder.encode(sseData("[DONE]")));
+        },
+      });
+      fetchSpy.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        headers: new Headers({ "Content-Type": "text/event-stream" }),
+        body: firstStream,
+        json: () => Promise.reject(new Error("streaming")),
+        text: () => Promise.reject(new Error("streaming")),
+      } as unknown as Response);
+      // Second fetch (after handler runs) returns a final plain reply.
+      fetchSpy.mockResolvedValueOnce(createMockResponse({
+        choices: [{ message: { role: "assistant", content: "22°C in Tokyo" } }],
+      }));
+
+      const handler = vi.fn().mockResolvedValue({ temp: 22 });
+      const core = new AiCore();
+      core.provider = "openai";
+      const result = await core.send("weather?", {
+        model: "gpt-4o",
+        tools: [{ name: "get_weather", description: "", parameters: {}, handler }],
+      });
+
+      expect(result).toBe("22°C in Tokyo");
+      // Handler called with fully-accumulated args from the streamed deltas.
+      expect(handler).toHaveBeenCalledWith({ loc: "Tokyo" });
+      // History: user + assistant(tool_calls) + tool + assistant(final).
+      expect(core.messages).toHaveLength(4);
+      expect(core.messages[1].toolCalls).toEqual([
+        { id: "c1", name: "get_weather", arguments: '{"loc":"Tokyo"}' },
+      ]);
+    }, 3000);
+
+    it("Anthropic: streaming tool_use blocks + message_stop + held-open で確実にloopへ抜ける", async () => {
+      const encoder = new TextEncoder();
+      const firstStream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          // content_block_start: establishes tool_use id + name at index 1.
+          controller.enqueue(encoder.encode(
+            'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"c1","name":"get_weather"}}\n\n',
+          ));
+          // input_json_delta fragments.
+          controller.enqueue(encoder.encode(
+            'event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"loc\\":"}}\n\n',
+          ));
+          controller.enqueue(encoder.encode(
+            'event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\\"Tokyo\\"}"}}\n\n',
+          ));
+          // message_stop sentinel. Held-open: NO controller.close() call.
+          controller.enqueue(encoder.encode(
+            'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+          ));
+        },
+      });
+      fetchSpy.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        headers: new Headers({ "Content-Type": "text/event-stream" }),
+        body: firstStream,
+        json: () => Promise.reject(new Error("streaming")),
+        text: () => Promise.reject(new Error("streaming")),
+      } as unknown as Response);
+      // Second fetch after the handler: plain Anthropic reply.
+      fetchSpy.mockResolvedValueOnce(createMockResponse({
+        content: [{ type: "text", text: "22°C in Tokyo" }],
+      }));
+
+      const handler = vi.fn().mockResolvedValue({ temp: 22 });
+      const core = new AiCore();
+      core.provider = "anthropic";
+      const result = await core.send("weather?", {
+        model: "claude-sonnet-4-20250514",
+        tools: [{ name: "get_weather", description: "", parameters: {}, handler }],
+      });
+
+      expect(result).toBe("22°C in Tokyo");
+      expect(handler).toHaveBeenCalledWith({ loc: "Tokyo" });
+      expect(core.messages[1].toolCalls).toEqual([
+        { id: "c1", name: "get_weather", arguments: '{"loc":"Tokyo"}' },
+      ]);
+    }, 3000);
+
+    it("Gemini: streaming functionCall + 後続usageMetadata (別チャンク) でtool callもusageも取り込む", async () => {
+      // Gemini has no sentinel — send() exits on natural server close.
+      // Verify: functionCall arriving before finishReason, usageMetadata
+      // trailing in a separate chunk, final-reply round-trip unaffected.
+      const firstChunks = [
+        sseData('{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"get_weather","args":{"loc":"Tokyo"}}}]}}]}'),
+        sseData('{"candidates":[{"content":{"parts":[]},"finishReason":"STOP"}]}'),
+        sseData('{"usageMetadata":{"promptTokenCount":9,"candidatesTokenCount":6,"totalTokenCount":15}}'),
+      ];
+      fetchSpy.mockResolvedValueOnce(createMockStreamResponse(firstChunks));
+      // Second fetch: final plain Gemini reply, same behaviour.
+      const secondChunks = [
+        sseData('{"candidates":[{"content":{"role":"model","parts":[{"text":"22°C"}]}}]}'),
+        sseData('{"candidates":[{"content":{"parts":[]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":14,"candidatesTokenCount":2,"totalTokenCount":16}}'),
+      ];
+      fetchSpy.mockResolvedValueOnce(createMockStreamResponse(secondChunks));
+
+      const handler = vi.fn().mockResolvedValue({ temp: 22 });
+      const core = new AiCore();
+      core.provider = "google";
+      const result = await core.send("weather?", {
+        model: "gemini-2.5-flash",
+        tools: [{ name: "get_weather", description: "", parameters: {}, handler }],
+      });
+
+      expect(result).toBe("22°C");
+      expect(handler).toHaveBeenCalledWith({ loc: "Tokyo" });
+      // Usage aggregates both turns (9+14 prompt, 6+2 completion).
+      expect(core.usage).toEqual({ promptTokens: 23, completionTokens: 8, totalTokens: 31 });
+      expect(core.messages[1].toolCalls?.[0]).toMatchObject({ name: "get_weather", arguments: '{"loc":"Tokyo"}' });
+    });
+
     it("Googleプロバイダで非ストリーミングリクエストを送信できる", async () => {
       fetchSpy.mockResolvedValueOnce(createMockResponse({
         candidates: [{
