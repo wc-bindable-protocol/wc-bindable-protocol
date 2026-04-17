@@ -100,15 +100,39 @@ export class S3Core extends EventTarget {
     gen: number;
     key: string;
     options: S3RequestOptions;
+    /**
+     * size / contentType are snapshotted here (not just read from
+     * `this._metadata` at completion time) because `deleteObject()` clears
+     * `_metadata` when its key matches — and there is no reason to couple
+     * the post-process context to that side channel. Keeping the values on
+     * the snapshot means a mid-upload delete, a racing Shell reset, or a
+     * future mutation of `_metadata` cannot silently corrupt what the
+     * registerPostProcess hook sees.
+     */
+    size: number;
+    contentType?: string;
   } | null = null;
   /**
    * Active single-PUT upload state. Same snapshot rationale as `_multipart`:
    * `complete()` consults this so the post-process hook sees the bucket the
    * bytes actually live in, and the GET presign points to the right path.
-   * There is no S3-side cleanup needed for single PUTs (no orphan equivalent
-   * of UploadId), so this is purely the options snapshot.
+   * `key` is captured here (not just read from the mutable `this._key` slot)
+   * because `requestDownload` also calls `_setKey()` and can clobber
+   * `this._key` mid-upload — letting a valid `complete(originalKey, ...)`
+   * fail with a spurious "key mismatch". `size` / `contentType` are
+   * captured for the same reason `_multipart` captures them: `deleteObject`
+   * clears `this._metadata` on key match, which would otherwise leak
+   * `undefined` into the post-process ctx even though the upload itself
+   * completed successfully. There is no S3-side cleanup needed for single
+   * PUTs (no orphan equivalent of UploadId), so this is purely a snapshot
+   * used for validation and post-process routing.
    */
-  private _singleUpload: { options: S3RequestOptions } | null = null;
+  private _singleUpload: {
+    key: string;
+    options: S3RequestOptions;
+    size?: number;
+    contentType?: string;
+  } | null = null;
 
   constructor(provider: IS3Provider, target?: EventTarget) {
     super();
@@ -303,7 +327,17 @@ export class S3Core extends EventTarget {
       const presigned = await this._provider.presignUpload(key, opts);
       // Capture the snapshot only after presign succeeds, so a failed presign
       // does not leave a stale slot that complete() would later consume.
-      this._singleUpload = { options: opts };
+      // Stash the key so completion can validate against the upload's
+      // original key rather than `this._key`, which requestDownload() can
+      // overwrite mid-flight. size/contentType are also snapshotted so a
+      // mid-upload `deleteObject()` that nulls `this._metadata` does not
+      // leak undefined into the post-process ctx.
+      this._singleUpload = {
+        key,
+        options: opts,
+        size,
+        contentType: contentType || this._contentType || undefined,
+      };
       // Intentionally do NOT publish presigned.url through `this.url`. The
       // public `url` property is documented as the post-completion GET URL
       // (see README) — surfacing the write-capable PUT URL here would both
@@ -342,13 +376,32 @@ export class S3Core extends EventTarget {
   async complete(key: string, etag?: string): Promise<string> {
     const gen = this._generation;
     if (!this._uploading) raiseError("complete() called without an active upload.");
-    if (key !== this._key) raiseError(`complete() key mismatch: expected ${this._key}, got ${key}.`);
+    // Refuse when a multipart is in flight. `complete()` is the single-PUT
+    // finalizer; it does not merge parts on S3, and its options fallback
+    // (`this._baseRequestOptions()` when `_singleUpload` is null) would use
+    // whatever bucket/prefix the inputs hold NOW — not the snapshot the
+    // multipart was initiated against. That silently misroutes the
+    // post-process ctx.bucket and the download GET presign. The remedy is
+    // not to "route through the multipart snapshot here" (that would
+    // conflate two different finalization protocols), but to surface the
+    // misuse so the caller switches to completeMultipart(). Symmetric with
+    // completeMultipart()'s own `if (!this._multipart)` guard.
+    if (this._multipart) raiseError("complete() called while a multipart upload is active — use completeMultipart() to finalize multipart uploads.");
+    // Validate against the snapshot, not the mutable `this._key` slot.
+    // `requestDownload()` (a legal public command) also calls `_setKey()` and
+    // can clobber `this._key` between requestUpload and complete — which
+    // would make a correct `complete(uploadKey, ...)` throw a spurious key
+    // mismatch. The snapshot is the source of truth for "what key is this
+    // upload targeting". Fall back to `this._key` only for the unusual case
+    // where a caller drove `_uploading=true` without going through
+    // requestUpload (test setups) and therefore has no snapshot.
+    const snapshot = this._singleUpload;
+    const expectedKey = snapshot ? snapshot.key : this._key;
+    if (key !== expectedKey) raiseError(`complete() key mismatch: expected ${expectedKey}, got ${key}.`);
     // Use the snapshot taken at requestUpload time so the post-process hook
     // and download presign target the bucket/prefix the bytes actually live
     // at, even if `this.bucket`/`this.prefix` were mutated mid-flight.
-    // Fall back to current options for the unusual case where a caller drove
-    // _uploading=true without going through requestUpload (e.g. test setups).
-    const opts = this._singleUpload?.options ?? this._baseRequestOptions();
+    const opts = snapshot?.options ?? this._baseRequestOptions();
     this._cancelFlush();
     this._setProgress({
       loaded: this._metadata?.size ?? this._progress.loaded,
@@ -361,8 +414,12 @@ export class S3Core extends EventTarget {
       bucket: opts.bucket,
       key,
       etag,
-      size: this._metadata?.size,
-      contentType: this._metadata?.contentType,
+      // Read from the snapshot, not `this._metadata`. `deleteObject(key)`
+      // clears `_metadata` when its key matches — so an in-flight upload
+      // racing a same-key delete would otherwise hand `undefined` to the
+      // post-process hook even though the upload itself succeeded.
+      size: snapshot?.size ?? this._metadata?.size,
+      contentType: snapshot?.contentType ?? this._metadata?.contentType,
     };
 
     try {
@@ -557,8 +614,18 @@ export class S3Core extends EventTarget {
     // Snapshot the options used for this multipart. completeMultipart, abort,
     // and the prior-cleanup path all consult this snapshot rather than the
     // current `this._bucket`/`this._prefix`, so mutating the inputs mid-flight
-    // does not misroute the cleanup or the download presign.
-    this._multipart = { uploadId, gen, key, options: opts };
+    // does not misroute the cleanup or the download presign. size /
+    // contentType are carried on the snapshot for the same reason — a
+    // mid-upload `deleteObject()` nulls `this._metadata`, and completeMultipart
+    // must still feed accurate values into the post-process ctx.
+    this._multipart = {
+      uploadId,
+      gen,
+      key,
+      options: opts,
+      size,
+      contentType: contentType || this._contentType || undefined,
+    };
     this._setUploading(true);
     this._setProgress({ loaded: 0, total: size, phase: "uploading" });
     return { uploadId, partSize: effectivePartSize, parts, key };
@@ -591,13 +658,49 @@ export class S3Core extends EventTarget {
     const gen = this._generation;
     if (!this._multipart) raiseError("completeMultipart() called without an active multipart upload.");
     if (this._multipart.uploadId !== uploadId) raiseError("completeMultipart() uploadId mismatch.");
-    if (key !== this._key) raiseError(`completeMultipart() key mismatch: expected ${this._key}, got ${key}.`);
+    // Validate against the snapshot's captured key, not `this._key`.
+    // `requestDownload()` also calls `_setKey()`, so a correct completion
+    // of the original multipart would otherwise throw a spurious mismatch
+    // if a download was issued mid-upload. Symmetric with signMultipartPart
+    // above, which already uses the snapshot.
+    if (key !== this._multipart.key) raiseError(`completeMultipart() key mismatch: expected ${this._multipart.key}, got ${key}.`);
     if (!Array.isArray(parts) || parts.length === 0) raiseError("parts must be a non-empty array.");
+    // Structural validation before handing off to S3. Previously we deferred
+    // everything below "is it an array" to the server, which meant a mis-
+    // shaped parts array (negative partNumber, duplicate entries, empty
+    // etag) only surfaced as an S3 InvalidPart / 400 after a network
+    // round-trip — harder to diagnose and opaque to the caller. Catching
+    // here produces a deterministic local error with the offending index.
+    const seen = new Set<number>();
+    for (let i = 0; i < parts.length; i++) {
+      const p = parts[i];
+      if (!p || typeof p !== "object") raiseError(`parts[${i}] is not an object.`);
+      if (!Number.isInteger(p.partNumber) || p.partNumber < 1 || p.partNumber > 10000) {
+        raiseError(`parts[${i}].partNumber must be an integer in [1, 10000], got ${p.partNumber}.`);
+      }
+      if (seen.has(p.partNumber)) {
+        raiseError(`parts contains duplicate partNumber ${p.partNumber}.`);
+      }
+      seen.add(p.partNumber);
+      // An empty etag here would propagate into the CompleteMultipartUpload
+      // XML body as `<ETag></ETag>` and S3 rejects with InvalidPart — but
+      // an S3-compatible server might not. The single-PUT path already
+      // rejects missing ETags at the XHR layer (MissingEtagError); this
+      // is the symmetric check for multipart at the Core boundary.
+      if (typeof p.etag !== "string" || p.etag.length === 0) {
+        raiseError(`parts[${i}].etag must be a non-empty string.`);
+      }
+    }
     // Capture the snapshot before the await — this._multipart is null'd out
     // partway through, and we still need bucket/prefix for the GET presign at
     // the end. Using `this._baseRequestOptions()` here would silently switch
-    // to whatever bucket/prefix the inputs hold *now*.
+    // to whatever bucket/prefix the inputs hold *now*. size / contentType
+    // are captured for the same reason we snapshot bucket/prefix: a mid-
+    // upload `deleteObject()` on this key would null `this._metadata`, so
+    // the post-process ctx built below must not depend on it.
     const mpOptions = this._multipart.options;
+    const mpSize = this._multipart.size;
+    const mpContentType = this._multipart.contentType;
     this._cancelFlush();
     this._setProgress({
       loaded: this._metadata?.size ?? this._progress.loaded,
@@ -627,8 +730,11 @@ export class S3Core extends EventTarget {
       bucket: mpOptions.bucket,
       key,
       etag,
-      size: this._metadata?.size,
-      contentType: this._metadata?.contentType,
+      // Read from the snapshot for the same reason `bucket` does: a mid-
+      // upload `deleteObject(key)` clears `this._metadata`, and we want the
+      // post-process ctx to always reflect the upload that actually happened.
+      size: mpSize,
+      contentType: mpContentType,
     };
 
     try {
@@ -667,6 +773,17 @@ export class S3Core extends EventTarget {
     // was started against, even if the inputs changed in the meantime.
     let opts: S3RequestOptions;
     if (this._multipart?.uploadId === uploadId) {
+      // Symmetric with `signMultipartPart` and `completeMultipart`: when we
+      // are identifying a tracked upload by its uploadId, the caller's key
+      // must match the snapshot. Without this check, a caller passing the
+      // wrong key (stale reference, copy/paste error, racing worker) causes
+      // us to drop internal tracking AND ask S3 to abort a different
+      // object path — so the real multipart survives and keeps billing.
+      // Checked BEFORE any state mutation so a mismatched call leaves the
+      // Core in a recoverable state rather than half-torn-down.
+      if (this._multipart.key !== key) {
+        raiseError(`abortMultipart() key mismatch: expected ${this._multipart.key}, got ${key}.`);
+      }
       opts = this._multipart.options;
       this._multipart = null;
       this._generation++;
@@ -676,9 +793,10 @@ export class S3Core extends EventTarget {
       this._setProgress({ loaded: 0, total: 0, phase: "idle" });
     } else {
       // The caller is aborting an upload we do not track (e.g. recovered
-      // from external state). We have no snapshot, so use current inputs —
-      // it is the caller's responsibility to have the right bucket/prefix
-      // configured before invoking this case.
+      // from external state, or a different uploadId against the same key
+      // that the Core never saw). We have no snapshot, so use current
+      // inputs — it is the caller's responsibility to have the right
+      // bucket/prefix configured before invoking this case.
       opts = this._baseRequestOptions();
     }
     await this._provider.abortMultipart(key, uploadId, opts);

@@ -201,6 +201,34 @@ describe("S3Core", () => {
     await expect(core.complete("k", "x")).rejects.toThrow(/without an active upload/);
   });
 
+  it("complete validates against the upload snapshot key, not the mutable _key slot", async () => {
+    // Regression guard: previously, `complete()` checked `key !== this._key`.
+    // `requestDownload(otherKey)` is a legal public command and calls
+    // `_setKey(otherKey)` — so a download issued mid-upload would clobber
+    // `this._key` and cause the subsequent (correct) `complete(uploadKey, ...)`
+    // to fail with a spurious "key mismatch". The fix captures the key in
+    // `_singleUpload` at requestUpload time and validates against that.
+    await core.requestUpload("upload.bin", 1);
+    // Simulate an unrelated download issued while the upload is in flight.
+    // `presignDownload` setter inside `requestDownload` mutates `_key` to
+    // "other.bin", which would have broken the old validator.
+    await core.requestDownload("other.bin");
+    // The mutable slot is now wrong, but completion with the original key
+    // must still succeed because the snapshot remembers "upload.bin".
+    const url = await core.complete("upload.bin", "etag-1");
+    expect(url).toContain("upload.bin");
+    expect(core.completed).toBe(true);
+  });
+
+  it("complete rejects the download's key after an interleaving requestDownload", async () => {
+    // Mirror of the test above: passing the key that `requestDownload` left
+    // in `this._key` must NOT accidentally be accepted. The snapshot is the
+    // sole source of truth for "what upload is this completing".
+    await core.requestUpload("upload.bin", 1);
+    await core.requestDownload("other.bin");
+    await expect(core.complete("other.bin", "etag")).rejects.toThrow(/key mismatch: expected upload.bin/);
+  });
+
   it("registerPostProcess returns a disposer", async () => {
     await core.requestUpload("k", 1);
     const seen: string[] = [];
@@ -252,6 +280,31 @@ describe("S3Core", () => {
     await expect(core.deleteObject("k")).rejects.toThrow("nope");
     expect(core.error).toBeInstanceOf(Error);
     expect(core.loading).toBe(false);
+  });
+
+  it("mid-upload deleteObject(sameKey) does NOT strip size/contentType from the post-process ctx", async () => {
+    // Regression guard: `deleteObject` clears `this._metadata` when the
+    // key matches. Before the fix, the single-PUT `complete()` built its
+    // post-process ctx by reading `this._metadata?.size` etc. directly, so
+    // a caller that raced a same-key `deleteObject` against their own
+    // upload saw the hook receive `size: undefined`, `contentType:
+    // undefined` — a silent integrity failure for any downstream code
+    // (DB inserts, virus scans) that relies on those fields. The fix
+    // snapshots size/contentType on `_singleUpload` at requestUpload time
+    // so the ctx is derived from the upload's actual parameters.
+    await core.requestUpload("asset.bin", 4096, "application/octet-stream");
+    // Racy same-key delete (e.g. a UI button handler, a dedup pass, or a
+    // stale cleanup task). Metadata is cleared by side-effect of this call.
+    await core.deleteObject("asset.bin");
+    expect(core.metadata).toBeNull(); // demonstrates the cleared side-channel
+    const received: any[] = [];
+    core.registerPostProcess(ctx => { received.push({ ...ctx }); });
+    await core.complete("asset.bin", "etag-xyz");
+    expect(received).toHaveLength(1);
+    expect(received[0].size).toBe(4096);
+    expect(received[0].contentType).toBe("application/octet-stream");
+    expect(received[0].etag).toBe("etag-xyz");
+    expect(received[0].key).toBe("asset.bin");
   });
 
   it("requestUpload validates size", async () => {

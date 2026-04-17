@@ -384,6 +384,42 @@ reconnects, reuse them on the next session). A resumable mode is not in this
 release; the extension points to build one are `IS3Provider` +
 `registerPostProcess`, and we would accept a PR.
 
+### Residual orphan-parts risk
+
+The `ws.on("close", () => core.abort())` hook and the provider-failure path
+in `completeMultipart` both call `abortMultipart` as **best-effort** cleanup
+(fire-and-forget with a swallowed catch — we intentionally do not block the
+caller on cleanup, and the server may itself be unreachable at that point).
+If that abort also fails (control plane outage, process crashes mid-call,
+etc.), S3 keeps the uploaded parts and keeps billing for them.
+
+The standard mitigation is a bucket-level lifecycle rule that sweeps them
+automatically:
+
+```json
+{
+  "Rules": [{
+    "ID": "abort-orphan-multipart",
+    "Status": "Enabled",
+    "Filter": {},
+    "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 1 }
+  }]
+}
+```
+
+Set the window to match your longest legitimate multipart (seconds to hours,
+not days). Most S3-compatible stores (R2, MinIO, Wasabi, etc.) expose the
+same `AbortIncompleteMultipartUpload` action on their lifecycle APIs, but
+support level and exact parameter names vary — **check your provider's
+current lifecycle documentation** before relying on it. If the action is
+not available on your store, you will need an out-of-band sweeper
+(`ListMultipartUploads` → `AbortMultipartUpload` on anything older than the
+chosen window).
+
+Configuring a backstop on every bucket that hosts `<hawc-s3>` uploads is
+strongly recommended — it is the operational safety net that covers the
+"best-effort cleanup itself failed" residual case.
+
 ## S3 bucket CORS
 
 Browser-side PUTs hit `https://<bucket>.s3.<region>.amazonaws.com` directly, so the bucket needs:

@@ -124,6 +124,32 @@ describe("S3Core multipart", () => {
     expect(core.etag).toBe("merged-etag");
   });
 
+  it("mid-upload deleteObject(sameKey) does NOT strip size/contentType from the multipart post-process ctx", async () => {
+    // Multipart counterpart to the single-PUT regression guard in
+    // s3Core.test.ts. `deleteObject(key)` side-effects `this._metadata` to
+    // null on key match, and the old code built the completeMultipart ctx
+    // straight from `this._metadata?.size` / `.contentType`. A caller
+    // (direct Core user or a misbehaving remote proxy client) that issued
+    // `deleteObject("k")` between `requestMultipartUpload("k", ...)` and
+    // `completeMultipart("k", ...)` saw the post-process hook receive
+    // `undefined` for both, even though the upload itself merged fine on
+    // S3. The fix snapshots size/contentType on `_multipart` at init time.
+    await core.requestMultipartUpload("k", 20 * MIB, "image/png");
+    await core.deleteObject("k");
+    const received: any[] = [];
+    core.registerPostProcess(ctx => { received.push({ ...ctx }); });
+    await core.completeMultipart("k", "mp-1", [
+      { partNumber: 1, etag: "\"a\"" },
+      { partNumber: 2, etag: "\"b\"" },
+      { partNumber: 3, etag: "\"c\"" },
+    ]);
+    expect(received).toHaveLength(1);
+    expect(received[0].size).toBe(20 * MIB);
+    expect(received[0].contentType).toBe("image/png");
+    expect(received[0].etag).toBe("merged-etag");
+    expect(received[0].key).toBe("k");
+  });
+
   it("completeMultipart aborts on provider failure", async () => {
     await core.requestMultipartUpload("k", 20 * MIB);
     provider.completeError = new Error("merge failed");
@@ -142,9 +168,138 @@ describe("S3Core multipart", () => {
     await expect(core.completeMultipart("k", "wrong", [{ partNumber: 1, etag: "a" }])).rejects.toThrow(/uploadId mismatch/);
   });
 
+  it("completeMultipart validates against _multipart.key snapshot, not mutable _key", async () => {
+    // Regression guard, symmetric with the single-PUT complete() case.
+    // `requestDownload` is a legal public command that mutates `_key` via
+    // `_setKey`. If completeMultipart validated against `this._key` (the
+    // previous behavior) and a download was issued mid-upload, the real
+    // multipart's `completeMultipart(originalKey, ...)` would fail with a
+    // spurious mismatch even though everything about the upload is fine.
+    await core.requestMultipartUpload("big.bin", 20 * MIB);
+    await core.requestDownload("unrelated.bin"); // clobbers `this._key`
+    const url = await core.completeMultipart("big.bin", "mp-1", [
+      { partNumber: 1, etag: "\"a\"" },
+      { partNumber: 2, etag: "\"b\"" },
+      { partNumber: 3, etag: "\"c\"" },
+    ]);
+    expect(url).toContain("big.bin");
+    expect(core.completed).toBe(true);
+  });
+
+  it("complete() refuses to run while a multipart upload is active", async () => {
+    // Regression guard: `complete()` is the single-PUT finalizer. During a
+    // multipart, `_uploading` is true but `_singleUpload` is null, so the
+    // old code fell through to `_baseRequestOptions()` — silently routing
+    // the post-process ctx.bucket and the download GET presign to CURRENT
+    // inputs instead of the multipart's snapshotted bucket/prefix. This
+    // test pins the misuse detection: complete() must throw and must NOT
+    // overwrite the download URL or call presignDownload.
+    await core.requestMultipartUpload("big.bin", 20 * MIB);
+    // Mutate inputs so current values differ from the snapshot — if the
+    // fix regresses, this is what would leak into the (wrong) code path.
+    core.bucket = "DIFFERENT-BUCKET";
+    core.prefix = "injected/";
+    await expect(core.complete("big.bin", "etag"))
+      .rejects.toThrow(/multipart upload is active — use completeMultipart/);
+    // Multipart tracking must remain intact so the caller can still call
+    // completeMultipart() with the correct snapshot afterwards.
+    expect((core as any)._multipart?.uploadId).toBe("mp-1");
+    expect(core.uploading).toBe(true);
+
+    // Actually perform the recovery. The misuse must not have poisoned the
+    // in-flight multipart, so finalizing against the captured snapshot has
+    // to succeed — and critically, the merge/presign must route to the
+    // ORIGINAL bucket ("test-bucket"), not the mutated current inputs.
+    const url = await core.completeMultipart("big.bin", "mp-1", [
+      { partNumber: 1, etag: "\"a\"" },
+      { partNumber: 2, etag: "\"b\"" },
+      { partNumber: 3, etag: "\"c\"" },
+    ]);
+    expect(core.completed).toBe(true);
+    expect(core.uploading).toBe(false);
+    // `MultipartFakeProvider.presignDownload` returns `https://download/<key>`
+    // without encoding the bucket, so this assertion pins completion rather
+    // than routing. We still assert on internal state to catch a regression
+    // where completeMultipart reached the wrong bucket/prefix: the
+    // provider's completeCalls reflect the uploadId we snapshotted, not
+    // anything derived from the mutated current inputs.
+    expect(url).toContain("big.bin");
+    expect(provider.completeCalls.at(-1)?.uploadId).toBe("mp-1");
+  });
+
+  it("completeMultipart rejects the download's key after an interleaving requestDownload", async () => {
+    // Mirror: the mutable `this._key` now reads "unrelated.bin", but passing
+    // that key to completeMultipart must still fail — the snapshot, not the
+    // mutable slot, is the source of truth for what upload we are finishing.
+    await core.requestMultipartUpload("big.bin", 20 * MIB);
+    await core.requestDownload("unrelated.bin");
+    await expect(core.completeMultipart("unrelated.bin", "mp-1", [
+      { partNumber: 1, etag: "a" },
+    ])).rejects.toThrow(/key mismatch: expected big.bin/);
+  });
+
   it("completeMultipart refuses empty parts", async () => {
     await core.requestMultipartUpload("k", 20 * MIB);
     await expect(core.completeMultipart("k", "mp-1", [])).rejects.toThrow(/non-empty/);
+  });
+
+  it("completeMultipart refuses out-of-range partNumber (< 1, > 10000, non-integer)", async () => {
+    // Catches the class of misuse that previously only surfaced as an S3
+    // InvalidPart after a network round-trip. Early local failure is both
+    // faster feedback and a better error message (points at the offending
+    // index in the caller's parts array).
+    await core.requestMultipartUpload("k", 20 * MIB);
+    await expect(core.completeMultipart("k", "mp-1", [{ partNumber: 0, etag: "a" }]))
+      .rejects.toThrow(/partNumber/);
+    await expect(core.completeMultipart("k", "mp-1", [{ partNumber: 10001, etag: "a" }]))
+      .rejects.toThrow(/partNumber/);
+    await expect(core.completeMultipart("k", "mp-1", [{ partNumber: 1.5 as any, etag: "a" }]))
+      .rejects.toThrow(/partNumber/);
+    await expect(core.completeMultipart("k", "mp-1", [{ partNumber: -1, etag: "a" }]))
+      .rejects.toThrow(/partNumber/);
+  });
+
+  it("completeMultipart refuses duplicate partNumbers", async () => {
+    // Duplicates are a classic concurrency bug: two workers each think they
+    // completed part N and both push to `completed[]`. S3 would return a
+    // 400 after the round-trip, but the caller's stack trace is already
+    // gone by then. Fail locally with the offending partNumber in the
+    // message instead.
+    await core.requestMultipartUpload("k", 20 * MIB);
+    await expect(core.completeMultipart("k", "mp-1", [
+      { partNumber: 1, etag: "a" },
+      { partNumber: 1, etag: "b" },
+    ])).rejects.toThrow(/duplicate partNumber 1/);
+  });
+
+  it("completeMultipart refuses empty or non-string etag", async () => {
+    // The symmetric check to the single-PUT `MissingEtagError` path: a part
+    // with no etag would serialize as `<ETag></ETag>` in the complete XML
+    // and S3 returns InvalidPart. An S3-compatible store might not, so we
+    // guard at the Core boundary to keep behavior uniform across providers.
+    await core.requestMultipartUpload("k", 20 * MIB);
+    await expect(core.completeMultipart("k", "mp-1", [{ partNumber: 1, etag: "" }]))
+      .rejects.toThrow(/non-empty string/);
+    await expect(core.completeMultipart("k", "mp-1", [{ partNumber: 1, etag: null as any }]))
+      .rejects.toThrow(/non-empty string/);
+    await expect(core.completeMultipart("k", "mp-1", [{ partNumber: 1, etag: 42 as any }]))
+      .rejects.toThrow(/non-empty string/);
+  });
+
+  it("completeMultipart refuses non-object entries in parts", async () => {
+    await core.requestMultipartUpload("k", 20 * MIB);
+    await expect(core.completeMultipart("k", "mp-1", [null as any]))
+      .rejects.toThrow(/parts\[0\] is not an object/);
+  });
+
+  it("completeMultipart never calls the provider when validation fails", async () => {
+    // Fast-fail is only useful if it actually avoids the server round-trip.
+    // Verify the provider's completeMultipart is not invoked on bad input.
+    await core.requestMultipartUpload("k", 20 * MIB);
+    const priorCalls = provider.completeCalls.length;
+    await expect(core.completeMultipart("k", "mp-1", [{ partNumber: 0, etag: "a" }]))
+      .rejects.toThrow();
+    expect(provider.completeCalls.length).toBe(priorCalls);
   });
 
   it("completeMultipart refuses when no multipart is active", async () => {
@@ -166,6 +321,35 @@ describe("S3Core multipart", () => {
     await core.abortMultipart("k", "mp-1");
     expect(provider.abortCalls.map(a => a.uploadId)).toContain("mp-1");
     expect(core.uploading).toBe(false);
+  });
+
+  it("abortMultipart refuses a key mismatch against the tracked uploadId", async () => {
+    // The regression this guards: when identifying the active multipart by
+    // uploadId, the Core used to accept whatever `key` the caller passed
+    // and forward it to the provider — tearing internal tracking down
+    // while asking S3 to abort a DIFFERENT object path. Net effect: the
+    // real multipart survives and keeps accruing storage cost, and the
+    // Core believes it is gone. Symmetric with signMultipartPart and
+    // completeMultipart, which already enforce this.
+    await core.requestMultipartUpload("k", 20 * MIB);
+    await expect(core.abortMultipart("wrong-key", "mp-1"))
+      .rejects.toThrow(/key mismatch: expected k, got wrong-key/);
+    // Must NOT have torn tracking down — the caller can retry with the
+    // correct key (or fall back to abort()) once they notice the error.
+    expect(core.uploading).toBe(true);
+    expect((core as any)._multipart?.uploadId).toBe("mp-1");
+    // And we must NOT have asked the provider to abort the wrong key.
+    expect(provider.abortCalls).toHaveLength(0);
+  });
+
+  it("abortMultipart still accepts an untracked (key, uploadId) pair", async () => {
+    // Counterpart to the mismatch test: when the Core does NOT track this
+    // uploadId, we have no snapshot to validate against, and the existing
+    // contract is that the caller is responsible for the arguments. A
+    // caller recovering a stale uploadId from external state must still
+    // be able to ask S3 to clean it up.
+    await core.abortMultipart("external-key", "external-uploadId");
+    expect(provider.abortCalls).toEqual([{ uploadId: "external-uploadId" }]);
   });
 
   it("a fresh requestMultipartUpload aborts the prior multipart on S3 (different key)", async () => {
