@@ -138,9 +138,88 @@ The URL is constructed as `{base-url}/openai/deployments/{model}/chat/completion
 </hawc-ai>
 ```
 
-System messages are extracted and placed in the top-level `systemInstruction` field. The assistant turn uses the role `model` on the wire — `<hawc-ai>` translates to/from `assistant` automatically so `messages` state stays consistent with the other providers. Gemini support is currently **text-only**; multi-modal `parts` (images, audio, video) are not exposed through `AiMessage`.
+System messages are extracted and placed in the top-level `systemInstruction` field. The assistant turn uses the role `model` on the wire — `<hawc-ai>` translates to/from `assistant` automatically so `messages` state stays consistent with the other providers. Multimodal image input works on Gemini too, but **only for `data:` URLs** (base64 encoded); http(s) URLs are rejected at request-building time with a clear error because Gemini's `inlineData` requires inline bytes. See [Multimodal](#multimodal) for details. Audio and video parts are not yet exposed through `AiMessage`.
 
-### 7. Development-only: API key on the element
+### 7. Tool use (function calling)
+
+Declare tools as JS objects with a `handler` function; `<hawc-ai>` / `AiCore` runs the tool-use loop automatically — each assistant turn that requests a tool gets its handler invoked, results are appended to history, and the loop continues until the model stops requesting tools or `maxToolRoundtrips` is reached.
+
+```html
+<hawc-ai id="chat" provider="openai" model="gpt-4o" base-url="/api/ai"></hawc-ai>
+<script type="module">
+  const el = document.getElementById("chat");
+  el.tools = [{
+    name: "get_weather",
+    description: "Get the current weather for a location.",
+    parameters: {
+      type: "object",
+      properties: { location: { type: "string" } },
+      required: ["location"],
+    },
+    handler: async ({ location }) => fetchWeather(location),   // returns {temp, unit}
+  }];
+  el.prompt = "What's the weather in Tokyo?";
+  const reply = await el.send();
+</script>
+```
+
+- Supported providers: OpenAI / Azure OpenAI / Anthropic / Google (Gemini). All four translate between the unified `AiTool` shape and each provider's own tool-use wire format.
+- Handlers may return any JSON-serializable value. Strings are passed through; everything else is `JSON.stringify`ed into the tool message content.
+- Errors thrown from a handler are captured into the tool message so the model can recover (the loop does not reject on handler failure).
+- Parallel tool calls in a single turn are executed via `Promise.all` and appended to history in the order the provider reported them.
+- See [Tool use](#tool-use) below for `toolChoice`, `maxToolRoundtrips`, event surface, and remote-mode `registerTool` patterns.
+
+### 8. Structured output (JSON Schema)
+
+Constrain the final assistant response to a JSON object matching a given schema. Providers that support it natively (OpenAI / Azure / Google) translate to their own `response_format` / `responseSchema` field; Anthropic is supported via a synthetic tool-use turn (non-streaming) that yields the same shape.
+
+```html
+<hawc-ai id="review" provider="openai" model="gpt-4o" base-url="/api/ai"></hawc-ai>
+<script type="module">
+  const el = document.getElementById("review");
+  el.responseSchema = {
+    type: "object",
+    properties: {
+      rating: { type: "integer", minimum: 1, maximum: 5 },
+      summary: { type: "string" },
+    },
+    required: ["rating", "summary"],
+    additionalProperties: false,
+  };
+  el.prompt = "Review the pizza I just had. It was amazing.";
+  const json = await el.send();          // JSON-stringified object
+  const review = JSON.parse(json);
+  console.log(review);                   // { rating: 5, summary: "..." }
+</script>
+```
+
+`responseSchema` is mutually exclusive with `tools` in a single `send()` call (the library throws synchronously if both are set). For Anthropic, `responseSchema` implies non-streaming even if `stream` is true — streaming the synthetic tool-use is not reliable. See [Structured output](#structured-output) for full details.
+
+### 9. Multimodal input (text + image)
+
+Pass an `AiContentPart[]` array as the prompt to include images alongside text. Supported on OpenAI / Azure OpenAI / Anthropic / Google (Gemini).
+
+```html
+<hawc-ai id="vision" provider="openai" model="gpt-4o" base-url="/api/ai"></hawc-ai>
+<script type="module">
+  const el = document.getElementById("vision");
+  el.prompt = [
+    { type: "text", text: "What's in this image?" },
+    { type: "image", url: "https://example.com/cat.jpg" },
+    // Or a data: URL for inline-encoded images:
+    // { type: "image", url: "data:image/png;base64,iVBORw0KG..." },
+  ];
+  const reply = await el.send();
+</script>
+```
+
+- Each part is either `{ type: "text", text }` or `{ type: "image", url, mediaType? }`.
+- **Google (Gemini) accepts data: URLs only** — http(s) URLs throw synchronously at request-building time with a clear error. Fetch + base64-encode client-side before passing.
+- OpenAI / Anthropic accept both http(s) and data: URLs.
+- Only user messages carry array content on the wire. Assistant / system / tool messages with array content are flattened to concatenated text parts.
+- See [Multimodal](#multimodal) below for the full provider mapping.
+
+### 10. Development-only: API key on the element
 
 For local prototyping you can put the key directly on the element. It is visible in the DOM, the network panel, and any framework state bound to the element. **Never ship this shape to production** — switch to section 1 (backend proxy) or [Remote Mode](#remote-mode) before deploying:
 
@@ -180,12 +259,17 @@ These properties control inference execution:
 | `base-url` | `string` | API endpoint (for proxies, local models, Azure) |
 | `api-key` | `string` | API key (development only — use a backend proxy in production) |
 | `system` | `string` | System message (shortcut, attribute) |
-| `prompt` | `string` | User input text (JS property) |
+| `prompt` | `string \| AiContentPart[]` | User input — string for text, array for multimodal (text + image). JS property. See [Multimodal](#multimodal). |
 | `trigger` | `boolean` | One-way send trigger |
 | `no-stream` | `boolean` | Disable streaming |
 | `temperature` | `number` | Generation temperature |
 | `max-tokens` | `number` | Maximum output tokens |
 | `api-version` | `string` | Azure OpenAI API version (default `2024-02-01`) |
+| `tools` | `AiTool[] \| null` | Tool declarations for the next `send()`. JS property only (handlers are functions). See [Tool use](#tool-use). |
+| `toolChoice` | `"auto" \| "none" \| { name }` | Force the model's tool-use mode. JS property only. |
+| `maxToolRoundtrips` | `number` | Upper bound on consecutive tool-use rounds (default 10). JS property only. |
+| `responseSchema` | `Record<string, any> \| null` | JSON Schema for structured output. JS property only. Mutually exclusive with `tools`. See [Structured output](#structured-output). |
+| `responseSchemaName` | `string` | Name tag forwarded to providers that accept it (default `"response"`). JS property only. |
 
 ## Architecture
 
@@ -322,6 +406,131 @@ aiEl.messages = [];
 aiEl.messages = savedMessages;
 ```
 
+## Tool use
+
+`AiCore.send()` runs a tool-use loop automatically: for each assistant turn that emits tool calls, matching handlers are invoked in parallel, their results are appended to history as `{ role: "tool", content, toolCallId }` messages, and another round-trip to the provider follows. The loop terminates when the model stops requesting tools or `maxToolRoundtrips` is hit.
+
+### `AiTool` shape
+
+```ts
+interface AiTool {
+  name: string;
+  description: string;
+  parameters: Record<string, any>;   // JSON Schema
+  handler?: (args: any) => unknown | Promise<unknown>;
+}
+```
+
+`handler` is optional so remote deployments can pass tool declarations over the wire (handlers are not serializable). When absent, `AiCore` looks up the handler in the process-wide registry populated via `registerTool()` — see [Remote Mode](#remote-mode) below.
+
+### Request options
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `tools` | `AiTool[]` | `undefined` | Tool declarations for this invocation. |
+| `toolChoice` | `"auto" \| "none" \| { name: string }` | provider default | Force the model toward no-tool / any-tool / a specific tool. |
+| `maxToolRoundtrips` | `number` | `10` | Upper bound on consecutive tool-use rounds before the loop errors out. `0` disables tool use even if `tools` is set (one round only). |
+
+`maxToolRoundtrips` exceeded throws an Error which is surfaced via `el.error` and rolls back the messages pushed by this `send()` call.
+
+### Event surface
+
+Tool-use events are dispatched on the element but are **not** part of the `wc-bindable-protocol` surface (they are notifications, not state). Listen with `addEventListener`:
+
+| Event | `detail` | Fires |
+|---|---|---|
+| `hawc-ai:tool-call-requested` | `{ toolCall: { id, name, arguments } }` | Before handler invocation. Useful for "Looking up weather..." UI indicators. |
+| `hawc-ai:tool-call-completed` | `{ toolCall, result }` on success, `{ toolCall, error }` on failure / unknown tool | After handler resolves or throws. |
+
+### Error handling within the loop
+
+- **Handler throws.** Captured into the tool message content as `{ error: "<message>" }` JSON. The model receives this and typically recovers on the next turn. No rejection bubbles out of `send()`.
+- **Unknown tool name.** Same treatment — tool message carries an `error` payload, the loop continues.
+- **`maxToolRoundtrips` exceeded.** `send()` resolves to `null`, `el.error` is set to an `Error`, and the messages pushed by this call are rolled back. Subsequent calls start fresh.
+- **Abort.** `abort()` during a tool handler await or between turns rolls back this send's messages cleanly.
+
+### Provider wire formats
+
+| Provider | Request | Response | Role for tool results |
+|---|---|---|---|
+| OpenAI / Azure | `tools: [{ type: "function", function: { name, description, parameters } }]` | `choices[0].message.tool_calls[]`; stream deltas under `choices[0].delta.tool_calls[].function.arguments` accumulated by index | `"tool"` with `tool_call_id` |
+| Anthropic | `tools: [{ name, description, input_schema }]` | `content[].type === "tool_use"`; stream via `content_block_start` (id, name) + `input_json_delta` (partial args) | `"user"` wrapping a `tool_result` content block with `tool_use_id` |
+| Google (Gemini) | `tools: [{ functionDeclarations: [{ name, description, parameters }] }]` | `parts[].functionCall: { name, args }` (no id — synthesized as `gemini:<name>:<counter>`) | `"function"` with `functionResponse: { name, response }` |
+
+## Structured output
+
+Pass a JSON Schema via `AiRequestOptions.responseSchema` (or `el.responseSchema`) to constrain the final assistant response to a structured object. `send()` still resolves to a `string` — that string is the JSON-stringified object, so consumers call `JSON.parse()` themselves (no Zod or schema validator is bundled).
+
+### Options
+
+| Option | Type | Description |
+|---|---|---|
+| `responseSchema` | `Record<string, any>` | JSON Schema object. Must be a plain object, not array or primitive. |
+| `responseSchemaName` | `string` | Name forwarded to providers that accept it (OpenAI's `json_schema.name`). Defaults to `"response"`. |
+
+### Provider wire formats
+
+| Provider | Wire representation |
+|---|---|
+| OpenAI / Azure | `response_format: { type: "json_schema", json_schema: { name, schema, strict: true } }` |
+| Google (Gemini) | `generationConfig.responseMimeType: "application/json"` + `generationConfig.responseSchema` |
+| Anthropic | Synthetic `tool_use` with `name: "__wc_bindable_structured_response__"` + `tool_choice: { type: "tool", name: ... }`. Response's `tool_use.input` is unwrapped back into a JSON content string before it reaches the caller. **Forces non-streaming** — streaming input_json_delta reliably across stateless chunk parsing is deferred. |
+
+### Constraints
+
+- **Mutually exclusive with `tools`.** Both set → synchronous throw. Use either structured output *or* tool use in a single turn, not both. (Tool handlers returning schema-shaped objects cover the multi-step case.)
+- **`responseSchema` must be a plain object.** Arrays, strings, or null throw synchronously.
+- **Streaming semantics.** OpenAI/Azure/Google streaming works as usual — text deltas arrive as normal, the accumulated content is valid JSON at stream end. Anthropic forces non-streaming; the response arrives in one non-stream fetch.
+- **No schema validation.** The library does not validate the returned content against `responseSchema`. Providers enforce it on their side; if they return invalid JSON, `JSON.parse()` will throw in your code. Pair with a validator (Zod, Ajv, etc.) if you need defensive parsing.
+
+## Multimodal
+
+User-turn content can be an array of parts instead of a plain string. This is the v1 multimodal surface — text + image inputs on any of the four providers.
+
+### Part types
+
+```ts
+type AiContentPart =
+  | { type: "text"; text: string }
+  | { type: "image"; url: string; mediaType?: string };
+
+type AiContent = string | AiContentPart[];
+```
+
+`url` accepts either an `http(s)://...` URL or a `data:<mediaType>;base64,<payload>` URL. `mediaType` is optional — providers that need an explicit media type fall back to parsing it from the data: URL header.
+
+### Using multimodal content
+
+```js
+// Via AiCore.send() — prompt argument accepts the array directly:
+await core.send([
+  { type: "text", text: "Identify the breed." },
+  { type: "image", url: "https://example.com/dog.jpg" },
+], { model: "gpt-4o" });
+
+// Via <hawc-ai>.prompt — same shape:
+el.prompt = [
+  { type: "text", text: "Identify the breed." },
+  { type: "image", url: dataUrlFromFileInput },
+];
+await el.send();
+```
+
+### Provider wire formats
+
+| Provider | Text part | Image (http/https URL) | Image (data: URL) |
+|---|---|---|---|
+| OpenAI / Azure | `{ type: "text", text }` | `{ type: "image_url", image_url: { url } }` | same `image_url` — data: URL passed through |
+| Anthropic | `{ type: "text", text }` | `{ type: "image", source: { type: "url", url } }` | `{ type: "image", source: { type: "base64", media_type, data } }` |
+| Google (Gemini) | `{ text }` | **Throws** at `buildRequest` — fetch + encode first | `{ inlineData: { mimeType, data } }` |
+
+### Scope and constraints
+
+- **v1 = user-message images only.** Assistant/system/tool messages with array content are flattened to concatenated text; only `user` messages carry mixed parts on the wire.
+- **No audio / video / file input.** Future additions will extend `AiContentPart` additively.
+- **No automatic fetching.** The library does not transform http(s) URLs into data: URLs; providers that require base64 (Gemini) fail early with a clear error so clients know to pre-encode.
+- **Assistant outputs stay text.** Models may describe images but current providers return text-only assistant messages, so `content` in assistant replies is always a string.
+
 ## Abort
 
 In-flight requests can be aborted:
@@ -402,34 +611,50 @@ Event delegation is used — works with dynamically added elements.
 | `loading` | `boolean` | `true` while request is active |
 | `streaming` | `boolean` | `true` while receiving chunks |
 | `error` | `AiHttpError \| Error \| null` | Error info |
-| `prompt` | `string` | User input text |
+| `prompt` | `string \| AiContentPart[]` | User input text, or multimodal content parts |
 | `trigger` | `boolean` | Set to `true` to send |
+| `tools` | `AiTool[] \| null` | Tool declarations (JS property only) |
+| `toolChoice` | `"auto" \| "none" \| { name } \| undefined` | Tool-use mode (JS property only) |
+| `maxToolRoundtrips` | `number \| undefined` | Roundtrip cap for tool-use loop (JS property only) |
+| `responseSchema` | `Record<string, any> \| null` | JSON Schema for structured output (JS property only) |
+| `responseSchemaName` | `string \| undefined` | Name tag for providers that accept one (JS property only) |
 
 | Method | Description |
 |--------|-------------|
-| `send()` | Send the current `prompt` |
+| `send()` | Send the current `prompt` (runs the tool-use loop if `tools` is set) |
 | `abort()` | Cancel the in-flight request |
 
 ### `<hawc-ai-message>`
 
-Defines the system prompt declaratively. Place it as the first child of `<hawc-ai>`.
-If the `system` attribute is set on `<hawc-ai>`, the attribute takes priority and this element is ignored.
+Declarative prompt content. Two use cases in a single element:
 
-| Attribute | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `role` | `string` | `system` | Must be `system` |
+| `role` | Behavior |
+|---|---|
+| `system` (default) | Becomes `options.system` for every `send()`. If the `system` attribute is set on `<hawc-ai>`, that attribute wins and this element is ignored. Only the first such child is used. |
+| `user` / `assistant` | Seeded into `messages` at `connectedCallback` time as a **few-shot template**. All such children are collected in document order. Seeding is skipped if `messages` was set programmatically before connect, or in remote mode (the server owns conversation state). |
 
-The message content is taken from the element's text content. Shadow DOM suppresses rendering.
-Only the first `<hawc-ai-message>` with `role="system"` is used.
+The message content is taken from the element's text content. Shadow DOM suppresses rendering. Whitespace-only children are skipped during seeding.
 
 ```html
+<!-- System prompt only -->
 <hawc-ai provider="openai" model="gpt-4o" base-url="/api/ai">
   <hawc-ai-message role="system">
     You are a helpful coding assistant.
     Always provide TypeScript examples.
   </hawc-ai-message>
 </hawc-ai>
+
+<!-- Few-shot template: system + example turn -->
+<hawc-ai provider="openai" model="gpt-4o" base-url="/api/ai">
+  <hawc-ai-message role="system">Translate English to French. Reply with the translation only.</hawc-ai-message>
+  <hawc-ai-message role="user">Hello</hawc-ai-message>
+  <hawc-ai-message role="assistant">Bonjour</hawc-ai-message>
+  <hawc-ai-message role="user">Good morning</hawc-ai-message>
+  <hawc-ai-message role="assistant">Bonjour</hawc-ai-message>
+</hawc-ai>
 ```
+
+The next `send()` appends the new user prompt to the seeded history, so the model sees the full few-shot context plus the live question.
 
 ## wc-bindable-protocol
 
@@ -673,6 +898,27 @@ class ServerAiCore extends AiCore {
 
 Also consider pinning `model` / `provider` / `maxTokens` server-side when the browser value is not trusted — the client can set any value it wants, and the server is the last line of defense for cost and quota controls.
 
+#### Registering tool handlers server-side
+
+When `<hawc-ai>` runs in remote mode, handler functions in `el.tools` are stripped before serialization (functions are not JSON-encodable). The server resolves handlers by name from a process-wide registry populated via `registerTool()`:
+
+```ts
+import { registerTool } from "@wc-bindable/hawc-ai";
+
+registerTool("get_weather", async ({ location }) => {
+  // Runs server-side: full access to secrets, database connections, private APIs.
+  return await fetchWeather(location);
+});
+
+registerTool("search_kb", async ({ query, limit }) => {
+  return await queryVectorStore(query, limit);
+});
+```
+
+Client side continues to pass full `AiTool` entries (including `handler` for local fallback); the Shell strips `handler` on send. If a client declares a tool that is not registered on the server, the loop inserts an error tool message and continues — the model typically backs off gracefully.
+
+This is also the correct place to enforce **per-tool authorization**: `registerTool("delete_account", async (args) => { if (!currentUser.canDelete) throw new Error("forbidden"); ... })`. Because the handler runs on the authenticated server, it can see the user context (via the closure established in `createCores`) that the browser cannot be trusted with.
+
 #### Authenticated deployments (pair with `<hawc-auth0>`)
 
 A public WebSocket endpoint that dispenses LLM tokens is a direct cost vector. Production deployments should gate the Core on an authenticated handshake. The recommended pattern is to combine `<hawc-auth0>` in remote mode with `createAuthenticatedWSS` from `@wc-bindable/hawc-auth0/server`, and use its `createCores` hook to construct `ServerAiCore` only after token verification:
@@ -729,15 +975,45 @@ bootstrapAi({
 import type {
   IAiProvider, AiMessage, AiUsage, AiRequestOptions,
   AiProviderRequest, AiStreamChunkResult,
-  AiHttpError, WcsAiCoreValues, WcsAiValues
+  AiHttpError, WcsAiCoreValues, WcsAiValues,
+  AiRole, AiToolCall, AiTool, AiToolChoice, AiToolCallDelta,
+  AiContent, AiContentPart, AiContentTextPart, AiContentImagePart,
 } from "@wc-bindable/hawc-ai";
+
+// Runtime registry for remote-mode tool handler resolution
+import { registerTool, unregisterTool } from "@wc-bindable/hawc-ai";
 ```
 
 ```typescript
-interface AiMessage {
-  role: "system" | "user" | "assistant";
-  content: string;
+type AiRole = "system" | "user" | "assistant" | "tool";
+
+interface AiToolCall {
+  id: string;
+  name: string;
+  arguments: string;   // JSON string
 }
+
+type AiContentPart =
+  | { type: "text"; text: string }
+  | { type: "image"; url: string; mediaType?: string };
+
+type AiContent = string | AiContentPart[];
+
+interface AiMessage {
+  role: AiRole;
+  content: AiContent;
+  toolCalls?: AiToolCall[];   // assistant turn that requested tools
+  toolCallId?: string;        // role === "tool" result correlation
+}
+
+interface AiTool {
+  name: string;
+  description: string;
+  parameters: Record<string, any>;
+  handler?: (args: any) => unknown | Promise<unknown>;
+}
+
+type AiToolChoice = "auto" | "none" | { name: string };
 
 interface AiUsage {
   promptTokens: number;
@@ -797,7 +1073,9 @@ interface WcsAiValues extends WcsAiCoreValues {
 - System: extracted from messages and placed in top-level `systemInstruction.parts[].text`
 - Streaming: SSE with `data: {...}` JSON chunks; terminal chunk carries `candidates[0].finishReason` (e.g. `STOP`, `MAX_TOKENS`, `SAFETY`) and is signalled as `done`
 - Usage: `usageMetadata.promptTokenCount` / `candidatesTokenCount` / `totalTokenCount`
-- Scope: text-only. Multi-modal `parts` (images, audio, video) are not currently supported — `AiMessage.content` is `string`. Vertex AI (OAuth, region-specific endpoints) is out of scope; point `base-url` at a proxy if you need it.
+- Multimodal: text + image input supported (see [Multimodal](#multimodal)). Images **must be `data:` URLs** — Gemini's `inlineData` takes inline base64 bytes, and http(s) URLs are not accepted by the API. Providing an http URL raises a synchronous error at `buildRequest` time with guidance to fetch+encode client-side. Audio/video parts are not yet exposed through `AiMessage`.
+- Tool calling: the provider preserves a server-supplied `functionCall.id` verbatim (Vertex AI / newer API versions use this to disambiguate parallel same-name calls) and echoes it back in `functionResponse.id`. When no id is present (public v1beta API), a synthetic `gemini:<name>:<counter>` id is used internally for in-memory correlation and never serialized to the wire.
+- Vertex AI (OAuth, region-specific endpoints) is out of scope for a dedicated provider; point `base-url` at a proxy if you need it.
 
 ## Security
 
@@ -823,7 +1101,13 @@ interface WcsAiValues extends WcsAiCoreValues {
 - `messages` is both readable (output state) and writable (for history reset/restore)
 - `system` attribute takes priority over `<hawc-ai-message role="system">`
 - Anthropic's `max_tokens` defaults to 4096 if not specified
-- Google (Gemini) uses distinct endpoints for streaming (`:streamGenerateContent?alt=sse`) vs non-streaming (`:generateContent`); the `assistant` role is translated to `model` on the wire; stream end is signalled by `candidates[0].finishReason` rather than a `[DONE]` sentinel; currently text-only (no multi-modal `parts`)
+- Google (Gemini) uses distinct endpoints for streaming (`:streamGenerateContent?alt=sse`) vs non-streaming (`:generateContent`); the `assistant` role is translated to `model` on the wire; stream end is signalled by `candidates[0].finishReason` rather than a `[DONE]` sentinel; multimodal image input is accepted as `data:` URLs (http(s) URLs throw at `buildRequest`); a server-supplied `functionCall.id` is preserved verbatim for Vertex AI parallel-call disambiguation, with a synthetic `gemini:<name>:<counter>` id used internally as fallback and stripped before serialization
+- tool use runs an auto-loop inside `AiCore.send()`: handlers execute in parallel via `Promise.all`, results are appended as `role: "tool"` messages, and the loop re-fetches until the model stops requesting tools or `maxToolRoundtrips` (default 10) is hit
+- handler errors and unknown tool names are captured into the tool message payload so the model can recover, instead of rejecting `send()` — only `maxToolRoundtrips` exhaustion and abort surface as terminal errors
+- `registerTool(name, handler)` provides a process-wide registry that `AiCore` consults when `tool.handler` is absent — this is how remote mode resolves handlers after the Shell strips functions from the wire payload
+- `responseSchema` constrains the final response to a JSON object: OpenAI/Azure/Google translate to their native schema fields; Anthropic is emulated via a synthetic forced `tool_use` and unwrapped back into a JSON content string. Forcing non-streaming on Anthropic is intentional — streaming input_json_delta deltas reliably across stateless chunk parsing is out of scope for v1. Mutually exclusive with `tools`.
+- `<hawc-ai-message role="user|assistant">` children seed the initial `messages` history at `connectedCallback` for few-shot templates; `role="system"` children continue to flow through `_collectSystem()` into `options.system` on each send. Seeding is skipped when `messages` was set programmatically before connect or in remote mode (server-owned state).
+- multimodal input widens `AiMessage.content` from `string` to `string | AiContentPart[]`; only `user` messages carry mixed parts on the wire (assistant/system/tool with array content are flattened to concatenated text). Google (Gemini) accepts only `data:` URLs for images — http(s) URLs throw at `buildRequest` with a clear message, rather than letting the API return a cryptic 400.
 - no provider SDK required — all providers use `fetch` + `ReadableStream` + SSE parsing directly
 
 ## License

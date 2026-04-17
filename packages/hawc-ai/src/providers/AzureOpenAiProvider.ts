@@ -21,12 +21,35 @@ export class AzureOpenAiProvider extends OpenAiProvider {
     }
 
     const body: Record<string, any> = {
-      messages: messages.map(m => ({ role: m.role, content: m.content })),
+      messages: messages.map(m => this._serializeMessage(m)),
       stream: options.stream ?? true,
     };
     if (options.temperature !== undefined) body.temperature = options.temperature;
     if (options.maxTokens !== undefined) body.max_tokens = options.maxTokens;
     if (body.stream) body.stream_options = { include_usage: true };
+    if (options.tools && options.tools.length > 0) {
+      body.tools = options.tools.map(t => ({
+        type: "function",
+        function: {
+          name: t.name,
+          description: t.description,
+          parameters: t.parameters,
+        },
+      }));
+      if (options.toolChoice !== undefined) {
+        body.tool_choice = this._serializeToolChoice(options.toolChoice);
+      }
+    }
+    if (options.responseSchema) {
+      body.response_format = {
+        type: "json_schema",
+        json_schema: {
+          name: options.responseSchemaName ?? "response",
+          schema: options.responseSchema,
+          strict: true,
+        },
+      };
+    }
 
     return { url, headers, body: JSON.stringify(body) };
   }

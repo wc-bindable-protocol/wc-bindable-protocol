@@ -367,10 +367,12 @@ describe("AiCore", () => {
 
       const result = await coreAny._processStream(body, abortController);
 
-      expect(result).toBe("");
+      // _processStream now returns a TurnResult object; _doSend pushes the
+      // assistant message and clears loading. A direct _processStream call
+      // only settles streaming state.
+      expect(result).toEqual({ content: "", toolCalls: undefined, usage: undefined });
       expect(core.content).toBe("");
       expect(core.streaming).toBe(false);
-      expect(core.loading).toBe(false);
     });
 
     it("usageマージ時に0トークン値を保持する", () => {
@@ -411,8 +413,9 @@ describe("AiCore", () => {
 
       const result = await coreAny._processStream(body, abortController);
 
-      expect(result).toBe("");
-      expect(core.messages).toEqual([{ role: "assistant", content: "" }]);
+      // _processStream returns a TurnResult; message-pushing now happens in _doSend.
+      expect(result).toEqual({ content: "", toolCalls: undefined, usage: undefined });
+      expect(core.messages).toEqual([]);
     });
 
     it("event-streamでもbodyが無ければjsonレスポンスとして処理する", async () => {
@@ -1543,6 +1546,430 @@ describe("AiCore", () => {
 
       core.messages = [];
       expect(core.messages).toHaveLength(0);
+    });
+  });
+
+  describe("tool use (auto-loop)", () => {
+    // OpenAI-shaped non-streaming response helpers for brevity.
+    const toolCallResponse = (id: string, name: string, args: object) => createMockResponse({
+      choices: [{
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id,
+            type: "function",
+            function: { name, arguments: JSON.stringify(args) },
+          }],
+        },
+        finish_reason: "tool_calls",
+      }],
+      usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+    });
+    const finalResponse = (text: string, usage = { prompt_tokens: 7, completion_tokens: 4, total_tokens: 11 }) =>
+      createMockResponse({
+        choices: [{ message: { role: "assistant", content: text }, finish_reason: "stop" }],
+        usage,
+      });
+
+    it("tool handlerが実行され、結果が履歴に積まれて次ターンで最終応答が返る", async () => {
+      fetchSpy
+        .mockResolvedValueOnce(toolCallResponse("call_1", "get_weather", { location: "Tokyo" }))
+        .mockResolvedValueOnce(finalResponse("The weather in Tokyo is 22°C."));
+
+      const handler = vi.fn().mockResolvedValue({ temp: 22, unit: "C" });
+
+      const core = new AiCore();
+      core.provider = "openai";
+      const result = await core.send("Weather in Tokyo?", {
+        model: "gpt-4o",
+        stream: false,
+        tools: [{
+          name: "get_weather",
+          description: "",
+          parameters: { type: "object" },
+          handler,
+        }],
+      });
+
+      expect(handler).toHaveBeenCalledWith({ location: "Tokyo" });
+      expect(result).toBe("The weather in Tokyo is 22°C.");
+      // history: user → assistant(toolCalls) → tool(result) → assistant(final)
+      expect(core.messages).toEqual([
+        { role: "user", content: "Weather in Tokyo?" },
+        {
+          role: "assistant",
+          content: "",
+          toolCalls: [{ id: "call_1", name: "get_weather", arguments: '{"location":"Tokyo"}' }],
+        },
+        { role: "tool", content: '{"temp":22,"unit":"C"}', toolCallId: "call_1" },
+        { role: "assistant", content: "The weather in Tokyo is 22°C." },
+      ]);
+      // Usage aggregates across both turns.
+      expect(core.usage).toEqual({ promptTokens: 12, completionTokens: 7, totalTokens: 19 });
+      expect(core.loading).toBe(false);
+      expect(core.error).toBeNull();
+    });
+
+    it("複数のtool callを並列実行する", async () => {
+      const parallelResponse = createMockResponse({
+        choices: [{
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              { id: "a", type: "function", function: { name: "addOne", arguments: '{"n":1}' } },
+              { id: "b", type: "function", function: { name: "addOne", arguments: '{"n":2}' } },
+            ],
+          },
+          finish_reason: "tool_calls",
+        }],
+      });
+      fetchSpy
+        .mockResolvedValueOnce(parallelResponse)
+        .mockResolvedValueOnce(finalResponse("done"));
+
+      const handler = vi.fn().mockImplementation(async ({ n }) => n + 1);
+
+      const core = new AiCore();
+      core.provider = "openai";
+      await core.send("run", {
+        model: "gpt-4o",
+        stream: false,
+        tools: [{ name: "addOne", description: "", parameters: {}, handler }],
+      });
+
+      expect(handler).toHaveBeenCalledTimes(2);
+      const toolMessages = core.messages.filter(m => m.role === "tool");
+      expect(toolMessages).toEqual([
+        { role: "tool", content: "2", toolCallId: "a" },
+        { role: "tool", content: "3", toolCallId: "b" },
+      ]);
+    });
+
+    it("tool-call-requested / tool-call-completed イベントが発火する", async () => {
+      fetchSpy
+        .mockResolvedValueOnce(toolCallResponse("call_1", "echo", { msg: "hi" }))
+        .mockResolvedValueOnce(finalResponse("ok"));
+
+      const requested: any[] = [];
+      const completed: any[] = [];
+      const core = new AiCore();
+      core.addEventListener("hawc-ai:tool-call-requested", (e) => requested.push((e as CustomEvent).detail));
+      core.addEventListener("hawc-ai:tool-call-completed", (e) => completed.push((e as CustomEvent).detail));
+      core.provider = "openai";
+
+      await core.send("go", {
+        model: "gpt-4o",
+        stream: false,
+        tools: [{
+          name: "echo",
+          description: "",
+          parameters: {},
+          handler: async ({ msg }) => msg,
+        }],
+      });
+
+      expect(requested).toHaveLength(1);
+      expect(requested[0].toolCall).toEqual({ id: "call_1", name: "echo", arguments: '{"msg":"hi"}' });
+      expect(completed).toHaveLength(1);
+      expect(completed[0].toolCall).toEqual({ id: "call_1", name: "echo", arguments: '{"msg":"hi"}' });
+      expect(completed[0].result).toBe("hi");
+    });
+
+    it("未定義のtool名はtool resultにエラーJSONを積んでループ継続する", async () => {
+      fetchSpy
+        .mockResolvedValueOnce(toolCallResponse("call_1", "undefined_tool", {}))
+        .mockResolvedValueOnce(finalResponse("handled"));
+
+      const completed: any[] = [];
+      const core = new AiCore();
+      core.addEventListener("hawc-ai:tool-call-completed", (e) => completed.push((e as CustomEvent).detail));
+      core.provider = "openai";
+
+      const result = await core.send("try unknown", {
+        model: "gpt-4o",
+        stream: false,
+        tools: [],
+      });
+
+      expect(result).toBe("handled");
+      const toolMsg = core.messages.find(m => m.role === "tool")!;
+      expect(toolMsg.content).toContain("not defined");
+      expect(completed[0].error).toContain("unknown tool");
+      expect(core.error).toBeNull();
+    });
+
+    it("tool handlerが例外を投げてもエラーJSONをtool resultに積んでループ継続する", async () => {
+      fetchSpy
+        .mockResolvedValueOnce(toolCallResponse("call_1", "boom", {}))
+        .mockResolvedValueOnce(finalResponse("recovered"));
+
+      const core = new AiCore();
+      core.provider = "openai";
+      const result = await core.send("recover please", {
+        model: "gpt-4o",
+        stream: false,
+        tools: [{
+          name: "boom",
+          description: "",
+          parameters: {},
+          handler: async () => { throw new Error("handler failed"); },
+        }],
+      });
+
+      expect(result).toBe("recovered");
+      const toolMsg = core.messages.find(m => m.role === "tool")!;
+      expect(toolMsg.content).toContain("handler failed");
+      expect(core.error).toBeNull();
+    });
+
+    it("maxToolRoundtrips超過でエラーに入り履歴がロールバックされる", async () => {
+      // 常にtool callを返すモデル(=ループ過多)
+      fetchSpy.mockResolvedValue(toolCallResponse("call_n", "loop", {}));
+
+      const core = new AiCore();
+      core.provider = "openai";
+      const result = await core.send("loop forever", {
+        model: "gpt-4o",
+        stream: false,
+        maxToolRoundtrips: 2,
+        tools: [{
+          name: "loop",
+          description: "",
+          parameters: {},
+          handler: async () => ({ next: true }),
+        }],
+      });
+
+      expect(result).toBeNull();
+      expect(core.error).toBeInstanceOf(Error);
+      expect((core.error as Error).message).toContain("maxToolRoundtrips");
+      // 履歴はsend()開始前の状態にロールバックされる
+      expect(core.messages).toEqual([]);
+      expect(core.loading).toBe(false);
+    });
+
+    it("maxToolRoundtripsが非整数の場合はsendが同期throwする", () => {
+      const core = new AiCore();
+      core.provider = "openai";
+      expect(() => core.send("x", { model: "gpt-4o", maxToolRoundtrips: 1.5 })).toThrow(
+        /maxToolRoundtrips must be a non-negative integer/,
+      );
+    });
+
+    it("toolsが空なら通常の1ターン応答として振る舞う（後方互換）", async () => {
+      fetchSpy.mockResolvedValueOnce(finalResponse("plain reply"));
+
+      const core = new AiCore();
+      core.provider = "openai";
+      const result = await core.send("hi", { model: "gpt-4o", stream: false });
+
+      expect(result).toBe("plain reply");
+      expect(core.messages).toEqual([
+        { role: "user", content: "hi" },
+        { role: "assistant", content: "plain reply" },
+      ]);
+    });
+
+    it("handlerが無くてもregisterToolされていればregistry経由で実行される（remote模倣）", async () => {
+      const { registerTool, clearToolRegistry } = await import("../src/toolRegistry");
+      clearToolRegistry();
+      const handler = vi.fn().mockResolvedValue({ ok: true });
+      registerTool("registered_tool", handler);
+
+      fetchSpy
+        .mockResolvedValueOnce(toolCallResponse("call_1", "registered_tool", { n: 42 }))
+        .mockResolvedValueOnce(finalResponse("done"));
+
+      const core = new AiCore();
+      core.provider = "openai";
+      const result = await core.send("go", {
+        model: "gpt-4o",
+        stream: false,
+        // handler abstractly stripped (as <hawc-ai> does in remote mode).
+        tools: [{
+          name: "registered_tool",
+          description: "",
+          parameters: {},
+        }],
+      });
+
+      expect(handler).toHaveBeenCalledWith({ n: 42 });
+      expect(result).toBe("done");
+      const toolMsg = core.messages.find(m => m.role === "tool")!;
+      expect(toolMsg.content).toBe('{"ok":true}');
+      clearToolRegistry();
+    });
+
+    it("options.tools にエントリが無くてもregisterToolがあれば呼ばれる", async () => {
+      const { registerTool, clearToolRegistry } = await import("../src/toolRegistry");
+      clearToolRegistry();
+      const handler = vi.fn().mockResolvedValue("ok");
+      registerTool("only_in_registry", handler);
+
+      fetchSpy
+        .mockResolvedValueOnce(toolCallResponse("c1", "only_in_registry", {}))
+        .mockResolvedValueOnce(finalResponse("final"));
+
+      const core = new AiCore();
+      core.provider = "openai";
+      const result = await core.send("x", { model: "gpt-4o", stream: false });
+
+      expect(handler).toHaveBeenCalled();
+      expect(result).toBe("final");
+      clearToolRegistry();
+    });
+
+    it("handlerが options にも registry にも無ければエラーJSONで継続する", async () => {
+      const { clearToolRegistry } = await import("../src/toolRegistry");
+      clearToolRegistry();
+
+      fetchSpy
+        .mockResolvedValueOnce(toolCallResponse("c1", "no_handler", {}))
+        .mockResolvedValueOnce(finalResponse("fallback"));
+
+      const core = new AiCore();
+      core.provider = "openai";
+      const result = await core.send("y", {
+        model: "gpt-4o",
+        stream: false,
+        // handler 省略 → registry にも無い
+        tools: [{ name: "no_handler", description: "", parameters: {} }],
+      });
+
+      expect(result).toBe("fallback");
+      const toolMsg = core.messages.find(m => m.role === "tool")!;
+      expect(toolMsg.content).toContain("has no handler");
+    });
+  });
+
+  describe("structured output (responseSchema)", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        title: { type: "string" },
+        rating: { type: "number" },
+      },
+      required: ["title", "rating"],
+    };
+
+    it("responseSchemaを送信し、返ってきたJSON文字列をcontentとして返す", async () => {
+      fetchSpy.mockResolvedValueOnce(createMockResponse({
+        choices: [{ message: { role: "assistant", content: '{"title":"Hi","rating":5}' } }],
+        usage: { prompt_tokens: 5, completion_tokens: 10, total_tokens: 15 },
+      }));
+
+      const core = new AiCore();
+      core.provider = "openai";
+      const result = await core.send("analyze", {
+        model: "gpt-4o",
+        stream: false,
+        responseSchema: schema,
+      });
+
+      expect(result).toBe('{"title":"Hi","rating":5}');
+      expect(JSON.parse(result!)).toEqual({ title: "Hi", rating: 5 });
+
+      // request body に response_format が含まれていることを確認
+      const [, init] = fetchSpy.mock.calls[0];
+      const body = JSON.parse((init as any).body);
+      expect(body.response_format?.type).toBe("json_schema");
+    });
+
+    it("responseSchemaとtoolsを同時指定するとsendが同期throwする", () => {
+      const core = new AiCore();
+      core.provider = "openai";
+      expect(() => core.send("x", {
+        model: "gpt-4o",
+        responseSchema: schema,
+        tools: [{ name: "t", description: "", parameters: {}, handler: () => null }],
+      })).toThrow(/responseSchema and tools cannot both be set/);
+    });
+
+    it("responseSchemaが非オブジェクトだとsendが同期throwする", () => {
+      const core = new AiCore();
+      core.provider = "openai";
+      expect(() => core.send("x", {
+        model: "gpt-4o",
+        responseSchema: "not-an-object" as any,
+      })).toThrow(/responseSchema must be a JSON Schema object/);
+      expect(() => core.send("x", {
+        model: "gpt-4o",
+        responseSchema: [] as any,
+      })).toThrow(/responseSchema must be a JSON Schema object/);
+    });
+  });
+
+  describe("multimodal content", () => {
+    it("AiContentPart[]をprompt引数に渡すとuserメッセージがarray contentで履歴に積まれる", async () => {
+      fetchSpy.mockResolvedValueOnce(createMockResponse({
+        choices: [{ message: { content: "I see a cat." } }],
+      }));
+
+      const core = new AiCore();
+      core.provider = "openai";
+      const parts = [
+        { type: "text" as const, text: "What's here?" },
+        { type: "image" as const, url: "https://example.com/cat.jpg" },
+      ];
+      const result = await core.send(parts, { model: "gpt-4o", stream: false });
+
+      expect(result).toBe("I see a cat.");
+      expect(core.messages).toEqual([
+        { role: "user", content: parts },
+        { role: "assistant", content: "I see a cat." },
+      ]);
+      // OpenAI形式でリクエストされていることを確認
+      const body = JSON.parse((fetchSpy.mock.calls[0][1] as RequestInit).body as string);
+      expect(body.messages[0].content).toEqual([
+        { type: "text", text: "What's here?" },
+        { type: "image_url", image_url: { url: "https://example.com/cat.jpg" } },
+      ]);
+    });
+
+    it("空の配列を渡すとsendが同期throwする", () => {
+      const core = new AiCore();
+      core.provider = "openai";
+      expect(() => core.send([], { model: "gpt-4o" })).toThrow(/content parts array is empty/);
+    });
+
+    it("未知のpart typeはsendが同期throwする", () => {
+      const core = new AiCore();
+      core.provider = "openai";
+      expect(() => core.send(
+        [{ type: "video" as any, url: "x" }],
+        { model: "gpt-4o" },
+      )).toThrow(/unknown content part type/);
+    });
+
+    it("image partでurlが空文字だとsendが同期throwする", () => {
+      const core = new AiCore();
+      core.provider = "openai";
+      expect(() => core.send(
+        [{ type: "image", url: "" }],
+        { model: "gpt-4o" },
+      )).toThrow(/requires a non-empty `url` field/);
+    });
+
+    it("prompt引数でstringとAiContentPart[]を混在できる（連続send）", async () => {
+      fetchSpy
+        .mockResolvedValueOnce(createMockResponse({ choices: [{ message: { content: "first" } }] }))
+        .mockResolvedValueOnce(createMockResponse({ choices: [{ message: { content: "second" } }] }));
+
+      const core = new AiCore();
+      core.provider = "openai";
+
+      await core.send("hi", { model: "gpt-4o", stream: false });
+      await core.send(
+        [{ type: "text", text: "follow-up" }, { type: "image", url: "https://x/y.png" }],
+        { model: "gpt-4o", stream: false },
+      );
+
+      expect(core.messages).toHaveLength(4);
+      expect(core.messages[0]).toEqual({ role: "user", content: "hi" });
+      expect(core.messages[2]).toMatchObject({ role: "user" });
+      expect(Array.isArray(core.messages[2].content)).toBe(true);
     });
   });
 });

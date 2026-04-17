@@ -30,7 +30,12 @@ export class Ai extends HTMLElement {
   private _unbind: (() => void) | null = null;
   private _ws: WebSocket | null = null;
   private _trigger: boolean = false;
-  private _prompt: string = "";
+  private _prompt: string | import("../types.js").AiContentPart[] = "";
+  private _tools: import("../types.js").AiTool[] | null = null;
+  private _toolChoice: import("../types.js").AiToolChoice | undefined = undefined;
+  private _maxToolRoundtrips: number | undefined = undefined;
+  private _responseSchema: Record<string, any> | null = null;
+  private _responseSchemaName: string | undefined = undefined;
   private _errorState: any = null;
   private _hasLocalError: boolean = false;
   private _lastProviderError: Error | null = null;
@@ -249,8 +254,23 @@ export class Ai extends HTMLElement {
 
   // --- JS-only properties ---
 
-  get prompt(): string { return this._prompt; }
-  set prompt(value: string) { this._prompt = value; }
+  get prompt(): string | import("../types.js").AiContentPart[] { return this._prompt; }
+  set prompt(value: string | import("../types.js").AiContentPart[]) { this._prompt = value; }
+
+  get tools(): import("../types.js").AiTool[] | null { return this._tools; }
+  set tools(value: import("../types.js").AiTool[] | null) { this._tools = value; }
+
+  get toolChoice(): import("../types.js").AiToolChoice | undefined { return this._toolChoice; }
+  set toolChoice(value: import("../types.js").AiToolChoice | undefined) { this._toolChoice = value; }
+
+  get maxToolRoundtrips(): number | undefined { return this._maxToolRoundtrips; }
+  set maxToolRoundtrips(value: number | undefined) { this._maxToolRoundtrips = value; }
+
+  get responseSchema(): Record<string, any> | null { return this._responseSchema; }
+  set responseSchema(value: Record<string, any> | null) { this._responseSchema = value; }
+
+  get responseSchemaName(): string | undefined { return this._responseSchemaName; }
+  set responseSchemaName(value: string | undefined) { this._responseSchemaName = value; }
 
   get temperature(): number | undefined {
     const v = this.getAttribute("temperature");
@@ -365,6 +385,40 @@ export class Ai extends HTMLElement {
     return "";
   }
 
+  /**
+   * Seed `_core.messages` from `<hawc-ai-message role="user|assistant">` children
+   * for few-shot prompt templates declared in markup. Runs once at connect
+   * time and only when the core's history is still empty so programmatic
+   * `el.messages = [...]` before connect wins.
+   *
+   * role="system" children are intentionally skipped — they flow through
+   * `_collectSystem()` into `options.system` on each send, not into the
+   * conversation history.
+   *
+   * Remote mode is not seeded from DOM: the server owns conversation state
+   * and client-side seeding at connect would race with the initial sync.
+   * Remote callers can still `el.messages = [...]` imperatively after sync.
+   */
+  private _seedMessagesFromDom(): void {
+    if (this._isRemote) return;
+    if (!this._core) return;
+    if (this._core.messages.length > 0) return;
+
+    const tag = config.tagNames.aiMessage;
+    const els = Array.from(this.querySelectorAll<AiMessageElement>(tag));
+    const seed: AiMessage[] = [];
+    for (const el of els) {
+      const role = el.role;
+      if (role === "user" || role === "assistant") {
+        const content = el.messageContent;
+        if (content) seed.push({ role, content });
+      }
+    }
+    if (seed.length > 0) {
+      this._core.messages = seed;
+    }
+  }
+
   async send(): Promise<string | null> {
     // Wait for any in-flight provider update so we gate on the latest result,
     // not a stale error from a previously superseded attempt.
@@ -378,6 +432,10 @@ export class Ai extends HTMLElement {
     }
     if (this._isRemote) {
       try {
+        // Strip `handler` from tools before serialization — functions are not
+        // JSON-encodable. The server resolves handlers by name from the
+        // `registerTool()` registry at invocation time.
+        const remoteTools = this._tools?.map(({ handler: _handler, ...rest }) => rest);
         // Use invokeWithOptions with timeoutMs: 0 to disable the default 30s
         // timeout — AI inference and long streaming responses routinely exceed it.
         return await this._proxy!.invokeWithOptions("send", [this._prompt, {
@@ -389,6 +447,11 @@ export class Ai extends HTMLElement {
           apiKey: this.apiKey,
           baseUrl: this.baseUrl,
           apiVersion: this.apiVersion,
+          tools: remoteTools,
+          toolChoice: this._toolChoice,
+          maxToolRoundtrips: this._maxToolRoundtrips,
+          responseSchema: this._responseSchema ?? undefined,
+          responseSchemaName: this._responseSchemaName,
         }], { timeoutMs: 0 }) as string | null;
       } catch (e) {
         if (Ai._isTransportError(e)) {
@@ -416,6 +479,11 @@ export class Ai extends HTMLElement {
       apiKey: this.apiKey,
       baseUrl: this.baseUrl,
       apiVersion: this.apiVersion,
+      ...(this._tools ? { tools: this._tools } : {}),
+      ...(this._toolChoice !== undefined ? { toolChoice: this._toolChoice } : {}),
+      ...(this._maxToolRoundtrips !== undefined ? { maxToolRoundtrips: this._maxToolRoundtrips } : {}),
+      ...(this._responseSchema !== null ? { responseSchema: this._responseSchema } : {}),
+      ...(this._responseSchemaName !== undefined ? { responseSchemaName: this._responseSchemaName } : {}),
     });
   }
 
@@ -444,6 +512,9 @@ export class Ai extends HTMLElement {
       registerAutoTrigger();
       this._autoTriggerRegistered = true;
     }
+    // Deferred to a microtask so child `<hawc-ai-message>` elements have a
+    // chance to upgrade when constructed imperatively before append.
+    queueMicrotask(() => this._seedMessagesFromDom());
   }
 
   attributeChangedCallback(name: string, _oldValue: string | null, newValue: string | null): void {

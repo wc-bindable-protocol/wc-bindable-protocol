@@ -498,6 +498,124 @@ describe("Ai (hawc-ai)", () => {
       expect(body.messages[0].content).toBe("System prompt");
     });
 
+    it("role='user'/'assistant'の子要素をmessagesにseedする（few-shot）", async () => {
+      fetchSpy.mockResolvedValueOnce(createMockResponse({
+        choices: [{ message: { content: "OK" } }],
+      }));
+
+      const el = document.createElement("hawc-ai") as Ai;
+      el.setAttribute("provider", "openai");
+      el.setAttribute("model", "gpt-4o");
+      el.stream = false;
+
+      const u1 = document.createElement("hawc-ai-message") as AiMessage;
+      u1.setAttribute("role", "user");
+      u1.textContent = "What is 2+2?";
+      el.appendChild(u1);
+
+      const a1 = document.createElement("hawc-ai-message") as AiMessage;
+      a1.setAttribute("role", "assistant");
+      a1.textContent = "4.";
+      el.appendChild(a1);
+
+      document.body.appendChild(el);
+      // connectedCallback内のqueueMicrotaskでseedが走るのを待つ
+      await new Promise(r => queueMicrotask(() => r(null)));
+
+      expect(el.messages).toEqual([
+        { role: "user", content: "What is 2+2?" },
+        { role: "assistant", content: "4." },
+      ]);
+
+      // few-shotのあとの実際のsendでも履歴が保持される
+      el.prompt = "Then 3+3?";
+      await el.send();
+
+      const body = JSON.parse((fetchSpy.mock.calls[0][1] as RequestInit).body as string);
+      expect(body.messages).toEqual([
+        { role: "user", content: "What is 2+2?" },
+        { role: "assistant", content: "4." },
+        { role: "user", content: "Then 3+3?" },
+      ]);
+    });
+
+    it("few-shotのseedはsystem子要素を履歴に含めない（_collectSystem経由のまま）", async () => {
+      fetchSpy.mockResolvedValueOnce(createMockResponse({
+        choices: [{ message: { content: "OK" } }],
+      }));
+
+      const el = document.createElement("hawc-ai") as Ai;
+      el.setAttribute("provider", "openai");
+      el.setAttribute("model", "gpt-4o");
+      el.stream = false;
+
+      const sys = document.createElement("hawc-ai-message") as AiMessage;
+      sys.setAttribute("role", "system");
+      sys.textContent = "Be terse.";
+      el.appendChild(sys);
+
+      const u = document.createElement("hawc-ai-message") as AiMessage;
+      u.setAttribute("role", "user");
+      u.textContent = "Hi";
+      el.appendChild(u);
+
+      document.body.appendChild(el);
+      await new Promise(r => queueMicrotask(() => r(null)));
+
+      // history has user only; system flows via options.system per send()
+      expect(el.messages).toEqual([{ role: "user", content: "Hi" }]);
+
+      el.prompt = "Bye";
+      await el.send();
+
+      const body = JSON.parse((fetchSpy.mock.calls[0][1] as RequestInit).body as string);
+      expect(body.messages[0]).toEqual({ role: "system", content: "Be terse." });
+      expect(body.messages[1]).toEqual({ role: "user", content: "Hi" });
+      expect(body.messages[2]).toEqual({ role: "user", content: "Bye" });
+    });
+
+    it("el.messagesをappend前にセットしていたらseedは上書きしない", async () => {
+      const el = document.createElement("hawc-ai") as Ai;
+      el.setAttribute("provider", "openai");
+      el.setAttribute("model", "gpt-4o");
+
+      // 先に明示設定
+      el.messages = [{ role: "user", content: "programmatic" }];
+
+      // 後からDOMにfew-shot子要素を追加
+      const u = document.createElement("hawc-ai-message") as AiMessage;
+      u.setAttribute("role", "user");
+      u.textContent = "from-dom";
+      el.appendChild(u);
+
+      document.body.appendChild(el);
+      await new Promise(r => queueMicrotask(() => r(null)));
+
+      // 明示設定を保持、DOM seed はスキップ
+      expect(el.messages).toEqual([{ role: "user", content: "programmatic" }]);
+    });
+
+    it("空コンテンツの子要素はseedされない", async () => {
+      const el = document.createElement("hawc-ai") as Ai;
+      el.setAttribute("provider", "openai");
+      el.setAttribute("model", "gpt-4o");
+
+      const empty = document.createElement("hawc-ai-message") as AiMessage;
+      empty.setAttribute("role", "user");
+      empty.textContent = "   "; // whitespace only
+      el.appendChild(empty);
+
+      const real = document.createElement("hawc-ai-message") as AiMessage;
+      real.setAttribute("role", "user");
+      real.textContent = "real content";
+      el.appendChild(real);
+
+      document.body.appendChild(el);
+      await new Promise(r => queueMicrotask(() => r(null)));
+
+      expect(el.messages).toEqual([{ role: "user", content: "real content" }]);
+    });
+
     it("role属性未指定の<hawc-ai-message>はsystemとして扱われる", async () => {
       fetchSpy.mockResolvedValueOnce(createMockResponse({
         choices: [{ message: { content: "OK" } }],

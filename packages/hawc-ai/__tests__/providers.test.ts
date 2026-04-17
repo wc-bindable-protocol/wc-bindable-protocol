@@ -767,3 +767,672 @@ describe("GoogleProvider", () => {
     });
   });
 });
+
+describe("Provider — tool use", () => {
+  describe("OpenAiProvider", () => {
+    const provider = new OpenAiProvider();
+
+    it("tools をリクエストボディに function type で添付する", () => {
+      const req = provider.buildRequest(
+        [{ role: "user", content: "weather?" }],
+        {
+          model: "gpt-4o",
+          tools: [{
+            name: "get_weather",
+            description: "Lookup weather",
+            parameters: { type: "object", properties: { loc: { type: "string" } } },
+            handler: () => null,
+          }],
+          toolChoice: { name: "get_weather" },
+        }
+      );
+      const body = JSON.parse(req.body);
+      expect(body.tools).toEqual([{
+        type: "function",
+        function: {
+          name: "get_weather",
+          description: "Lookup weather",
+          parameters: { type: "object", properties: { loc: { type: "string" } } },
+        },
+      }]);
+      expect(body.tool_choice).toEqual({ type: "function", function: { name: "get_weather" } });
+    });
+
+    it("toolChoice 'auto'/'none' はそのまま送る", () => {
+      const req = provider.buildRequest(
+        [{ role: "user", content: "hi" }],
+        { model: "gpt-4o", tools: [{ name: "t", description: "", parameters: {}, handler: () => null }], toolChoice: "auto" },
+      );
+      expect(JSON.parse(req.body).tool_choice).toBe("auto");
+
+      const req2 = provider.buildRequest(
+        [{ role: "user", content: "hi" }],
+        { model: "gpt-4o", tools: [{ name: "t", description: "", parameters: {}, handler: () => null }], toolChoice: "none" },
+      );
+      expect(JSON.parse(req2.body).tool_choice).toBe("none");
+    });
+
+    it("assistant + toolCalls を tool_calls 付きで直列化する", () => {
+      const req = provider.buildRequest(
+        [
+          { role: "user", content: "weather?" },
+          {
+            role: "assistant",
+            content: "",
+            toolCalls: [{ id: "c1", name: "get_weather", arguments: '{"loc":"Tokyo"}' }],
+          },
+          { role: "tool", content: '{"temp":22}', toolCallId: "c1" },
+        ],
+        { model: "gpt-4o" },
+      );
+      const body = JSON.parse(req.body);
+      expect(body.messages[1]).toEqual({
+        role: "assistant",
+        content: null,
+        tool_calls: [{ id: "c1", type: "function", function: { name: "get_weather", arguments: '{"loc":"Tokyo"}' } }],
+      });
+      expect(body.messages[2]).toEqual({
+        role: "tool",
+        content: '{"temp":22}',
+        tool_call_id: "c1",
+      });
+    });
+
+    it("parseResponseがtool_callsを抽出する", () => {
+      const result = provider.parseResponse({
+        choices: [{
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              { id: "c1", type: "function", function: { name: "fn_a", arguments: '{"x":1}' } },
+              { id: "c2", type: "function", function: { name: "fn_b", arguments: '{}' } },
+            ],
+          },
+          finish_reason: "tool_calls",
+        }],
+      });
+      expect(result.content).toBe("");
+      expect(result.toolCalls).toEqual([
+        { id: "c1", name: "fn_a", arguments: '{"x":1}' },
+        { id: "c2", name: "fn_b", arguments: '{}' },
+      ]);
+    });
+
+    it("parseResponseでtype!=='function'や欠損idは除外する", () => {
+      const result = provider.parseResponse({
+        choices: [{
+          message: {
+            tool_calls: [
+              { type: "code_interpreter", id: "x1" },              // type が function でない
+              { type: "function", function: { name: "ok" } },        // id 欠損
+              { type: "function", id: "c3", function: { name: "" } },// name 欠損
+              { type: "function", id: "c4", function: { name: "good", arguments: '{}' } },
+            ],
+          },
+        }],
+      });
+      expect(result.toolCalls).toEqual([{ id: "c4", name: "good", arguments: '{}' }]);
+    });
+
+    it("parseStreamChunkがtool_call deltasを配列で返す", () => {
+      const result = provider.parseStreamChunk(undefined,
+        '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"fn_a","arguments":""}},{"index":1,"id":"c2","type":"function","function":{"name":"fn_b"}}]}}]}'
+      );
+      expect(result?.toolCallDeltas).toEqual([
+        { index: 0, id: "c1", name: "fn_a", argumentsDelta: "" },
+        { index: 1, id: "c2", name: "fn_b" },
+      ]);
+      expect(result?.done).toBe(false);
+    });
+
+    it("parseStreamChunkがargumentsの断片を拾う", () => {
+      const result = provider.parseStreamChunk(undefined,
+        '{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"loc"}}]}}]}'
+      );
+      expect(result?.toolCallDeltas).toEqual([
+        { index: 0, argumentsDelta: '{"loc' },
+      ]);
+    });
+
+    it("finish_reason=tool_callsでdone=trueを返す", () => {
+      const result = provider.parseStreamChunk(undefined,
+        '{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}'
+      );
+      expect(result?.done).toBe(true);
+    });
+  });
+
+  describe("AnthropicProvider", () => {
+    const provider = new AnthropicProvider();
+
+    it("tools を input_schema 付きで直列化する", () => {
+      const req = provider.buildRequest(
+        [{ role: "user", content: "hi" }],
+        {
+          model: "claude-sonnet-4",
+          tools: [{
+            name: "lookup",
+            description: "",
+            parameters: { type: "object", properties: {} },
+            handler: () => null,
+          }],
+          toolChoice: "auto",
+        }
+      );
+      const body = JSON.parse(req.body);
+      expect(body.tools).toEqual([{
+        name: "lookup",
+        description: "",
+        input_schema: { type: "object", properties: {} },
+      }]);
+      expect(body.tool_choice).toEqual({ type: "auto" });
+    });
+
+    it("toolChoice {name} を tool type で送る", () => {
+      const req = provider.buildRequest(
+        [{ role: "user", content: "hi" }],
+        {
+          model: "claude-sonnet-4",
+          tools: [{ name: "fn", description: "", parameters: {}, handler: () => null }],
+          toolChoice: { name: "fn" },
+        }
+      );
+      expect(JSON.parse(req.body).tool_choice).toEqual({ type: "tool", name: "fn" });
+    });
+
+    it("assistant+toolCallsをtool_useブロックで直列化し、toolメッセージをuserロールのtool_resultで直列化する", () => {
+      const req = provider.buildRequest(
+        [
+          { role: "user", content: "weather?" },
+          {
+            role: "assistant",
+            content: "Let me check.",
+            toolCalls: [{ id: "c1", name: "get_weather", arguments: '{"loc":"Tokyo"}' }],
+          },
+          { role: "tool", content: "22C", toolCallId: "c1" },
+        ],
+        { model: "claude-sonnet-4" }
+      );
+      const body = JSON.parse(req.body);
+      expect(body.messages[1]).toEqual({
+        role: "assistant",
+        content: [
+          { type: "text", text: "Let me check." },
+          { type: "tool_use", id: "c1", name: "get_weather", input: { loc: "Tokyo" } },
+        ],
+      });
+      expect(body.messages[2]).toEqual({
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "c1", content: "22C" }],
+      });
+    });
+
+    it("parseResponseがtool_useブロックを抽出する", () => {
+      const result = provider.parseResponse({
+        content: [
+          { type: "text", text: "Checking..." },
+          { type: "tool_use", id: "c1", name: "get_weather", input: { loc: "Tokyo" } },
+        ],
+      });
+      expect(result.content).toBe("Checking...");
+      expect(result.toolCalls).toEqual([
+        { id: "c1", name: "get_weather", arguments: '{"loc":"Tokyo"}' },
+      ]);
+    });
+
+    it("parseStreamChunk: content_block_start(tool_use) で id/name を emit", () => {
+      const result = provider.parseStreamChunk("content_block_start",
+        '{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"c1","name":"fn"}}'
+      );
+      expect(result?.toolCallDeltas).toEqual([{ index: 1, id: "c1", name: "fn" }]);
+    });
+
+    it("parseStreamChunk: input_json_deltaでargumentsDeltaを emit", () => {
+      const result = provider.parseStreamChunk("content_block_delta",
+        '{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"loc"}}'
+      );
+      expect(result?.toolCallDeltas).toEqual([{ index: 1, argumentsDelta: '{"loc' }]);
+    });
+  });
+
+  describe("GoogleProvider", () => {
+    const provider = new GoogleProvider();
+
+    it("tools を functionDeclarations でラップする", () => {
+      const req = provider.buildRequest(
+        [{ role: "user", content: "hi" }],
+        {
+          model: "gemini-2.5-flash",
+          stream: false,
+          tools: [{
+            name: "get_weather",
+            description: "",
+            parameters: { type: "object" },
+            handler: () => null,
+          }],
+          toolChoice: "auto",
+        }
+      );
+      const body = JSON.parse(req.body);
+      expect(body.tools).toEqual([{
+        functionDeclarations: [{ name: "get_weather", description: "", parameters: { type: "object" } }],
+      }]);
+      expect(body.toolConfig).toEqual({ functionCallingConfig: { mode: "AUTO" } });
+    });
+
+    it("toolChoice {name} を ANY+allowedFunctionNames で送る", () => {
+      const req = provider.buildRequest(
+        [{ role: "user", content: "hi" }],
+        {
+          model: "gemini-2.5-flash",
+          stream: false,
+          tools: [{ name: "fn", description: "", parameters: {}, handler: () => null }],
+          toolChoice: { name: "fn" },
+        }
+      );
+      expect(JSON.parse(req.body).toolConfig).toEqual({
+        functionCallingConfig: { mode: "ANY", allowedFunctionNames: ["fn"] },
+      });
+    });
+
+    it("assistant+toolCallsをfunctionCallパートで直列化、toolをfunctionロールで送る", () => {
+      const req = provider.buildRequest(
+        [
+          { role: "user", content: "weather?" },
+          {
+            role: "assistant",
+            content: "",
+            toolCalls: [{ id: "gemini:get_weather:0", name: "get_weather", arguments: '{"loc":"Tokyo"}' }],
+          },
+          { role: "tool", content: '{"temp":22}', toolCallId: "gemini:get_weather:0" },
+        ],
+        { model: "gemini-2.5-flash", stream: false }
+      );
+      const body = JSON.parse(req.body);
+      expect(body.contents[1]).toEqual({
+        role: "model",
+        parts: [{ functionCall: { name: "get_weather", args: { loc: "Tokyo" } } }],
+      });
+      expect(body.contents[2]).toEqual({
+        role: "function",
+        parts: [{ functionResponse: { name: "get_weather", response: { temp: 22 } } }],
+      });
+    });
+
+    it("parseResponseがfunctionCallパートを合成IDで抽出する", () => {
+      const result = provider.parseResponse({
+        candidates: [{
+          content: {
+            parts: [
+              { text: "Looking up..." },
+              { functionCall: { name: "get_weather", args: { loc: "Tokyo" } } },
+            ],
+          },
+          finishReason: "STOP",
+        }],
+      });
+      expect(result.content).toBe("Looking up...");
+      expect(result.toolCalls).toHaveLength(1);
+      expect(result.toolCalls![0].name).toBe("get_weather");
+      expect(result.toolCalls![0].id).toMatch(/^gemini:get_weather:\d+$/);
+      expect(result.toolCalls![0].arguments).toBe('{"loc":"Tokyo"}');
+    });
+
+    it("parseStreamChunkがfunctionCallをtoolCallDeltasで返す", () => {
+      const result = provider.parseStreamChunk(undefined,
+        '{"candidates":[{"content":{"parts":[{"functionCall":{"name":"get_weather","args":{"loc":"Tokyo"}}}]}}]}'
+      );
+      expect(result?.toolCallDeltas).toHaveLength(1);
+      const d = result!.toolCallDeltas![0];
+      expect(d.name).toBe("get_weather");
+      expect(d.argumentsDelta).toBe('{"loc":"Tokyo"}');
+      expect(d.id).toMatch(/^gemini:get_weather:\d+$/);
+    });
+
+    it("parseResponseはサーバー供給のfunctionCall.idをそのまま保持する（Vertex / 新API互換）", () => {
+      // Newer Gemini / Vertex include an `id` on functionCall for parallel
+      // call disambiguation. It must round-trip verbatim; no synthetic overwrite.
+      const result = provider.parseResponse({
+        candidates: [{
+          content: {
+            parts: [
+              { functionCall: { name: "fetch", args: { x: 1 }, id: "call_abc" } },
+              { functionCall: { name: "fetch", args: { x: 2 }, id: "call_def" } },
+            ],
+          },
+          finishReason: "STOP",
+        }],
+      });
+      expect(result.toolCalls).toHaveLength(2);
+      expect(result.toolCalls![0].id).toBe("call_abc");
+      expect(result.toolCalls![1].id).toBe("call_def");
+    });
+
+    it("parseStreamChunkもサーバー供給idを保持する", () => {
+      const result = provider.parseStreamChunk(undefined,
+        '{"candidates":[{"content":{"parts":[{"functionCall":{"name":"fetch","args":{},"id":"call_server_123"}}]}}]}'
+      );
+      expect(result?.toolCallDeltas?.[0].id).toBe("call_server_123");
+    });
+
+    it("_serializeMessage: 非合成idはfunctionCall / functionResponse に echo される", () => {
+      const req = provider.buildRequest(
+        [
+          { role: "user", content: "run twice" },
+          {
+            role: "assistant",
+            content: "",
+            toolCalls: [
+              { id: "call_A", name: "ping", arguments: '{"i":1}' },
+              { id: "call_B", name: "ping", arguments: '{"i":2}' },
+            ],
+          },
+          { role: "tool", content: '{"ok":1}', toolCallId: "call_A" },
+          { role: "tool", content: '{"ok":2}', toolCallId: "call_B" },
+        ],
+        { model: "gemini-2.5-flash", stream: false },
+      );
+      const body = JSON.parse(req.body);
+      // assistant → functionCall.id echoed
+      expect(body.contents[1].parts).toEqual([
+        { functionCall: { name: "ping", args: { i: 1 }, id: "call_A" } },
+        { functionCall: { name: "ping", args: { i: 2 }, id: "call_B" } },
+      ]);
+      // tool → functionResponse.id echoed, name looked up via idToName map
+      expect(body.contents[2]).toEqual({
+        role: "function",
+        parts: [{ functionResponse: { name: "ping", response: { ok: 1 }, id: "call_A" } }],
+      });
+      expect(body.contents[3]).toEqual({
+        role: "function",
+        parts: [{ functionResponse: { name: "ping", response: { ok: 2 }, id: "call_B" } }],
+      });
+    });
+
+    it("_serializeMessage: 合成id（gemini:プレフィックス）はwireに漏れない", () => {
+      const req = provider.buildRequest(
+        [
+          { role: "user", content: "x" },
+          {
+            role: "assistant",
+            content: "",
+            toolCalls: [{ id: "gemini:lookup:0", name: "lookup", arguments: "{}" }],
+          },
+          { role: "tool", content: '{"v":1}', toolCallId: "gemini:lookup:0" },
+        ],
+        { model: "gemini-2.5-flash", stream: false },
+      );
+      const body = JSON.parse(req.body);
+      // functionCall no id field
+      expect(body.contents[1].parts[0]).toEqual({
+        functionCall: { name: "lookup", args: {} },
+      });
+      // functionResponse no id field
+      expect(body.contents[2].parts[0]).toEqual({
+        functionResponse: { name: "lookup", response: { v: 1 } },
+      });
+    });
+  });
+});
+
+describe("Provider — structured output", () => {
+  const schema = {
+    type: "object",
+    properties: {
+      title: { type: "string" },
+      rating: { type: "number" },
+    },
+    required: ["title", "rating"],
+    additionalProperties: false,
+  };
+
+  describe("OpenAiProvider", () => {
+    const provider = new OpenAiProvider();
+
+    it("responseSchemaをresponse_format.json_schemaに変換する", () => {
+      const req = provider.buildRequest(
+        [{ role: "user", content: "analyze" }],
+        { model: "gpt-4o", responseSchema: schema, responseSchemaName: "review" },
+      );
+      const body = JSON.parse(req.body);
+      expect(body.response_format).toEqual({
+        type: "json_schema",
+        json_schema: { name: "review", schema, strict: true },
+      });
+    });
+
+    it("nameが省略された場合は'response'をデフォルトにする", () => {
+      const req = provider.buildRequest(
+        [{ role: "user", content: "x" }],
+        { model: "gpt-4o", responseSchema: schema },
+      );
+      expect(JSON.parse(req.body).response_format.json_schema.name).toBe("response");
+    });
+
+    it("responseSchema未設定ではresponse_formatを含まない", () => {
+      const req = provider.buildRequest(
+        [{ role: "user", content: "x" }],
+        { model: "gpt-4o" },
+      );
+      expect(JSON.parse(req.body).response_format).toBeUndefined();
+    });
+  });
+
+  describe("AzureOpenAiProvider", () => {
+    const provider = new AzureOpenAiProvider();
+
+    it("OpenAIと同じresponse_format形式を送る", () => {
+      const req = provider.buildRequest(
+        [{ role: "user", content: "x" }],
+        { model: "gpt-4o", baseUrl: "https://x.openai.azure.com", responseSchema: schema },
+      );
+      expect(JSON.parse(req.body).response_format).toEqual({
+        type: "json_schema",
+        json_schema: { name: "response", schema, strict: true },
+      });
+    });
+  });
+
+  describe("GoogleProvider", () => {
+    const provider = new GoogleProvider();
+
+    it("generationConfigにresponseMimeTypeとresponseSchemaを入れる", () => {
+      const req = provider.buildRequest(
+        [{ role: "user", content: "x" }],
+        { model: "gemini-2.5-flash", stream: false, responseSchema: schema },
+      );
+      const body = JSON.parse(req.body);
+      expect(body.generationConfig).toMatchObject({
+        responseMimeType: "application/json",
+        responseSchema: schema,
+      });
+    });
+  });
+
+  describe("AnthropicProvider", () => {
+    const provider = new AnthropicProvider();
+
+    it("合成toolを注入しtool_choiceでそれを強制、streamをfalseにする", () => {
+      const req = provider.buildRequest(
+        [{ role: "user", content: "analyze" }],
+        { model: "claude-sonnet-4", responseSchema: schema, stream: true },
+      );
+      const body = JSON.parse(req.body);
+      expect(body.stream).toBe(false);
+      expect(body.tool_choice).toEqual({ type: "tool", name: "__wc_bindable_structured_response__" });
+      expect(body.tools).toHaveLength(1);
+      expect(body.tools[0]).toMatchObject({
+        name: "__wc_bindable_structured_response__",
+        input_schema: schema,
+      });
+    });
+
+    it("parseResponseは合成tool_useをJSON文字列contentとして返しtoolCallsを出さない", () => {
+      const result = provider.parseResponse({
+        content: [{
+          type: "tool_use",
+          id: "irrelevant",
+          name: "__wc_bindable_structured_response__",
+          input: { title: "Good", rating: 4 },
+        }],
+        usage: { input_tokens: 5, output_tokens: 10 },
+      });
+      expect(result.content).toBe('{"title":"Good","rating":4}');
+      expect(result.toolCalls).toBeUndefined();
+      expect(result.usage).toEqual({ promptTokens: 5, completionTokens: 10, totalTokens: 15 });
+    });
+  });
+});
+
+describe("Provider — multimodal", () => {
+  describe("OpenAiProvider", () => {
+    const provider = new OpenAiProvider();
+
+    it("text + image URL のcontent配列をOpenAIの形式に変換する", () => {
+      const req = provider.buildRequest(
+        [{
+          role: "user",
+          content: [
+            { type: "text", text: "What's in this image?" },
+            { type: "image", url: "https://example.com/cat.jpg" },
+          ],
+        }],
+        { model: "gpt-4o" },
+      );
+      const body = JSON.parse(req.body);
+      expect(body.messages[0]).toEqual({
+        role: "user",
+        content: [
+          { type: "text", text: "What's in this image?" },
+          { type: "image_url", image_url: { url: "https://example.com/cat.jpg" } },
+        ],
+      });
+    });
+
+    it("string contentは従来通りそのまま送る", () => {
+      const req = provider.buildRequest(
+        [{ role: "user", content: "plain text" }],
+        { model: "gpt-4o" },
+      );
+      expect(JSON.parse(req.body).messages[0]).toEqual({ role: "user", content: "plain text" });
+    });
+
+    it("assistant+toolCalls時は配列contentをテキストにflattenしてから載せる", () => {
+      const req = provider.buildRequest(
+        [
+          { role: "user", content: [{ type: "text", text: "hi" }] },
+          {
+            role: "assistant",
+            content: [{ type: "text", text: "on it" }],
+            toolCalls: [{ id: "c1", name: "fn", arguments: "{}" }],
+          },
+        ],
+        { model: "gpt-4o" },
+      );
+      const body = JSON.parse(req.body);
+      expect(body.messages[1]).toMatchObject({ role: "assistant", content: "on it" });
+    });
+
+    it("system contentが配列でもflattenされる", () => {
+      const req = provider.buildRequest(
+        [
+          { role: "system", content: [{ type: "text", text: "Be terse." }] },
+          { role: "user", content: "x" },
+        ],
+        { model: "gpt-4o" },
+      );
+      expect(JSON.parse(req.body).messages[0]).toEqual({ role: "system", content: "Be terse." });
+    });
+  });
+
+  describe("AnthropicProvider", () => {
+    const provider = new AnthropicProvider();
+
+    it("http URL 画像は source.type='url' で送る", () => {
+      const req = provider.buildRequest(
+        [{
+          role: "user",
+          content: [
+            { type: "text", text: "Describe" },
+            { type: "image", url: "https://example.com/a.png" },
+          ],
+        }],
+        { model: "claude-sonnet-4" },
+      );
+      const body = JSON.parse(req.body);
+      expect(body.messages[0]).toEqual({
+        role: "user",
+        content: [
+          { type: "text", text: "Describe" },
+          { type: "image", source: { type: "url", url: "https://example.com/a.png" } },
+        ],
+      });
+    });
+
+    it("data: URL 画像は source.type='base64' で送る", () => {
+      const req = provider.buildRequest(
+        [{
+          role: "user",
+          content: [
+            { type: "image", url: "data:image/png;base64,iVBORw0KG==" },
+          ],
+        }],
+        { model: "claude-sonnet-4" },
+      );
+      const body = JSON.parse(req.body);
+      expect(body.messages[0].content[0]).toEqual({
+        type: "image",
+        source: { type: "base64", media_type: "image/png", data: "iVBORw0KG==" },
+      });
+    });
+
+    it("mediaType明示指定時はdata:URL ヘッダーより優先する", () => {
+      const req = provider.buildRequest(
+        [{
+          role: "user",
+          content: [
+            { type: "image", url: "data:application/octet-stream;base64,AAAA", mediaType: "image/jpeg" },
+          ],
+        }],
+        { model: "claude-sonnet-4" },
+      );
+      expect(JSON.parse(req.body).messages[0].content[0].source.media_type).toBe("image/jpeg");
+    });
+  });
+
+  describe("GoogleProvider", () => {
+    const provider = new GoogleProvider();
+
+    it("data: URL 画像をinlineDataで送る", () => {
+      const req = provider.buildRequest(
+        [{
+          role: "user",
+          content: [
+            { type: "text", text: "label" },
+            { type: "image", url: "data:image/png;base64,iVBORw0KG==" },
+          ],
+        }],
+        { model: "gemini-2.5-flash", stream: false },
+      );
+      const body = JSON.parse(req.body);
+      expect(body.contents[0]).toEqual({
+        role: "user",
+        parts: [
+          { text: "label" },
+          { inlineData: { mimeType: "image/png", data: "iVBORw0KG==" } },
+        ],
+      });
+    });
+
+    it("http URL はbuildRequest時に明示エラーになる", () => {
+      expect(() => provider.buildRequest(
+        [{
+          role: "user",
+          content: [{ type: "image", url: "https://example.com/a.png" }],
+        }],
+        { model: "gemini-2.5-flash", stream: false },
+      )).toThrow(/requires a data: URL/);
+    });
+  });
+});

@@ -6,9 +6,15 @@ export { OpenAiProvider } from "./providers/OpenAiProvider.js";
 export { AnthropicProvider } from "./providers/AnthropicProvider.js";
 export { AzureOpenAiProvider } from "./providers/AzureOpenAiProvider.js";
 export { GoogleProvider } from "./providers/GoogleProvider.js";
+export {
+  registerTool, unregisterTool, getRegisteredTool, clearToolRegistry,
+} from "./toolRegistry.js";
+export type { AiToolHandler } from "./toolRegistry.js";
 
 export type {
   IWritableConfig, IWritableTagNames, IWritableRemoteConfig, IAiProvider,
-  AiMessage, AiUsage, AiRequestOptions, AiProviderRequest,
-  AiStreamChunkResult, AiHttpError, WcsAiCoreValues, WcsAiValues
+  AiMessage, AiUsage, AiRequestOptions, AiProviderRequest, AiStreamChunkResult,
+  AiHttpError, WcsAiCoreValues, WcsAiValues,
+  AiRole, AiToolCall, AiTool, AiToolChoice, AiToolCallDelta,
+  AiContent, AiContentPart, AiContentTextPart, AiContentImagePart,
 } from "./types.js";
