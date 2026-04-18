@@ -1175,6 +1175,41 @@ describe("AuthLogout (hawc-auth0-logout)", () => {
     expect(() => logoutEl.click()).not.toThrow();
   });
 
+  it("target指定で解決できない場合 console.warn を出す", () => {
+    // Regression: previously the click was a silent ignore, leaving
+    // integrators with no signal that target="nonexistent" misfired.
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const logoutEl = document.createElement("hawc-auth0-logout") as AuthLogout;
+      logoutEl.target = "nonexistent";
+      document.body.appendChild(logoutEl);
+      logoutEl.click();
+
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      const message = String(warnSpy.mock.calls[0][0]);
+      expect(message).toContain("hawc-auth0-logout");
+      expect(message).toContain("nonexistent");
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("target未指定でフォールバックも空のときは console.warn を出さない", () => {
+    // The closest()/first() fallback legitimately returns null on
+    // pages with no <hawc-auth0> mounted (SSR, unrelated routes that
+    // still load the script). Warning there would noise up logs.
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const logoutEl = document.createElement("hawc-auth0-logout") as AuthLogout;
+      document.body.appendChild(logoutEl);
+      logoutEl.click();
+
+      expect(warnSpy).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
   it("logout()がrejectしてもunhandled rejectionにならない", async () => {
     // Regression: AuthLogout's click handler previously did
     // `authElement.logout(options)` with no .catch(). Same reject

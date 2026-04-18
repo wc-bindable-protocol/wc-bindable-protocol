@@ -37,6 +37,12 @@ export class AuthShell extends EventTarget {
   private _transport: InterceptingClientTransport | null = null;
   private _url: string = "";
   private _mode: AuthMode = "local";
+  // Audience passed to initialize(). Cached so connect() / reconnect()
+  // can fail fast in remote mode when it's missing — the server's
+  // verifyAuth0Token enforces an `aud` match and would otherwise close
+  // the just-opened socket with 1008, leaving the failure to surface
+  // through the WebSocket close path far from the originating call.
+  private _audience: string | undefined;
   // Synchronous in-flight claim used by the atomic `failIfConnected`
   // ownership guard in `connect()`. Flipped to `true` BEFORE the first
   // `await` and reset in `finally`, so concurrent callers — including
@@ -127,6 +133,7 @@ export class AuthShell extends EventTarget {
    */
   initialize(options: AuthShellOptions): Promise<void> {
     this._mode = options.mode ?? "local";
+    this._audience = options.audience || undefined;
 
     const authorizationParams: Record<string, any> = {
       scope: options.scope ?? "openid profile email",
@@ -217,6 +224,21 @@ export class AuthShell extends EventTarget {
     if (!url) {
       raiseError(
         "connect(): WebSocket URL is required. Pass it as the argument or set the `remote-url` attribute on <hawc-auth0>.",
+      );
+    }
+    // Remote mode without `audience` is unrecoverable on the wire:
+    // verifyAuth0Token rejects the handshake on `aud` mismatch and the
+    // server closes with 1008. Without this precondition, the failure
+    // would only surface through the close handler — long after the
+    // call site, and via a generic "WebSocket connection failed"
+    // message that points at the URL instead of the missing attribute.
+    // Throwing here keeps the diagnostic next to the configuration
+    // mistake (see README-REMOTE.md §State Surface — `audience`).
+    if (this._mode === "remote" && !this._audience) {
+      raiseError(
+        "connect(): `audience` is required in remote mode. " +
+        "Set the `audience` attribute on <hawc-auth0> to your API identifier — " +
+        "without it the server's verifyAuth0Token rejects the handshake on `aud` mismatch.",
       );
     }
 
@@ -449,6 +471,16 @@ export class AuthShell extends EventTarget {
     }
     if (!this._url) {
       raiseError("No previous connection URL. Call connect() first.");
+    }
+    // Mirror connect(): a remote-mode reconnect without audience is
+    // rejected by the server on `aud` mismatch — fail fast at the
+    // call site instead of waiting for the 1008 close to surface.
+    if (this._mode === "remote" && !this._audience) {
+      raiseError(
+        "reconnect(): `audience` is required in remote mode. " +
+        "Set the `audience` attribute on <hawc-auth0> to your API identifier — " +
+        "without it the server's verifyAuth0Token rejects the handshake on `aud` mismatch.",
+      );
     }
 
     // Atomic ownership claim shared with connect(). Set BEFORE any

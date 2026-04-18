@@ -39,7 +39,22 @@ export class AuthLogout extends HTMLElement {
     event.preventDefault();
 
     const authElement = this._findAuth();
-    if (!authElement) return;
+    if (!authElement) {
+      // A click on a logout button that resolves to nothing is a config
+      // bug (mistyped target ID, no <hawc-auth0> in the document) — the
+      // user clicked and nothing visible happens. Surface it on the
+      // console so integrators see a hint instead of blaming "logout
+      // is broken". Only the explicit-ID path is logged: the
+      // closest()/first() fallbacks legitimately return null when the
+      // page truly has no auth element on screen, and warning there
+      // would noise up SSR / unrelated pages that include the script.
+      if (this.target) {
+        console.warn(
+          `[@wc-bindable/hawc-auth0] <hawc-auth0-logout>: target="${this.target}" did not resolve to a <hawc-auth0> element. Click ignored.`,
+        );
+      }
+      return;
+    }
 
     const options: Record<string, any> = {};
     if (this.returnTo) {

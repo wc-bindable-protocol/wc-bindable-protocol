@@ -315,6 +315,40 @@ describe("AuthShell", () => {
       );
     });
 
+    it("rejects fast in remote mode when audience is missing", async () => {
+      // Without this precondition the missing audience would only
+      // surface as a 1008 Unauthorized close from the server's
+      // verifyAuth0Token, far from the connect() call site and via
+      // a generic "WebSocket connection failed" error that points
+      // at the URL instead of the missing attribute. Failing here
+      // keeps the diagnostic next to the configuration mistake.
+      const mockClient = createMockAuth0Client();
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const shell = new AuthShell();
+      await shell.initialize({
+        domain: "d",
+        clientId: "c",
+        mode: "remote",
+        // audience intentionally omitted
+      });
+
+      await expect(shell.connect("ws://localhost:3000")).rejects.toThrow(
+        /audience.*required in remote mode/,
+      );
+    });
+
+    it("does not throw the audience precondition in local mode", async () => {
+      const mockClient = createMockAuth0Client();
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const shell = new AuthShell();
+      await shell.initialize({ domain: "d", clientId: "c", mode: "local" });
+
+      const transport = await shell.connect("ws://localhost:3000");
+      expect(transport).toBeDefined();
+    });
+
     it("throws if token cannot be obtained", async () => {
       const mockClient = createMockAuth0Client({
         getTokenSilently: vi.fn().mockResolvedValue(null),

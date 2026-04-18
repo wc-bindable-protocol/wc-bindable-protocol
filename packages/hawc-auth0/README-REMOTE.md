@@ -71,6 +71,21 @@ registerCoreDeclaration("app-core", AppCore.wcBindable);
 
 Re-registering the same key with an identical reference is idempotent; re-registering with a different declaration throws (to avoid desynchronizing already-mounted session elements).
 
+#### HMR / hot reload
+
+Module reload swaps the declaration object reference, so a naive HMR cycle would hit the "different declaration" throw. The intent is to keep the production desync guard strict; for development, pair the registration with `unregisterCoreDeclaration(key)` in your bundler's HMR dispose hook:
+
+```ts
+// Vite / Webpack module HMR
+registerCoreDeclaration("app-core", AppCore.wcBindable);
+
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => unregisterCoreDeclaration("app-core"));
+}
+```
+
+This unregisters the prior declaration before the new module re-registers, so the next pass starts from an empty slot and `<hawc-auth0-session>` instances re-bind cleanly. Already-mounted sessions keep working against their captured declaration until they re-mount; if you need them to pick up the new declaration immediately, force a session remount in the same dispose hook.
+
 ### 2. Declare the pair in markup
 
 ```html
@@ -169,6 +184,8 @@ bind(proxy, (name, value) => {
 
 As a safety net, `<hawc-auth0-session>` fails fast when it detects this conflict: if `authEl.connected === true` at the point where the session would otherwise call `connect()`, it sets `error` to a message pointing to [SPEC-REMOTE.md §3.7](SPEC-REMOTE.md) instead of building a proxy. This surfaces the mistake loudly rather than producing a session that silently goes quiet.
 
+The same rule extends to **multiple `<hawc-auth0-session>` elements** pointing at the same `<hawc-auth0>`: only one can own the connection. The second session's `connect()` is rejected by the same ownership guard. If you need to drive multiple server-side Cores (`user-core`, `billing-core`, …) from a single Auth0 session, the multiplexing is the responsibility of a layer above this package — either pair one `<hawc-auth0>` with one session per Core (one WebSocket per Core), or build a single Core on the server that aggregates the sub-states and exposes them through one proxy. This package guarantees **1 `<hawc-auth0>` = 1 connection = 1 proxy**.
+
 ## Token Refresh
 
 Access tokens expire (typically 300–900s). The remote deployment uses **in-band refresh** as the primary strategy: the client periodically obtains a fresh token from Auth0 and sends it to the server over the existing WebSocket. Core state is not rebuilt.
@@ -225,7 +242,7 @@ See [SPEC-REMOTE.md §3.4](SPEC-REMOTE.md) for the full refresh model including 
 |----------|------|-------------|
 | `domain` | `string` | Auth0 tenant domain |
 | `client-id` | `string` | Auth0 application client ID |
-| `audience` | `string` | API audience identifier. Technically optional on `<hawc-auth0>`, but **effectively required in remote mode** — the server's `verifyAuth0Token` enforces an `aud` match and rejects the handshake when it is missing. Set this to the API identifier registered in your Auth0 tenant. |
+| `audience` | `string` | API audience identifier. Technically optional on `<hawc-auth0>`, but **required in remote mode** — `connect()` / `reconnect()` reject synchronously when `mode === "remote"` and `audience` is missing, because the server's `verifyAuth0Token` would otherwise close the just-opened WebSocket with `1008 Unauthorized` on `aud` mismatch (a far-from-call-site failure). Set this to the API identifier registered in your Auth0 tenant. |
 | `remote-url` | `string` | WebSocket endpoint. Setting this to a **non-empty** value infers `mode="remote"`. An empty `remote-url=""` is treated as unset for mode inference (see [§Empty vs unset `remote-url`](#empty-vs-unset-remote-url)). |
 | `mode` | `"local" \| "remote"` | Explicit deployment mode |
 | `trigger` | `boolean` | One-way login trigger |
@@ -248,8 +265,8 @@ The `trigger` one-way command follows the same contract.
 
 | Method | Rejects on |
 |--------|------------|
-| `authEl.connect(url?)` | missing URL, missing token, WebSocket handshake failure |
-| `authEl.reconnect()` | no prior URL, token fetch failure, WebSocket handshake failure |
+| `authEl.connect(url?)` | missing URL, **missing `audience` in remote mode**, missing token, WebSocket handshake failure |
+| `authEl.reconnect()` | no prior URL, **missing `audience` in remote mode**, token fetch failure, WebSocket handshake failure |
 | `authEl.refreshToken()` | no active connection, token fetch failure, server `throw` frame, timeout (30 s), transport close / error |
 | `authEl.getToken()` | always throws in remote mode (token is not reachable from JS by design) |
 

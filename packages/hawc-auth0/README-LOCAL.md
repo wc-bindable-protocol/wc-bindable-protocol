@@ -322,6 +322,11 @@ When the user returns from Auth0's login page, the URL contains `code` and `stat
 
 No additional configuration or route handling is required.
 
+### Caveats
+
+- **Only `code` and `state` are stripped.** Auth0 may also append `session_state` on success or `error` / `error_description` on failure. Those parameters are intentionally **left in place** so application code can inspect them — `error` / `error_description` in particular are useful for surfacing OIDC-level failures that never reach `handleRedirectCallback()`. If you don't want them visible in the address bar, strip them yourself after `await authEl.connectedCallbackPromise`.
+- **SPA routers may not see the URL change.** `history.replaceState()` does not fire a `popstate` event, so React Router / Vue Router / TanStack Router will not re-evaluate routes after the strip. In practice this is fine — the strip only removes query parameters, not the path — but if your route depends on `useSearchParams()` / `useRoute().query`, force a re-read after `connectedCallbackPromise` resolves, or take ownership of the redirect URL yourself by intercepting before `<hawc-auth0>` initializes.
+
 ## Programmatic Usage
 
 ```javascript
@@ -518,6 +523,61 @@ This makes authentication look like ordinary state updates.
 
 Since `<hawc-auth0>` is HAWC + `wc-bindable-protocol`, it works with any framework through thin adapters from `@wc-bindable/*`.
 
+### TypeScript: declaring the custom elements in JSX / templates
+
+Custom elements are not in the default JSX / Vue intrinsic-element table, so TypeScript flags `<hawc-auth0 ref={ref}>` as "no such element" even though the runtime works. Add a one-time module augmentation per project — typically in `src/types/hawc-auth0.d.ts`:
+
+```ts
+// React (any version that exposes JSX.IntrinsicElements)
+import type { DetailedHTMLProps, HTMLAttributes } from "react";
+import type { HawcAuth0, HawcAuth0Logout, HawcAuth0Session } from "@wc-bindable/hawc-auth0";
+
+type Custom<T> = DetailedHTMLProps<HTMLAttributes<T>, T> & {
+  // Attribute-style props you intend to write in JSX. All optional.
+  domain?: string;
+  "client-id"?: string;
+  "redirect-uri"?: string;
+  audience?: string;
+  scope?: string;
+  "remote-url"?: string;
+  mode?: "local" | "remote";
+  "cache-location"?: "memory" | "localstorage";
+  "use-refresh-tokens"?: string | boolean;
+  popup?: string | boolean;
+};
+
+declare global {
+  namespace JSX {
+    interface IntrinsicElements {
+      "hawc-auth0": Custom<HawcAuth0>;
+      "hawc-auth0-logout": Custom<HawcAuth0Logout> & { target?: string; "return-to"?: string };
+      "hawc-auth0-session": Custom<HawcAuth0Session> & {
+        target?: string;
+        core?: string;
+        url?: string;
+        "auto-connect"?: string | boolean;
+      };
+    }
+  }
+}
+```
+
+For Vue, augment `@vue/runtime-core`'s `GlobalComponents` instead:
+
+```ts
+import type { HawcAuth0, HawcAuth0Logout, HawcAuth0Session } from "@wc-bindable/hawc-auth0";
+
+declare module "@vue/runtime-core" {
+  interface GlobalComponents {
+    "hawc-auth0": HawcAuth0;
+    "hawc-auth0-logout": HawcAuth0Logout;
+    "hawc-auth0-session": HawcAuth0Session;
+  }
+}
+```
+
+Without this, the JSX / template type checker rejects the element at compile time even though the browser-side behaviour is correct. The augmentation file ships once per app, not per component.
+
 ### React
 
 ```tsx
@@ -652,7 +712,8 @@ bootstrapAuth({
 - initialization happens once on `connectedCallback` — changing `domain` or `client-id` after connect does not re-initialize
 - redirect callback is automatically detected and processed during initialization
 - `<hawc-auth0-logout>` with explicit `target` resolves by ID only (no fallback); without `target`, it falls back to closest ancestor, then first-in-document
-- `popup` mode uses `loginWithPopup` — no redirect required, state syncs after popup closes
+- `popup` mode uses `loginWithPopup` — no redirect required, state syncs after popup closes. **Failure modes** (popup blocked by browser, user closes the popup without authenticating, popup times out) all surface the same way: `error` is set to the raw `loginWithPopup` rejection (typically a `PopupCancelledError`, `PopupTimeoutError`, or `Error("Unable to open a popup for loginWithPopup")`) and `loading` is cleared. The promise from `authEl.login()` does **not** reject — the contract is observable via `error` / `hawc-auth0:error`. Inspect `error.message` / `error.error` if you need to branch on the specific cause
 - Shell methods (`login()`, `logout()`, `getToken()`) await initialization before executing — safe to call immediately after connect
 - `@auth0/auth0-spa-js` is a peer dependency — bring your own version
-- `AuthCore` requires browser globals — "headless" means without the Shell, not without a browser
+- `AuthCore` requires browser globals — "headless" means without the Shell, not without a browser. The HAWC architecture's general claim that "Core is runtime-agnostic" is a property of the *pattern*, not a guarantee of every Core implementation: `AuthCore` depends on `@auth0/auth0-spa-js`, `globalThis.location`, and `globalThis.history`, so it will **not** run under Node.js / Deno / Cloudflare Workers. A different authentication backend with a Node-compatible SDK could be wrapped as a Core that does cross runtimes; this particular Core does not
+- `connectedCallbackPromise` (also exposed on `<hawc-auth0-session>`) is a wc-bindable-protocol convention, not part of the Web Components standard. The element opts in via the `static hasConnectedCallbackPromise = true` marker, and the promise resolves once `initialize()` has settled. Treat it as a stable part of this package's public API; do not assume other custom-element libraries expose the same property
