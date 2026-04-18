@@ -267,7 +267,7 @@ A small set of failures are programmer / I/O errors that cannot be meaningfully 
 - auth state transitions
 - `wc-bindable-protocol` declaration
 
-It can run headlessly in any runtime that supports `EventTarget`.
+"Headless" here means **without the Shell element**, not without a browser. `AuthCore` depends on `@auth0/auth0-spa-js`, `globalThis.location`, and `globalThis.history`, so it requires a browser-like environment — it will not run under bare Node.js / Deno / Cloudflare Workers. The HAWC pattern is runtime-agnostic; this particular Core implementation is bound to the browser by its Auth0 SDK and redirect-callback dependencies. See §Headless Usage and the Design Notes at the end of this file for the full caveat.
 
 ### Shell: `<hawc-auth0>`
 
@@ -410,8 +410,8 @@ Declarative logout element. Clicking it triggers logout on the associated `<hawc
 | `return-to` | `string` | — | URL to redirect after logout |
 
 Target resolution:
-- If `target` is set: resolve by ID only. If the ID does not match a `<hawc-auth0>`, the click is silently ignored (no fallback).
-- If `target` is not set: closest ancestor `<hawc-auth0>`, then first `<hawc-auth0>` in the document.
+- If `target` is set: resolve by ID only — there is no fallback. If the ID does not match a `<hawc-auth0>`, the click is ignored **and `console.warn` is emitted** so the misconfiguration is visible (mistyped ID, target removed from the DOM, etc.). The fallback chain is intentionally suppressed in this branch so a typo silently logging out the wrong element cannot happen.
+- If `target` is not set: closest ancestor `<hawc-auth0>`, then first `<hawc-auth0>` in the document. When even those return nothing the click is silently ignored — the page legitimately has no auth element on screen (SSR, unrelated routes that still load the script), and warning would noise up unrelated logs.
 
 ## wc-bindable-protocol
 

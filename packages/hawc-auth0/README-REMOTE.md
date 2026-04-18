@@ -76,6 +76,9 @@ Re-registering the same key with an identical reference is idempotent; re-regist
 Module reload swaps the declaration object reference, so a naive HMR cycle would hit the "different declaration" throw. The intent is to keep the production desync guard strict; for development, pair the registration with `unregisterCoreDeclaration(key)` in your bundler's HMR dispose hook:
 
 ```ts
+import { registerCoreDeclaration, unregisterCoreDeclaration } from "@wc-bindable/hawc-auth0";
+import { AppCore } from "./my-app-core.js";
+
 // Vite / Webpack module HMR
 registerCoreDeclaration("app-core", AppCore.wcBindable);
 
