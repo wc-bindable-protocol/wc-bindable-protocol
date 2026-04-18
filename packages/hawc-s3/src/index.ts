@@ -9,12 +9,12 @@ export { presignS3Url } from "./signing/sigv4.js";
 export type {
   SigV4Credentials, SigV4PresignParams, SigV4PresignResult,
 } from "./signing/sigv4.js";
-export { retryWithBackoff, defaultPutRetryPolicy, PutHttpError } from "./retry.js";
-export type { RetryOptions } from "./retry.js";
+export { retryWithBackoff, defaultPutRetryPolicy, PutHttpError, MissingEtagError } from "./retry.js";
+export type { RetryOptions, S3OwnedError } from "./retry.js";
 
 export type {
   IWritableConfig, IWritableTagNames, IWritableRemoteConfig,
   IS3Provider, S3RequestOptions, PresignedUpload, PresignedDownload,
   S3ObjectMetadata, S3Progress, PostProcessHook, PostProcessContext,
-  S3Error, WcsS3CoreValues, WcsS3Values,
+  PostProcessOptions, S3Error, WcsS3CoreValues, WcsS3Values,
 } from "./types.js";

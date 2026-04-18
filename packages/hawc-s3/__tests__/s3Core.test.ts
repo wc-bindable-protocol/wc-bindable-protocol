@@ -192,6 +192,35 @@ describe("S3Core", () => {
     expect(core.uploading).toBe(false);
   });
 
+  it("non-fatal hook failure does not abort the chain", async () => {
+    await core.requestUpload("k", 1);
+    const seen: string[] = [];
+    const warnings: any[] = [];
+    core.addEventListener("hawc-s3:postprocess-warning", (e) => {
+      warnings.push((e as CustomEvent).detail);
+    });
+    core.registerPostProcess(() => { seen.push("a"); });
+    core.registerPostProcess(() => { throw new Error("audit log down"); }, { fatal: false });
+    core.registerPostProcess(() => { seen.push("c"); });
+    const url = await core.complete("k", "et");
+    expect(seen).toEqual(["a", "c"]);
+    expect(url).toBe("https://example.com/download/k");
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0].error.message).toBe("audit log down");
+    expect(warnings[0].ctx.key).toBe("k");
+    expect(core.completed).toBe(true);
+    expect(core.error).toBeNull();
+  });
+
+  it("fatal hook (default) still aborts even when a later hook is non-fatal", async () => {
+    await core.requestUpload("k", 1);
+    const seen: string[] = [];
+    core.registerPostProcess(() => { throw new Error("gate fail"); }); // fatal default
+    core.registerPostProcess(() => { seen.push("never"); }, { fatal: false });
+    await expect(core.complete("k", "et")).rejects.toThrow("gate fail");
+    expect(seen).toEqual([]);
+  });
+
   it("complete refuses key mismatch", async () => {
     await core.requestUpload("a", 1);
     await expect(core.complete("b", "x")).rejects.toThrow(/key mismatch/);

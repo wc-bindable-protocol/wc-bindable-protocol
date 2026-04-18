@@ -166,6 +166,23 @@ export interface PostProcessContext {
 
 export type PostProcessHook = (ctx: PostProcessContext) => Promise<void> | void;
 
+/**
+ * Options for `S3Core.registerPostProcess`.
+ *
+ * `fatal` (default `true`) controls what happens when the hook throws.
+ * Fatal hooks abort the rest of the chain and reject the `complete` /
+ * `completeMultipart` RPC — the canonical behavior for hooks that gate
+ * the upload (DB insert, virus scan, content-type allowlist).
+ *
+ * `fatal: false` is for ancillary hooks (audit log, notification, telemetry)
+ * whose failure must not invalidate the upload. A non-fatal throw is
+ * surfaced via a `hawc-s3:postprocess-warning` event on the Core's target
+ * and the chain continues.
+ */
+export interface PostProcessOptions {
+  fatal?: boolean;
+}
+
 export interface S3Error {
   code?: string;
   message: string;

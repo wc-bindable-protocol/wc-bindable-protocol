@@ -61,10 +61,21 @@ export async function retryWithBackoff<T>(
  * failures (which are always retried).
  */
 export class PutHttpError extends Error {
+  // Literal-typed `name` so `S3OwnedError` is a true TypeScript discriminated
+  // union: `switch (err.name) { case "PutHttpError": … }` narrows `err` to
+  // this class, and a future widening of the union surfaces as a
+  // `Type '...' is not assignable to type 'never'` on the default branch
+  // (the standard exhaustiveness pattern). The `Error` parent declares
+  // `name: string`; narrowing it covariantly in the subclass is allowed.
+  declare readonly name: "PutHttpError";
   readonly status: number;
   readonly responseBody: string;
   constructor(message: string, status: number, responseBody = "") {
     super(message);
+    // `declare` above only types the field; the runtime assignment still has
+    // to happen in the constructor (after super) so the instance literally
+    // carries the discriminator. Without this line, `err.name` would be
+    // "Error" at runtime even though TS sees the literal.
     this.name = "PutHttpError";
     this.status = status;
     this.responseBody = responseBody;
@@ -80,11 +91,37 @@ export class PutHttpError extends Error {
  * appear — so the retry policy must treat this as terminal.
  */
 export class MissingEtagError extends Error {
+  // See PutHttpError above for the rationale on the literal-typed `name`.
+  declare readonly name: "MissingEtagError";
   constructor(message: string) {
     super(message);
     this.name = "MissingEtagError";
   }
 }
+
+/**
+ * Discriminated union of every error class this package raises itself.
+ * Lets consumers `instanceof`-discriminate (or, with TS narrowing, pattern
+ * match by `error.name`) without parsing message strings:
+ *
+ * ```ts
+ * import type { S3OwnedError } from "@wc-bindable/hawc-s3";
+ * function handle(err: S3OwnedError) {
+ *   switch (err.name) {
+ *     case "MissingEtagError": // CORS / ExposeHeaders fix
+ *     case "PutHttpError":     // err.status, err.responseBody
+ *   }
+ * }
+ * ```
+ *
+ * Errors from the underlying transport, `IS3Provider`, or AWS itself
+ * (`AccessDenied`, `NoSuchBucket`, network failures) are deliberately NOT
+ * members of this union — wrapping them would couple this package to AWS's
+ * evolving error vocabulary. They surface as plain `Error` instances with
+ * the upstream message preserved; check the `error` property after this
+ * union is exhausted (`if (!(err instanceof PutHttpError) && !(err instanceof MissingEtagError))`).
+ */
+export type S3OwnedError = PutHttpError | MissingEtagError;
 
 /**
  * Default policy used by the Shell.

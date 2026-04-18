@@ -101,6 +101,40 @@ This separation yields three practical benefits:
 2. **Reuse beyond the browser** — The same Core class can power a server-side process, a CLI tool, or a Cloudflare Worker, with `bind()` subscribing to its state just as a framework adapter would.
 3. **Shell minimality** — The Shell contains no business logic at all. It is purely a DOM integration surface, making it trivial to write and maintain.
 
+### Variant: When the Shell Owns the Data Plane
+
+The "thin Shell" rule above describes the canonical case where the Core
+performs all work and the Shell only marshals attributes / lifecycle. That
+holds whenever the Core can reach every external system the work requires —
+HTTP fetches, DB writes, cron, etc. — from its runtime.
+
+There is a class of work where it cannot. When the **data plane** must run
+in the browser for reasons unrelated to business logic — direct upload to
+object storage, WebRTC, WebUSB, the `File System Access API`, anything
+gated on a user gesture or that would otherwise tunnel a payload through
+the WebSocket — the Shell stops being a thin marshaller and becomes the
+**data-plane executor**. The Core retains the **control plane** (signing,
+authorization, post-processing, persistence) and the wire still carries
+only small JSON-RPC messages, but the Shell now holds an XHR pump, a
+worker pool, retry / re-sign logic, and abort plumbing.
+
+`@wc-bindable/hawc-s3` is the canonical example: the bytes go
+browser → S3 directly because tunneling them through the control WebSocket
+would (a) double the egress cost, (b) waste the server's bandwidth, and
+(c) defeat S3's parallel multipart upload. The Shell ends up at ~800 lines.
+That is not a violation of HAWC's intent — it is the variant that applies
+when the data plane is anchored to the browser by the platform.
+
+The principle that survives is the same one the canonical case enforces:
+**the Core owns every decision; the Shell owns only execution it cannot
+delegate.** A "thick" Shell that signs its own URLs or runs its own
+authorization checks would be a HAWC violation, regardless of byte count.
+A thick Shell that PUTs bytes to a Core-signed URL is not.
+
+When you build a HAWC component and the Shell starts to grow, ask which
+side of that line the new code is on. Pumping bytes that cannot leave the
+browser → Shell. Anything else → Core.
+
 ### Remote: Core/Shell Separation Over the Network
 
 The Core/Shell separation naturally extends to a network boundary. With `@wc-bindable/remote`, the Core runs on a server while the client holds a proxy `EventTarget` — and `bind()` works identically on both sides.

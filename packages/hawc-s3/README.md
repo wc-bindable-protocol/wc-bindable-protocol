@@ -184,6 +184,54 @@ A dedicated `registerValidate` hook running **before** presign (so it can reject
 without minting a URL) is on the roadmap; until it lands, the provider wrapper
 is the supported equivalent.
 
+#### Provider wrapper recipe — Content-Type allowlist
+
+Pre-presign rejection avoids the post-process hook's "bytes are already in S3"
+window (extra cost, brief visibility, audit trail noise). Wrap your real
+provider, gate `presignUpload` / `initiateMultipart`, and pass the wrapper to
+`new S3Core(wrapper)`:
+
+```ts
+import {
+  AwsS3Provider, S3Core,
+  type IS3Provider, type S3RequestOptions,
+} from "@wc-bindable/hawc-s3/server";
+
+const ALLOWED = new Set([
+  "image/png", "image/jpeg", "image/webp", "application/pdf",
+]);
+
+class ContentTypeAllowlist implements IS3Provider {
+  constructor(private inner: IS3Provider) {}
+  private _check(opts: S3RequestOptions): void {
+    if (!opts.contentType || !ALLOWED.has(opts.contentType)) {
+      throw new Error(`[upload] content-type not allowed: ${opts.contentType ?? "<none>"}`);
+    }
+  }
+  presignUpload(key: string, opts: S3RequestOptions) {
+    this._check(opts);
+    return this.inner.presignUpload(key, opts);
+  }
+  initiateMultipart(key: string, opts: S3RequestOptions) {
+    this._check(opts);
+    return this.inner.initiateMultipart(key, opts);
+  }
+  // pass-through for the rest (presignDownload, presignPart, completeMultipart,
+  // abortMultipart, deleteObject) — they cannot leak unauthorized bytes.
+  presignDownload(k: string, o: S3RequestOptions) { return this.inner.presignDownload(k, o); }
+  presignPart(k: string, u: string, n: number, o: S3RequestOptions) { return this.inner.presignPart(k, u, n, o); }
+  completeMultipart(k: string, u: string, p: any, o: S3RequestOptions) { return this.inner.completeMultipart(k, u, p, o); }
+  abortMultipart(k: string, u: string, o: S3RequestOptions) { return this.inner.abortMultipart(k, u, o); }
+  deleteObject(k: string, o: S3RequestOptions) { return this.inner.deleteObject(k, o); }
+}
+
+const core = new S3Core(new ContentTypeAllowlist(new AwsS3Provider()));
+```
+
+The throw surfaces as `hawc-s3:error` on the Shell, no presigned URL is minted,
+and S3 sees nothing. Use the same shape for max-size / key-shape / per-tenant
+checks.
+
 ## Component API
 
 ### `<hawc-s3>` attributes
@@ -202,7 +250,7 @@ is the supported equivalent.
 
 | property / method | meaning |
 |---|---|
-| `file` | the `Blob`/`File` to upload |
+| `file` | the `Blob`/`File` to upload. Setting `file` is **passive** — it stores the value and does nothing else. The pending upload is not aborted, restarted, or re-keyed. The new value is consumed by the next `upload()` call (or `trigger=true`). To replace an in-flight upload's payload: call `abort()`, set `file`, then re-trigger. |
 | `upload()` | explicit start. Returns the final download URL. Re-entry is serialized: a call while another upload is in flight aborts the prior one and waits for it to unwind before starting fresh. |
 | `trigger` | attribute-/binding-driven convenience: setting it to `true` calls `upload()` and resets to `false` on completion. Prefer `upload()` from imperative code — `trigger` exists so reactive frameworks can drive the component as a property. |
 | `abort()` | cancel the current upload. Also triggers server-side multipart cleanup when applicable. |
@@ -252,7 +300,22 @@ then read it as state to get the resolved key emitted by the Core (`hawc-s3:key-
 > and dynamic-`import()`s the resulting `blob:` URL. That means a strict CSP
 > needs `script-src 'self' blob:` (and `worker-src` is irrelevant here).
 > If `blob:` is not allowed, use the `src` attribute to point at a real
-> module URL instead.
+> module URL instead — or skip `<hawc-s3-callback>` entirely and subscribe
+> through the wc-bindable adapter your framework already uses (see below).
+
+#### When NOT to use `<hawc-s3-callback>`
+
+`<hawc-s3-callback>` is the recommended path for **vanilla / no-framework**
+pages, because the inline script keeps callback logic colocated with the
+markup. For framework-driven apps, prefer the wc-bindable subscription that
+your framework already speaks (`useWcBindable` in React/Vue, Svelte's
+`use:wcBindable`, etc.) — bind to `<hawc-s3>` directly and read `progress`,
+`completed`, `error` as reactive values. The callback element duplicates
+that capability with extra DOM and a `blob:` requirement.
+
+Strict-CSP environments (no `blob:` in `script-src`) should also drop the
+callback element and bind through the framework adapter. The data plane is
+the same — only the surface changes.
 
 ### Event naming
 
@@ -266,6 +329,168 @@ outweighs the local readability win.
 
 The one exception is `error`, which dispatches as `hawc-s3:error` (no suffix)
 because it is a signal, not a state transition.
+
+## Framework Integration
+
+`<hawc-s3>` is HAWC + `wc-bindable-protocol`, so it works with any framework
+through the thin adapters in `@wc-bindable/*`. The progress bar, completion
+banner, and error surface in every example below are reactive views of the
+**same** Shell state — no framework-specific upload code, no `useEffect` /
+`onMounted` orchestration of XHRs.
+
+For strict-CSP environments where `<hawc-s3-callback>` is not viable
+(see [the CSP note](#-hawc-s3-callback-)), the framework adapters are also
+the recommended substitute.
+
+### React
+
+`useWcBindable` returns a **callback ref**, not a `RefObject` — there is no
+`.current`. Capture the element with a small fan-out callback ref so the
+imperative `file=` / `trigger=true` assignments still have something to
+target:
+
+```tsx
+import { useWcBindable } from "@wc-bindable/react";
+import { useCallback, useRef, useState } from "react";
+import type { WcsS3Values } from "@wc-bindable/hawc-s3";
+
+type S3Element = HTMLElement & { file: Blob | null; trigger: boolean };
+
+function Uploader() {
+  const [bindRef, { progress, completed, url, error }] =
+    useWcBindable<HTMLElement, WcsS3Values>();
+  const [s3, setS3] = useState<S3Element | null>(null);
+  const fileInput = useRef<HTMLInputElement>(null);
+
+  // Fan out one ref slot to (a) the wcBindable subscriber and (b) our
+  // imperative handle. React calls callback refs on mount with the node
+  // and on unmount with null.
+  const setS3Ref = useCallback((node: HTMLElement | null) => {
+    bindRef(node);
+    setS3(node as S3Element | null);
+  }, [bindRef]);
+
+  const onUpload = () => {
+    const file = fileInput.current?.files?.[0];
+    if (!file || !s3) return;
+    s3.file = file;
+    s3.trigger = true;
+  };
+
+  return (
+    <>
+      <hawc-s3 ref={setS3Ref} multipart-threshold="8388608" />
+      <input type="file" ref={fileInput} />
+      <button onClick={onUpload}>Upload</button>
+      <progress value={progress?.total ? progress.loaded / progress.total : 0} />
+      {completed && url && <a href={url}>Download</a>}
+      {error && <p className="error">{(error as Error).message}</p>}
+    </>
+  );
+}
+```
+
+### Vue
+
+```vue
+<script setup lang="ts">
+import { useWcBindable } from "@wc-bindable/vue";
+import type { WcsS3Values } from "@wc-bindable/hawc-s3";
+
+const { ref: s3Ref, values } = useWcBindable<HTMLElement, WcsS3Values>();
+
+function onUpload(e: Event) {
+  const file = (e.target as HTMLInputElement).files?.[0];
+  const s3 = s3Ref.value as any;
+  if (!file || !s3) return;
+  s3.file = file;
+  s3.trigger = true;
+}
+</script>
+
+<template>
+  <hawc-s3 :ref="s3Ref" multipart-threshold="8388608" />
+  <input type="file" @change="onUpload" />
+  <progress :value="values.progress?.total ? values.progress.loaded / values.progress.total : 0" />
+  <a v-if="values.completed && values.url" :href="values.url">Download</a>
+  <p v-if="values.error" class="error">{{ values.error.message }}</p>
+</template>
+```
+
+### Svelte
+
+```svelte
+<script>
+import { wcBindable } from "@wc-bindable/svelte";
+
+let s3El;
+let progress = $state({ loaded: 0, total: 0 });
+let completed = $state(false);
+let url = $state("");
+let error = $state(null);
+
+function onUpload(e) {
+  const file = e.target.files?.[0];
+  if (!file || !s3El) return;
+  s3El.file = file;
+  s3El.trigger = true;
+}
+</script>
+
+<hawc-s3 bind:this={s3El} multipart-threshold="8388608"
+  use:wcBindable={{ onUpdate: (name, v) => {
+    if (name === "progress") progress = v;
+    if (name === "completed") completed = v;
+    if (name === "url") url = v;
+    if (name === "error") error = v;
+  }}} />
+
+<input type="file" on:change={onUpload} />
+<progress value={progress.total ? progress.loaded / progress.total : 0} />
+{#if completed && url}<a href={url}>Download</a>{/if}
+{#if error}<p class="error">{error.message}</p>{/if}
+```
+
+### Vanilla — `bind()` directly
+
+When you do not want to take the callback element's `blob:` CSP cost (or
+just prefer imperative wiring), subscribe with `bind()`:
+
+```javascript
+import { bind } from "@wc-bindable/core";
+
+const s3 = document.querySelector("hawc-s3");
+const bar = document.getElementById("bar");
+
+bind(s3, (name, value) => {
+  if (name === "progress") {
+    bar.value = value.total ? value.loaded / value.total : 0;
+  } else if (name === "completed" && value === true) {
+    bar.value = 1;
+  }
+});
+
+document.getElementById("go").onclick = () => {
+  s3.file = document.getElementById("picker").files[0];
+  s3.trigger = true;
+};
+```
+
+### What the adapters do *not* cover
+
+The adapters subscribe to **state**. The two browser-side actions —
+choosing a `File` and starting the upload — stay imperative because both
+are gestures the framework's reactive layer should not own:
+
+- `s3.file = file` runs on a user-driven `<input type="file">` change. Most
+  frameworks treat the `FileList` as escape-hatch territory and do not
+  reactively bind it.
+- `s3.trigger = true` (or `s3.upload()`) is a command, not state. Like
+  `fetch()` itself, it should fire from an event handler, not from a render
+  cycle.
+
+Everything downstream of those two lines — progress, completion, errors —
+is fully reactive through the adapter.
 
 ## Multipart sizing
 
@@ -297,6 +522,33 @@ Any `headers` your `presignPart` returns (SSE-C, custom auth, etc.) are
 forwarded to the Shell on both the initial signing and every re-sign and
 echoed on the part PUT — the multipart path is symmetrical with the single
 PUT path.
+
+### Single-PUT URL lifetime
+
+The single-PUT path does **not** re-sign on demand. The presigned PUT URL is
+issued once at `requestUpload()` time and used as-is for the whole upload —
+including any retry. A PUT that 403s mid-flight (signature expired) is
+classified as a non-retriable 4xx by the default policy and surfaces to
+`error` immediately; `put-retries` is not consumed because retrying with the
+same expired URL would 403 again.
+
+In practice this only matters for the long-tail combination of (a) a small
+file under `multipart-threshold` and (b) a link slow enough to take longer
+than the presign TTL (default **15 minutes**). At that size a typical link
+finishes in seconds, so the window is narrow. If you support genuinely slow
+clients (satellite, weak mobile) where a single ≤ 8 MiB PUT can run past
+15 minutes:
+
+- **Lower the threshold** so those uploads route through multipart, which
+  has the lazy-refresh + 403-retry behavior described above.
+  `<hawc-s3 multipart-threshold="1048576">` (1 MiB) is a reasonable floor.
+- **Or widen the TTL** for that workload via
+  `new AwsS3Provider({ defaultExpiresInSeconds: 3600 })` — capped at SigV4's
+  hard maximum of 7 days.
+
+First-class single-PUT re-sign (eager refresh + 403-retry on the single path,
+mirroring multipart) is on the same roadmap as `registerValidate`; PRs
+welcome.
 
 ## Retry policy
 
@@ -342,11 +594,33 @@ When a `registerPostProcess` hook throws, the contract is:
 | `url` | **not** published (no presigned GET minted) |
 | the `complete` / `completeMultipart` RPC | rejects with the same error |
 
-Hooks run **sequentially** — the first to throw aborts the rest. The Core
-deliberately does **not** auto-delete the S3 object on hook failure, because
-that decision depends on your invariants (DB insert rolled back? virus scan
-quarantined? audit trail needed?). If you want rollback, call
-`core.deleteObject(key)` from an outer try/catch around the hook you register.
+Hooks run **sequentially** — the first **fatal** hook to throw aborts the
+rest. The Core deliberately does **not** auto-delete the S3 object on hook
+failure, because that decision depends on your invariants (DB insert rolled
+back? virus scan quarantined? audit trail needed?). If you want rollback,
+call `core.deleteObject(key)` from an outer try/catch around the hook you
+register.
+
+### Fatal vs non-fatal hooks
+
+By default every hook is **fatal**: a throw aborts the chain and rejects the
+upload. That is the right behavior for hooks that gate the upload (DB insert,
+virus scan, content-type allowlist) — losing them is unsafe.
+
+For ancillary hooks whose failure must **not** invalidate the upload (audit
+log, notification, metrics), opt out with `{ fatal: false }`:
+
+```ts
+core.registerPostProcess(logAudit,  { fatal: false }); // warn, keep going
+core.registerPostProcess(virusScan);                   // gate (fatal default)
+core.registerPostProcess(insertDB);                    // gate (fatal default)
+```
+
+A non-fatal throw is surfaced via a `hawc-s3:postprocess-warning` event on
+the Core's target (detail: `{ error, ctx }`) and the chain continues with
+the next hook. This removes the implicit "wrap your own try/catch" tax that
+ancillary hooks would otherwise carry, and prevents a logging sink outage
+from blocking real uploads.
 
 **Atomicity with your DB.** There is no two-phase commit between S3 and your
 database. The supported patterns are:
@@ -370,6 +644,78 @@ database. The supported patterns are:
   client-side and store it in your DB via the post-process hook, or wrap
   `IS3Provider` to add the header and verify the response.
 
+## Error types
+
+Errors surfaced through `hawc-s3:error` (and the `error` property) come from
+two distinct layers, and the package treats them differently.
+
+### Package-owned errors — discriminated union
+
+Cases the package itself raises are exported as named classes **and** unioned
+under a single `S3OwnedError` type, so consumers get exhaustive narrowing
+without parsing message strings:
+
+| class | thrown when | retried? |
+|---|---|---|
+| `PutHttpError` | a browser PUT receives a non-2xx status. Carries `status` and `responseBody`. | yes for 408 / 429 / 5xx; no for other 4xx |
+| `MissingEtagError` | a 2xx PUT response has no visible `ETag` header (CORS `ExposeHeaders` or non-emitting S3-compatible server). | no — configuration issue |
+
+```ts
+import {
+  PutHttpError, MissingEtagError,
+  type S3OwnedError,
+} from "@wc-bindable/hawc-s3";
+
+function handleOwned(err: S3OwnedError): void {
+  switch (err.name) {                         // exhaustive on the union
+    case "MissingEtagError":
+      // Surface a CORS-fix prompt; never going to self-heal.
+      return;
+    case "PutHttpError":
+      // err.status, err.responseBody available
+      if (err.status === 403) { /* likely expired single-PUT presign */ }
+      return;
+  }
+}
+
+s3.addEventListener("hawc-s3:error", (e) => {
+  const err = (e as CustomEvent).detail;
+  if (err instanceof PutHttpError || err instanceof MissingEtagError) {
+    handleOwned(err);
+  } else {
+    // Upstream / transport — see next section.
+  }
+});
+```
+
+`S3OwnedError` is intentionally **closed**: every member is a class this
+package raises itself, so adding a new member is a breaking change you can
+catch at compile time. If the union widens in a future release, your
+`switch` will surface a non-exhaustive warning at the unhandled case rather
+than silently changing behavior at runtime.
+
+### Upstream errors — passed through unwrapped
+
+Errors **not** owned by this package — `AccessDenied`, `NoSuchBucket`,
+`InvalidPart`, CORS preflight rejections, the underlying transport's
+network errors — surface as plain `Error` instances with the upstream
+message preserved. **They are not members of `S3OwnedError`** and are
+deliberately not wrapped:
+
+- `AwsS3Provider` already produces messages that discriminate the SDK error
+  code; wrapping each into a class here would couple the package to AWS's
+  evolving error vocabulary.
+- The WebSocket transport and browser XHR layer have their own established
+  error shapes that downstream tooling already handles.
+- A single "wraps everything" parent class would force consumers to
+  re-discriminate by message anyway.
+
+If you need code-level discrimination on upstream cases, do it where the
+vocabulary is stable: in your wrapped `IS3Provider`, throw your own typed
+errors at the boundary you control. Those will then surface through
+`hawc-s3:error` with their original class intact, and you can extend your
+own discriminated union alongside `S3OwnedError`.
+
 ## Resumability
 
 This component is **not resumable**. When the WebSocket drops mid-multipart,
@@ -380,9 +726,17 @@ A subsequent upload re-uploads every byte.
 For workloads with single-file uploads in the low-GB range this is usually
 acceptable. For workloads that routinely ship tens of GB over flaky links
 you want a resumable design (persist `uploadId` + completed part list across
-reconnects, reuse them on the next session). A resumable mode is not in this
-release; the extension points to build one are `IS3Provider` +
-`registerPostProcess`, and we would accept a PR.
+reconnects, reuse them on the next session).
+
+**Roadmap.** Resumable mode is **not** planned for the core package — the
+required machinery (durable `uploadId` + part-etag store, reconnect
+handshake, server-side Core re-attach across WebSocket sessions) materially
+expands the surface area and is out of scope for the "control-plane only"
+design. The intended path is a separate `@wc-bindable/hawc-s3-resumable`
+companion that composes with this package via `IS3Provider` +
+`registerPostProcess` (the same seams documented above). PRs that build it
+in-tree as a sibling package are welcome; until then, treat in-flight
+multiparts as discardable on disconnect.
 
 ### Residual orphan-parts risk
 
@@ -419,6 +773,31 @@ chosen window).
 Configuring a backstop on every bucket that hosts `<hawc-s3>` uploads is
 strongly recommended — it is the operational safety net that covers the
 "best-effort cleanup itself failed" residual case.
+
+## Scaling characteristics
+
+A useful side effect of the "bytes never traverse the WebSocket" design is
+that the **server cost is decoupled from upload size**:
+
+- Per upload, the server holds: one WebSocket slot, one `S3Core` instance,
+  and any per-hook state (DB connections, scan queue tickets).
+- It does **not** hold the bytes. The browser PUTs directly to S3; the
+  server only signs URLs, receives rAF-batched progress updates, runs the
+  post-process hook, and presigns the final GET.
+
+In big-O terms the server-side work is `O(connections × signing_rate)`,
+not `O(bytes_uploaded)`. A 100 GB upload and a 1 KB upload cost the server
+roughly the same — both are a handful of small RPCs spread over the
+upload's wall-clock time. The bandwidth and storage cost lives entirely
+on AWS's side of the wire.
+
+This makes the package a good fit for workloads that would otherwise force
+horizontal scaling on the upload-receiver tier: large media ingest, dataset
+uploads, regulatory archives. Plan capacity by concurrent **connections**
+(≈ a few KB of process memory each + your hook's per-call cost), not by
+expected throughput. The constraints that *do* scale with byte volume —
+S3 request rate, lifecycle / replication, downstream processing — sit on
+AWS or in your own post-process pipeline, not in this Core.
 
 ## S3 bucket CORS
 

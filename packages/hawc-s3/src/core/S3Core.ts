@@ -1,7 +1,7 @@
 import { raiseError } from "../raiseError.js";
 import {
   IWcBindable, IS3Provider, S3RequestOptions, PresignedUpload, PresignedDownload,
-  S3ObjectMetadata, S3Progress, PostProcessHook, PostProcessContext, S3Error,
+  S3ObjectMetadata, S3Progress, PostProcessHook, PostProcessContext, PostProcessOptions, S3Error,
   MultipartInit, MultipartPartUrl, MultipartPart,
 } from "../types.js";
 
@@ -88,7 +88,7 @@ export class S3Core extends EventTarget {
   private _rafId: any = 0;
   /** Monotonically incremented per requestUpload. Stale reports are dropped. */
   private _generation: number = 0;
-  private _postProcessHooks: PostProcessHook[] = [];
+  private _postProcessHooks: { hook: PostProcessHook; fatal: boolean }[] = [];
   /**
    * Active multipart upload state. Captures both `key` AND the full
    * S3RequestOptions snapshot taken at init time, so cleanup / complete
@@ -171,12 +171,20 @@ export class S3Core extends EventTarget {
   /**
    * Register a server-side hook that runs after the browser confirms upload
    * completion. Returns a disposer.
+   *
+   * `options.fatal` (default `true`): when the hook throws, abort the rest of
+   * the chain and reject the `complete` / `completeMultipart` RPC. Pass
+   * `{ fatal: false }` for ancillary hooks (audit log, notification,
+   * telemetry) whose failure must not invalidate the upload — non-fatal
+   * throws emit a `hawc-s3:postprocess-warning` event on the Core's target
+   * and the chain continues with the next hook.
    */
-  registerPostProcess(hook: PostProcessHook): () => void {
+  registerPostProcess(hook: PostProcessHook, options: PostProcessOptions = {}): () => void {
     if (typeof hook !== "function") raiseError("hook must be a function.");
-    this._postProcessHooks.push(hook);
+    const entry = { hook, fatal: options.fatal !== false };
+    this._postProcessHooks.push(entry);
     return () => {
-      const idx = this._postProcessHooks.indexOf(hook);
+      const idx = this._postProcessHooks.indexOf(entry);
       if (idx >= 0) this._postProcessHooks.splice(idx, 1);
     };
   }
@@ -423,10 +431,22 @@ export class S3Core extends EventTarget {
     };
 
     try {
-      // Hooks run sequentially; a single failure aborts the rest so the caller
-      // sees the first error rather than a Promise.all aggregate.
-      for (const hook of this._postProcessHooks) {
-        await hook(ctx);
+      // Hooks run sequentially; fatal hooks abort the rest so the caller sees
+      // the first error rather than a Promise.all aggregate. Non-fatal hooks
+      // (`{ fatal: false }`) survive their own throw — failure is surfaced via
+      // `hawc-s3:postprocess-warning` and the chain continues. Use this for
+      // audit / notification / telemetry hooks that must not invalidate the
+      // upload because their sink is degraded.
+      for (const entry of this._postProcessHooks) {
+        try {
+          await entry.hook(ctx);
+        } catch (e: any) {
+          if (entry.fatal) throw e;
+          this._target.dispatchEvent(new CustomEvent("hawc-s3:postprocess-warning", {
+            detail: { error: e, ctx },
+            bubbles: true,
+          }));
+        }
       }
       // Stale completion (e.g. user kicked off a new upload mid-hook).
       if (gen !== this._generation) return "";
@@ -738,8 +758,18 @@ export class S3Core extends EventTarget {
     };
 
     try {
-      for (const hook of this._postProcessHooks) {
-        await hook(ctx);
+      // Fatal/non-fatal semantics match `complete()` — see the long comment
+      // there. Keep the two paths in lockstep.
+      for (const entry of this._postProcessHooks) {
+        try {
+          await entry.hook(ctx);
+        } catch (e: any) {
+          if (entry.fatal) throw e;
+          this._target.dispatchEvent(new CustomEvent("hawc-s3:postprocess-warning", {
+            detail: { error: e, ctx },
+            bubbles: true,
+          }));
+        }
       }
       if (gen !== this._generation) return "";
       // The download must point at the path the bytes actually live at.
