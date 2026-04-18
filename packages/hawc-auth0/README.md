@@ -9,7 +9,7 @@ It is not a visual UI widget. It is an **I/O node** that connects Auth0 authenti
 
 Authentication state can be expressed declaratively in HTML, without writing OAuth flows, token management, or login/logout glue code in your UI layer.
 
-`@wc-bindable/hawc-auth0` follows the [HAWC](https://github.com/wc-bindable-protocol/wc-bindable-protocol/blob/main/docs/articles/HAWC.md) architecture:
+`@wc-bindable/hawc-auth0` follows the [HAWC](https://github.com/wc-bindable-protocol/wc-bindable-protocol/blob/main/packages/hawc/README.md) architecture:
 
 - **Core** (`AuthCore`) handles Auth0 SDK interaction, token management, and auth state
 - **Shell** (`<hawc-auth0>`) connects that state to the DOM

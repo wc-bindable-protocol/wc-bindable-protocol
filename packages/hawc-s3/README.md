@@ -8,7 +8,7 @@ It is an **I/O node** that connects an upload pipeline to reactive state — wit
 - **input / command surface**: `file`, `trigger`, `bucket`, `prefix`, `key`, `content-type`
 - **output state surface**: `url`, `etag`, `progress`, `loading`, `uploading`, `completed`, `metadata`, `error`
 
-`@wc-bindable/hawc-s3` follows the [HAWC](https://github.com/wc-bindable-protocol/wc-bindable-protocol/blob/main/docs/articles/HAWC.md) architecture:
+`@wc-bindable/hawc-s3` follows the [HAWC](https://github.com/wc-bindable-protocol/wc-bindable-protocol/blob/main/packages/hawc/README.md) architecture:
 
 - **Core** (`S3Core`) lives server-side. Owns AWS credentials, signs URLs, runs post-process hooks.
 - **Shell** (`<hawc-s3>`) lives in the browser. Picks the file, PUTs **directly to S3**, reports progress.

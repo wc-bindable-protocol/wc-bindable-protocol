@@ -12,14 +12,14 @@
   .label-anno { font-size: 11px; font-weight: 400; }
 </style>
 
-<!-- ======== Shell (HTMLElement) — outer boundary ======== -->
+<!-- ======== Shell (HTMLElement) - outer boundary ======== -->
 <rect x="40" y="30" width="600" height="260" rx="16"
       fill="#f1efe8" stroke="#5f5e5a" stroke-width="0.5" stroke-dasharray="6 4"/>
 <text x="340" y="50" text-anchor="middle" class="label-main" fill="#444441">
   Shell (HTMLElement)
 </text>
 
-<!-- ======== Core (EventTarget) — inner boundary ======== -->
+<!-- ======== Core (EventTarget) - inner boundary ======== -->
 <rect x="55" y="60" width="570" height="110" rx="12"
       fill="#e8e6df" stroke="#8a887f" stroke-width="0.5" stroke-dasharray="4 3"/>
 <text x="340" y="78" text-anchor="middle" class="label-sub" fill="#5f5e5a">
@@ -54,7 +54,7 @@
 <line x1="230" y1="114" x2="250" y2="114" marker-end="url(#arrow)" stroke="#73726c" stroke-width="1.5"/>
 <line x1="402" y1="114" x2="422" y2="114" marker-end="url(#arrow)" stroke="#73726c" stroke-width="1.5"/>
 
-<!-- ── Shell-specific area (below Core, inside Shell) ── -->
+<!-- -- Shell-specific area (below Core, inside Shell) -- -->
 
 <!-- Attributes + Lifecycle -->
 <rect x="70" y="185" width="140" height="40" rx="8"
@@ -83,16 +83,16 @@
   target injection: Core dispatches events directly on Shell
 </text>
 
-<!-- ── Side annotations: boundary crossing ── -->
+<!-- -- Side annotations: boundary crossing -- -->
 <text x="660" y="120" class="label-anno" fill="#993c1d">
-  ← crosses
+  &lt;- crosses
 </text>
 <text x="660" y="133" class="label-anno" fill="#993c1d">
      runtime boundary
 </text>
 
 <text x="660" y="202" class="label-anno" fill="#854f0b">
-  ← crosses
+  &lt;- crosses
 </text>
 <text x="660" y="215" class="label-anno" fill="#854f0b">
      framework boundary
@@ -152,7 +152,7 @@
 <text x="340" y="480" text-anchor="middle" dominant-baseline="central"
       class="label-main" fill="#633806">Framework = rendering machine</text>
 <text x="340" y="498" text-anchor="middle" dominant-baseline="central"
-      class="label-sub" fill="#854f0b">No async logic, just state → UI</text>
+      class="label-sub" fill="#854f0b">No async logic, just state -&gt; UI</text>
 
 <!-- Arrows from adapters to framework -->
 <line x1="125" y1="401" x2="200" y2="458" stroke="#3d3d3a" stroke-width="0.5" marker-end="url(#arrow)"/>
@@ -162,6 +162,6 @@
 
 <!-- Bottom annotation -->
 <text x="340" y="548" text-anchor="middle" class="label-sub" fill="#3d3d3a">
-  Core (EventTarget) crosses runtime boundary — Shell (HTMLElement) crosses framework boundary
+  Core (EventTarget) crosses runtime boundary - Shell (HTMLElement) crosses framework boundary
 </text>
 </svg>

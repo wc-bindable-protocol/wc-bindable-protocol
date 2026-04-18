@@ -10,7 +10,7 @@ It is an **I/O node** that connects LLM inference to reactive state — with fir
 
 This means chat UIs and AI-powered features can be expressed declaratively, without writing fetch calls, SSE parsing, token management, or streaming glue code in your UI layer.
 
-`@wc-bindable/hawc-ai` follows the [HAWC](https://github.com/wc-bindable-protocol/wc-bindable-protocol/blob/main/docs/articles/HAWC.md) architecture:
+`@wc-bindable/hawc-ai` follows the [HAWC](https://github.com/wc-bindable-protocol/wc-bindable-protocol/blob/main/packages/hawc/README.md) architecture:
 
 - **Core** (`AiCore`) handles provider abstraction, streaming, and conversation state
 - **Shell** (`<hawc-ai>`) connects that state to the DOM

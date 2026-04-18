@@ -1,0 +1,23 @@
+{
+  "name": "@wc-bindable/hawc",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Architecture documentation for Headless Async Web Components (HAWC).",
+  "type": "module",
+  "scripts": {
+    "build": "node -e \"process.exit(0)\""
+  },
+  "keywords": [
+    "wc-bindable",
+    "hawc",
+    "architecture",
+    "documentation"
+  ],
+  "author": "mogera551",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wc-bindable-protocol/wc-bindable-protocol.git",
+    "directory": "packages/hawc"
+  },
+  "license": "MIT"
+}
