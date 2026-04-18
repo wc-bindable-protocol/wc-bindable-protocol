@@ -1,7 +1,7 @@
 import { warnStreamParseFailure } from "../debug.js";
 import {
   IAiProvider, AiMessage, AiUsage, AiRequestOptions, AiProviderRequest,
-  AiStreamChunkResult, AiToolCall, AiToolCallDelta, AiContent,
+  AiStreamChunkResult, AiToolCall, AiToolCallDelta, AiContent, AiFinishReason,
 } from "../types.js";
 import { validateRequestOptions } from "./validateRequestOptions.js";
 import { flattenContentToText } from "./contentHelpers.js";
@@ -108,10 +108,17 @@ export class OpenAiProvider implements IAiProvider {
     return "auto";
   }
 
-  parseResponse(data: any): { content: string; toolCalls?: AiToolCall[]; usage?: AiUsage } {
-    const msg = data.choices?.[0]?.message;
+  parseResponse(data: any): {
+    content: string;
+    toolCalls?: AiToolCall[];
+    usage?: AiUsage;
+    finishReason?: AiFinishReason;
+  } {
+    const choice = data.choices?.[0];
+    const msg = choice?.message;
     const content = msg?.content ?? "";
     const usage = data.usage ? this._parseUsage(data.usage) : undefined;
+    const finishReason = this._normalizeFinishReason(choice?.finish_reason);
     let toolCalls: AiToolCall[] | undefined;
     if (Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0) {
       const extracted: AiToolCall[] = [];
@@ -127,7 +134,7 @@ export class OpenAiProvider implements IAiProvider {
       }
       if (extracted.length > 0) toolCalls = extracted;
     }
-    return { content, toolCalls, usage };
+    return { content, toolCalls, usage, finishReason };
   }
 
   parseStreamChunk(_event: string | undefined, data: string): AiStreamChunkResult | null {
@@ -139,11 +146,37 @@ export class OpenAiProvider implements IAiProvider {
       const delta = choice?.delta?.content || undefined;
       const usage = parsed.usage ? this._parseUsage(parsed.usage) : undefined;
       const toolCallDeltas = this._extractToolCallDeltas(choice?.delta?.tool_calls);
+      const finishReason = this._normalizeFinishReason(choice?.finish_reason);
       const done = choice?.finish_reason === "tool_calls";
-      return { delta, usage, toolCallDeltas, done };
+      return { delta, usage, toolCallDeltas, finishReason, done };
     } catch (error) {
       warnStreamParseFailure("openai", _event, data, error);
       return null;
+    }
+  }
+
+  /**
+   * Normalize OpenAI's `finish_reason` (also shared with Azure and
+   * OpenAI-compatible proxies like Ollama, vLLM, LiteLLM) to AiFinishReason.
+   *
+   * `function_call` is the deprecated pre-tool_calls name for the same event
+   * — mapped identically so a proxy that still emits the legacy value is not
+   * misclassified. Unknown / future values fall through to `"other"`.
+   */
+  protected _normalizeFinishReason(raw: unknown): AiFinishReason | undefined {
+    if (typeof raw !== "string" || !raw) return undefined;
+    switch (raw) {
+      case "stop":
+        return "stop";
+      case "length":
+        return "length";
+      case "tool_calls":
+      case "function_call":
+        return "tool_use";
+      case "content_filter":
+        return "safety";
+      default:
+        return "other";
     }
   }
 

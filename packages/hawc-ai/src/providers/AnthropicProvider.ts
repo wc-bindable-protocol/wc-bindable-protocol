@@ -1,7 +1,7 @@
 import { warnStreamParseFailure } from "../debug.js";
 import {
   IAiProvider, AiMessage, AiUsage, AiRequestOptions, AiProviderRequest,
-  AiStreamChunkResult, AiToolCall, AiContent,
+  AiStreamChunkResult, AiToolCall, AiContent, AiFinishReason,
 } from "../types.js";
 import { validateRequestOptions } from "./validateRequestOptions.js";
 import { flattenContentToText, parseDataUrl } from "./contentHelpers.js";
@@ -38,7 +38,7 @@ export class AnthropicProvider implements IAiProvider {
       stream: options.stream ?? true,
     };
     if (systemMessages.length > 0) {
-      body.system = systemMessages.map(m => flattenContentToText(m.content)).join("\n\n");
+      body.system = this._buildSystemField(systemMessages);
     }
     if (options.temperature !== undefined) body.temperature = options.temperature;
     if (options.tools && options.tools.length > 0) {
@@ -73,6 +73,11 @@ export class AnthropicProvider implements IAiProvider {
   }
 
   private _serializeMessage(m: AiMessage): Record<string, any> {
+    const wire = this._serializeMessageBody(m);
+    return this._applyCacheControlIfHinted(wire, m);
+  }
+
+  private _serializeMessageBody(m: AiMessage): Record<string, any> {
     if (m.role === "assistant" && m.toolCalls && m.toolCalls.length > 0) {
       const blocks: any[] = [];
       const text = flattenContentToText(m.content);
@@ -107,6 +112,90 @@ export class AnthropicProvider implements IAiProvider {
       return { role: m.role, content: m.content };
     }
     return { role: m.role, content: this._serializeContentBlocks(m.content) };
+  }
+
+  /**
+   * Extract the Anthropic prompt-caching hint from `AiMessage.providerHints`.
+   *
+   * Accepted shapes (escape-hatch passthrough — the value is shipped to
+   * Anthropic as-is so future `cache_control` types don't need a library
+   * release):
+   *   - `providerHints.anthropic.cacheControl = { type: "ephemeral" }`
+   *   - `providerHints.anthropic.cacheControl = true`  (sugar: treated as `{ type: "ephemeral" }`)
+   *
+   * Any other shape (null, non-object) is ignored. Returns undefined when no
+   * hint applies; non-undefined return means the caller must emit `cache_control`
+   * on the wire message's final content block.
+   */
+  private _extractCacheControl(m: AiMessage): any | undefined {
+    const hint = m.providerHints?.anthropic?.cacheControl;
+    if (hint === undefined || hint === null) return undefined;
+    if (hint === true) return { type: "ephemeral" };
+    if (typeof hint === "object") return hint;
+    return undefined;
+  }
+
+  /**
+   * Apply `cache_control` to the terminal content block of the wire message
+   * representation when `providerHints.anthropic.cacheControl` is set.
+   *
+   * Anthropic marks a cache breakpoint by the *position* of the `cache_control`
+   * field: every prefix token up to and including the block that carries it is
+   * eligible for cache reuse. Placing the mark on the last block of the
+   * hinted message means "cache everything up to here" — the common case for
+   * long system prompts or stable few-shot templates.
+   *
+   * Normalizes `content: string` into `[{ type: "text", text, cache_control }]`
+   * so a caller can attach the hint to a message authored as a plain string
+   * (the ergonomic default) without manually converting to block form.
+   */
+  private _applyCacheControlIfHinted(
+    wire: Record<string, any>,
+    source: AiMessage,
+  ): Record<string, any> {
+    const cacheControl = this._extractCacheControl(source);
+    if (!cacheControl) return wire;
+    const content = wire.content;
+    if (typeof content === "string") {
+      return {
+        ...wire,
+        content: [{ type: "text", text: content, cache_control: cacheControl }],
+      };
+    }
+    if (!Array.isArray(content) || content.length === 0) return wire;
+    const lastIdx = content.length - 1;
+    const last = content[lastIdx];
+    const hinted = { ...last, cache_control: cacheControl };
+    return { ...wire, content: [...content.slice(0, lastIdx), hinted] };
+  }
+
+  /**
+   * Build the top-level `system` field on the Anthropic request.
+   *
+   * Without hints: returns a concatenated string (preserves the historical
+   * shape and keeps the wire payload minimal — most proxies and logging
+   * layers handle a string more gracefully than a block array).
+   *
+   * With any system message carrying `providerHints.anthropic.cacheControl`:
+   * returns a `[{ type: "text", text, cache_control? }, ...]` block array so
+   * each system message's cache boundary is independently addressable. This
+   * is the only way to cache the system prompt — the sibling `options.system`
+   * string field skips AiMessage entirely and has nowhere to hang a hint;
+   * authors who want a cached system prompt must set it via
+   * `messages = [{ role: "system", content: "...", providerHints: { anthropic: { cacheControl: true } } }, ...]`.
+   */
+  private _buildSystemField(systemMessages: AiMessage[]): any {
+    const hints = systemMessages.map(m => this._extractCacheControl(m));
+    const anyHint = hints.some(h => h !== undefined);
+    if (!anyHint) {
+      return systemMessages.map(m => flattenContentToText(m.content)).join("\n\n");
+    }
+    return systemMessages.map((m, i) => {
+      const block: any = { type: "text", text: flattenContentToText(m.content) };
+      const cc = hints[i];
+      if (cc) block.cache_control = cc;
+      return block;
+    });
   }
 
   private _serializeContentBlocks(content: Exclude<AiContent, string>): any[] {
@@ -144,18 +233,28 @@ export class AnthropicProvider implements IAiProvider {
     return { type: "auto" };
   }
 
-  parseResponse(data: any): { content: string; toolCalls?: AiToolCall[]; usage?: AiUsage } {
+  parseResponse(data: any): {
+    content: string;
+    toolCalls?: AiToolCall[];
+    usage?: AiUsage;
+    finishReason?: AiFinishReason;
+  } {
     const blocks = Array.isArray(data.content) ? data.content : [];
     const usage = data.usage ? this._parseUsage(data.usage) : undefined;
+    const finishReason = this._normalizeFinishReason(data.stop_reason);
 
     // Structured-output emulation: a tool_use block with the reserved name is
     // unwrapped back into a JSON content string; tools field stays empty so
     // the caller sees a plain structured response rather than a tool-use turn.
+    // The synthetic tool_use is an internal transport detail — surface it as
+    // `finishReason: "stop"` instead of `"tool_use"` so consumers don't treat
+    // a structured-output turn as an intermediate tool-calling turn.
     const structuredBlock = blocks.find((b: any) => b.type === "tool_use" && b.name === STRUCTURED_OUTPUT_TOOL);
     if (structuredBlock) {
       return {
         content: JSON.stringify(structuredBlock.input ?? {}),
         usage,
+        finishReason: finishReason === "tool_use" ? "stop" : finishReason,
       };
     }
 
@@ -172,7 +271,34 @@ export class AnthropicProvider implements IAiProvider {
         }));
       if (extracted.length > 0) toolCalls = extracted;
     }
-    return { content, toolCalls, usage };
+    return { content, toolCalls, usage, finishReason };
+  }
+
+  /**
+   * Normalize Anthropic's `stop_reason` vocabulary to AiFinishReason.
+   *
+   * Docs as of 2025: `end_turn` (model chose to stop), `stop_sequence`
+   * (caller-provided sequence), `max_tokens`, `tool_use`, `refusal`
+   * (Claude 3.5+ policy decline), `pause_turn` (reserved for long-running
+   * interaction continuation). Unknown values collapse to `"other"` rather
+   * than throwing — the enum is intentionally forward-compatible so a newer
+   * `stop_reason` doesn't brick the field.
+   */
+  private _normalizeFinishReason(raw: unknown): AiFinishReason | undefined {
+    if (typeof raw !== "string" || !raw) return undefined;
+    switch (raw) {
+      case "end_turn":
+      case "stop_sequence":
+        return "stop";
+      case "max_tokens":
+        return "length";
+      case "tool_use":
+        return "tool_use";
+      case "refusal":
+        return "safety";
+      default:
+        return "other";
+    }
   }
 
   private _parseUsage(usage: any): AiUsage {
@@ -222,12 +348,22 @@ export class AnthropicProvider implements IAiProvider {
         return { usage: this._parseUsage(parsed.message.usage), done: false };
       }
 
-      if (parsed.type === "message_delta" && parsed.usage) {
-        // Later deltas update only output_tokens; AiCore merges this partial usage with the earlier snapshot.
-        // Leave completionTokens undefined when output_tokens is absent so _mergeUsage preserves the prior value.
-        const outputTokens = parsed.usage.output_tokens;
+      if (parsed.type === "message_delta") {
+        // `message_delta` carries the final `stop_reason` for the turn, and may
+        // also update `output_tokens` in `usage`. Emit both in a single result
+        // so AiCore's accumulator sees the finish reason on the same path it
+        // already merges usage on. `stop_reason` is the sole signal here — the
+        // synthetic structured-output mapping only applies to parseResponse
+        // (structured output forces non-streaming upstream).
+        const finishReason = this._normalizeFinishReason(parsed.delta?.stop_reason);
+        const outputTokens = parsed.usage?.output_tokens;
+        const usage = parsed.usage
+          ? { completionTokens: outputTokens != null ? Number(outputTokens) : undefined }
+          : undefined;
+        if (!finishReason && !usage) return null;
         return {
-          usage: { completionTokens: outputTokens != null ? Number(outputTokens) : undefined },
+          ...(usage ? { usage } : {}),
+          ...(finishReason ? { finishReason } : {}),
           done: false,
         };
       }

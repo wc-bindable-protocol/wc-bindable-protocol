@@ -60,6 +60,31 @@ export interface IWcBindable {
 
 export type AiRole = "system" | "user" | "assistant" | "tool";
 
+/**
+ * Unified finish-reason enum. Providers ship distinct vocabularies
+ * (OpenAI `stop|length|tool_calls|content_filter|function_call`,
+ * Anthropic `end_turn|max_tokens|stop_sequence|tool_use|refusal|pause_turn`,
+ * Google `STOP|MAX_TOKENS|SAFETY|RECITATION|BLOCKLIST|PROHIBITED_CONTENT|SPII|LANGUAGE|OTHER|...`);
+ * each provider normalizes its native value into this enum.
+ *
+ * - `"stop"`: model completed naturally (OpenAI `stop`, Anthropic `end_turn`/`stop_sequence`, Google `STOP`).
+ * - `"length"`: output was cut off by max-token budget.
+ * - `"tool_use"`: turn ended because the assistant requested a tool call.
+ *   Present even when the loop auto-executes the tool — consumers reading
+ *   `messages[*].finishReason` can distinguish intermediate tool-use turns
+ *   from the terminal assistant turn.
+ * - `"safety"`: refused / blocked by provider safety classifier
+ *   (OpenAI `content_filter`, Anthropic `refusal`,
+ *   Google `SAFETY|RECITATION|BLOCKLIST|PROHIBITED_CONTENT|SPII|LANGUAGE`).
+ *   Not an error — `send()` still resolves normally. Use this flag to branch
+ *   UI (e.g. show a "declined" banner instead of a chat bubble).
+ * - `"other"`: anything the library cannot confidently bucket (Anthropic
+ *   `pause_turn`, Google `OTHER|MALFORMED_FUNCTION_CALL`, unknown strings
+ *   from provider-proxy extensions). Do not treat as stop — inspect the
+ *   raw provider response if disambiguation matters.
+ */
+export type AiFinishReason = "stop" | "length" | "tool_use" | "safety" | "other";
+
 export interface AiToolCall {
   id: string;
   name: string;
@@ -103,6 +128,22 @@ export interface AiMessage {
   // Set only when role === "tool". Correlates this message with the assistant
   // tool call that produced it via AiToolCall.id.
   toolCallId?: string;
+  // Populated by AiCore on assistant messages it appends to history. Normalized
+  // from the provider's native finish/stop field; see AiFinishReason. Absent on
+  // user / system / tool messages and on history injected via `messages =`
+  // (assign it yourself if the history you're restoring carried one).
+  finishReason?: AiFinishReason;
+  // Provider-specific hints the default transport cannot express through the
+  // neutral surface (prompt caching, safety-setting overrides, etc.). Keyed by
+  // provider namespace so unrelated providers ignore each other's hints:
+  //
+  //   providerHints: { anthropic: { cacheControl: { type: "ephemeral" } } }
+  //
+  // The library passes the inner object through verbatim at wire-build time —
+  // no schema validation, no normalization. A misspelled key is a silent no-op
+  // rather than a request-time error. Consult each provider's docs for the
+  // accepted shapes (supported keys listed in README §Provider Details).
+  providerHints?: Record<string, any>;
 }
 
 export interface AiTool {
@@ -179,12 +220,23 @@ export interface AiStreamChunkResult {
   // this for parallel tool calls). Keep as an array so each delta can carry
   // its own `index`.
   toolCallDeltas?: AiToolCallDelta[];
+  // Normalized finish reason reported by the provider on the terminal chunk
+  // of a turn. Streamed turns may emit `finishReason` on the same chunk as
+  // the stream sentinel (OpenAI, Anthropic) or on a content-block chunk
+  // shortly before a separate usage-only chunk (Gemini). AiCore keeps the
+  // *last* non-undefined value seen across the turn.
+  finishReason?: AiFinishReason;
   done: boolean;
 }
 
 export interface IAiProvider {
   buildRequest(messages: AiMessage[], options: AiRequestOptions): AiProviderRequest;
-  parseResponse(data: any): { content: string; toolCalls?: AiToolCall[]; usage?: AiUsage };
+  parseResponse(data: any): {
+    content: string;
+    toolCalls?: AiToolCall[];
+    usage?: AiUsage;
+    finishReason?: AiFinishReason;
+  };
   parseStreamChunk(event: string | undefined, data: string): AiStreamChunkResult | null;
 }
 
@@ -192,6 +244,14 @@ export interface AiHttpError {
   status: number;
   statusText: string;
   body: string;
+  // Seconds to wait before retrying, parsed from the response's `Retry-After`
+  // header when present. Populated on any status that ships the header (most
+  // commonly 429 and 503, occasionally 529 from Anthropic on overload). Both
+  // delta-seconds and HTTP-date forms of the header are normalized to seconds;
+  // past-dated or unparseable values are omitted. The library itself still does
+  // not retry — this is exposed so a consumer building a retry queue can honor
+  // the provider's hint without reparsing `body`.
+  retryAfter?: number;
 }
 
 export interface WcsAiCoreValues {

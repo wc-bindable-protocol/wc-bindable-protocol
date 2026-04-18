@@ -1,7 +1,7 @@
 import { warnStreamParseFailure } from "../debug.js";
 import {
   IAiProvider, AiMessage, AiUsage, AiRequestOptions, AiProviderRequest,
-  AiStreamChunkResult, AiToolCall, AiToolCallDelta, AiContent,
+  AiStreamChunkResult, AiToolCall, AiToolCallDelta, AiContent, AiFinishReason,
 } from "../types.js";
 import { validateRequestOptions } from "./validateRequestOptions.js";
 import { flattenContentToText, parseDataUrl } from "./contentHelpers.js";
@@ -176,12 +176,19 @@ export class GoogleProvider implements IAiProvider {
     return { mode: "AUTO" };
   }
 
-  parseResponse(data: any): { content: string; toolCalls?: AiToolCall[]; usage?: AiUsage } {
-    const parts = data?.candidates?.[0]?.content?.parts;
+  parseResponse(data: any): {
+    content: string;
+    toolCalls?: AiToolCall[];
+    usage?: AiUsage;
+    finishReason?: AiFinishReason;
+  } {
+    const candidate = data?.candidates?.[0];
+    const parts = candidate?.content?.parts;
     const content = this._extractText(parts);
     const toolCalls = this._extractToolCalls(parts);
     const usage = data?.usageMetadata ? this._parseUsage(data.usageMetadata) : undefined;
-    return { content, toolCalls, usage };
+    const finishReason = this._normalizeFinishReason(candidate?.finishReason);
+    return { content, toolCalls, usage, finishReason };
   }
 
   parseStreamChunk(event: string | undefined, data: string): AiStreamChunkResult | null {
@@ -192,6 +199,7 @@ export class GoogleProvider implements IAiProvider {
       const delta = this._extractText(parts) || undefined;
       const usage = parsed?.usageMetadata ? this._parseUsage(parsed.usageMetadata) : undefined;
       const toolCallDeltas = this._extractStreamToolCallDeltas(parts);
+      const finishReason = this._normalizeFinishReason(candidate?.finishReason);
       // Gemini has no definitive end-of-stream sentinel comparable to
       // OpenAI `[DONE]` or Anthropic `message_stop`: `finishReason` marks
       // the end of the *content turn* but `usageMetadata` is emitted in a
@@ -199,10 +207,43 @@ export class GoogleProvider implements IAiProvider {
       // here would cause AiCore to short-circuit the read loop and drop
       // the trailing usage event. We always return `done: false` and let
       // the stream loop exit when the server closes the connection.
-      return { delta, usage, toolCallDeltas, done: false };
+      return { delta, usage, toolCallDeltas, finishReason, done: false };
     } catch (error) {
       warnStreamParseFailure("google", event, data, error);
       return null;
+    }
+  }
+
+  /**
+   * Normalize Gemini's `finishReason` enum to AiFinishReason.
+   *
+   * Safety-adjacent values (`SAFETY`, `RECITATION`, `BLOCKLIST`,
+   * `PROHIBITED_CONTENT`, `SPII`, `LANGUAGE`) collapse to `"safety"` even
+   * though Gemini distinguishes them internally — the UI-level decision
+   * (refusal banner vs. chat bubble) is the same for all of them. Consumers
+   * that need per-category triage should inspect the raw provider response
+   * via a custom provider subclass or proxy-layer tagging.
+   */
+  private _normalizeFinishReason(raw: unknown): AiFinishReason | undefined {
+    if (typeof raw !== "string" || !raw) return undefined;
+    switch (raw) {
+      case "STOP":
+        return "stop";
+      case "MAX_TOKENS":
+        return "length";
+      case "SAFETY":
+      case "RECITATION":
+      case "BLOCKLIST":
+      case "PROHIBITED_CONTENT":
+      case "SPII":
+      case "LANGUAGE":
+        return "safety";
+      default:
+        // OTHER, MALFORMED_FUNCTION_CALL, FINISH_REASON_UNSPECIFIED, and any
+        // unknown / future values fall through — consumers can still read
+        // `messages[*].finishReason === "other"` to distinguish an
+        // unclassifiable stop from a clean `"stop"`.
+        return "other";
     }
   }
 

@@ -172,6 +172,25 @@ describe("OpenAiProvider", () => {
       });
       expect(result.usage).toEqual({ promptTokens: 0, completionTokens: 0, totalTokens: 0 });
     });
+
+    it("finish_reasonをAiFinishReasonにnormalizeする", () => {
+      const mk = (reason: string) => provider.parseResponse({
+        choices: [{ message: { content: "x" }, finish_reason: reason }],
+      });
+      expect(mk("stop").finishReason).toBe("stop");
+      expect(mk("length").finishReason).toBe("length");
+      expect(mk("tool_calls").finishReason).toBe("tool_use");
+      expect(mk("function_call").finishReason).toBe("tool_use");
+      expect(mk("content_filter").finishReason).toBe("safety");
+      expect(mk("weird_future_value").finishReason).toBe("other");
+    });
+
+    it("finish_reasonが無い場合はfinishReasonを含めない", () => {
+      const result = provider.parseResponse({
+        choices: [{ message: { content: "x" } }],
+      });
+      expect(result.finishReason).toBeUndefined();
+    });
   });
 
   describe("parseStreamChunk", () => {
@@ -358,6 +377,120 @@ describe("AnthropicProvider", () => {
       const body = JSON.parse(req.body);
       expect(body.messages[1]).toEqual({ role: "assistant", content: "hello world" });
     });
+
+    describe("providerHints.anthropic.cacheControl", () => {
+      it("user messageのcacheControlオブジェクトを最後のブロックのcache_controlとしてシリアライズする", () => {
+        const req = provider.buildRequest(
+          [{
+            role: "user",
+            content: "long stable context",
+            providerHints: { anthropic: { cacheControl: { type: "ephemeral" } } },
+          }],
+          { model: "claude-sonnet-4-20250514" },
+        );
+        const body = JSON.parse(req.body);
+        expect(body.messages[0]).toEqual({
+          role: "user",
+          content: [{ type: "text", text: "long stable context", cache_control: { type: "ephemeral" } }],
+        });
+      });
+
+      it("cacheControl=true のシュガーを { type: \"ephemeral\" } に展開する", () => {
+        const req = provider.buildRequest(
+          [{
+            role: "user",
+            content: "ctx",
+            providerHints: { anthropic: { cacheControl: true } },
+          }],
+          { model: "claude-sonnet-4-20250514" },
+        );
+        const body = JSON.parse(req.body);
+        expect(body.messages[0].content[0].cache_control).toEqual({ type: "ephemeral" });
+      });
+
+      it("マルチモーダル(array content)の場合は最後のブロックにのみcache_controlを付ける", () => {
+        const req = provider.buildRequest(
+          [{
+            role: "user",
+            content: [
+              { type: "text", text: "look at this" },
+              { type: "image", url: "data:image/png;base64,aGVsbG8=" },
+            ],
+            providerHints: { anthropic: { cacheControl: true } },
+          }],
+          { model: "claude-sonnet-4-20250514" },
+        );
+        const body = JSON.parse(req.body);
+        const blocks = body.messages[0].content;
+        expect(blocks).toHaveLength(2);
+        expect(blocks[0].cache_control).toBeUndefined();
+        expect(blocks[1].cache_control).toEqual({ type: "ephemeral" });
+      });
+
+      it("systemメッセージにcacheControlを指定するとsystemフィールドをblock配列に切り替える", () => {
+        const req = provider.buildRequest(
+          [
+            {
+              role: "system",
+              content: "long system prompt",
+              providerHints: { anthropic: { cacheControl: true } },
+            },
+            { role: "user", content: "hi" },
+          ],
+          { model: "claude-sonnet-4-20250514" },
+        );
+        const body = JSON.parse(req.body);
+        expect(body.system).toEqual([
+          { type: "text", text: "long system prompt", cache_control: { type: "ephemeral" } },
+        ]);
+      });
+
+      it("複数systemメッセージで一部だけcacheControlを持つ場合、各メッセージが独立したtextブロックになる", () => {
+        const req = provider.buildRequest(
+          [
+            {
+              role: "system",
+              content: "static preamble",
+              providerHints: { anthropic: { cacheControl: true } },
+            },
+            { role: "system", content: "volatile header" },
+            { role: "user", content: "hi" },
+          ],
+          { model: "claude-sonnet-4-20250514" },
+        );
+        const body = JSON.parse(req.body);
+        expect(body.system).toEqual([
+          { type: "text", text: "static preamble", cache_control: { type: "ephemeral" } },
+          { type: "text", text: "volatile header" },
+        ]);
+      });
+
+      it("hintが無いsystemは従来通りの結合文字列として送る", () => {
+        const req = provider.buildRequest(
+          [
+            { role: "system", content: "a" },
+            { role: "system", content: "b" },
+            { role: "user", content: "hi" },
+          ],
+          { model: "claude-sonnet-4-20250514" },
+        );
+        const body = JSON.parse(req.body);
+        expect(body.system).toBe("a\n\nb");
+      });
+
+      it("他providerの名前空間のhintは無視する(cross-provider leakage防止)", () => {
+        const req = provider.buildRequest(
+          [{
+            role: "user",
+            content: "hi",
+            providerHints: { openai: { cacheControl: true } },
+          }],
+          { model: "claude-sonnet-4-20250514" },
+        );
+        const body = JSON.parse(req.body);
+        expect(body.messages[0]).toEqual({ role: "user", content: "hi" });
+      });
+    });
   });
 
   describe("parseResponse", () => {
@@ -409,6 +542,36 @@ describe("AnthropicProvider", () => {
         usage: { input_tokens: 0, output_tokens: 0 },
       });
       expect(result.usage).toEqual({ promptTokens: 0, completionTokens: 0, totalTokens: 0 });
+    });
+
+    it("stop_reasonをAiFinishReasonにnormalizeする", () => {
+      const mk = (reason: string) => provider.parseResponse({
+        content: [{ type: "text", text: "x" }],
+        stop_reason: reason,
+      });
+      expect(mk("end_turn").finishReason).toBe("stop");
+      expect(mk("stop_sequence").finishReason).toBe("stop");
+      expect(mk("max_tokens").finishReason).toBe("length");
+      expect(mk("tool_use").finishReason).toBe("tool_use");
+      expect(mk("refusal").finishReason).toBe("safety");
+      expect(mk("pause_turn").finishReason).toBe("other");
+    });
+
+    it("構造化出力のtool_useは最終応答扱いなのでfinishReasonをstopに置換する", () => {
+      // Synthetic structured-output tool is an internal transport detail —
+      // surface it as a normal stop so consumers don't see an intermediate
+      // tool-use reason on what is really a terminal JSON response.
+      const result = provider.parseResponse({
+        content: [{
+          type: "tool_use",
+          id: "x",
+          name: "__wc_bindable_structured_response__",
+          input: { ok: true },
+        }],
+        stop_reason: "tool_use",
+      });
+      expect(result.content).toBe('{"ok":true}');
+      expect(result.finishReason).toBe("stop");
     });
   });
 
@@ -467,9 +630,16 @@ describe("AnthropicProvider", () => {
       expect(result?.usage).toEqual({ completionTokens: undefined });
     });
 
-    it("message_deltaにusageがない場合はnullを返す", () => {
+    it("message_deltaにusageが無くstop_reasonのみの場合はfinishReasonを返す", () => {
       const result = provider.parseStreamChunk("message_delta",
         '{"type":"message_delta","delta":{"stop_reason":"end_turn"}}'
+      );
+      expect(result).toEqual({ finishReason: "stop", done: false });
+    });
+
+    it("message_deltaにusageもstop_reasonも無い場合はnullを返す", () => {
+      const result = provider.parseStreamChunk("message_delta",
+        '{"type":"message_delta","delta":{}}'
       );
       expect(result).toBeNull();
     });
@@ -726,6 +896,26 @@ describe("GoogleProvider", () => {
       });
       expect(result.content).toBe("Hello!");
       expect(result.usage).toEqual({ promptTokens: 10, completionTokens: 5, totalTokens: 15 });
+      expect(result.finishReason).toBe("stop");
+    });
+
+    it("finishReasonをAiFinishReasonにnormalizeする", () => {
+      const mk = (reason: string) => provider.parseResponse({
+        candidates: [{ content: { parts: [{ text: "x" }] }, finishReason: reason }],
+      });
+      expect(mk("STOP").finishReason).toBe("stop");
+      expect(mk("MAX_TOKENS").finishReason).toBe("length");
+      // Safety-adjacent values all collapse to "safety" — UI branching is the
+      // same for them even though Gemini distinguishes them internally.
+      expect(mk("SAFETY").finishReason).toBe("safety");
+      expect(mk("RECITATION").finishReason).toBe("safety");
+      expect(mk("BLOCKLIST").finishReason).toBe("safety");
+      expect(mk("PROHIBITED_CONTENT").finishReason).toBe("safety");
+      expect(mk("SPII").finishReason).toBe("safety");
+      expect(mk("LANGUAGE").finishReason).toBe("safety");
+      expect(mk("OTHER").finishReason).toBe("other");
+      expect(mk("MALFORMED_FUNCTION_CALL").finishReason).toBe("other");
+      expect(mk("FINISH_REASON_UNSPECIFIED").finishReason).toBe("other");
     });
 
     it("複数のtext partsを結合する", () => {

@@ -1,7 +1,7 @@
 import { raiseError } from "../raiseError.js";
 import {
   IWcBindable, IAiProvider, AiMessage, AiUsage, AiRequestOptions, AiTool, AiToolCall,
-  AiContentPart,
+  AiContentPart, AiFinishReason,
 } from "../types.js";
 import { assertKnownContentParts } from "../providers/contentHelpers.js";
 import { SseParser } from "../streaming/SseParser.js";
@@ -12,6 +12,27 @@ import { GoogleProvider } from "../providers/GoogleProvider.js";
 import { getRegisteredTool, AiToolHandler } from "../toolRegistry.js";
 import { cloneMessage } from "./cloneMessage.js";
 import { validateMessages } from "./validateMessages.js";
+
+/**
+ * Normalize the HTTP `Retry-After` header to seconds.
+ * Accepts either a delta-seconds value ("120") or an HTTP-date
+ * ("Wed, 21 Oct 2015 07:28:00 GMT"). Returns `undefined` for missing,
+ * unparseable, or past-dated values so consumers can treat absence uniformly.
+ */
+function parseRetryAfter(raw: string | null): number | undefined {
+  if (!raw) return undefined;
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  // Delta-seconds form is a non-negative integer per RFC 9110.
+  if (/^\d+$/.test(trimmed)) {
+    const n = Number(trimmed);
+    return Number.isFinite(n) ? n : undefined;
+  }
+  const date = Date.parse(trimmed);
+  if (Number.isNaN(date)) return undefined;
+  const delta = Math.ceil((date - Date.now()) / 1000);
+  return delta > 0 ? delta : undefined;
+}
 
 function resolveProvider(name: string): IAiProvider {
   switch (name) {
@@ -29,6 +50,7 @@ interface TurnResult {
   content: string;
   toolCalls?: AiToolCall[];
   usage?: AiUsage;
+  finishReason?: AiFinishReason;
 }
 
 // Accumulator for streamed tool call fragments keyed by provider-reported index.
@@ -362,6 +384,14 @@ export class AiCore extends EventTarget {
         if (hasToolCalls && !treatAsTerminal) {
           assistantMessage.toolCalls = turn.toolCalls;
         }
+        // Preserve the provider's finish reason on the stored assistant turn
+        // so consumers can branch UI on it (e.g. "safety" → refusal banner).
+        // Intermediate tool-use turns in the loop also get theirs recorded,
+        // which lets history readers distinguish a tool-use continuation from
+        // a terminal assistant turn without re-consulting `toolCalls`.
+        if (turn.finishReason !== undefined) {
+          assistantMessage.finishReason = turn.finishReason;
+        }
         pushMessage(assistantMessage);
         lastAssistantContent = turn.content;
 
@@ -499,7 +529,13 @@ export class AiCore extends EventTarget {
     if (!response.ok) {
       const errorBody = await response.text().catch(() => "");
       if (isCurrent()) {
-        this._setError({ status: response.status, statusText: response.statusText, body: errorBody });
+        const retryAfter = parseRetryAfter(response.headers.get("retry-after"));
+        this._setError({
+          status: response.status,
+          statusText: response.statusText,
+          body: errorBody,
+          ...(retryAfter !== undefined ? { retryAfter } : {}),
+        });
       }
       // Null signals "failure observed + state already handled" to _doSend.
       return null;
@@ -522,6 +558,7 @@ export class AiCore extends EventTarget {
       content: parsed.content,
       toolCalls: parsed.toolCalls,
       usage: parsed.usage,
+      finishReason: parsed.finishReason,
     };
   }
 
@@ -542,6 +579,12 @@ export class AiCore extends EventTarget {
     const decoder = new TextDecoder();
     const parser = new SseParser();
     let lastUsage: AiUsage | undefined;
+    // Streaming providers emit finishReason on whichever chunk closes the
+    // content turn (OpenAI's final `[DONE]`-adjacent chunk, Anthropic's
+    // `message_delta`, Gemini's candidate-bearing chunk that also carries
+    // `finishReason`). Accumulate last-non-undefined so a trailing usage-only
+    // chunk (Gemini) does not clobber the reason seen on the earlier chunk.
+    let lastFinishReason: AiFinishReason | undefined;
     const toolCallAcc = new Map<number, ToolCallAccumulator>();
     const isCurrent = () => this._abortController === abortController;
 
@@ -601,6 +644,10 @@ export class AiCore extends EventTarget {
             for (const d of result.toolCallDeltas) applyToolCallDelta(d);
           }
 
+          if (result.finishReason !== undefined) {
+            lastFinishReason = result.finishReason;
+          }
+
           // Do NOT break the inner loop here: drain same-batch events
           // (notably Gemini's usage-only event immediately following the
           // finishReason-carrying content event when both parse out of
@@ -626,6 +673,9 @@ export class AiCore extends EventTarget {
           if (result.toolCallDeltas) {
             for (const d of result.toolCallDeltas) applyToolCallDelta(d);
           }
+          if (result.finishReason !== undefined) {
+            lastFinishReason = result.finishReason;
+          }
         }
       }
       const trailing = parser.flush();
@@ -640,6 +690,9 @@ export class AiCore extends EventTarget {
           }
           if (result.toolCallDeltas) {
             for (const d of result.toolCallDeltas) applyToolCallDelta(d);
+          }
+          if (result.finishReason !== undefined) {
+            lastFinishReason = result.finishReason;
           }
         }
       }
@@ -672,6 +725,7 @@ export class AiCore extends EventTarget {
       content: this._content,
       toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
       usage: lastUsage,
+      finishReason: lastFinishReason,
     };
   }
 

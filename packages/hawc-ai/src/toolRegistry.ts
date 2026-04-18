@@ -23,6 +23,8 @@
  * bodies for those declarations when the wire payload could not carry them.
  */
 
+import { warnToolHandlerOverwrite } from "./debug.js";
+
 export type AiToolHandler = (args: any) => unknown | Promise<unknown>;
 
 const handlers = new Map<string, AiToolHandler>();
@@ -30,11 +32,23 @@ const handlers = new Map<string, AiToolHandler>();
 /**
  * Register a handler for `name`. Overwrites any previous handler for the same name
  * (callers wanting strict semantics should check with `getRegisteredTool` first).
+ *
+ * Re-registering with the *same* function reference is idempotent and silent
+ * (supports modules that register at top level and may be imported twice).
+ * Re-registering with a *different* reference emits a dev-mode warning — this
+ * is the HMR / hot-reload footgun: older sessions still hold a `send()` loop
+ * that can reach the newly-installed handler and execute it with a previous
+ * user's context. In production, use `core.registerTool()` to scope handlers
+ * per connection (see README §Tool use).
  */
 export function registerTool(name: string, handler: AiToolHandler): void {
   if (!name) throw new Error("[@wc-bindable/hawc-ai] registerTool: name is required.");
   if (typeof handler !== "function") {
     throw new Error("[@wc-bindable/hawc-ai] registerTool: handler must be a function.");
+  }
+  const existing = handlers.get(name);
+  if (existing && existing !== handler) {
+    warnToolHandlerOverwrite(name);
   }
   handlers.set(name, handler);
 }

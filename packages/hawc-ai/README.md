@@ -271,7 +271,7 @@ These properties represent the current inference state and are the main HAWC sur
 | Property | Type | Description |
 |----------|------|-------------|
 | `content` | `string` | Current response text. **Updates on every streaming chunk** (~60fps via rAF batching) |
-| `messages` | `AiMessage[]` | Full conversation history (user + assistant). Updated on send and completion |
+| `messages` | `AiMessage[]` | Full conversation history (user + assistant). Updated on send and completion. Stored assistant entries carry a normalized `finishReason` (`"stop" \| "length" \| "tool_use" \| "safety" \| "other"`) — see [Error contract §Safety refusals](#safety-refusals-are-not-errors). |
 | `usage` | `AiUsage \| null` | Token usage `{ promptTokens, completionTokens, totalTokens }` |
 | `loading` | `boolean` | `true` from send to completion or error |
 | `streaming` | `boolean` | `true` from stream start (after HTTP response headers) to stream completion. Stays `false` for the entire call when `no-stream` is set, or when `responseSchema` is used on Anthropic (structured output forces non-streaming there — see [Structured output](#structured-output)). |
@@ -623,7 +623,7 @@ OpenAI's `image_url.detail` (`"low"` / `"high"` / `"auto"`) and equivalent knobs
 - **v1 = user-message images only.** Assistant/system/tool messages with array content are flattened to concatenated text; only `user` messages carry mixed parts on the wire.
 - **No audio / video / file input.** Future additions will extend `AiContentPart` additively.
 - **No automatic fetching.** The library does not transform http(s) URLs into data: URLs; providers that require base64 (Gemini) fail early with a clear error so clients know to pre-encode.
-- **Assistant outputs stay text.** Models may describe images but current providers return text-only assistant messages, so `content` in assistant replies is always a string.
+- **Assistant outputs stay text.** Models may describe images but current providers return text-only assistant messages, so `content` in assistant replies is always a string. **Forward-compat caveat:** as providers ship image-generation-as-assistant-turn (DALL·E 3, Imagen 3, Gemini 2.0 image output), this contract will likely widen so that assistant `content` can also be `AiContentPart[]`. The plan is additive — the `AiContentPart` union already covers the shape — but a v2 that flips assistant `content` from `string` to `AiContent` on the output side is the kind of change that propagates into every binding that does `msg.content.slice(...)` or pattern-matches on string. If you build long-term code against `el.messages`, treat assistant `content` as `string` today *and* write against a narrowed `AiContent` type, e.g. `typeof m.content === "string" ? m.content : m.content.map(...)`, so a future widening does not ripple into every consumer.
 
 ## Abort
 
@@ -647,6 +647,17 @@ A new `send()` call automatically aborts any previous request.
 ### Retry and backoff
 
 `<hawc-ai>` does **not** retry failed requests, apply exponential backoff, or rate-limit on its own. Provider 4xx/5xx surface as `el.error` with the raw status — the consumer decides whether to retry, switch model, surface to the user, or queue for later. Retry policy belongs at the proxy layer (where you can apply per-tenant quotas) or in framework state (where you can debounce against UI intent), not inside the I/O primitive.
+
+`AiHttpError` exposes `retryAfter?: number` (seconds) populated from the response's `Retry-After` header when the provider sends one (commonly on 429 / 503, and on Anthropic's 529 overload). Both delta-seconds and HTTP-date forms of the header are normalized; past-dated or missing values leave the field `undefined`. A consumer-side retry queue can read this directly instead of parsing `body`:
+
+```ts
+bind(aiEl, (name, value) => {
+  if (name !== "error" || !value || typeof value !== "object") return;
+  if (value.status === 429 && typeof value.retryAfter === "number") {
+    scheduleRetry(value.retryAfter);
+  }
+});
+```
 
 ## Programmatic Usage
 
@@ -992,6 +1003,18 @@ wss.on("connection", (ws) => {
 
 Point the browser at `wss://<host>:8080/hawc-ai` via `remoteCoreUrl`. Instantiate `AiCore` **per connection** — `AiCore` owns conversation history, in-flight `AbortController`, and streaming state, and must not be shared across sessions.
 
+##### Pooling and reuse on edge runtimes
+
+On platforms where cold start on `new AiCore()` is a real cost (CF Workers, Vercel Edge, Lambda at low concurrency), a pool of pre-warmed Cores is sometimes attractive. `AiCore` is not a thread-safe pool entry, but its *per-request* state can be reset to pool-entry condition between requests:
+
+1. **Cancel any in-flight work.** `core.abort()` — no-op when idle; otherwise aborts the active `fetch` and the streaming pipeline.
+2. **Reset conversation history.** `core.messages = []` — emits `messages-changed` and rebuilds internal state.
+3. **Drop tool handler bindings carrying the previous principal.** Call `core.unregisterTool(name)` for every per-user handler registered via `core.registerTool()`, or recreate the Core entirely if you don't track what was registered (new construction is cheap — the cold-start cost is mostly `fetch` warm-up, not object allocation).
+
+After (1)–(3), `content` / `usage` / `loading` / `streaming` / `error` are observable state, not hidden machinery; the next `send()` clears them at turn start (`_setLoading(true); _setStreaming(false); _setError(null); _setUsage(null);`) so stale values do not leak into the next request's event stream. **What you must not reuse**: anything that captured the previous connection's user in a closure (tool handlers, custom provider instances, `EventTarget` listeners attached to the Core by the previous session's code). The process-wide `registerTool()` map survives — that is by design for user-agnostic tools, so pool cleanup must not blanket-clear it.
+
+For WebSocket servers, the simpler and safer default is a fresh `AiCore` per `connection` event. Pool only when profiling actually shows construction as the bottleneck.
+
 #### Injecting the provider API key server-side
 
 This is the whole reason to run remote. `<hawc-ai>.send()` in remote mode forwards `{ model, apiKey, baseUrl, apiVersion, ... }` from the DOM element to the server as `send` command arguments ([components/Ai.ts:383-392](src/components/Ai.ts#L383-L392)). In a hardened deployment the browser has no `api-key` attribute, so the incoming `apiKey` is `""` — the server must override it before calling the provider:
@@ -1048,6 +1071,20 @@ createCores: (user, ws) => {
 Resolution order at tool-call time is: per-call `tool.handler` → `core.registerTool()` instance registry → module-level `registerTool()` process registry. Keep the module-level registry for stateless, user-agnostic tools (a pure weather lookup that takes no user context); put anything gated on identity / permissions on the Core instance.
 
 **Both registries are gated by `AiRequestOptions.tools`.** The registry is a *handler* fallback — it never widens the per-request tool catalog. If a model hallucinates or replays a tool name that the current `send()` call did not declare in `options.tools`, the call is answered with a `"not defined on this send() invocation"` error tool message regardless of what is registered. This prevents a privileged registered handler (for example a `delete_account` bound to a different endpoint) from being reachable just because the model produced its name.
+
+**HMR / hot-reload.** Bundlers that re-execute the registering module (Vite, webpack) will call `registerTool("name", handler)` a second time with a *different* function reference. The registry silently replaces the entry in both cases — same security shape as the `createCores` overwrite above, now stretched across a reload cycle where an older browser tab's in-flight `send()` can reach the newly-installed handler. The library emits one `console.warn` per reference-changing overwrite **only in development builds** (gated on `import.meta.env.DEV` / `NODE_ENV !== "production"`); production runs stay silent by design, so a noisy reload cycle does not reach end-user consoles. Silence the dev warning and drop the footgun by pairing registration with `unregisterTool(name)` in your bundler's dispose hook:
+
+```ts
+import { registerTool, unregisterTool } from "@wc-bindable/hawc-ai";
+
+registerTool("get_weather", getWeatherHandler);
+
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => unregisterTool("get_weather"));
+}
+```
+
+If a production deployment needs a louder signal for bootstrap-ordering bugs (the same module registering twice with different handlers at startup), wrap `registerTool` in application code that checks `getRegisteredTool(name)` first and throws, rather than relying on the dev-only warning.
 
 #### Authenticated deployments (pair with `<hawc-auth0>`)
 
@@ -1117,6 +1154,8 @@ import { registerTool, unregisterTool } from "@wc-bindable/hawc-ai";
 ```typescript
 type AiRole = "system" | "user" | "assistant" | "tool";
 
+type AiFinishReason = "stop" | "length" | "tool_use" | "safety" | "other";
+
 interface AiToolCall {
   id: string;
   name: string;
@@ -1134,6 +1173,8 @@ interface AiMessage {
   content: AiContent;
   toolCalls?: AiToolCall[];   // assistant turn that requested tools
   toolCallId?: string;        // role === "tool" result correlation
+  finishReason?: AiFinishReason;       // populated on stored assistant turns
+  providerHints?: Record<string, any>; // namespaced per-provider overrides
 }
 
 interface AiTool {
@@ -1155,6 +1196,7 @@ interface AiHttpError {
   status: number;
   statusText: string;
   body: string;
+  retryAfter?: number;   // seconds; populated from the `Retry-After` header when present
 }
 
 interface WcsAiCoreValues {
@@ -1188,6 +1230,40 @@ interface WcsAiValues extends WcsAiCoreValues {
 - Streaming: SSE with event types (`content_block_delta`, `message_start`, `message_delta`, `message_stop`)
 - Usage: `input_tokens` from `message_start`, `output_tokens` from `message_delta` — merged by Core
 - Default `max_tokens`: 4096
+- Prompt caching: set `providerHints.anthropic.cacheControl` on any `AiMessage` to mark a cache breakpoint — the wire representation of that message gets `cache_control: { type: "ephemeral" }` on its last content block (see [Provider hints](#provider-hints) below). Ignored by all other providers.
+
+#### Provider hints
+
+`AiMessage.providerHints` is a namespaced passthrough for provider-specific knobs the neutral surface cannot express. Keys are provider names; values are provider-defined objects shipped on the wire as-is. Unknown keys are silent no-ops (no request-time rejection).
+
+**`providerHints.anthropic.cacheControl`** — Enable Claude's prompt caching on this message:
+
+```ts
+el.messages = [
+  {
+    role: "system",
+    content: LONG_SYSTEM_PROMPT,        // > ~1024 tokens to be worth caching
+    providerHints: { anthropic: { cacheControl: true } },
+  },
+  ...previousTurns,
+];
+```
+
+| Hint value | Wire effect |
+|---|---|
+| `true` | Sugar: expands to `cache_control: { type: "ephemeral" }` on the last content block. |
+| `{ type: "ephemeral" }` | Sent verbatim. Accepts future `type` values without a library release (e.g. if Anthropic introduces longer-TTL cache types). |
+| any other shape | Ignored. |
+
+Mechanics:
+
+- **System caching.** A system message carrying the hint flips the top-level `system` field from a string to `[{ type: "text", text, cache_control }, ...]`. System messages without the hint in the same request render as plain text blocks in the same array. System prompts set via the `options.system` shortcut (or the `system` attribute on `<hawc-ai>`) **cannot be cached** — there is no `AiMessage` to hang the hint on. To cache the system prompt, place it in `messages[]` as `{ role: "system", content, providerHints }` instead.
+- **Message caching.** On user / assistant / tool messages, the hint attaches `cache_control` to the last content block (appending to an already-array content, or promoting a string content to `[{ type: "text", text, cache_control }]`). Place the hint on the message that marks your cache breakpoint — everything *up to and including* that block becomes the cacheable prefix.
+- **Anthropic limit: 4 breakpoints.** The provider rejects a request with more than four `cache_control` marks. The library does not cap or warn — if you sprinkle hints on every message, Anthropic returns a 400 and `el.error` surfaces it. Mark only the stable prefix boundaries (system prompt, fixed few-shot preamble, long document, etc.).
+- **No client-side eligibility check.** Whether the cached prefix actually exceeds Anthropic's token minimum (currently ~1024 input tokens, subject to change) is a runtime property the library does not inspect; the provider silently skips cache reuse when the prefix is too short.
+- **Cross-provider safety.** Other providers ignore `providerHints.anthropic` entirely — `OpenAiProvider`, `AzureOpenAiProvider`, and `GoogleProvider` never read the namespace, so the same `AiMessage` history can flow to any provider without conditional shaping in the consumer.
+
+The hint is intentionally permissive (no schema validation) so that new `cache_control` variants or other Anthropic-specific fields can be added at the call site without waiting for a library release — the tradeoff is that typos become silent no-ops. If caching appears ineffective, inspect the outgoing request body to verify the `cache_control` field landed where intended.
 
 ### Azure OpenAI
 
@@ -1255,11 +1331,45 @@ A cross-cutting summary of how each failure class surfaces, consolidated from th
 - **`try / catch`** around `send()` only if you're dispatching unvalidated options from UI, or you deploy in remote mode and want to distinguish server-side business errors (reject) from transport glitches (`el.error`, resolves `null`).
 - **Tool handler errors never reach your code.** They're scoped to the tool-use loop — the model sees them and recovers. If you need handler failures as a caller signal, either re-throw out of the loop yourself (by NOT using the built-in loop — invoke tools manually) or listen to `hawc-ai:tool-call-completed` for observability.
 
+### Safety refusals are not errors
+
+When a model declines to produce a response for policy reasons, the provider returns **HTTP 200** with the refusal text (or an empty body) as a normal assistant turn:
+
+| Provider | Signal |
+|---|---|
+| OpenAI / Azure | `choices[0].finish_reason` = `"content_filter"`; may also include a `refusal` field on the message |
+| Anthropic | `stop_reason` = `"refusal"` (Claude 3.5+) or refusal text in the content block |
+| Google (Gemini) | `candidates[0].finishReason` = `"SAFETY"` with `safetyRatings[]` attached |
+
+These **do not populate `el.error`** — the request succeeded. `content` holds the refusal text (or `""` on hard blocks), `messages` gets the refusal as an `{ role: "assistant", content: "...", finishReason: "safety" }` entry, and `send()` resolves normally. Branch the UI off `finishReason` on the stored assistant message:
+
+```ts
+const last = el.messages.at(-1);
+if (last?.role === "assistant" && last.finishReason === "safety") {
+  showRefusalBanner();        // "This request was declined."
+} else {
+  renderAssistantBubble(last);
+}
+```
+
+`finishReason` is normalized across providers to one of `"stop" | "length" | "tool_use" | "safety" | "other"` (see [AiFinishReason](#typescript-types) for the full per-provider mapping). Safety-adjacent Gemini values (`RECITATION`, `BLOCKLIST`, `PROHIBITED_CONTENT`, `SPII`, `LANGUAGE`) all collapse to `"safety"` because UI branching is the same for them; consumers needing per-category triage (e.g. "recitation vs. safety classifier" for compliance logging) must subclass the provider or tag at the proxy layer.
+
+`AiHttpError` is still the right channel when the consumer wants a refusal to *fail* rather than *succeed*. Pattern:
+
+- **Proxy-layer tagging.** Read `candidates[0].finishReason` / `choices[0].finish_reason` server-side; on safety values, respond with `422` + `X-Finish-Reason: safety` so the browser sees an `AiHttpError` instead of a normal assistant turn. Use this when the UI cannot render a refusal in-line and should instead surface the bounce like any other 4xx.
+
+`finishReason` is absent on assistant messages whose turn reported no explicit reason (rare — most providers always set one), and absent on user / system / tool messages. History assigned programmatically via `core.messages = [...]` preserves `finishReason` when present; the validator does not require it.
+
 ## Design Notes
 
 - `content`, `messages`, `usage`, `loading`, `streaming`, and `error` are **output state**
 - `prompt`, `trigger`, `provider`, `model` are **input / command surface**
-- `trigger` is intentionally one-way: writing `true` executes send, reset emits completion
+- `trigger` is intentionally one-way: writing `true` executes send, reset emits completion. **Ordering with `prompt`.** `trigger` reads `el.prompt` synchronously at the moment it is set to `true`, so `prompt` must be assigned *before* `trigger` when using the JS API:
+  ```js
+  el.prompt = "...";
+  el.trigger = true;   // reads el.prompt now
+  ```
+  Writing `trigger = true` with an empty / unset `prompt` is a no-op — `AiCore.send()` rejects synchronously with `"prompt is required"`, the `trigger` setter swallows that rejection (trigger is a fire-and-forget command surface, not a promise), and the trigger flag flips back to `false`. `el.error` is **not** populated in that case because the validation happens before the state-setting path; the failure is observable only as "trigger cycled without content ever streaming." For cases where the prompt source is itself async (e.g. a promise chain), set `prompt` inside the async callback and then flip `trigger`, or call `el.send()` directly so the caller sees the rejection. In HTML attributes, order of `prompt` assignment vs. `trigger` depends on how the framework / binding applies the mapping; bind `prompt` through a JS property (rather than an attribute) so assignment order is under your control
 - `content` updates are batched via `requestAnimationFrame` — each rAF cycle emits at most one `hawc-ai:content-changed` event, limiting DOM updates to ~60fps even under high-throughput streaming
 - on error, the user message is removed from history to keep it clean for retry
 - a new `send()` automatically aborts any in-flight request
@@ -1273,6 +1383,8 @@ A cross-cutting summary of how each failure class surfaces, consolidated from th
 - `responseSchema` constrains the final response to a JSON object: OpenAI/Azure/Google translate to their native schema fields; Anthropic is emulated via a synthetic forced `tool_use` and unwrapped back into a JSON content string. Forcing non-streaming on Anthropic is intentional — streaming input_json_delta deltas reliably across stateless chunk parsing is out of scope for v1. Mutually exclusive with `tools`.
 - `<hawc-ai-message role="user|assistant">` children seed the initial `messages` history at `connectedCallback` for few-shot templates; `role="system"` children continue to flow through `_collectSystem()` into `options.system` on each send. Seeding is skipped when `messages` was set programmatically before connect or in remote mode (server-owned state).
 - multimodal input widens `AiMessage.content` from `string` to `string | AiContentPart[]`; only `user` messages carry mixed parts on the wire (assistant/system/tool with array content are flattened to concatenated text). Google (Gemini) accepts only `data:` URLs for images — http(s) URLs throw at `buildRequest` with a clear message, rather than letting the API return a cryptic 400.
+- stored assistant messages carry a normalized `finishReason` (`"stop" | "length" | "tool_use" | "safety" | "other"`) — providers map their native `finish_reason` / `stop_reason` / `finishReason` vocabularies into this union; unknown values collapse to `"other"` so the field stays forward-compatible. Safety refusals reach the consumer through this field, not through `el.error` (see [Error contract §Safety refusals](#safety-refusals-are-not-errors))
+- `AiMessage.providerHints` is a namespaced passthrough for provider-specific wire fields (Anthropic prompt caching via `providerHints.anthropic.cacheControl`; see [Provider details §Provider hints](#provider-hints)). Other providers silently ignore unknown namespaces, so the same history is safe to flow through any provider without per-site shaping
 - no provider SDK required — all providers use `fetch` + `ReadableStream` + SSE parsing directly
 
 ## License

@@ -262,6 +262,101 @@ describe("AiCore", () => {
       expect(core.messages[1].toolCalls).toHaveLength(1);
     });
 
+    it("providerHintsの入れ子オブジェクトも防御コピーされ、外部からの破壊的変更が内部履歴に波及しない", () => {
+      // Regression guard for cloneMessage's JSON-round-trip deep clone of
+      // providerHints. The hint surface is a namespaced passthrough, so if a
+      // caller reaches into `providerHints.anthropic.cacheControl` after the
+      // setter accepted the message, that mutation must not rewrite what the
+      // next send() ships to the provider.
+      const core = new AiCore();
+      const hint = { anthropic: { cacheControl: { type: "ephemeral" } } };
+      core.messages = [{
+        role: "user",
+        content: "stable context",
+        providerHints: hint,
+      }];
+
+      // Mutate the original nested object — internal history stays intact.
+      (hint.anthropic.cacheControl as any).type = "tampered";
+      (hint.anthropic as any).extra = "injected";
+      expect(core.messages[0].providerHints).toEqual({
+        anthropic: { cacheControl: { type: "ephemeral" } },
+      });
+
+      // Mutate the returned snapshot — also does not leak back.
+      const snapshot = core.messages;
+      (snapshot[0].providerHints!.anthropic as any).cacheControl.type = "tampered-2";
+      (snapshot[0].providerHints!.anthropic as any).other = "injected-2";
+      expect(core.messages[0].providerHints).toEqual({
+        anthropic: { cacheControl: { type: "ephemeral" } },
+      });
+    });
+
+    it("providerHintsがJSON化不能な値を含んでもcloneは投げずbest-effortで受け入れる", () => {
+      // cloneMessage's providerHints path deep-clones via JSON round-trip and
+      // falls back to a shallow spread when JSON.stringify throws (BigInt,
+      // circular refs, functions). The contract the fallback protects is
+      // "don't break the setter on an exotic hint payload" — not a specific
+      // shape for what survives. Assert only that: (1) the setter does not
+      // throw, (2) the namespace key is still reachable so history traversal
+      // in the provider pipeline doesn't blow up. The exact contents of the
+      // fallback-cloned value are intentionally left unspecified so a future
+      // refactor can swap the fallback strategy without breaking this test.
+      const core = new AiCore();
+      const hintWithBigInt: any = { anthropic: { breakpointCount: BigInt(2) } };
+      expect(() => {
+        core.messages = [{ role: "user", content: "x", providerHints: hintWithBigInt }];
+      }).not.toThrow();
+      expect(core.messages[0].providerHints?.anthropic).toBeDefined();
+
+      // Circular reference also forces the JSON-round-trip to throw; same
+      // contract applies.
+      const cyclic: any = { anthropic: {} };
+      cyclic.anthropic.self = cyclic.anthropic;
+      expect(() => {
+        core.messages = [{ role: "user", content: "y", providerHints: cyclic }];
+      }).not.toThrow();
+      expect(core.messages[0].providerHints?.anthropic).toBeDefined();
+    });
+
+    it("finishReasonは履歴再注入で保持される", () => {
+      // A consumer serializes `core.messages` (local storage, server sync,
+      // undo stack) and re-assigns it later — the finish reason must round-
+      // trip so UI branches built off `finishReason === "safety"` still work
+      // after a reload. Covers both the setter's cloneMessage path and the
+      // getter's snapshot clone.
+      const core = new AiCore();
+      core.messages = [
+        { role: "user", content: "prompt that gets declined" },
+        { role: "assistant", content: "I can't help with that.", finishReason: "safety" },
+        { role: "user", content: "follow-up" },
+        {
+          role: "assistant",
+          content: "",
+          toolCalls: [{ id: "call_1", name: "search", arguments: "{}" }],
+          finishReason: "tool_use",
+        },
+        { role: "tool", content: "{}", toolCallId: "call_1" },
+        { role: "assistant", content: "done", finishReason: "stop" },
+      ];
+
+      const snapshot = core.messages;
+      expect(snapshot[1].finishReason).toBe("safety");
+      expect(snapshot[3].finishReason).toBe("tool_use");
+      expect(snapshot[5].finishReason).toBe("stop");
+      // Non-assistant messages have no finishReason and must not gain one
+      // through the clone path.
+      expect(snapshot[0].finishReason).toBeUndefined();
+      expect(snapshot[4].finishReason).toBeUndefined();
+
+      // Round-trip: re-assigning the snapshot must preserve the field on
+      // every assistant entry. JSON round-trip simulates a persistence layer.
+      core.messages = JSON.parse(JSON.stringify(snapshot));
+      expect(core.messages[1].finishReason).toBe("safety");
+      expect(core.messages[3].finishReason).toBe("tool_use");
+      expect(core.messages[5].finishReason).toBe("stop");
+    });
+
     it("存在しないメッセージの削除は無視される", () => {
       const core = new AiCore();
       const coreAny = core as any;
@@ -2132,15 +2227,18 @@ describe("AiCore", () => {
       expect(handler).toHaveBeenCalledWith({ location: "Tokyo" });
       expect(result).toBe("The weather in Tokyo is 22°C.");
       // history: user → assistant(toolCalls) → tool(result) → assistant(final)
+      // Intermediate tool-use turn's finishReason normalizes to "tool_use"
+      // (OpenAI `finish_reason: "tool_calls"`); terminal turn is "stop".
       expect(core.messages).toEqual([
         { role: "user", content: "Weather in Tokyo?" },
         {
           role: "assistant",
           content: "",
           toolCalls: [{ id: "call_1", name: "get_weather", arguments: '{"location":"Tokyo"}' }],
+          finishReason: "tool_use",
         },
         { role: "tool", content: '{"temp":22,"unit":"C"}', toolCallId: "call_1" },
-        { role: "assistant", content: "The weather in Tokyo is 22°C." },
+        { role: "assistant", content: "The weather in Tokyo is 22°C.", finishReason: "stop" },
       ]);
       // Usage aggregates across both turns.
       expect(core.usage).toEqual({ promptTokens: 12, completionTokens: 7, totalTokens: 19 });
@@ -2372,7 +2470,7 @@ describe("AiCore", () => {
       expect(core.error).toBeNull();
       expect(core.messages).toEqual([
         { role: "user", content: "hi" },
-        { role: "assistant", content: "ok" },
+        { role: "assistant", content: "ok", finishReason: "stop" },
       ]);
     });
 
@@ -2420,7 +2518,7 @@ describe("AiCore", () => {
       expect(result).toBe("plain reply");
       expect(core.messages).toEqual([
         { role: "user", content: "hi" },
-        { role: "assistant", content: "plain reply" },
+        { role: "assistant", content: "plain reply", finishReason: "stop" },
       ]);
     });
 
