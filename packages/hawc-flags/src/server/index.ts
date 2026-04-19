@@ -7,6 +7,7 @@ export type {
 } from "../providers/InMemoryFlagProvider.js";
 export { FlagsmithProvider } from "../providers/FlagsmithProvider.js";
 export { UnleashProvider } from "../providers/UnleashProvider.js";
+export { LaunchDarklyProvider } from "../providers/LaunchDarklyProvider.js";
 
 export type {
   FlagMap,
@@ -17,6 +18,13 @@ export type {
   FlagsCoreOptions,
   FlagsmithProviderOptions,
   FlagsValues,
+  LaunchDarklyContext,
+  LaunchDarklyContextCommon,
+  LaunchDarklyContextMeta,
+  LaunchDarklyMultiKindContext,
+  LaunchDarklyProviderOptions,
+  LaunchDarklySingleKindContext,
+  LaunchDarklyValueShape,
   UnleashContext,
   UnleashProviderOptions,
   UserContextLike,

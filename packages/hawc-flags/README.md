@@ -83,12 +83,14 @@ Implications:
 npm install @wc-bindable/hawc-flags
 ```
 
-Pick whichever flag-service SDK matches your deployment (both are optional peer deps):
+Pick whichever flag-service SDK matches your deployment (all optional peer deps):
 
 ```bash
-npm install flagsmith-nodejs   # Flagsmith
+npm install flagsmith-nodejs              # Flagsmith
 # or
-npm install unleash-client     # Unleash
+npm install unleash-client                # Unleash
+# or
+npm install @launchdarkly/node-server-sdk # LaunchDarkly
 ```
 
 Any transport-layer dependency already comes from `@wc-bindable/hawc-auth0` (via `@wc-bindable/remote`); `@wc-bindable/hawc-flags` does not open its own socket.
@@ -204,6 +206,110 @@ createAuthenticatedWSS({
 Override with `options.contextBuilder: (identity) => UnleashContext` to produce a project-specific shape (e.g. mapping `orgId` to Unleash's `sessionId`, dropping attributes Unleash doesn't consume).
 
 Each Unleash flag becomes `{ enabled, value }`, where `value` is `variant.payload.value` when the toggle is enabled with a variant payload, or the variant name otherwise, or `null`.
+
+## Server setup (LaunchDarkly)
+
+Same shape as Flagsmith / Unleash — swap the Provider. LaunchDarkly's Node SDK streams upstream flag updates by default and emits `update` on every change, so fan-out is event-driven (no per-identity timer).
+
+```ts
+import { createAuthenticatedWSS } from "@wc-bindable/hawc-auth0/server";
+import { FlagsCore, LaunchDarklyProvider } from "@wc-bindable/hawc-flags/server";
+
+const provider = new LaunchDarklyProvider({
+  sdkKey: process.env.LD_SDK_KEY!,
+  // Optional — override streaming / polling endpoints for LD Relay Proxy
+  // streamUri: "https://relay.internal/",
+  // Optional — disable streaming and fall back to polling
+  // stream: false,
+  // pollInterval: 30,
+
+  // Optional — restrict which flags the Provider surfaces
+  flagFilter: (name) => !name.startsWith("_internal_"),
+
+  // Optional — only flags flagged "available to client-side SDKs"
+  // in the LD dashboard
+  clientSideOnly: true,
+});
+
+createAuthenticatedWSS({
+  port: 8080,
+  auth0Domain: "your.auth0.domain",
+  auth0Audience: "https://api.example.com/",
+  createCores: (user) => new FlagsCore({
+    provider,
+    userContext: user,
+  }),
+  onTokenRefresh: (core, user) =>
+    (core as FlagsCore).updateUserContext(user),
+});
+```
+
+`FlagIdentity` → `LDContext` mapping (default):
+
+| LDContext field | FlagIdentity source |
+|---|---|
+| `kind` | `options.contextKind ?? "user"` |
+| `key` | `identity.userId` |
+| *top-level attrs* | each `identity.attrs.<k>` (preserved verbatim; `undefined` dropped, `null` preserved) |
+
+Override with `options.contextBuilder: (identity) => LaunchDarklyContext` to rename attributes to match your LD targeting schema, or to emit a multi-kind context:
+
+```ts
+new LaunchDarklyProvider({
+  sdkKey: process.env.LD_SDK_KEY!,
+  contextBuilder: (id) => ({
+    kind: "multi",
+    user: { key: id.userId, email: id.attrs?.email as string | undefined },
+    organization: { key: (id.attrs?.orgId as string) ?? "unknown" },
+  }),
+});
+```
+
+Per the LaunchDarkly schema, a multi-kind context has `kind: "multi"` at the root with **no** root-level `key` — each child is keyed by its kind name (`user`, `organization`, …) and carries its own `key`. The `LaunchDarklyContext` type exported from `/server` is a union of `LaunchDarklySingleKindContext | LaunchDarklyMultiKindContext`, which distinguishes the two shapes — but TypeScript cannot natively express "any string except `'multi'`" on the single-kind `kind` field, so `{ kind: "multi", key: "x" }` still type-checks as a single-kind context (same loophole the LD SDK's own types have). The Provider narrows the loophole along one path only: passing `options.contextKind: "multi"` throws at construction, so the default builder can never produce a malformed single-kind context. A `contextBuilder` returning `{ kind: "multi", key }` is **not** caught here — downstream LD SDK validation surfaces the error at evaluation time.
+
+To declare private attributes (names excluded from analytics events), place a `_meta` field on the common context:
+
+```ts
+contextBuilder: (id) => ({
+  kind: "user",
+  key: id.userId,
+  email: id.attrs?.email as string | undefined,
+  _meta: { privateAttributes: ["email"] },
+});
+```
+
+The default builder passes `identity.attrs._meta` through unchanged, so you can also set it upstream on `FlagIdentity.attrs`.
+
+### Flag value shape: `"wrapped"` (default) vs `"raw"`
+
+LaunchDarkly flags natively return typed values (boolean / string / number / JSON). The Provider exposes two shapes via `valueShape`:
+
+- `"wrapped"` **(default)** — each entry is `{ enabled, value }`, matching Flagsmith / Unleash so a single `data-wcs` template (`values.flags.X.enabled`) works across every Provider. Defaulting to this keeps an application's existing bindings intact when swapping in from another Provider.
+
+  | LD value | Wrapped entry |
+  |---|---|
+  | `true` / `false` | `{ enabled: v, value: v }` |
+  | string / number / object | `{ enabled: true, value: v }` |
+  | `null` / `undefined` | `{ enabled: false, value: null }` |
+
+  ```js
+  if (values.flags.new_checkout_flow?.enabled) { ... }
+  label.textContent = values.flags.cta_text?.value;
+  ```
+
+- `"raw"` (LD-native) — each entry is the flag's evaluated value. Boolean flags are booleans; string flags are strings; etc. Pick this for an LD-only frontend where wrapping would surprise readers used to LD's native semantics.
+
+  ```js
+  if (values.flags.new_checkout_flow) { ... }
+  label.textContent = values.flags.cta_text;
+  ```
+
+```ts
+new LaunchDarklyProvider({
+  sdkKey: process.env.LD_SDK_KEY!,
+  valueShape: "raw",  // opt out of the default wrapping
+});
+```
 
 ## Alternatives
 

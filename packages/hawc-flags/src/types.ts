@@ -225,6 +225,191 @@ export interface UnleashProviderOptions {
 }
 
 /**
+ * Per-context metadata. Mirrors the SDK's `LDContextMeta`.
+ *
+ * `privateAttributes` lists attribute names (or slash-delimited paths
+ * to nested JSON properties) that should NOT be sent to LaunchDarkly
+ * in analytics events — evaluation still sees them, but analytics
+ * payloads redact them. The `kind`, `key`, and `_meta` attributes
+ * cannot be marked private.
+ */
+export interface LaunchDarklyContextMeta {
+  /** Attribute names (or paths) to strip from analytics events. */
+  privateAttributes?: string[];
+}
+
+/**
+ * Attributes common to any single context kind — used both as the
+ * standalone single-kind shape (via {@link LaunchDarklySingleKindContext})
+ * and as each child object inside a multi-kind context. Mirrors the
+ * SDK's `LDContextCommon` so consumers can write a `contextBuilder`
+ * without depending on `@launchdarkly/node-server-sdk` directly.
+ */
+export interface LaunchDarklyContextCommon {
+  /** Primary identifier within the context kind. Required. */
+  key: string;
+  name?: string;
+  email?: string;
+  anonymous?: boolean;
+  /**
+   * Per-context metadata (private attribute declarations, etc.). See
+   * {@link LaunchDarklyContextMeta}.
+   */
+  _meta?: LaunchDarklyContextMeta;
+  /**
+   * Arbitrary custom attributes. LD evaluates targeting rules against
+   * these — any JSON-serializable value is accepted.
+   */
+  [attr: string]: unknown;
+}
+
+/**
+ * Single-kind LaunchDarkly context. `kind` names the context kind and
+ * defaults to `"user"` at the SDK level; `key` is the primary
+ * identifier within that kind.
+ *
+ * NOTE: the field type is `string` for compatibility with LD's own SDK
+ * types, but the literal `"multi"` is **reserved for the root of a
+ * multi-kind context** and is invalid on a single-kind context.
+ * TypeScript cannot natively express "any string except 'multi'"
+ * without forcing casts at every call site, so this restriction is
+ * only enforced at runtime along the default-builder path — the
+ * Provider's constructor rejects `options.contextKind === "multi"`.
+ * A custom `contextBuilder` returning a malformed `{ kind: "multi", key }`
+ * object is **not** caught by the Provider; the downstream LD SDK's
+ * own validation surfaces the error at evaluation time.
+ */
+export interface LaunchDarklySingleKindContext extends LaunchDarklyContextCommon {
+  /**
+   * Context kind. Defaults to `"user"` at the SDK level. Must not be
+   * the literal `"multi"` — use {@link LaunchDarklyMultiKindContext}
+   * for multi-kind contexts.
+   */
+  kind?: string;
+}
+
+/**
+ * Multi-kind LaunchDarkly context. The root MUST have `kind: "multi"`
+ * and does NOT carry a root-level `key` — each child context is keyed
+ * by its kind name (e.g. `user`, `organization`) and carries its own
+ * {@link LaunchDarklyContextCommon}. Mirrors the SDK's
+ * `LDMultiKindContext`.
+ *
+ * Example:
+ * ```ts
+ * const ctx: LaunchDarklyMultiKindContext = {
+ *   kind: "multi",
+ *   user: { key: "user-123", name: "Alice" },
+ *   organization: { key: "org-456", name: "Acme" },
+ * };
+ * ```
+ */
+export interface LaunchDarklyMultiKindContext {
+  kind: "multi";
+  [contextKind: string]: "multi" | LaunchDarklyContextCommon;
+}
+
+/**
+ * A LaunchDarkly context forwarded to `allFlagsState` / `variation`.
+ * Consumers may return either a single-kind or a multi-kind shape from
+ * a {@link LaunchDarklyProviderOptions.contextBuilder}.
+ */
+export type LaunchDarklyContext = LaunchDarklySingleKindContext | LaunchDarklyMultiKindContext;
+
+/**
+ * Shape of flag values surfaced to subscribers.
+ *
+ * - `"wrapped"` (default, package-wide convention): each entry is
+ *   `{ enabled, value }`. Boolean flags map to `{ enabled: v, value: v }`;
+ *   non-boolean non-null flags map to `{ enabled: true, value: v }`;
+ *   null/undefined map to `{ enabled: false, value: null }`. This
+ *   matches Flagsmith / Unleash so a single `data-wcs` template
+ *   (`values.flags.X.enabled`) works against every Provider.
+ * - `"raw"` (LD-native): each entry is the flag's evaluated value
+ *   (boolean / string / number / JSON). Pick this when integrating an
+ *   LD-only frontend where wrapping would surprise readers used to
+ *   LD's native semantics.
+ *
+ * The default is `"wrapped"` so a consumer swapping from
+ * Flagsmith / Unleash to LaunchDarkly keeps their existing templates
+ * working without a silent regression.
+ */
+export type LaunchDarklyValueShape = "raw" | "wrapped";
+
+/**
+ * LaunchDarkly-specific Provider options.
+ *
+ * The underlying `@launchdarkly/node-server-sdk` SDK streams upstream
+ * flag updates by default and emits `update` whenever a flag changes.
+ * {@link LaunchDarklyProvider} wires that event to its per-identity
+ * fan-out — no additional identity-level timer. Per-identity evaluation
+ * calls `allFlagsState(context)` against the SDK's in-process cache.
+ */
+export interface LaunchDarklyProviderOptions {
+  /** Server-side SDK key. Required. */
+  sdkKey: string;
+  /**
+   * Default context kind used when building an LDContext from a
+   * {@link FlagIdentity}. Defaults to `"user"`. Ignored when
+   * `contextBuilder` is supplied. Must not be the literal `"multi"` —
+   * multi-kind contexts require a `contextBuilder`, because their
+   * structural shape is not expressible as a flat `{ kind, key, ...attrs }`.
+   */
+  contextKind?: string;
+  /** Override the default streaming endpoint (e.g. for LD Relay Proxy). */
+  streamUri?: string;
+  /** Override the default polling endpoint. */
+  baseUri?: string;
+  /** Override the default events endpoint. */
+  eventsUri?: string;
+  /**
+   * Enable/disable streaming updates. Defaults to the SDK default
+   * (streaming on). Set to `false` to fall back to polling.
+   */
+  stream?: boolean;
+  /**
+   * Polling interval in seconds when `stream` is `false`. Forwarded to
+   * the SDK's `pollInterval`. Ignored when streaming is enabled.
+   */
+  pollInterval?: number;
+  /** Suppress analytics events. Forwarded to the SDK's `sendEvents`. */
+  disableEvents?: boolean;
+  /**
+   * Timeout waiting for the SDK to finish its initial LaunchDarkly
+   * handshake. Default 5_000 ms. On timeout the initial `identify()`
+   * rejects and the Provider tears down the half-built client.
+   */
+  initializationTimeoutMs?: number;
+  /**
+   * Restrict which flags the Provider surfaces. Useful when the LD
+   * project is shared across applications and only a subset of flags is
+   * relevant to this frontend. Defaults to "include all".
+   */
+  flagFilter?: (name: string) => boolean;
+  /**
+   * Restrict to flags flagged "Make this flag available to client-side
+   * SDKs" in the LaunchDarkly dashboard — defense-in-depth when flag
+   * definitions are reused across internal and public surfaces.
+   */
+  clientSideOnly?: boolean;
+  /**
+   * Output shape for each flag. See {@link LaunchDarklyValueShape}.
+   * Defaults to `"wrapped"` so `values.flags.X.enabled` works the
+   * same way it does under Flagsmith / Unleash. Set to `"raw"` to
+   * surface LD's native value types directly.
+   */
+  valueShape?: LaunchDarklyValueShape;
+  /**
+   * Custom mapping from {@link FlagIdentity} to {@link LaunchDarklyContext}.
+   * Defaults: `{ kind: options.contextKind ?? "user", key: identity.userId,
+   * ...identity.attrs }` with `undefined` attributes dropped. Override to
+   * produce a multi-kind context or rename attributes to match the
+   * targeting schema of your LD project.
+   */
+  contextBuilder?: (identity: FlagIdentity) => LaunchDarklyContext;
+}
+
+/**
  * Flagsmith-specific Provider options.
  *
  * `flagsmith-nodejs` supports two evaluation modes:
