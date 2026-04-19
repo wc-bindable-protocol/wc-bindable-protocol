@@ -21,9 +21,9 @@ Flip `trigger` to run the ceremony; observe `status`, `credentialId`, `user`, `e
 
 ---
 
-## Architecture (Case C: thick Shell, control / data split)
+## Architecture (Case C: browser-anchored execution Shell)
 
-The same HAWC architecture as `@wc-bindable/hawc-s3`. Blob bytes are replaced by credential material, but the shape is identical.
+The same HAWC architecture as `@wc-bindable/hawc-s3`. Blob bytes are replaced by credential material, but the shape is identical: the Core owns decisions, while the Shell owns the browser-anchored execution the server cannot delegate.
 
 | Plane | Where | Responsibility |
 |-------|-------|----------------|

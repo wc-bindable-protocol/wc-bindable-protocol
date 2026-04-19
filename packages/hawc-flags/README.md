@@ -9,7 +9,7 @@ It is not a visual UI widget. It is a **pure observation node** that connects se
 
 Feature-flag state can be expressed declaratively in HTML, without writing SDK integration, identify calls, or streaming glue code in your UI layer.
 
-`@wc-bindable/hawc-flags` follows the [HAWC](https://github.com/wc-bindable-protocol/wc-bindable-protocol/blob/main/packages/hawc/README.md) architecture (Case B — **Core on server, thin Shell**):
+`@wc-bindable/hawc-flags` follows the [HAWC](https://github.com/wc-bindable-protocol/wc-bindable-protocol/blob/main/packages/hawc/README.md) architecture as the **Case B2** shape: Core on the server, thin Shell in the browser, with the Shell acting as a pure observation adapter rather than a command surface:
 
 - **Server** (`FlagsCore`) handles SDK interaction, targeting-rule evaluation, identity management, and change propagation.
 - **Browser** (`<hawc-flags>`) subscribes to the session proxy and re-dispatches the flag-shaped bindable surface onto itself.

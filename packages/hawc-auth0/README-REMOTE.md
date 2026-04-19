@@ -2,6 +2,8 @@
 
 This document covers **remote mode**: `<hawc-auth0>` acts as a gatekeeper to server-side Cores over an authenticated WebSocket. The access token stays inside the Shell and is sent on the wire only at the WebSocket handshake and during in-band `auth:refresh`. **Application code does not see the token.**
 
+In the HAWC taxonomy this is a thin browser-side gatekeeper that enables the **Case B** family: server-side Cores remain authoritative, while `<hawc-auth0>` and `<hawc-auth0-session>` establish and expose the authenticated transport to the browser.
+
 For the in-browser Auth0-only flow where the application reads the token to attach `Authorization: Bearer` headers, see [README-LOCAL.md](README-LOCAL.md).
 
 For the protocol / server-side / threat-model details, see [SPEC-REMOTE.md](SPEC-REMOTE.md).

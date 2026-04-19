@@ -15,6 +15,8 @@ Authentication state can be expressed declaratively in HTML, without writing OAu
 - **Shell** (`<hawc-auth0>`) connects that state to the DOM
 - frameworks and binding systems consume it through [wc-bindable-protocol](https://github.com/wc-bindable-protocol/wc-bindable-protocol)
 
+`@wc-bindable/hawc-auth0` spans two HAWC shapes. In **local mode** it is the **Case A** shape: the Core itself is browser-anchored because the Auth0 SPA SDK and redirect callback flow require browser globals. In **remote mode** the element becomes a thin browser-side gatekeeper for authenticated access to server-side Cores, typically paired with `<hawc-auth0-session>`.
+
 ## Two deployment modes
 
 `<hawc-auth0>` supports two distinct modes. They share the same element and the same bindable surface, but they differ in **where the access token lives** and **what application code can do with it**.

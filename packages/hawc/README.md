@@ -2,7 +2,7 @@
 
 ## Overview
 
-HAWC (Headless Async Web Components) is an architectural concept that leverages Web Components as headless, asynchronous components, separating async processing from the framework layer. Built on wc-bindable-protocol as its foundation, it enables reuse across any framework through thin adapters.
+HAWC (Headless Async Web Components) is an architectural concept that leverages Web Components as headless, asynchronous components, separating async processing from the framework layer. Built on wc-bindable-protocol as its foundation, it enables reuse across any framework by keeping **decisions** in a headless Core and leaving the browser-side Shell responsible only for framework integration and execution that cannot be delegated away.
 
 This document summarizes the technical structure of HAWC, its contribution to solving the framework lock-in problem, and its practical operational benefits.
 
@@ -28,22 +28,30 @@ HAWC's architecture consists of three layers:
 
 ![architecure overview](./hawc_architecture_overview.svg)
 
+The diagram above shows the **base HAWC shape**: the Core owns the authoritative state machine and decisions, while the Shell is the framework-facing surface that receives events and exposes the protocol boundary to adapters. In the thin-Shell cases, the Shell adds little beyond lifecycle, command forwarding, and local event bridging. In **Case C**, the same structure still holds, but the Shell additionally carries browser-anchored execution that cannot be delegated to the Core's runtime.
+
 ### Core/Shell Separation
 
-The Headless Web Component Layer can be further decomposed into two distinct parts: a **Core** and a **Shell**. Each crosses a different boundary.
+The Headless Web Component Layer can be further decomposed into two distinct parts: a **Core** and a **Shell**. The most useful invariant is not "the Shell is always thin" but rather:
 
-**Core (EventTarget)** — Contains all business logic: async processing, state management, and event dispatching. It extends `EventTarget`, not `HTMLElement`, and therefore has zero DOM dependency. This means the Core works in any JavaScript runtime that provides `EventTarget` and `CustomEvent` — browsers, Node.js, Deno, Cloudflare Workers, and others. The Core crosses the **runtime boundary**.
+**Core owns decisions** — business logic, policy, state transitions, authorization-sensitive behavior, and event emission.
 
-**Shell (HTMLElement)** — A thin wrapper that extends `HTMLElement`. It holds a Core instance internally, maps HTML attributes to Core parameters, and manages DOM lifecycle (`connectedCallback` / `disconnectedCallback`). Because it is an `HTMLElement`, frameworks can reference it via `ref` and adapters can bind to it. The Shell crosses the **framework boundary**.
+**Shell owns only undelegatable execution** — framework binding, DOM lifecycle, and any browser-anchored execution the Core cannot perform from its own runtime.
+
+From that invariant, two common consequences follow.
+
+**Core (EventTarget)** — The Core contains the authoritative logic and state machine. It extends `EventTarget`, not `HTMLElement`, so when the domain allows it, it has zero DOM dependency and can cross the **runtime boundary** into Node.js, Deno, Cloudflare Workers, and other runtimes. That portability is a major benefit, but it is not the primary invariant: some domains are browser-anchored and therefore keep the Core in the browser.
+
+**Shell (HTMLElement)** — The Shell is the framework-facing surface. It extends `HTMLElement`, so frameworks can reference it via `ref` and adapters can bind to it. In the simplest case it is a thin wrapper that maps attributes and lifecycle to the Core. In other cases it may be a command proxy or a browser-side execution engine. The Shell crosses the **framework boundary**.
 
 ```
 ┌─────────────────────────────────────────────────┐
 │  Core (EventTarget)                             │
-│  - async logic, state, dispatchEvent            │
-│  - runs anywhere: browser, Node, Deno, Workers  │
+│  - owns decisions, state, dispatchEvent         │
+│  - often runtime-portable when domain allows    │
 ├─────────────────────────────────────────────────┤
 │  Shell (HTMLElement)                            │
-│  - attribute mapping, lifecycle                 │
+│  - framework surface, lifecycle, execution      │
 │  - enables framework binding via ref            │
 └─────────────────────────────────────────────────┘
 ```
@@ -97,43 +105,52 @@ class MyFetch extends HTMLElement {
 
 This separation yields three practical benefits:
 
-1. **Testability** — The Core can be unit-tested in Node.js without jsdom or a browser. Instantiate it, call `fetch()`, and assert on events.
-2. **Reuse beyond the browser** — The same Core class can power a server-side process, a CLI tool, or a Cloudflare Worker, with `bind()` subscribing to its state just as a framework adapter would.
-3. **Shell minimality** — The Shell contains no business logic at all. It is purely a DOM integration surface, making it trivial to write and maintain.
+1. **Framework decoupling** — The UI layer binds to state and commands instead of owning async orchestration.
+2. **Execution confinement** — Security-sensitive or platform-anchored work stays on the side that must own it.
+3. **Runtime portability when available** — When the domain is not browser-anchored, the Core can be unit-tested and reused outside the browser.
 
-### Variant: When the Shell Owns the Data Plane
+### Three Canonical Cases
 
-The "thin Shell" rule above describes the canonical case where the Core
-performs all work and the Shell only marshals attributes / lifecycle. That
-holds whenever the Core can reach every external system the work requires —
-HTTP fetches, DB writes, cron, etc. — from its runtime.
+The thin-Shell case is important, but it is not the only canonical shape. In practice HAWC appears in three parallel cases.
 
-There is a class of work where it cannot. When the **data plane** must run
-in the browser for reasons unrelated to business logic — direct upload to
-object storage, WebRTC, WebUSB, the `File System Access API`, anything
-gated on a user gesture or that would otherwise tunnel a payload through
-the WebSocket — the Shell stops being a thin marshaller and becomes the
-**data-plane executor**. The Core retains the **control plane** (signing,
-authorization, post-processing, persistence) and the wire still carries
-only small JSON-RPC messages, but the Shell now holds an XHR pump, a
-worker pool, retry / re-sign logic, and abort plumbing.
+| Case | Shape | Typical example | What the Shell does |
+|------|-------|-----------------|---------------------|
+| A | Core in browser | `hawc-auth0` local | Thin framework-facing wrapper around a browser-anchored Core |
+| B | Core on server + thin Shell | `hawc-ai` remote, `hawc-flags` | Proxy, command delegation, or observation adapter over the wire |
+| C | Core on server + browser-anchored execution Shell | `hawc-s3`, `hawc-webauthn` | Executes the data plane the browser platform refuses to delegate |
 
-`@wc-bindable/hawc-s3` is the canonical example: the bytes go
-browser → S3 directly because tunneling them through the control WebSocket
-would (a) double the egress cost, (b) waste the server's bandwidth, and
-(c) defeat S3's parallel multipart upload. The Shell ends up at ~800 lines.
-That is not a violation of HAWC's intent — it is the variant that applies
-when the data plane is anchored to the browser by the platform.
+Case C is not a deviation from HAWC. It is a first-class case for domains where the browser owns an execution surface the server cannot stand in for: direct object upload, WebRTC, WebUSB, WebBluetooth, `File System Access API`, clipboard / drag-and-drop / paste flows, camera / microphone capture, and other user-gesture- or device-anchored capabilities.
 
-The principle that survives is the same one the canonical case enforces:
-**the Core owns every decision; the Shell owns only execution it cannot
-delegate.** A "thick" Shell that signs its own URLs or runs its own
-authorization checks would be a HAWC violation, regardless of byte count.
-A thick Shell that PUTs bytes to a Core-signed URL is not.
+### Case C: Browser-Anchored Execution
 
-When you build a HAWC component and the Shell starts to grow, ask which
-side of that line the new code is on. Pumping bytes that cannot leave the
-browser → Shell. Anything else → Core.
+The familiar thin-Shell rule holds whenever the Core can reach every external system the work requires — HTTP fetches, DB writes, cron, and so on — from its own runtime.
+
+There is a different but equally canonical class of work where it cannot. When the **data plane** must run in the browser for reasons unrelated to business logic — direct upload to object storage, WebRTC, WebUSB, the `File System Access API`, anything gated on a user gesture or that would otherwise tunnel a payload through the WebSocket — the Shell stops being a thin marshaller and becomes the **data-plane executor**. The Core retains the **control plane** (signing, authorization, post-processing, persistence) and the wire still carries only small JSON-RPC messages, but the Shell now holds an XHR pump, a worker pool, retry / re-sign logic, and abort plumbing.
+
+`@wc-bindable/hawc-s3` is the canonical example: the bytes go browser → S3 directly because tunneling them through the control WebSocket would (a) double the egress cost, (b) waste the server's bandwidth, and (c) defeat S3's parallel multipart upload. The Shell ends up at ~800 lines. That is not a violation of HAWC's intent. It is the correct HAWC shape when the data plane is anchored to the browser by the platform.
+
+The principle that survives across all three cases is:
+**the Core owns every decision; the Shell owns only execution it cannot delegate.** A "thick" Shell that signs its own URLs or runs its own authorization checks would be a HAWC violation, regardless of byte count. A thick Shell that PUTs bytes to a Core-signed URL is not.
+
+When you build a HAWC component and the Shell starts to grow, ask which side of that line the new code is on. Pumping bytes that cannot leave the browser → Shell. Anything else → Core.
+
+### A More Accurate Taxonomy
+
+The A/B/C split is useful, but real packages show that Case B itself has two sub-shapes:
+
+- **B1: command-mediating thin Shell** — The browser surface forwards inputs and commands to a remote Core while exposing the same bindable state locally. `hawc-ai` fits here.
+- **B2: observation-only thin Shell** — The browser surface exists mainly to subscribe to a remote session proxy and re-dispatch a shape that works with `data-wcs`. `hawc-flags` fits here.
+
+That makes a small matrix more accurate than a single numbered ladder:
+
+| Core location | Shell role | Example |
+|---------------|------------|---------|
+| Browser | Thin wrapper around browser-anchored Core | `hawc-auth0` local |
+| Server | Command-mediating / proxy thin Shell | `hawc-ai` remote |
+| Server | Observation adapter thin Shell | `hawc-flags` |
+| Server | Browser-anchored execution Shell | `hawc-s3`, `hawc-webauthn` |
+
+This framing keeps the true invariant in view. Runtime portability remains a major advantage, but it is a consequence available to some domains, not the sole definition of HAWC.
 
 ### Remote: Core/Shell Separation Over the Network
 
@@ -291,7 +308,9 @@ By treating Web Components not as "visible UI parts" but as an "async service la
 
 What HAWC and wc-bindable-protocol provide is not a replacement for frameworks, but a structure that is free from framework dependency.
 
-A zero-dependency protocol design relying solely on Web standards, adapters that fit in a few dozen lines, and async processing encapsulated in headless Web Components — with the Core (EventTarget) crossing runtime boundaries, the Shell (HTMLElement) crossing framework boundaries, and `@wc-bindable/remote` crossing network boundaries — together, these form a practical and durable escape from frontend framework lock-in.
+Its central rule is simple: keep decisions in the Core, and keep only undelegatable execution in the Shell. Sometimes that yields a runtime-portable Core and a nearly invisible Shell. Sometimes it yields a remote proxy. Sometimes it yields a browser-side execution engine for a browser-anchored data plane. All three are legitimate HAWC shapes.
+
+A zero-dependency protocol design relying solely on Web standards, adapters that fit in a few dozen lines, and async processing encapsulated in headless Web Components — with the Core (EventTarget) owning the authoritative state machine, the Shell (HTMLElement) crossing framework boundaries, and `@wc-bindable/remote` crossing network boundaries — together, these form a practical and durable escape from frontend framework lock-in.
 
 ## Reference
 

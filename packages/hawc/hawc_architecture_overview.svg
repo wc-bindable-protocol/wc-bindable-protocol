@@ -1,4 +1,4 @@
-<svg width="100%" viewBox="0 0 780 620" xmlns="http://www.w3.org/2000/svg">
+<svg width="100%" viewBox="0 0 780 650" xmlns="http://www.w3.org/2000/svg">
 <defs>
   <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
     <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
@@ -18,41 +18,47 @@
 <text x="340" y="50" text-anchor="middle" class="label-main" fill="#444441">
   Shell (HTMLElement)
 </text>
+<text x="340" y="66" text-anchor="middle" class="label-anno" fill="#5f5e5a">
+  Framework surface and undelegatable browser execution
+</text>
 
 <!-- ======== Core (EventTarget) - inner boundary ======== -->
-<rect x="55" y="60" width="570" height="110" rx="12"
+<rect x="55" y="74" width="570" height="110" rx="12"
       fill="#e8e6df" stroke="#8a887f" stroke-width="0.5" stroke-dasharray="4 3"/>
-<text x="340" y="78" text-anchor="middle" class="label-sub" fill="#5f5e5a">
+<text x="340" y="92" text-anchor="middle" class="label-sub" fill="#5f5e5a">
   Core (EventTarget)
+</text>
+<text x="340" y="106" text-anchor="middle" class="label-anno" fill="#5f5e5a">
+  Authoritative decisions and state machine
 </text>
 
 <!-- Async logic -->
-<rect x="70" y="88" width="160" height="52" rx="8"
+<rect x="70" y="116" width="160" height="52" rx="8"
       fill="#faece7" stroke="#993c1d" stroke-width="0.5"/>
-<text x="150" y="108" text-anchor="middle" dominant-baseline="central"
-      class="label-main" fill="#712b13">Async logic</text>
-<text x="150" y="126" text-anchor="middle" dominant-baseline="central"
-      class="label-sub" fill="#993c1d">fetch, WS, timer</text>
+<text x="150" y="136" text-anchor="middle" dominant-baseline="central"
+      class="label-main" fill="#712b13">Decisions + async logic</text>
+<text x="150" y="154" text-anchor="middle" dominant-baseline="central"
+      class="label-sub" fill="#993c1d">policy, fetch, WS, timer</text>
 
 <!-- Internal state -->
-<rect x="252" y="88" width="150" height="52" rx="8"
+<rect x="252" y="116" width="150" height="52" rx="8"
       fill="#eeedfe" stroke="#534ab7" stroke-width="0.5"/>
-<text x="327" y="108" text-anchor="middle" dominant-baseline="central"
-      class="label-main" fill="#3c3489">Internal state</text>
-<text x="327" y="126" text-anchor="middle" dominant-baseline="central"
+<text x="327" y="136" text-anchor="middle" dominant-baseline="central"
+      class="label-main" fill="#3c3489">Authoritative state</text>
+<text x="327" y="154" text-anchor="middle" dominant-baseline="central"
       class="label-sub" fill="#534ab7">value, loading, error</text>
 
 <!-- static wcBindable -->
-<rect x="424" y="88" width="180" height="52" rx="8"
+<rect x="424" y="116" width="180" height="52" rx="8"
       fill="#e1f5ee" stroke="#0f6e56" stroke-width="0.5"/>
-<text x="514" y="108" text-anchor="middle" dominant-baseline="central"
+<text x="514" y="136" text-anchor="middle" dominant-baseline="central"
       class="label-main" fill="#085041">static wcBindable</text>
-<text x="514" y="126" text-anchor="middle" dominant-baseline="central"
+<text x="514" y="154" text-anchor="middle" dominant-baseline="central"
       class="label-sub" fill="#0f6e56">Protocol declaration</text>
 
 <!-- Arrows within Core -->
-<line x1="230" y1="114" x2="250" y2="114" marker-end="url(#arrow)" stroke="#73726c" stroke-width="1.5"/>
-<line x1="402" y1="114" x2="422" y2="114" marker-end="url(#arrow)" stroke="#73726c" stroke-width="1.5"/>
+<line x1="230" y1="142" x2="250" y2="142" marker-end="url(#arrow)" stroke="#73726c" stroke-width="1.5"/>
+<line x1="402" y1="142" x2="422" y2="142" marker-end="url(#arrow)" stroke="#73726c" stroke-width="1.5"/>
 
 <!-- -- Shell-specific area (below Core, inside Shell) -- -->
 
@@ -60,21 +66,21 @@
 <rect x="70" y="185" width="140" height="40" rx="8"
       fill="#faf0e2" stroke="#854f0b" stroke-width="0.5"/>
 <text x="140" y="205" text-anchor="middle" dominant-baseline="central"
-      class="label-main" fill="#633806">Attributes</text>
+      class="label-main" fill="#633806">Framework surface</text>
 
 <rect x="228" y="185" width="140" height="40" rx="8"
       fill="#faf0e2" stroke="#854f0b" stroke-width="0.5"/>
 <text x="298" y="205" text-anchor="middle" dominant-baseline="central"
-      class="label-main" fill="#633806">Lifecycle</text>
+      class="label-main" fill="#633806">Lifecycle / commands</text>
 
 <!-- CustomEvent dispatch (via target injection) -->
 <rect x="386" y="185" width="240" height="40" rx="8"
       fill="#eeedfe" stroke="#534ab7" stroke-width="0.5"/>
 <text x="506" y="205" text-anchor="middle" dominant-baseline="central"
-      class="label-main" fill="#3c3489">CustomEvent dispatch</text>
+      class="label-main" fill="#3c3489">Events / local bridge</text>
 
 <!-- Arrow from Internal state down to CustomEvent dispatch -->
-<line x1="327" y1="140" x2="327" y2="172" stroke="#73726c" stroke-width="1"/>
+<line x1="327" y1="168" x2="327" y2="172" stroke="#73726c" stroke-width="1"/>
 <line x1="327" y1="172" x2="506" y2="172" stroke="#73726c" stroke-width="1"/>
 <line x1="506" y1="172" x2="506" y2="183" marker-end="url(#arrow)" stroke="#73726c" stroke-width="1"/>
 
@@ -82,13 +88,16 @@
 <text x="340" y="248" text-anchor="middle" class="label-anno" fill="#5f5e5a">
   target injection: Core dispatches events directly on Shell
 </text>
+<text x="340" y="262" text-anchor="middle" class="label-anno" fill="#5f5e5a">
+      In Case C, browser-anchored execution also lives here
+</text>
 
 <!-- -- Side annotations: boundary crossing -- -->
 <text x="660" y="120" class="label-anno" fill="#993c1d">
   &lt;- crosses
 </text>
 <text x="660" y="133" class="label-anno" fill="#993c1d">
-     runtime boundary
+      runtime boundary when domain allows
 </text>
 
 <text x="660" y="202" class="label-anno" fill="#854f0b">
@@ -141,7 +150,7 @@
 
 <!-- Thin adapter label -->
 <text x="340" y="430" text-anchor="middle" class="label-sub" fill="#3d3d3a">
-  Thin adapters (subscribe only)
+      Thin adapters around the protocol
 </text>
 
 <!-- ======== Framework rendering layer ======== -->
@@ -162,6 +171,9 @@
 
 <!-- Bottom annotation -->
 <text x="340" y="548" text-anchor="middle" class="label-sub" fill="#3d3d3a">
-  Core (EventTarget) crosses runtime boundary - Shell (HTMLElement) crosses framework boundary
+  Core owns decisions - Shell owns framework integration and undelegatable execution
+</text>
+<text x="340" y="568" text-anchor="middle" class="label-anno" fill="#5f5e5a">
+  Runtime portability is a major benefit, but only where the domain is not browser-anchored
 </text>
 </svg>

@@ -13,8 +13,10 @@ This means chat UIs and AI-powered features can be expressed declaratively, with
 `@wc-bindable/hawc-ai` follows the [HAWC](https://github.com/wc-bindable-protocol/wc-bindable-protocol/blob/main/packages/hawc/README.md) architecture:
 
 - **Core** (`AiCore`) handles provider abstraction, streaming, and conversation state
-- **Shell** (`<hawc-ai>`) connects that state to the DOM
+- **Shell** (`<hawc-ai>`) is a thin, command-mediating browser surface: it exposes bindable state locally, forwards commands to the Core, and can proxy a remote Core over the wire
 - frameworks and binding systems consume it through [wc-bindable-protocol](https://github.com/wc-bindable-protocol/wc-bindable-protocol)
+
+In the taxonomy used by the HAWC architecture document, this is the **Case B1** shape: Core on the server in remote deployments, thin Shell in the browser, with the Shell acting as a command surface rather than a pure observation wrapper.
 
 **No provider SDK required.** All providers are implemented with `fetch` + `ReadableStream` + SSE parsing. The only runtime dependencies are `@wc-bindable/core` and `@wc-bindable/remote`.
 

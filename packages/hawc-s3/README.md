@@ -15,6 +15,8 @@ It is an **I/O node** that connects an upload pipeline to reactive state — wit
 - **Bytes never traverse the WebSocket** — only signing requests, progress, and completion notifications do.
 - frameworks and binding systems consume it through [wc-bindable-protocol](https://github.com/wc-bindable-protocol/wc-bindable-protocol)
 
+In the HAWC taxonomy this is the **Case C** shape: the Core owns decisions and policy on the server, while the Shell is a browser-anchored execution engine for a data plane the server cannot perform on the browser's behalf.
+
 **No AWS SDK required.** SigV4 presigning is implemented with the Web Crypto API. The only runtime dependencies are `@wc-bindable/core` and `@wc-bindable/remote`.
 
 ## Why this exists

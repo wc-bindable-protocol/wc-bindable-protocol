@@ -2,6 +2,8 @@
 
 This document covers **local mode**: `<hawc-auth0>` drives Auth0 in the browser and exposes the access token to application JS so it can attach `Authorization: Bearer` headers to outbound HTTP requests.
 
+In the HAWC taxonomy this is the **Case A** shape: the Core remains in the browser because the Auth0 SPA SDK, redirect callback handling, and token lifecycle are browser-anchored.
+
 For WebSocket-backed remote deployments where the token stays inside the element and is never handed to application code, see [README-REMOTE.md](README-REMOTE.md).
 
 For the protocol / server-side details of the remote variant, see [SPEC-REMOTE.md](SPEC-REMOTE.md).
