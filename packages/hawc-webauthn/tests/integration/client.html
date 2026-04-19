@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>hawc-webauthn e2e</title>
+</head>
+<body>
+  <div id="status">idle</div>
+  <pre id="results"></pre>
+  <pre id="log"></pre>
+
+  <hawc-webauthn id="passkey"></hawc-webauthn>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "@wc-bindable/hawc-webauthn": "/packages/hawc-webauthn/dist/index.js"
+      }
+    }
+  </script>
+
+  <script type="module">
+    import { bootstrapWebAuthn } from "@wc-bindable/hawc-webauthn";
+    bootstrapWebAuthn();
+
+    const statusEl = document.getElementById("status");
+    const resultsEl = document.getElementById("results");
+    const logEl = document.getElementById("log");
+
+    const log = [];
+    function record(...args) { log.push(args.join(" ")); logEl.textContent = log.join("\n"); }
+
+    // Patch fetch so every WebAuthn call carries a stable session header.
+    // Real apps would carry a session cookie; simpler to use a header here.
+    const SESSION = "e2e-session";
+    const realFetch = window.fetch;
+    window.fetch = (input, init = {}) => {
+      const headers = new Headers(init.headers);
+      headers.set("x-session-id", SESSION);
+      return realFetch(input, { ...init, headers });
+    };
+
+    // Tests drive the page by calling window functions exposed below.
+    // The page exposes the result object on #results so tests can read it
+    // back via `JSON.parse(textContent)`.
+
+    function fresh(mode, attrs = {}) {
+      const old = document.getElementById("passkey");
+      if (old) old.remove();
+      const el = document.createElement("hawc-webauthn");
+      el.id = "passkey";
+      el.setAttribute("mode", mode);
+      el.setAttribute("rp-id", "localhost");
+      el.setAttribute("challenge-url", "/api/webauthn/challenge");
+      el.setAttribute("verify-url", "/api/webauthn/verify");
+      for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+      document.body.appendChild(el);
+      return el;
+    }
+
+    async function captureCeremony(mode, attrs) {
+      const el = fresh(mode, attrs);
+      const statuses = [];
+      el.addEventListener("hawc-webauthn:status-changed", e => statuses.push(e.detail));
+      let error;
+      try {
+        await el.start();
+      } catch (e) {
+        error = e?.message ?? String(e);
+      }
+      return {
+        status: el.status,
+        credentialId: el.credentialId,
+        user: el.user,
+        statuses,
+        error,
+      };
+    }
+
+    window.runRegister = async function (userAttrs) {
+      statusEl.textContent = "running";
+      const out = await captureCeremony("register", userAttrs);
+      resultsEl.textContent = JSON.stringify(out);
+      statusEl.textContent = "done";
+    };
+
+    window.runAuthenticate = async function (extraAttrs = {}) {
+      statusEl.textContent = "running";
+      const out = await captureCeremony("authenticate", extraAttrs);
+      resultsEl.textContent = JSON.stringify(out);
+      statusEl.textContent = "done";
+    };
+  </script>
+</body>
+</html>
