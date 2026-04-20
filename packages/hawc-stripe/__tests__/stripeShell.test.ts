@@ -1050,6 +1050,92 @@ describe("<hawc-stripe> Shell", () => {
       }
     });
 
+    it("remote abort() cancels pi_X even when updates/return have not reached the client yet (regression: intentId sync race)", async () => {
+      // Race: Core.requestIntent finishes server-side (pi_X created,
+      // `_activeIntent` set, updates + return queued) but the client
+      // has not processed the update frames yet. If `abort()` reads
+      // `_remoteValues.intentId` at that moment, it gets null and
+      // falls through to `_coreReset`, which clears `_activeIntent`
+      // BEFORE prepare's supersede cleanup can call
+      // `_cancelIntent(pi_X)` — and that late cancel then no-ops
+      // because Core's cancelIntent bails on a null `_activeIntent`.
+      // End result without the fix: pi_X orphaned at Stripe.
+      //
+      // Reproduce with a transport whose client-side delivery can be
+      // paused. Prepare → pause → Core queues updates+return → abort
+      // → resume → assert pi_X is in provider.cancelCalls.
+      setUrlSearch("");
+      const freshProvider = new FakeProvider();
+      const freshCore = new StripeCore(freshProvider, { webhookSecret: "whsec_test" });
+      freshCore.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+
+      let clientHandler: ((msg: ServerMessage) => void) | null = null;
+      let serverHandler: ((msg: ClientMessage) => void) | null = null;
+      let clientDelivering = true;
+      const clientInbox: ServerMessage[] = [];
+      const client: ClientTransport = {
+        send: (msg) => { if (serverHandler) Promise.resolve().then(() => serverHandler!(msg)); },
+        onMessage: (h) => { clientHandler = h; },
+      };
+      const server: ServerTransport = {
+        send: (msg) => {
+          Promise.resolve().then(() => {
+            if (clientDelivering) clientHandler?.(msg);
+            else clientInbox.push(msg);
+          });
+        },
+        onMessage: (h) => { serverHandler = h; },
+      };
+      const pauseClient = (): void => { clientDelivering = false; };
+      const resumeClient = (): void => {
+        clientDelivering = true;
+        const pending = clientInbox.splice(0);
+        for (const m of pending) clientHandler?.(m);
+      };
+
+      // Connect WITHOUT a publishable-key so auto-prepare cannot fire
+      // at connect time. Let initial sync deliver to the client normally.
+      el = createEl({ mode: "payment" });
+      const shellProxy = new RemoteShellProxy(freshCore, server);
+      try {
+        el._connectRemote(client);
+        await flushTransport(2);
+
+        // Now pause the client, THEN set the publishable-key to kick
+        // off auto-prepare. The requestIntent cmd flows to the server,
+        // Core creates pi_shell and queues updates + return, but the
+        // client cannot receive them.
+        pauseClient();
+        el.setAttribute("publishable-key", "pk_test_abort_race");
+        // Give the server enough turns to finish the requestIntent.
+        // (Our mock createPaymentIntent is synchronous, so one flush
+        // would already suffice — extra flushes are a safety margin.)
+        await flushTransport(4);
+        expect(freshCore.intentId).toBe("pi_shell");
+        expect(el.intentId).toBeNull(); // client NOT yet synced
+
+        // User clicks abort. The fix awaits `_preparePromise`, so the
+        // cancellation flows through prepare's supersede cleanup and
+        // pi_shell ends up in provider.cancelCalls regardless of the
+        // client-side sync timing.
+        const abortPromise = el.abort();
+        // Let abort park on `await preparePromise`, then resume the
+        // transport so prepare can finish.
+        await flushTransport(1);
+        resumeClient();
+        await abortPromise;
+        await flushTransport(4);
+
+        // The authoritative proof: the intent created in this aborted
+        // prepare IS canceled at the provider. Without the fix, abort
+        // would have raced `_coreReset` ahead of the supersede cancel
+        // and left pi_shell uncanceled.
+        expect(freshProvider.cancelCalls).toContain("pi_shell");
+      } finally {
+        shellProxy.dispose();
+      }
+    });
+
     it("transport disconnect dispatches null transitions for intentId/amount/paymentMethod (regression)", async () => {
       // After successful resume the element holds intentId / amount /
       // paymentMethod. A subsequent transport disconnect must notify

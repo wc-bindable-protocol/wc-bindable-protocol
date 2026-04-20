@@ -517,6 +517,14 @@ export class StripeCore extends EventTarget {
     }
     switch (view.status) {
       case "succeeded":
+        // Mirror the clear in reportConfirmation's direct succeeded
+        // branch and the webhook succeeded fold — reach here through
+        // the reportConfirmation-processing-poll or resumeIntent paths
+        // with a terminal "succeeded" view, so any lingering error
+        // from a prior failed attempt on the same intent must be
+        // dropped. Without this, a fail-then-processing-then-succeeded
+        // sequence ends with status=succeeded + error=card_declined.
+        this._setError(null);
         this._setStatus("succeeded");
         this._setLoading(false);
         break;

@@ -226,6 +226,33 @@ describe("StripeCore", () => {
       expect(core.status).toBe("succeeded");
     });
 
+    it("clears stale error on processing → succeeded poll path (fail-then-processing-then-succeed, regression)", async () => {
+      // Same failure-then-success contract, but this time success
+      // arrives through `_reconcileFromIntentView` (reportConfirmation
+      // outcome=processing polls the provider and reconciles a
+      // terminal succeeded view). Without clearing in the reconcile
+      // branch, the direct and webhook succeeded paths are fixed but
+      // this one still shows status=succeeded + error=card_declined.
+      await core.requestIntent({ mode: "payment", hint: {} });
+      await core.reportConfirmation({
+        intentId: "pi_123",
+        outcome: "failed",
+        error: { code: "card_declined", message: "Declined." },
+      });
+      expect(core.error?.code).toBe("card_declined");
+
+      // Provider poll resolves as succeeded → reconcile must clear error.
+      provider.retrieveResult = {
+        id: "pi_123",
+        status: "succeeded",
+        mode: "payment",
+        paymentMethod: { id: "pm_retry", brand: "visa", last4: "9999" },
+      };
+      await core.reportConfirmation({ intentId: "pi_123", outcome: "processing" });
+      expect(core.status).toBe("succeeded");
+      expect(core.error).toBeNull();
+    });
+
     it("clears stale error on succeeded (fail-then-succeed on same intent, regression)", async () => {
       // Real user flow: first confirm fails with card_declined, user
       // switches card on the same Elements mount and retries. The

@@ -1016,6 +1016,30 @@ export class Stripe extends HTMLElement {
     // teardown + cancel sequence so a parked prepare cannot resume and
     // undo the abort afterward.
     this._markSupersede(true);
+    // In remote mode, `this.intentId` reads from `_remoteValues.intentId`
+    // — populated asynchronously by `update` frames from the Core. If a
+    // prepare is still in flight (Core may already have created the
+    // intent and queued updates + return, but the client has not
+    // processed them yet), reading intentId right now returns null and
+    // we would fall through to `_coreReset`. Core's reset then clears
+    // `_activeIntent` BEFORE the prepare's own supersede cleanup can
+    // call `_cancelIntent(creation.intentId)` — whose Core-side check
+    // `if (!active) return;` now no-ops, leaving the PaymentIntent
+    // orphaned at Stripe.
+    //
+    // Await the in-flight prepare first so one of two stable outcomes
+    // holds by the time we read intentId:
+    //   1. Prepare resolved → intentId is synced and `_cancelIntent`
+    //      below cancels it.
+    //   2. Prepare was superseded by the `_markSupersede(true)` above
+    //      → its own cleanup already called `_cancelIntent(pi_X)` on
+    //      a still-active `_activeIntent` — pi_X is canceled at Stripe,
+    //      intentId has since gone to null, and `_coreReset` below
+    //      becomes a no-op.
+    const preparePromise = this._preparePromise;
+    if (preparePromise) {
+      await preparePromise.catch(() => { /* supersede / prior failure */ });
+    }
     const id = this.intentId;
     this._teardownElements();
     if (id) {
