@@ -8,6 +8,10 @@ import type {
   IStripeProvider, IntentCreationResult, PaymentIntentOptions, SetupIntentOptions,
   StripeEvent, StripeIntentView, StripeMode,
 } from "../src/types";
+import { RemoteShellProxy } from "@wc-bindable/remote";
+import type {
+  ClientTransport, ServerTransport, ClientMessage, ServerMessage,
+} from "@wc-bindable/remote";
 
 class FakeProvider implements IStripeProvider {
   nextPaymentIntentId = "pi_shell";
@@ -87,6 +91,34 @@ function createEl(attrs: Record<string, string> = {}): WcsStripe {
 /** Reset the URL search. Used to control `_isPostRedirect` in tests. */
 function setUrlSearch(search: string): void {
   history.replaceState(null, "", `${location.pathname}${search}`);
+}
+
+/**
+ * Mock transport pair for remote-proxy integration tests. Mirrors the
+ * `createMockTransportPair` helper from `@wc-bindable/remote`'s internal
+ * tests: client.send enqueues a microtask on the server's handler and vice
+ * versa, so the pair exercises real async message ordering without a
+ * WebSocket.
+ */
+function createMockTransportPair(): { client: ClientTransport; server: ServerTransport } {
+  let clientHandler: ((msg: ServerMessage) => void) | null = null;
+  let serverHandler: ((msg: ClientMessage) => void) | null = null;
+  const client: ClientTransport = {
+    send: (msg) => { if (serverHandler) Promise.resolve().then(() => serverHandler!(msg)); },
+    onMessage: (handler) => { clientHandler = handler; },
+  };
+  const server: ServerTransport = {
+    send: (msg) => { if (clientHandler) Promise.resolve().then(() => clientHandler!(msg)); },
+    onMessage: (handler) => { serverHandler = handler; },
+  };
+  return { client, server };
+}
+
+/** Flush a few microtask rounds so both directions of an async transport settle. */
+async function flushTransport(rounds = 4): Promise<void> {
+  for (let i = 0; i < rounds; i++) {
+    await new Promise(r => setTimeout(r, 0));
+  }
 }
 
 describe("<hawc-stripe> Shell", () => {
@@ -485,6 +517,36 @@ describe("<hawc-stripe> Shell", () => {
       expect(el.status).toBe("succeeded");
     });
 
+    it("concurrent submit() calls dedupe into one confirm (regression: double-click)", async () => {
+      // A rapid double-click (or two listeners both calling submit)
+      // must fire confirmPayment exactly once. Without the guard, two
+      // confirms for the same intent race and the later outcome
+      // overwrites the earlier one on the Core — a card_declined
+      // arriving after a succeeded would silently paint the UI
+      // "failed" despite a real charge.
+      await el.prepare();
+      // Gate confirmPayment so both submit() calls are in flight
+      // concurrently when the dedupe check runs.
+      let release!: (v: unknown) => void;
+      const originalConfirm = fakes.stripeJs.confirmPayment.bind(fakes.stripeJs);
+      fakes.stripeJs.confirmPayment = ((opts: unknown) => {
+        fakes.confirmCalls.push({ kind: "payment", opts });
+        return new Promise((resolve) => { release = resolve; });
+      }) as typeof fakes.stripeJs.confirmPayment;
+      const p1 = el.submit();
+      const p2 = el.submit();
+      // Both callers observe the same in-flight submit promise.
+      expect(p1).toBe(p2);
+      // Let the single confirmPayment resolve.
+      release({ paymentIntent: { id: "pi_shell", status: "succeeded" } });
+      await Promise.all([p1, p2]);
+      // Exactly ONE confirm went through despite two submit() callers.
+      expect(fakes.confirmCalls).toHaveLength(1);
+      expect(el.status).toBe("succeeded");
+      // After settlement, the next submit is a fresh call again.
+      fakes.stripeJs.confirmPayment = originalConfirm;
+    });
+
     it("surfaces confirm error and reports failure to Core", async () => {
       await el.prepare();
       fakes.setConfirmResult({ error: { code: "card_declined", message: "Declined." } });
@@ -711,6 +773,474 @@ describe("<hawc-stripe> Shell", () => {
         expect((el.dataset as any)[k]).not.toContain(secret);
       }
       expect(Object.keys(el as any)).not.toContain("clientSecret");
+    });
+  });
+
+  describe("remote proxy integration", () => {
+    // These tests exercise the `_connectRemote` path end-to-end through an
+    // in-memory transport pair + RemoteShellProxy + a real StripeCore, the
+    // same wiring a WebSocket deployment uses — just without the socket.
+    // The `attachLocalCore` path is covered elsewhere; this block pins the
+    // behaviors that only show up once Core events have to cross the wire
+    // (initial `sync`, `setWithAck` ordering, `invoke` + update interleave).
+
+    it("connect-time input sync: declarative attrs reach the Core via setWithAck", async () => {
+      // Deliberately omit publishable-key so auto-prepare bails — the test
+      // isolates the input-sync path without an intent-creation round-trip
+      // fighting for the same microtask queue.
+      el = createEl({
+        mode: "setup",
+        "amount-value": "500",
+        "amount-currency": "usd",
+        "customer-id": "cus_remote_1",
+      });
+
+      const { client, server } = createMockTransportPair();
+      const shellProxy = new RemoteShellProxy(core, server);
+      try {
+        el._connectRemote(client);
+        await flushTransport();
+
+        // Inputs declared on the element landed on the server-side Core.
+        expect(core.mode).toBe("setup");
+        expect(core.amountValue).toBe(500);
+        expect(core.amountCurrency).toBe("usd");
+        expect(core.customerId).toBe("cus_remote_1");
+
+        // Initial sync delivered server state to the client; the element
+        // reads remote-cached values via its getters.
+        expect(el.status).toBe("idle");
+        expect(el.loading).toBe(false);
+        expect(el.intentId).toBeNull();
+
+        // No intent was created — auto-prepare bailed (no publishable-key).
+        expect(fakes.mountCalls).toHaveLength(0);
+      } finally {
+        shellProxy.dispose();
+      }
+    });
+
+    it("connect-time sync ignores unset attrs — Core inputs keep their defaults", async () => {
+      // Only some attrs are present; unset attrs must NOT be forwarded as
+      // setWithAck calls. Regression guard: `hasAttribute` (not truthiness)
+      // decides whether to forward, so an attribute that never existed
+      // leaves the Core-side default untouched.
+      core.amountValue = 9999; // pre-existing Core-side default
+      core.customerId = "cus_preexisting";
+
+      el = createEl({ mode: "payment" }); // only `mode` is set
+
+      const { client, server } = createMockTransportPair();
+      const shellProxy = new RemoteShellProxy(core, server);
+      try {
+        el._connectRemote(client);
+        await flushTransport();
+
+        expect(core.mode).toBe("payment");
+        // Unset attrs must not have overwritten pre-existing Core state.
+        expect(core.amountValue).toBe(9999);
+        expect(core.customerId).toBe("cus_preexisting");
+      } finally {
+        shellProxy.dispose();
+      }
+    });
+
+    it("post-redirect resume: cmd → retrieveIntent → update fold back to the element", async () => {
+      // Simulate a 3DS return: URL carries the intent id and Stripe's
+      // client_secret; the element autofires resumeIntent over the wire on
+      // _connectRemote. The server-side Core retrieves and hydrates state;
+      // its update messages must drive `el.status` / `el.intentId` over
+      // the remote boundary without any call to attachLocalCore.
+      setUrlSearch("?payment_intent=pi_remote_resume&payment_intent_client_secret=pi_remote_resume_secret_ok&redirect_status=succeeded");
+      provider.retrieveResult = {
+        id: "pi_remote_resume",
+        status: "succeeded",
+        mode: "payment",
+        amount: { value: 2500, currency: "usd" },
+        paymentMethod: { id: "pm_remote", brand: "visa", last4: "4242" },
+        clientSecret: "pi_remote_resume_secret_ok",
+      };
+
+      el = createEl({ mode: "payment", "publishable-key": "pk_test_remote" });
+      const { client, server } = createMockTransportPair();
+      const shellProxy = new RemoteShellProxy(core, server);
+      try {
+        el._connectRemote(client);
+        // Resume is an async cmd over the transport; give it enough rounds
+        // for: sync, cmd dispatch, retrieveIntent, update(intentId), update
+        // (paymentMethod), update(amount), update(status), return.
+        await flushTransport(8);
+
+        // Core actually ran resumeIntent for the URL's intent.
+        expect(provider.retrieveCalls).toEqual([{ mode: "payment", id: "pi_remote_resume" }]);
+        // Shell observable state hydrated over the wire — no mount, no
+        // second intent alongside the resumed one.
+        expect(el.status).toBe("succeeded");
+        expect(el.intentId).toBe("pi_remote_resume");
+        expect(el.amount).toEqual({ value: 2500, currency: "usd" });
+        expect(el.paymentMethod).toEqual({ id: "pm_remote", brand: "visa", last4: "4242" });
+        expect(fakes.mountCalls).toHaveLength(0);
+
+        // Redirect params must be stripped so a reload / share does not
+        // re-trigger resume — same contract as the local-Core path.
+        const params = new URLSearchParams(globalThis.location.search);
+        expect(params.has("payment_intent")).toBe(false);
+        expect(params.has("payment_intent_client_secret")).toBe(false);
+      } finally {
+        shellProxy.dispose();
+      }
+    });
+
+    it("transport-side resume failure preserves URL params + _resumed so retry is possible (regression: 3DS duplicate-charge exposure)", async () => {
+      // The Core never sees this resume — transport rejects the cmd. The
+      // element must NOT mark the 3DS return "consumed": that would strip
+      // the URL and latch `_resumed = true`, blocking any subsequent
+      // retry and forcing a fresh intent for the same cart. Real risk:
+      // the 3DS flow already cleared at Stripe, so creating a NEW intent
+      // can lead to double-charging, while the user sees "failed" despite
+      // the underlying charge going through.
+      setUrlSearch("?payment_intent=pi_ws_resume&payment_intent_client_secret=pi_ws_resume_secret_ok&redirect_status=succeeded");
+      provider.retrieveResult = {
+        id: "pi_ws_resume",
+        status: "succeeded",
+        mode: "payment",
+        clientSecret: "pi_ws_resume_secret_ok",
+      };
+
+      el = createEl({ mode: "payment", "publishable-key": "pk_test_ws" });
+      const { client: realClient, server } = createMockTransportPair();
+      // Transport that refuses every cmd — Core never receives the
+      // resumeIntent invocation.
+      const deadClient: ClientTransport = {
+        send: (msg) => {
+          if (msg.type === "cmd") throw new Error("transport closed");
+          realClient.send(msg);
+        },
+        onMessage: (handler) => realClient.onMessage(handler),
+      };
+      const shellProxy = new RemoteShellProxy(core, server);
+      try {
+        el._connectRemote(deadClient);
+        await flushTransport(6);
+
+        // Core DID NOT run the resume (transport ate the cmd).
+        expect(provider.retrieveCalls).toHaveLength(0);
+
+        // URL params must still be present so a later retry (reload,
+        // re-connect) can re-read them.
+        const params = new URLSearchParams(globalThis.location.search);
+        expect(params.has("payment_intent")).toBe(true);
+        expect(params.has("payment_intent_client_secret")).toBe(true);
+
+        // A fresh connect on a recovered transport must re-attempt the
+        // resume — not fall through to auto-prepare for a new intent.
+        // Simulate reconnect by disposing the dead proxy + attaching
+        // a fresh working pair. Re-using the same element instance is
+        // what a WS-recovery flow would do.
+        (el as unknown as { _disposeRemote: () => void })._disposeRemote();
+        const recovered = createMockTransportPair();
+        const recoveredProxy = new RemoteShellProxy(core, recovered.server);
+        try {
+          (el as unknown as { _connectRemote: (t: ClientTransport) => void })._connectRemote(recovered.client);
+          await flushTransport(8);
+          // Resume retried and Core now ran the retrieve.
+          expect(provider.retrieveCalls).toEqual([{ mode: "payment", id: "pi_ws_resume" }]);
+          expect(el.status).toBe("succeeded");
+          expect(el.intentId).toBe("pi_ws_resume");
+        } finally {
+          recoveredProxy.dispose();
+        }
+      } finally {
+        shellProxy.dispose();
+      }
+    });
+
+    it("transport-only resume failure with STALE remote error keeps URL retriable (seq-based coreSpoke regression)", async () => {
+      // The coarse `!!this._remoteValues.error` check would misclassify
+      // this scenario as a Core-origin rejection: the session already
+      // holds a truthy `_remoteValues.error` from a prior operation, so
+      // even though the resume cmd never reached the Core, the Shell
+      // would strip the URL and latch `_resumed = true`. The seq-based
+      // check must gate on whether an error update crossed the wire
+      // DURING this specific resume.
+      //
+      // Build-up order is important: start with an empty URL and NO
+      // publishable-key so the element connects idle. Prime the remote
+      // Core with a prior error so its initial sync carries a truthy
+      // `_remoteValues.error`. Only then set the URL + close the gate
+      // and trigger the resume manually.
+      setUrlSearch("");
+      const coreWithErr = new StripeCore(provider, { webhookSecret: "whsec_test" });
+      coreWithErr.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      // Prior failure: Core's `_setError(err)` runs, leaving
+      // `coreWithErr.error.code = resume_client_secret_mismatch`. This
+      // value is what the initial sync will deliver to the Shell.
+      await coreWithErr.resumeIntent("pi_prior", "payment", "wrong_secret")
+        .catch(() => { /* expected */ });
+      expect(coreWithErr.error?.code).toBe("resume_client_secret_mismatch");
+
+      // No publishable-key → auto-prepare bails, so the only cmd the
+      // element would ever send is a later resume.
+      el = createEl({ mode: "payment" });
+      const { client: realClient, server } = createMockTransportPair();
+      let dropCmds = false;
+      const gatedClient: ClientTransport = {
+        send: (msg) => {
+          if (dropCmds && msg.type === "cmd") throw new Error("gated cmd send");
+          realClient.send(msg);
+        },
+        onMessage: (handler) => realClient.onMessage(handler),
+      };
+
+      const shellProxy = new RemoteShellProxy(coreWithErr, server);
+      try {
+        el._connectRemote(gatedClient);
+        // Initial sync delivers the pre-existing truthy error — exactly
+        // the "stale remote error" precondition this test protects.
+        await flushTransport(4);
+        expect(el.error?.code).toBe("resume_client_secret_mismatch");
+
+        // Now simulate the 3DS return: URL arrives, transport is gated.
+        setUrlSearch("?payment_intent=pi_stale&payment_intent_client_secret=pi_stale_secret_ok");
+        dropCmds = true;
+
+        await (el as unknown as { _resumeFromRedirect: () => Promise<void> })._resumeFromRedirect();
+        await flushTransport(4);
+
+        // Core never processed this resume (cmd send was gated). The
+        // authoritative proof: `_resumed` must stay false and URL
+        // params preserved so a recovered transport can retry.
+        expect((el as unknown as { _resumed: boolean })._resumed).toBe(false);
+        const params = new URLSearchParams(globalThis.location.search);
+        expect(params.has("payment_intent")).toBe(true);
+        expect(params.has("payment_intent_client_secret")).toBe(true);
+      } finally {
+        shellProxy.dispose();
+      }
+    });
+
+    it("Core-originated resume rejection still marks URL consumed (contract preserved)", async () => {
+      // Counterpart to the transport-failure test: a real Core denial
+      // IS a definitive answer, so URL must be stripped and a retry
+      // trigger must NOT re-run resume.
+      setUrlSearch("?payment_intent=pi_denied&payment_intent_client_secret=pi_denied_secret_GUESS");
+      provider.retrieveResult = {
+        id: "pi_denied",
+        status: "succeeded",
+        mode: "payment",
+        clientSecret: "pi_denied_secret_REAL",
+      };
+      el = createEl({ mode: "payment", "publishable-key": "pk_test_denial" });
+      const { client, server } = createMockTransportPair();
+      const shellProxy = new RemoteShellProxy(core, server);
+      try {
+        el._connectRemote(client);
+        await flushTransport(8);
+        expect(el.error?.code).toBe("resume_client_secret_mismatch");
+        // URL consumed.
+        const params = new URLSearchParams(globalThis.location.search);
+        expect(params.has("payment_intent")).toBe(false);
+        // Subsequent trigger must NOT retry — Core already spoke.
+        const callsBefore = provider.retrieveCalls.length;
+        await (el as unknown as { _resumeFromRedirect: () => Promise<void> })._resumeFromRedirect();
+        await flushTransport(2);
+        expect(provider.retrieveCalls.length).toBe(callsBefore);
+      } finally {
+        shellProxy.dispose();
+      }
+    });
+
+    it("transport disconnect dispatches null transitions for intentId/amount/paymentMethod (regression)", async () => {
+      // After successful resume the element holds intentId / amount /
+      // paymentMethod. A subsequent transport disconnect must notify
+      // subscribers that these values have gone to null — UIs wired on
+      // `*-changed` events must not keep painting stale card / total
+      // data that no longer reflects any live state.
+      setUrlSearch("?payment_intent=pi_disc&payment_intent_client_secret=pi_disc_secret_ok");
+      provider.retrieveResult = {
+        id: "pi_disc",
+        status: "succeeded",
+        mode: "payment",
+        amount: { value: 1980, currency: "jpy" },
+        paymentMethod: { id: "pm_disc", brand: "visa", last4: "4242" },
+        clientSecret: "pi_disc_secret_ok",
+      };
+
+      el = createEl({ mode: "payment", "publishable-key": "pk_test_disc" });
+      const events: Record<string, unknown[]> = {
+        intentId: [],
+        amount: [],
+        paymentMethod: [],
+      };
+      el.addEventListener("hawc-stripe:intentId-changed", (e) => events.intentId.push((e as CustomEvent).detail));
+      el.addEventListener("hawc-stripe:amount-changed", (e) => events.amount.push((e as CustomEvent).detail));
+      el.addEventListener("hawc-stripe:paymentMethod-changed", (e) => events.paymentMethod.push((e as CustomEvent).detail));
+
+      const { client, server } = createMockTransportPair();
+      const shellProxy = new RemoteShellProxy(core, server);
+      try {
+        el._connectRemote(client);
+        await flushTransport(8);
+        // Post-resume snapshot.
+        expect(el.intentId).toBe("pi_disc");
+        expect(el.amount).toEqual({ value: 1980, currency: "jpy" });
+        expect(el.paymentMethod).toEqual({ id: "pm_disc", brand: "visa", last4: "4242" });
+        const intentIdEventsBefore = events.intentId.length;
+        const amountEventsBefore = events.amount.length;
+        const pmEventsBefore = events.paymentMethod.length;
+
+        // Simulate transport failure path — `_resetRemoteBusyState` is
+        // the Shell's contract entry point for "connection is gone,
+        // surface state is stale". `_initRemote`'s onFail calls it
+        // before `_disposeRemote`.
+        (el as unknown as { _resetRemoteBusyState: () => void })._resetRemoteBusyState();
+
+        // Null transitions must have been dispatched for each bindable
+        // that had a non-null value.
+        expect(events.intentId.length).toBeGreaterThan(intentIdEventsBefore);
+        expect(events.intentId[events.intentId.length - 1]).toBeNull();
+        expect(events.amount.length).toBeGreaterThan(amountEventsBefore);
+        expect(events.amount[events.amount.length - 1]).toBeNull();
+        expect(events.paymentMethod.length).toBeGreaterThan(pmEventsBefore);
+        expect(events.paymentMethod[events.paymentMethod.length - 1]).toBeNull();
+      } finally {
+        shellProxy.dispose();
+      }
+    });
+
+    it("post-redirect resume rejects foreign intent over the wire (permission-bypass)", async () => {
+      // The security contract proven for local Core must also hold when
+      // the resume cmd crosses the wire: a URL with a valid-looking victim
+      // intent id but a guessed client_secret must end with an error state
+      // on the element, no hydrated intent.
+      setUrlSearch("?payment_intent=pi_remote_victim&payment_intent_client_secret=pi_remote_victim_secret_GUESSED");
+      provider.retrieveResult = {
+        id: "pi_remote_victim",
+        status: "succeeded",
+        mode: "payment",
+        amount: { value: 9999, currency: "usd" },
+        paymentMethod: { id: "pm_v", brand: "visa", last4: "0000" },
+        clientSecret: "pi_remote_victim_secret_REAL",
+      };
+
+      el = createEl({ mode: "payment", "publishable-key": "pk_test_remote" });
+      const { client, server } = createMockTransportPair();
+      const shellProxy = new RemoteShellProxy(core, server);
+      try {
+        el._connectRemote(client);
+        await flushTransport(8);
+
+        // Core did retrieve the intent but rejected the resume.
+        expect(provider.retrieveCalls).toEqual([{ mode: "payment", id: "pi_remote_victim" }]);
+        expect(core.error?.code).toBe("resume_client_secret_mismatch");
+        // Element did not hydrate victim state.
+        expect(el.status).not.toBe("succeeded");
+        expect(el.intentId).toBeNull();
+        expect(el.paymentMethod).toBeNull();
+        // The denial's `code` must survive the wire. The Core dispatches
+        // an `error` update before throwing, and `_setErrorStateFromUnknown`
+        // must defer to that richer publish instead of overwriting with
+        // the serialized throw's sparse {name,message} copy.
+        expect(el.error?.code).toBe("resume_client_secret_mismatch");
+      } finally {
+        shellProxy.dispose();
+      }
+    });
+
+    it("proxy-side failure AFTER a remote error still surfaces locally (stale-remote regression)", async () => {
+      // Scenario the seq-based defer in `_setErrorStateFromUnknown`
+      // protects against: (1) a remote cmd rejection leaves a truthy
+      // `_remoteValues.error` (e.g. resume denial); (2) a later unrelated
+      // cmd fails purely on the proxy side without reaching the Core
+      // (transport send throws, invoke timeout). Without the seq check,
+      // the second failure would silently defer to the first's stale
+      // remote error. With the seq check, the new local error must win.
+      setUrlSearch("?payment_intent=pi_stale_victim&payment_intent_client_secret=pi_stale_victim_secret_GUESSED");
+      provider.retrieveResult = {
+        id: "pi_stale_victim",
+        status: "succeeded",
+        mode: "payment",
+        clientSecret: "pi_stale_victim_secret_REAL",
+      };
+
+      el = createEl({ mode: "payment", "publishable-key": "pk_test_stale" });
+      const { client: realClient, server } = createMockTransportPair();
+
+      // Gate: let the first cmd (the resume) through; drop subsequent cmds
+      // by having `send` throw. This simulates "transport fine for the
+      // first call, broken for the next" which is the exact shape where
+      // `_remoteValues.error` would be left stale.
+      let cmdSent = 0;
+      const gatingClient: ClientTransport = {
+        send: (msg) => {
+          if (msg.type === "cmd") {
+            cmdSent++;
+            if (cmdSent > 1) throw new Error("synthetic cmd-2 send failure");
+          }
+          realClient.send(msg);
+        },
+        onMessage: (handler) => realClient.onMessage(handler),
+      };
+
+      const shellProxy = new RemoteShellProxy(core, server);
+      try {
+        el._connectRemote(gatingClient);
+        await flushTransport(8);
+
+        // Step 1: resume denial landed, richer code is visible.
+        expect(el.error?.code).toBe("resume_client_secret_mismatch");
+
+        // Step 2: trigger a second cmd that the gated transport will
+        // refuse to send. `prepare()` routes through the proxy which
+        // invokes `requestIntent` — a cmd.
+        await expect(el.prepare()).rejects.toBeDefined();
+        await flushTransport(2);
+
+        // The stale remote error must NOT mask the new transport failure.
+        // With the coarse `if (remote) return` guard, this would still
+        // read as `resume_client_secret_mismatch`; with the seq guard,
+        // the proxy-side error surfaces through local state.
+        expect(el.error?.message).toMatch(/synthetic cmd-2 send failure/);
+        expect(el.error?.code).not.toBe("resume_client_secret_mismatch");
+      } finally {
+        shellProxy.dispose();
+      }
+    });
+
+    it("pure proxy-side rejection (no remote error update) still surfaces as local error", async () => {
+      // Regression guard for the `_setErrorStateFromUnknown` remote-defer
+      // branch: it must NOT swallow rejections for which the Core never
+      // dispatched an error update (proxy timeout, validation failure on a
+      // property that isn't in the bindable surface). A transport that
+      // refuses every invoke by throwing from `send` is the most direct
+      // way to model this — the Core never sees the cmd, so nothing lands
+      // in `_remoteValues.error`, and the local fallback must fire.
+      el = createEl({ mode: "payment", "publishable-key": "pk_test_remote" });
+      const { client: realClient, server } = createMockTransportPair();
+      const failingClient: ClientTransport = {
+        send: (msg) => {
+          // Drop all cmd frames so pending invokes never resolve; let
+          // sync/set pass so initial hookup still works.
+          if (msg.type === "cmd") {
+            throw new Error("synthetic transport send failure");
+          }
+          realClient.send(msg);
+        },
+        onMessage: (handler) => realClient.onMessage(handler),
+      };
+      const shellProxy = new RemoteShellProxy(core, server);
+      try {
+        el._connectRemote(failingClient);
+        await flushTransport();
+        el.setAttribute("publishable-key", "pk_B"); // triggers prepare → requestIntent cmd
+        await flushTransport(4);
+        // Core's `_remoteValues.error` was never populated — the Core
+        // never received the cmd — so local state must surface.
+        expect(el.error).not.toBeNull();
+        expect(el.error?.message).toMatch(/synthetic transport send failure/);
+      } finally {
+        shellProxy.dispose();
+      }
     });
   });
 

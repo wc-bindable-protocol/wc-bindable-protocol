@@ -110,7 +110,12 @@ type StripeStatus =
 
 ### loading は別軸
 
-`loading: boolean` は **Stripe.js のスクリプトロードおよび Elements の初期 mount 中** を指し、`status` とは直交する(hawc-s3 の `loading` / `uploading` 分離と同じ)。
+`loading: boolean` は **何らかの非同期操作が進行中** であることを示し、`status` とは直交する(hawc-s3 の `loading` / `uploading` 分離と同じ)。具体的には次のいずれかで `true` となる:
+
+- Shell 側: Stripe.js のスクリプトロード、Elements の初期 mount 中
+- Core 側: `requestIntent` / `resumeIntent` の provider 呼び出し中、`reportConfirmation` の `processing` 分岐での provider polling 中
+
+UI を `loading` に直結すると、サーバーサイドの intent 作成や 3DS 復帰中もスピナが立つ。ブラウザ側の Stripe.js 初期化だけを区別したい場合は `hawc-stripe:element-ready` を使うこと。
 
 ### requires_action の扱い
 
@@ -146,8 +151,8 @@ raw な authorizer 例外(ACL lookup 失敗、DB エラー、stack trace など)
 | name | type | 説明 |
 |---|---|---|
 | `status` | `StripeStatus` | §4 の状態 |
-| `loading` | `boolean` | Stripe.js / Elements の初期化中 |
-| `amount` | `{ value: number; currency: string } \| null` | サーバーで確定した最終金額(payment モード時) |
+| `loading` | `boolean` | Core / Shell の非同期操作進行中(§4.loading 参照) |
+| `amount` | `{ value: number; currency: string } \| null` | サーバーで確定した最終金額(payment モード時のみ。setup モードでは常に `null`) |
 | `paymentMethod` | `{ id: string; brand: string; last4: string } \| null` | 成功後のみ。card number / CVC / exp は**絶対に含めない** |
 | `intentId` | `string \| null` | PaymentIntent / SetupIntent の id |
 | `error` | `StripeError \| null` | 失敗時のサニタイズ済みエラー |

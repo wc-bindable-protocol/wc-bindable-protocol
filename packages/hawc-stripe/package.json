@@ -26,7 +26,8 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "test": "vitest run __tests__",
-    "test:watch": "vitest __tests__"
+    "test:watch": "vitest __tests__",
+    "test:integration": "npm run build -w @wc-bindable/core -w @wc-bindable/remote -w @wc-bindable/hawc-stripe && playwright test"
   },
   "keywords": [
     "web-components",

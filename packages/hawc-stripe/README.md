@@ -55,12 +55,26 @@ core.registerWebhookHandler("payment_intent.succeeded", async (event) => {
 });
 
 // Wire to an HTTP endpoint. `rawBody` MUST be the unparsed request body.
+// Response codes control Stripe's retry policy (SPEC §6.2 / §9):
+//   4xx — Stripe stops retrying. Use for requests we can prove are
+//     unprocessable regardless of how often Stripe tries:
+//       · StripeSignatureVerificationError (forged/wrong signing secret)
+//       · hawc-stripe input/config guards (missing rawBody, missing
+//         stripe-signature header, webhookSecret not configured on the
+//         Core). These come through as plain Errors whose `message`
+//         starts with `[@wc-bindable/hawc-stripe]`.
+//   5xx — Stripe retries per its delivery policy. Reserve for fatal
+//     fulfillment handler failures (DB write failed, downstream 5xx).
 app.post("/webhooks/stripe", async (req, res) => {
   try {
     await core.handleWebhook(req.rawBody, req.headers["stripe-signature"]);
     res.status(200).end();
-  } catch {
-    res.status(400).end();
+  } catch (err) {
+    const e = err as { type?: string; message?: string };
+    const isSignatureError = e?.type === "StripeSignatureVerificationError";
+    const isInputOrConfigError =
+      typeof e?.message === "string" && e.message.startsWith("[@wc-bindable/hawc-stripe]");
+    res.status(isSignatureError || isInputOrConfigError ? 400 : 500).end();
   }
 });
 ```

@@ -405,7 +405,10 @@ export class StripeCore extends EventTarget {
 
     this._activeIntent = { id: creation.intentId, mode, generation: gen };
     this._setIntentId(creation.intentId);
-    if (creation.amount) this._setAmount(creation.amount);
+    // amount is only meaningful in payment mode (SPEC §5.1). In setup mode
+    // force it to null so a prior payment-mode amount does not bleed through
+    // into a subsequent setup session on the same Core.
+    this._setAmount(mode === "payment" && creation.amount ? creation.amount : null);
     this._setStatus("collecting");
     this._setLoading(false);
     return creation;
@@ -435,6 +438,11 @@ export class StripeCore extends EventTarget {
 
     switch (report.outcome) {
       case "succeeded": {
+        // A prior failed attempt on the SAME intent (card_declined → retry
+        // with another card → success) would otherwise leave the stale
+        // `error` populated even as status flips to succeeded. Clear it
+        // so the observable surface reflects the terminal truth.
+        this._setError(null);
         if (report.paymentMethod) {
           this._setPaymentMethod(report.paymentMethod);
         } else if (!this._paymentMethod) {
@@ -475,7 +483,7 @@ export class StripeCore extends EventTarget {
         try {
           const view = await this._provider.retrieveIntent(active.mode, active.id);
           if (gen !== this._generation) return; // superseded during await
-          this._reconcileFromIntentView(view);
+          this._reconcileFromIntentView(active.mode, view);
         } catch { /* ignore — webhook or next confirmation will resolve */ }
         return;
       }
@@ -496,9 +504,17 @@ export class StripeCore extends EventTarget {
    *   processing                         → "processing"
    *   canceled                           → "failed"
    */
-  private _reconcileFromIntentView(view: { status: string; amount?: StripeAmount; paymentMethod?: StripePaymentMethod; lastPaymentError?: StripeError }): void {
+  private _reconcileFromIntentView(mode: StripeMode, view: { status: string; amount?: StripeAmount; paymentMethod?: StripePaymentMethod; lastPaymentError?: StripeError }): void {
     if (view.paymentMethod) this._setPaymentMethod(view.paymentMethod);
-    if (view.amount) this._setAmount(view.amount);
+    // amount is only meaningful in payment mode (SPEC §5.1). Reflect it
+    // only for payment-mode views — if a custom provider returns amount on
+    // a setup intent view, drop it rather than leak it through the bindable
+    // surface. Symmetric with the amount-clear in `requestIntent`.
+    if (mode === "payment") {
+      if (view.amount) this._setAmount(view.amount);
+    } else if (this._amount !== null) {
+      this._setAmount(null);
+    }
     switch (view.status) {
       case "succeeded":
         this._setStatus("succeeded");
@@ -518,6 +534,12 @@ export class StripeCore extends EventTarget {
         this._setLoading(false);
         break;
       case "canceled":
+        // Stripe keeps `last_payment_error` / `last_setup_error` on the
+        // canceled intent when cancellation followed a failed attempt
+        // (declined card, authentication fail, etc). Surface it so UI
+        // can show *why* — otherwise the caller only sees a silent
+        // `failed`. Symmetric with requires_payment_method above.
+        if (view.lastPaymentError) this._setError(view.lastPaymentError);
         this._setStatus("failed");
         this._setLoading(false);
         break;
@@ -541,16 +563,47 @@ export class StripeCore extends EventTarget {
     if (active.id !== intentId) {
       raiseError(`cancelIntent id mismatch: expected ${active.id}, got ${intentId}.`);
     }
-    this._generation++;
-    this._activeIntent = null;
+    // Snapshot the generation for a post-await supersede check. If a
+    // key-change or other caller starts a fresh `requestIntent()` while
+    // we are parked on the cancel network call, the replacement session
+    // will have bumped `_generation` and rebuilt `_activeIntent`. Blindly
+    // proceeding with the state-clear below would then wipe the NEW
+    // session's intentId / amount / paymentMethod / status. Compare
+    // generations after the await and bail if they no longer match.
+    const activeGen = active.generation;
     if (active.mode === "payment") {
       try {
+        // Keep `_activeIntent` and the current generation set while the
+        // provider call is in flight — if Stripe rejects the cancel (network
+        // error, intent already in a non-cancelable state), we surface the
+        // error and leave ownership intact so the caller can retry or react
+        // to incoming reports/webhooks for the same intent. Clearing state
+        // before the await would zombify the intent: retries would hit the
+        // `if (!active) return;` early-out and webhooks would stop folding.
         await this._provider.cancelPaymentIntent(intentId);
       } catch (e: unknown) {
-        this._setError(this._sanitizeError(e));
+        // Only surface the error if THIS cancel still owns the session.
+        // If another requestIntent / reset has already taken over, the
+        // user-visible truth is the new session, not our dead intent.
+        if (this._activeIntent?.generation === activeGen) {
+          this._setError(this._sanitizeError(e));
+        }
         throw e;
       }
     }
+    if (this._activeIntent?.generation !== activeGen) {
+      // Superseded during the cancel await — a fresh session owns the
+      // surface now. Do NOT clobber its state. The pi_OLD cancel did
+      // happen at Stripe (that is what we requested), but the Core-side
+      // lifecycle reset belongs to whoever now holds `_activeIntent`.
+      return;
+    }
+    this._generation++;
+    this._activeIntent = null;
+    // Clear any error left over from a prior failed cancel attempt on this
+    // same intent — on the success path the terminal state must be a clean
+    // idle, mirroring requestIntent / resumeIntent / reset.
+    this._setError(null);
     this._setStatus("idle");
     this._setLoading(false);
     this._setPaymentMethod(null);
@@ -684,10 +737,19 @@ export class StripeCore extends EventTarget {
 
     this._activeIntent = { id: intentId, mode, generation: gen };
     this._setIntentId(intentId);
-    this._reconcileFromIntentView(view);
-    // Terminal of the resume call — if `_reconcileFromIntentView` did not
-    // hit a status branch, flip loading off explicitly.
-    this._setLoading(false);
+    this._reconcileFromIntentView(mode, view);
+    // Terminal of the resume call — flip loading off only if the
+    // reconciled status is not "processing". A 3DS redirect can land
+    // while Stripe is still asynchronously finalizing the charge
+    // (`intent.status === "processing"`), and `_reconcileFromIntentView`
+    // deliberately keeps `loading = true` in that branch so the UI
+    // spinner bridges the processing → succeeded/failed transition
+    // delivered via webhook. Unconditionally clearing loading here
+    // would drop the spinner mid-flight and make a still-in-progress
+    // charge look idle.
+    if (this._status !== "processing") {
+      this._setLoading(false);
+    }
   }
 
   /**
@@ -812,6 +874,10 @@ export class StripeCore extends EventTarget {
         // stamp "succeeded" onto a new session that is currently
         // mid-prepare.
         if (gen !== this._generation) return;
+        // Clear any lingering failure (e.g. a prior card_declined from
+        // a retried attempt on the same intent) so the terminal
+        // observable surface matches the success.
+        this._setError(null);
         this._setStatus("succeeded");
         this._setLoading(false);
         break;
@@ -827,15 +893,32 @@ export class StripeCore extends EventTarget {
       case "payment_intent.requires_action":
       case "setup_intent.requires_action":
         this._setStatus("requires_action");
+        // Mirror reportConfirmation's requires_action branch: the
+        // user is now owning the flow (3DS challenge, redirect, etc),
+        // so the server-side "busy" flag must clear — otherwise a
+        // session that was `loading=true` during processing stays
+        // stuck on the spinner even though the UI should be showing
+        // the challenge.
+        this._setLoading(false);
         break;
       case "payment_intent.processing":
+      case "setup_intent.processing":
         this._setStatus("processing");
+        this._setLoading(true);
         break;
       case "payment_intent.canceled":
-      case "setup_intent.canceled":
+      case "setup_intent.canceled": {
+        // Mirror the payment_failed / setup_failed branch above — a
+        // canceled intent can carry `last_payment_error` / `last_setup_
+        // error` that explains why (declined attempt that preceded the
+        // cancel, for example). Without this, cancellation-by-failure
+        // arrives on the Shell as a silent "failed" with no diagnostic.
+        const le = obj!.last_payment_error ?? obj!.last_setup_error;
+        if (le) this._setError(this._sanitizeError(le));
         this._setStatus("failed");
         this._setLoading(false);
         break;
+      }
     }
   }
 

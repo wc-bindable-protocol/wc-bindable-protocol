@@ -100,6 +100,22 @@ describe("StripeCore", () => {
       expect(c.amount).toEqual({ value: 1980, currency: "jpy" });
     });
 
+    it("clears stale payment amount when switching to setup mode on the same Core", async () => {
+      // First request: payment mode — amount lands on observable state.
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 1980, currency: "jpy" }));
+      await core.requestIntent({ mode: "payment", hint: {} });
+      expect(core.amount).toEqual({ value: 1980, currency: "jpy" });
+
+      // Now switch the builder and issue a setup-mode request. SPEC §5.1
+      // says `amount` is only meaningful for payment mode — the prior value
+      // must not leak into the setup session.
+      core.registerIntentBuilder(() => ({ mode: "setup" }));
+      provider.nextSetupIntentId = "seti_switch";
+      await core.requestIntent({ mode: "setup", hint: {} });
+      expect(core.intentId).toBe("seti_switch");
+      expect(core.amount).toBeNull();
+    });
+
     it("rejects on builder mode mismatch", async () => {
       core.registerIntentBuilder(() => ({ mode: "setup" }));
       await expect(core.requestIntent({ mode: "payment", hint: {} })).rejects.toThrow(
@@ -210,6 +226,31 @@ describe("StripeCore", () => {
       expect(core.status).toBe("succeeded");
     });
 
+    it("clears stale error on succeeded (fail-then-succeed on same intent, regression)", async () => {
+      // Real user flow: first confirm fails with card_declined, user
+      // switches card on the same Elements mount and retries. The
+      // second confirm's success MUST clear the prior decline — the
+      // observable surface otherwise reads "succeeded" with a stale
+      // card_declined error, which UI components render as "paid" +
+      // "your card was declined" simultaneously.
+      await core.requestIntent({ mode: "payment", hint: {} });
+      await core.reportConfirmation({
+        intentId: "pi_123",
+        outcome: "failed",
+        error: { code: "card_declined", message: "Your card was declined." },
+      });
+      expect(core.status).toBe("failed");
+      expect(core.error?.code).toBe("card_declined");
+
+      await core.reportConfirmation({
+        intentId: "pi_123",
+        outcome: "succeeded",
+        paymentMethod: { id: "pm_retry", brand: "visa", last4: "9999" },
+      });
+      expect(core.status).toBe("succeeded");
+      expect(core.error).toBeNull();
+    });
+
     it("drops stale reports for a superseded intent", async () => {
       provider.nextPaymentIntentId = "pi_first";
       await core.requestIntent({ mode: "payment", hint: {} });
@@ -255,6 +296,81 @@ describe("StripeCore", () => {
       expect(provider.cancelCalls).toHaveLength(0);
       expect(c.status).toBe("idle");
     });
+
+    it("slow cancel does NOT clobber a newer session started during the await (regression: key-change race)", async () => {
+      // Scenario: the Shell triggers `cancelIntent(pi_OLD)` on a
+      // key-change, then lets auto-prepare run immediately. If the
+      // cancel network call takes longer than the replacement
+      // requestIntent, the old cancel's post-await state-clear would
+      // wipe pi_NEW's intentId / amount / paymentMethod / status. The
+      // generation-check after the await must bail in that case.
+      await core.requestIntent({ mode: "payment", hint: {} }); // pi_123 active
+      let releaseCancel!: () => void;
+      provider.cancelPaymentIntent = (id: string) => {
+        provider.cancelCalls.push(id);
+        return new Promise<void>((resolve) => { releaseCancel = resolve; });
+      };
+
+      // Kick off cancel for pi_123 — it parks.
+      const cancelPromise = core.cancelIntent("pi_123");
+      // Start a replacement session BEFORE the cancel completes.
+      provider.nextPaymentIntentId = "pi_NEW";
+      await core.requestIntent({ mode: "payment", hint: {} });
+      expect(core.intentId).toBe("pi_NEW");
+      expect(core.status).toBe("collecting");
+      expect(core.amount).toEqual({ value: 1000, currency: "usd" });
+
+      // Let the stalled cancel resolve. Its post-await clear MUST NOT
+      // wipe pi_NEW's state.
+      releaseCancel();
+      await cancelPromise;
+
+      expect(core.intentId).toBe("pi_NEW");
+      expect(core.status).toBe("collecting");
+      expect(core.amount).toEqual({ value: 1000, currency: "usd" });
+      // Stripe-side cancel did run for pi_123.
+      expect(provider.cancelCalls).toContain("pi_123");
+    });
+
+    it("preserves _activeIntent when provider cancel fails so retry is still possible", async () => {
+      await core.requestIntent({ mode: "payment", hint: {} });
+      const cancelErr = new Error("network down");
+      let calls = 0;
+      provider.cancelPaymentIntent = async (id: string) => {
+        calls++;
+        provider.cancelCalls.push(id);
+        if (calls === 1) throw cancelErr;
+      };
+
+      await expect(core.cancelIntent("pi_123")).rejects.toThrow(/network down/);
+      // The error must be surfaced, but state is otherwise intact — the
+      // intent still exists at Stripe, so dropping ownership would make
+      // subsequent reports/webhooks silently unroutable.
+      expect(core.error?.message).toMatch(/network down/);
+      expect(core.intentId).toBe("pi_123");
+      expect(core.status).toBe("collecting");
+
+      // Late webhook for the same intent must still fold (ownership alive).
+      provider.webhookEvent = {
+        id: "evt_late",
+        type: "payment_intent.succeeded",
+        data: { object: { id: "pi_123" } },
+        created: 0,
+      };
+      await core.handleWebhook("{}", "sig");
+      expect(core.status).toBe("succeeded");
+
+      // Caller can retry the cancel after the transient error clears.
+      // (Even though the intent succeeded in this test, the point is that
+      // `cancelIntent` is still callable — no ghost `_activeIntent = null`.)
+      await core.cancelIntent("pi_123");
+      expect(calls).toBe(2);
+      expect(core.status).toBe("idle");
+      expect(core.intentId).toBeNull();
+      // The stale error from the failed first attempt must NOT leak into
+      // the terminal idle state on successful retry.
+      expect(core.error).toBeNull();
+    });
   });
 
   describe("handleWebhook", () => {
@@ -285,6 +401,152 @@ describe("StripeCore", () => {
       };
       await core.handleWebhook("{}", "sig");
       expect(core.status).toBe("succeeded");
+    });
+
+    it("webhook succeeded clears stale error from a prior failed attempt (regression)", async () => {
+      // Webhook-driven success path: pi_123 has a retained error from
+      // an earlier failed confirm (stored in observable `error`). A
+      // subsequent `payment_intent.succeeded` webhook arrives. The
+      // observable surface must end in a clean succeeded state — error
+      // cleared — or UIs will simultaneously show "paid" and "your
+      // card was declined".
+      await core.requestIntent({ mode: "payment", hint: {} });
+      await core.reportConfirmation({
+        intentId: "pi_123",
+        outcome: "failed",
+        error: { code: "card_declined", message: "Your card was declined." },
+      });
+      expect(core.error?.code).toBe("card_declined");
+
+      provider.webhookEvent = {
+        id: "evt_succ",
+        type: "payment_intent.succeeded",
+        data: { object: { id: "pi_123" } },
+        created: 0,
+      };
+      await core.handleWebhook("{}", "sig");
+      expect(core.status).toBe("succeeded");
+      expect(core.error).toBeNull();
+    });
+
+    it("clears loading on payment_intent.requires_action webhook (regression: stuck spinner)", async () => {
+      // Start with a processing session (loading=true). A
+      // requires_action webhook must hand control back to the user —
+      // mirror reportConfirmation's requires_action branch which
+      // clears loading, so the UI can surface the 3DS / bank challenge
+      // instead of showing an indefinite spinner.
+      await core.requestIntent({ mode: "payment", hint: {} });
+      // Keep the provider's retrieve returning "processing" so
+      // reportConfirmation's poll does not short-circuit to succeeded.
+      provider.retrieveResult = { id: "pi_123", status: "processing", mode: "payment" };
+      await core.reportConfirmation({ intentId: "pi_123", outcome: "processing" });
+      expect(core.status).toBe("processing");
+      expect(core.loading).toBe(true);
+
+      provider.webhookEvent = {
+        id: "evt_ra",
+        type: "payment_intent.requires_action",
+        data: { object: { id: "pi_123" } },
+        created: 0,
+      };
+      await core.handleWebhook("{}", "sig");
+      expect(core.status).toBe("requires_action");
+      expect(core.loading).toBe(false);
+    });
+
+    it("sets loading=true on payment_intent.processing webhook (contract symmetry)", async () => {
+      // Inverse of the requires_action case. A processing webhook
+      // after a collecting/idle session must ALSO raise loading so
+      // UIs wired on `loading` show the spinner for the processing
+      // window, matching reportConfirmation's processing branch.
+      await core.requestIntent({ mode: "payment", hint: {} });
+      expect(core.loading).toBe(false); // collecting
+      provider.webhookEvent = {
+        id: "evt_proc",
+        type: "payment_intent.processing",
+        data: { object: { id: "pi_123" } },
+        created: 0,
+      };
+      await core.handleWebhook("{}", "sig");
+      expect(core.status).toBe("processing");
+      expect(core.loading).toBe(true);
+    });
+
+    it("surfaces last_payment_error on payment_intent.canceled webhook (regression: silent failed)", async () => {
+      // Stripe's canceled PaymentIntent retains `last_payment_error`
+      // when cancellation followed a failed attempt. The Core must
+      // surface it so UIs can show *why*, not just "failed".
+      await core.requestIntent({ mode: "payment", hint: {} });
+      provider.webhookEvent = {
+        id: "evt_cancel_err",
+        type: "payment_intent.canceled",
+        data: {
+          object: {
+            id: "pi_123",
+            last_payment_error: {
+              code: "card_declined",
+              decline_code: "insufficient_funds",
+              type: "card_error",
+              message: "Your card has insufficient funds.",
+            },
+          },
+        },
+        created: 0,
+      };
+      await core.handleWebhook("{}", "sig");
+      expect(core.status).toBe("failed");
+      expect(core.error?.code).toBe("card_declined");
+      expect(core.error?.declineCode).toBe("insufficient_funds");
+      expect(core.error?.message).toMatch(/insufficient funds/);
+    });
+
+    it("surfaces last_setup_error on setup_intent.canceled webhook (regression)", async () => {
+      const c = new StripeCore(provider, { webhookSecret: "whsec_test" });
+      c.registerIntentBuilder(() => ({ mode: "setup" }));
+      await c.requestIntent({ mode: "setup", hint: {} });
+      provider.webhookEvent = {
+        id: "evt_setup_cancel_err",
+        type: "setup_intent.canceled",
+        data: {
+          object: {
+            id: "seti_123",
+            last_setup_error: {
+              code: "setup_intent_authentication_failure",
+              type: "invalid_request_error",
+              message: "Mandate authentication failed.",
+            },
+          },
+        },
+        created: 0,
+      };
+      await c.handleWebhook("{}", "sig");
+      expect(c.status).toBe("failed");
+      expect(c.error?.code).toBe("setup_intent_authentication_failure");
+      expect(c.error?.message).toMatch(/authentication failed/);
+    });
+
+    it("folds setup_intent.processing symmetrically with payment_intent.processing (regression)", async () => {
+      // Stripe emits `setup_intent.processing` for SetupIntents whose
+      // payment methods require async verification (ACH, SEPA
+      // mandates, etc). The webhook fold must drive the same state
+      // transition as the payment-mode event — otherwise a setup flow
+      // that enters processing stays pinned to `collecting` and the
+      // UI never shows the bridging spinner.
+      const c = new StripeCore(provider, { webhookSecret: "whsec_test" });
+      c.registerIntentBuilder(() => ({ mode: "setup" }));
+      await c.requestIntent({ mode: "setup", hint: {} });
+      expect(c.status).toBe("collecting");
+      expect(c.loading).toBe(false);
+
+      provider.webhookEvent = {
+        id: "evt_setup_proc",
+        type: "setup_intent.processing",
+        data: { object: { id: "seti_123" } },
+        created: 0,
+      };
+      await c.handleWebhook("{}", "sig");
+      expect(c.status).toBe("processing");
+      expect(c.loading).toBe(true);
     });
 
     it("does NOT fold events for a different intent id", async () => {
@@ -451,6 +713,69 @@ describe("StripeCore", () => {
       await core.resumeIntent("seti_xx", "setup", "seti_xx_secret_zzz");
       expect(provider.retrieveCalls).toEqual([{ mode: "setup", id: "seti_xx" }]);
       expect(core.intentId).toBe("seti_xx");
+    });
+
+    it("surfaces lastPaymentError when resumed intent is already canceled (regression: silent failed)", async () => {
+      // 3DS redirect back onto a PaymentIntent that Stripe canceled after
+      // a failed attempt. `_reconcileFromIntentView` must lift the
+      // lastPaymentError into observable state — same as the
+      // requires_payment_method branch does — so the UI can explain the
+      // failure. Before the fix, only status flipped to "failed" with
+      // `core.error` left null.
+      provider.retrieveResult = {
+        id: "pi_resumed_canceled",
+        status: "canceled",
+        mode: "payment",
+        clientSecret: "pi_resumed_canceled_secret_ok",
+        lastPaymentError: {
+          code: "card_declined",
+          declineCode: "generic_decline",
+          type: "card_error",
+          message: "Your card was declined.",
+        },
+      };
+      await core.resumeIntent("pi_resumed_canceled", "payment", "pi_resumed_canceled_secret_ok");
+      expect(core.status).toBe("failed");
+      expect(core.error?.code).toBe("card_declined");
+      expect(core.error?.declineCode).toBe("generic_decline");
+    });
+
+    it("keeps loading=true when the resumed intent is still processing (regression: processing spinner)", async () => {
+      // 3DS redirect can land while Stripe is still asynchronously
+      // finalizing the charge — intent.status is "processing" and the
+      // terminal state will arrive via webhook. The resume call must
+      // NOT flip loading off in that window, or the UI drops the
+      // spinner while money is still moving.
+      provider.retrieveResult = {
+        id: "pi_still_processing",
+        status: "processing",
+        mode: "payment",
+        amount: { value: 1980, currency: "jpy" },
+        clientSecret: "pi_still_processing_secret_ok",
+      };
+      await core.resumeIntent("pi_still_processing", "payment", "pi_still_processing_secret_ok");
+      expect(core.status).toBe("processing");
+      // Loading must bridge to the webhook-driven terminal state.
+      expect(core.loading).toBe(true);
+      expect(core.intentId).toBe("pi_still_processing");
+    });
+
+    it("drops amount from a setup-mode view (defense against custom providers)", async () => {
+      // A conformant Stripe SDK never returns an amount on a setup intent,
+      // but the provider interface is open to custom implementations. If
+      // one leaks amount into the setup view, the reconciler must drop it
+      // rather than expose a meaningless value through the bindable surface
+      // (SPEC §5.1 — amount is payment-mode only).
+      provider.retrieveResult = {
+        id: "seti_amt",
+        status: "succeeded",
+        mode: "setup",
+        amount: { value: 7777, currency: "usd" }, // bogus — should be ignored
+        clientSecret: "seti_amt_secret_ok",
+      };
+      await core.resumeIntent("seti_amt", "setup", "seti_amt_secret_ok");
+      expect(core.intentId).toBe("seti_amt");
+      expect(core.amount).toBeNull();
     });
 
     it("rejects invalid mode", async () => {

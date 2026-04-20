@@ -130,6 +130,15 @@ export class Stripe extends HTMLElement {
   private _trigger: boolean = false;
   private _errorState: StripeError | null = null;
   private _hasLocalError: boolean = false;
+  /**
+   * Monotonic counter for `error` updates received over the remote wire.
+   * Pairs with `_localErrorSeqSync` so `_setErrorStateFromUnknown` can tell
+   * "the Core just published this same failure as a richer error update"
+   * (seq advanced) from "there is a stale remote error, but my current
+   * rejection is unrelated and proxy-side" (seq unchanged).
+   */
+  private _remoteErrorSeq: number = 0;
+  private _localErrorSeqSync: number = 0;
 
   /**
    * Stripe.js instance + the Elements group scoped to the active intent.
@@ -169,6 +178,15 @@ export class Stripe extends HTMLElement {
    * prepare should not wedge the element; the next call retries.
    */
   private _preparePromise: Promise<void> | null = null;
+  /**
+   * Dedupe guard for `submit()`. A double-click (or two sources calling
+   * submit back-to-back) must not fire two `confirmPayment` calls for
+   * the same intent — doing so lets the later result overwrite the
+   * earlier one even though the Core only accepts one decisive outcome
+   * per intent generation. Subsequent calls while a submit is in flight
+   * return the same promise.
+   */
+  private _submitPromise: Promise<void> | null = null;
   /**
    * Monotonic counter bumped by any invalidation path that must stop an
    * in-flight `prepare()` — `_invalidateForKeyChange`, `reset()`,
@@ -257,6 +275,10 @@ export class Stripe extends HTMLElement {
       this._proxy = null;
     }
     this._remoteValues = {};
+    // Reset the remote-error seq pairing so a subsequent `_connectRemote`
+    // does not carry a stale delta from the prior session.
+    this._remoteErrorSeq = 0;
+    this._localErrorSeqSync = 0;
     if (this._ws) {
       const ws = this._ws;
       this._ws = null;
@@ -273,11 +295,36 @@ export class Stripe extends HTMLElement {
       this._remoteValues.status = "idle";
       this.dispatchEvent(new CustomEvent("hawc-stripe:status-changed", { detail: "idle", bubbles: true }));
     }
+    // Also transition the card / amount / intent surface to null and
+    // notify subscribers. The getters already report null once
+    // `_disposeRemote` empties `_remoteValues`, but UIs wired on
+    // `-changed` events need an explicit null dispatch — otherwise
+    // "last card" / "last total" stays painted after disconnect and
+    // can be confused for a current charge.
+    if (this._remoteValues.intentId != null) {
+      this._remoteValues.intentId = null;
+      this.dispatchEvent(new CustomEvent("hawc-stripe:intentId-changed", { detail: null, bubbles: true }));
+    }
+    if (this._remoteValues.amount != null) {
+      this._remoteValues.amount = null;
+      this.dispatchEvent(new CustomEvent("hawc-stripe:amount-changed", { detail: null, bubbles: true }));
+    }
+    if (this._remoteValues.paymentMethod != null) {
+      this._remoteValues.paymentMethod = null;
+      this.dispatchEvent(new CustomEvent("hawc-stripe:paymentMethod-changed", { detail: null, bubbles: true }));
+    }
   }
 
   private _setErrorState(err: StripeError): void {
     this._errorState = err;
     this._hasLocalError = true;
+    // Snapshot the remote error-update counter at the moment we take
+    // ownership locally. A subsequent remote `error` update will bump
+    // `_remoteErrorSeq` past this snapshot; the delta is how
+    // `_setErrorStateFromUnknown` decides whether a truthy
+    // `_remoteValues.error` is fresh-enough to defer to or stale from a
+    // prior unrelated failure.
+    this._localErrorSeqSync = this._remoteErrorSeq;
     this.dispatchEvent(new CustomEvent("hawc-stripe:error", { detail: err, bubbles: true }));
   }
 
@@ -293,6 +340,21 @@ export class Stripe extends HTMLElement {
     this._proxy = createRemoteCoreProxy(StripeCore.wcBindable, transport);
     this._unbind = bind(this._proxy, (name, value) => {
       this._remoteValues[name] = value;
+      if (name === "error") {
+        // Bump on every error update (even null) so
+        // `_setErrorStateFromUnknown` can pair a subsequent cmd-throw
+        // with its Core-originated publish.
+        this._remoteErrorSeq++;
+        // A truthy remote error supersedes any stale local state — the
+        // Core has asserted authority. A null publish leaves local
+        // alone so a pre-connect transport-level error (set before the
+        // first sync arrived) is not silently cleared by an initial
+        // `error: null` sync.
+        if (value) {
+          this._hasLocalError = false;
+          this._errorState = null;
+        }
+      }
       const prop = Stripe.wcBindable.properties.find(p => p.name === name);
       if (prop) {
         this.dispatchEvent(new CustomEvent(prop.event, { detail: value, bubbles: true }));
@@ -322,6 +384,31 @@ export class Stripe extends HTMLElement {
   }
 
   private _setErrorStateFromUnknown(e: unknown): void {
+    // In remote mode, a cmd/setWithAck rejection typically travels
+    // alongside an `error` property update the Core dispatches before
+    // (re-)throwing. The update carries the full sanitized `StripeError`
+    // (`code`, `declineCode`, `type`, `message`) while the cmd-throw is
+    // serialized through RemoteCoreProxy's error serializer which only
+    // preserves `name`/`message`/`stack`. Overwriting with the sparse
+    // local copy would mask the richer Core-authoritative error.
+    //
+    // Defer ONLY when the truthy remote error is for *this same failure*
+    // — i.e. `_remoteErrorSeq` has advanced since the last local set.
+    // Otherwise the rejection is a pure proxy-side failure (transport
+    // send throw, invoke timeout) whose error never reached the Core, and
+    // the existing `_remoteValues.error` is stale from an earlier
+    // unrelated Core rejection. In that case fall through to the local
+    // path so the user sees the current failure.
+    if (this._isRemote) {
+      const remote = this._remoteValues.error as StripeError | null | undefined;
+      if (remote && this._remoteErrorSeq > this._localErrorSeqSync) {
+        // Consume the freshness so a follow-up proxy-side failure with
+        // no new remote publish surfaces locally instead of deferring
+        // to this now-stale value.
+        this._localErrorSeqSync = this._remoteErrorSeq;
+        return;
+      }
+    }
     if (e && typeof e === "object") {
       const rec = e as Record<string, unknown>;
       this._setErrorState({
@@ -806,7 +893,27 @@ export class Stripe extends HTMLElement {
    *   - 3DS redirect → `confirmPayment` redirects away; the next page load's
    *     `connectedCallback` handles `_resumeFromRedirect`.
    */
-  async submit(): Promise<void> {
+  submit(): Promise<void> {
+    // Dedupe concurrent submits. A double-click must yield ONE confirm,
+    // not two that race on reportConfirmation — the Core only
+    // distinguishes by intentId + generation, so a second confirm for
+    // the same intent would overwrite the first's outcome.
+    //
+    // Return the in-flight promise directly (not an `async` wrapper
+    // around it) so repeat callers share identity and can observe a
+    // unified resolution rather than racing on separately-allocated
+    // wrappers around the same underlying work.
+    if (this._submitPromise) return this._submitPromise;
+    const promise = this._submitImpl();
+    this._submitPromise = promise;
+    const cleanup = (): void => {
+      if (this._submitPromise === promise) this._submitPromise = null;
+    };
+    promise.then(cleanup, cleanup);
+    return promise;
+  }
+
+  private async _submitImpl(): Promise<void> {
     this._clearErrorState();
 
     if (this._preparePromise) {
@@ -1055,18 +1162,54 @@ export class Stripe extends HTMLElement {
     if (!intentId || !clientSecret || !mode) return;
 
     this._resuming = true;
+    // Only mark the URL "consumed" when the Core gave a definitive answer
+    // (success or a Core-originated rejection) for THIS resume call.
+    // Transport-level failures (WebSocket close mid-invoke, proxy
+    // timeout, cmd-send throw, a transient 5xx from the server) must
+    // leave `_resumed = false` and the URL params intact so a later
+    // trigger — reconnect, component re-mount, page reload — can retry.
+    // Stripping on transport failure is the path that creates duplicate-
+    // charge exposure: the 3DS flow already cleared at Stripe's end, but
+    // the app would have no way to fold the real intent's terminal state
+    // back into observable state and would auto-prepare a NEW intent for
+    // the same cart.
+    //
+    // Snapshot `_remoteErrorSeq` BEFORE the await so "Core spoke" is
+    // decided by whether it published any error update during THIS
+    // resume, not by whether some stale error from an earlier operation
+    // is still sitting in `_remoteValues.error`. Checking only
+    // `!!_remoteValues.error` would misclassify a pure cmd-send failure
+    // on a session that already holds an old error as a Core-origin
+    // denial and strip the URL. Mirrors the same seq-based freshness
+    // check used in `_setErrorStateFromUnknown`.
+    const remoteSeqBefore = this._isRemote ? this._remoteErrorSeq : 0;
+    let coreSpoke = false;
     try {
       await this._coreResume(intentId, mode, clientSecret);
+      coreSpoke = true;
     } catch (e: unknown) {
       this._setErrorStateFromUnknown(e);
+      if (this._isRemote) {
+        // Core participated in this resume iff at least one `error`
+        // update crossed the wire since we started. A Core-origin
+        // rejection ALWAYS bumps the seq (via `_setError(null)` at the
+        // top of resumeIntent + `_setError(err)` before throwing). A
+        // cmd that never reached the Core advances nothing.
+        coreSpoke = this._remoteErrorSeq > remoteSeqBefore;
+      } else {
+        // Local mode has no transport boundary — a throw out of
+        // `_coreResume` is the Core's own throw. Treat as definitive.
+        coreSpoke = true;
+      }
     } finally {
       this._resuming = false;
-      this._resumed = true;
-      // Strip the 3DS-return params regardless of success/failure: the
-      // URL has now been consumed by this element and must not continue
-      // to block future prepare() calls on this page load, nor trigger
-      // re-resume on a reload or share.
-      this._stripRedirectParamsFromUrl();
+      if (coreSpoke) {
+        this._resumed = true;
+        this._stripRedirectParamsFromUrl();
+      }
+      // Transport-only failure path: leave `_resumed = false` so the
+      // next trigger (`_connectRemote` after a reconnect, a fresh
+      // `connectedCallback` on page reload) picks the URL up again.
     }
   }
 
