@@ -1,0 +1,104 @@
+# @wc-bindable/hawc-stripe
+
+`@wc-bindable/hawc-stripe` is a headless **Stripe payments** component built on wc-bindable-protocol.
+
+It is not a visual UI widget.
+It is an **I/O node** that connects Stripe's PaymentIntent / SetupIntent + Elements flow to reactive state — with PCI-safe card entry, 3DS redirect handling, and server-side webhook reconciliation.
+
+- **input / command surface**: `mode`, `amount-value`, `amount-currency`, `customer-id`, `publishable-key`, `return-url`, `prepare()`, `submit()`, `reset()`, `abort()`
+- **output state surface**: `status`, `loading`, `amount`, `paymentMethod`, `intentId`, `error`
+
+`@wc-bindable/hawc-stripe` follows the [HAWC](https://github.com/wc-bindable-protocol/wc-bindable-protocol/blob/main/packages/hawc/README.md) architecture:
+
+- **Core** (`StripeCore`) lives server-side. Owns the Stripe secret key (via `IStripeProvider`), creates PaymentIntents / SetupIntents, verifies and dispatches webhook events.
+- **Shell** (`<hawc-stripe>`) lives in the browser. Loads Stripe.js, mounts the Payment Element in an iframe **sandboxed by Stripe**, drives `confirmPayment` / `confirmSetup`, handles the 3DS redirect return.
+- **Card data never traverses the WebSocket** — Stripe Elements posts it directly to Stripe from within its iframe; only PaymentIntent creation, confirmation outcomes, and webhook-driven status updates flow through our server.
+
+In the HAWC taxonomy this is the **Case C** shape: the Core owns decisions and policy on the server, while the Shell is a browser-anchored execution engine for a data plane the server cannot perform on the browser's behalf.
+
+See [SPEC.md](./SPEC.md) for the full protocol — state machine, wcBindable surface, authorization model for 3DS resume, PCI scope invariants, webhook pipeline, and the security section that apps must follow in production.
+
+## Quick start
+
+### Server
+
+```ts
+import Stripe from "stripe";
+import { StripeCore, StripeSdkProvider } from "@wc-bindable/hawc-stripe/server";
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
+const provider = new StripeSdkProvider(stripe);
+
+const core = new StripeCore(provider, {
+  webhookSecret: process.env.STRIPE_WEBHOOK_SECRET,
+  userContext: authenticatedUser,
+});
+
+// REQUIRED — server decides the final amount/currency/metadata from the
+// authenticated user + cart, never from the Shell's hint.
+core.registerIntentBuilder((request, ctx) => {
+  if (request.mode === "setup") {
+    return { mode: "setup", customer: resolveCustomer(ctx) };
+  }
+  const cart = loadCart(ctx);
+  return {
+    mode: "payment",
+    amount: cart.totalInSmallestCurrencyUnit(),
+    currency: cart.currency,
+    metadata: { cartId: cart.id },
+  };
+});
+
+// Webhook route handler — Stripe's HMAC-signed events land here.
+core.registerWebhookHandler("payment_intent.succeeded", async (event) => {
+  await fulfillOrder(event.data.object);
+});
+
+// Wire to an HTTP endpoint. `rawBody` MUST be the unparsed request body.
+app.post("/webhooks/stripe", async (req, res) => {
+  try {
+    await core.handleWebhook(req.rawBody, req.headers["stripe-signature"]);
+    res.status(200).end();
+  } catch {
+    res.status(400).end();
+  }
+});
+```
+
+### Browser
+
+```html
+<hawc-stripe
+  mode="payment"
+  publishable-key="pk_live_..."
+  amount-value="1980"
+  amount-currency="jpy"
+  return-url="https://example.com/checkout/complete"
+></hawc-stripe>
+
+<button onclick="document.querySelector('hawc-stripe').submit()">Pay</button>
+```
+
+Auto-prepare mounts Stripe Elements as soon as the element is connected and a `publishable-key` is present. `submit()` drives confirmation. 3DS redirect returns are detected and folded back into state via an authenticated `resumeIntent` call (the element reads Stripe's `payment_intent_client_secret` from the URL as the ownership token).
+
+## Security — Your Responsibilities
+
+The Quick Start is **deliberately minimal** and **not production-ready**. Before shipping, read SPEC.md §9 and at a minimum:
+
+- **Authenticate the WebSocket / HTTP session** that backs the Core.
+- **Compute the intent amount server-side** in `registerIntentBuilder` from authenticated user context. Never trust `request.hint.amountValue`.
+- **Preserve the raw webhook body** before any JSON parser touches it — signature verification requires the exact bytes Stripe sent.
+- **Consider `registerResumeAuthorizer`** for multi-tenant deployments so a leaked `client_secret` alone cannot resume a foreign user's intent.
+- **Sanitize errors** that cross the wire: the built-in sanitizer keeps `code` / `decline_code` but your custom handlers must be equally careful.
+
+## Install
+
+```bash
+npm install @wc-bindable/hawc-stripe stripe @stripe/stripe-js
+```
+
+`stripe` (server SDK) and `@stripe/stripe-js` (browser loader) are declared as optional peer dependencies. Install whichever side you consume.
+
+## License
+
+MIT. See [LICENSE](./LICENSE).
