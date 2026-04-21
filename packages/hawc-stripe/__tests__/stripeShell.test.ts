@@ -1558,6 +1558,48 @@ describe("<hawc-stripe> Shell", () => {
         shellProxy.dispose();
       }
     });
+
+    it("local unknown-object fallback preserves declineCode/type fields", () => {
+      el = createEl({ mode: "payment", "publishable-key": "pk_test_local" });
+      el.attachLocalCore(core);
+
+      (el as any)._setErrorStateFromUnknown({
+        code: "card_declined",
+        declineCode: "insufficient_funds",
+        type: "card_error",
+        message: "Declined.",
+      });
+      expect(el.error?.code).toBe("card_declined");
+      expect(el.error?.declineCode).toBe("insufficient_funds");
+      expect(el.error?.type).toBe("card_error");
+      expect(el.error?.message).toBe("Declined.");
+    });
+
+    it("local unknown-object fallback falls back to snake_case decline_code", () => {
+      el = createEl({ mode: "payment", "publishable-key": "pk_test_local" });
+      el.attachLocalCore(core);
+
+      (el as any)._setErrorStateFromUnknown({
+        code: "card_declined",
+        decline_code: "insufficient_funds",
+        message: "Declined.",
+      });
+      expect(el.error?.code).toBe("card_declined");
+      expect(el.error?.declineCode).toBe("insufficient_funds");
+      expect(el.error?.type).toBeUndefined();
+      expect(el.error?.message).toBe("Declined.");
+    });
+
+    it("local unknown-object fallback keeps optional fields undefined when missing", () => {
+      el = createEl({ mode: "payment", "publishable-key": "pk_test_local" });
+      el.attachLocalCore(core);
+
+      (el as any)._setErrorStateFromUnknown({ message: "x" });
+      expect(el.error?.code).toBeUndefined();
+      expect(el.error?.declineCode).toBeUndefined();
+      expect(el.error?.type).toBeUndefined();
+      expect(el.error?.message).toBe("x");
+    });
   });
 
   describe("lifecycle commands", () => {

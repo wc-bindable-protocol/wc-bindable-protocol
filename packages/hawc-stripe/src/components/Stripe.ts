@@ -490,8 +490,13 @@ export class Stripe extends HTMLElementCtor {
     }
     if (e && typeof e === "object") {
       const rec = e as Record<string, unknown>;
+      const declineCode = typeof rec.declineCode === "string"
+        ? rec.declineCode
+        : (typeof rec.decline_code === "string" ? rec.decline_code : undefined);
       this._setErrorState({
         code: typeof rec.code === "string" ? rec.code : undefined,
+        declineCode,
+        type: typeof rec.type === "string" ? rec.type : undefined,
         message: typeof rec.message === "string" ? rec.message : "Unknown error.",
       });
     } else {
