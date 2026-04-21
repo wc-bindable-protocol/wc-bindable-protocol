@@ -16,12 +16,18 @@ import { raiseError } from "../raiseError.js";
  */
 export interface StripeNodeLike {
   paymentIntents: {
-    create(params: Record<string, unknown>): Promise<Record<string, unknown>>;
+    create(
+      params: Record<string, unknown>,
+      options?: { idempotencyKey?: string },
+    ): Promise<Record<string, unknown>>;
     retrieve(id: string, opts?: Record<string, unknown>): Promise<Record<string, unknown>>;
     cancel(id: string): Promise<Record<string, unknown>>;
   };
   setupIntents: {
-    create(params: Record<string, unknown>): Promise<Record<string, unknown>>;
+    create(
+      params: Record<string, unknown>,
+      options?: { idempotencyKey?: string },
+    ): Promise<Record<string, unknown>>;
     retrieve(id: string, opts?: Record<string, unknown>): Promise<Record<string, unknown>>;
     /**
      * Present on real stripe-node clients but optional here so tests/mocks
@@ -34,6 +40,16 @@ export interface StripeNodeLike {
   webhooks: {
     constructEvent(payload: string, header: string, secret: string): Record<string, unknown>;
   };
+}
+
+export interface StripeSdkProviderIdempotencyContext {
+  operation: "createPaymentIntent" | "createSetupIntent";
+  mode: StripeMode;
+  options: PaymentIntentOptions | SetupIntentOptions;
+}
+
+export interface StripeSdkProviderOptions {
+  buildIdempotencyKey?: (ctx: StripeSdkProviderIdempotencyContext) => string | undefined;
 }
 
 function extractAmount(obj: Record<string, unknown>): StripeAmount | undefined {
@@ -89,10 +105,18 @@ function extractLastPaymentError(obj: Record<string, unknown>): StripeError | un
  */
 export class StripeSdkProvider implements IStripeProvider {
   private _client: StripeNodeLike;
+  private _buildIdempotencyKey?: StripeSdkProviderOptions["buildIdempotencyKey"];
 
-  constructor(client: StripeNodeLike) {
+  constructor(client: StripeNodeLike, options: StripeSdkProviderOptions = {}) {
     if (!client) raiseError("stripe client is required.");
+    if (
+      options.buildIdempotencyKey !== undefined
+      && typeof options.buildIdempotencyKey !== "function"
+    ) {
+      raiseError("buildIdempotencyKey must be a function.");
+    }
     this._client = client;
+    this._buildIdempotencyKey = options.buildIdempotencyKey;
   }
 
   async createPaymentIntent(opts: PaymentIntentOptions): Promise<IntentCreationResult> {
@@ -108,7 +132,15 @@ export class StripeSdkProvider implements IStripeProvider {
     if (params.automatic_payment_methods === undefined && params.payment_method_types === undefined) {
       params.automatic_payment_methods = { enabled: true };
     }
-    const result = await this._client.paymentIntents.create(params);
+    const idempotencyKey = this._buildIdempotencyKey?.({
+      operation: "createPaymentIntent",
+      mode: "payment",
+      options: opts,
+    });
+    const result = await this._client.paymentIntents.create(
+      params,
+      idempotencyKey ? { idempotencyKey } : undefined,
+    );
     const id = typeof result.id === "string" ? result.id : "";
     const clientSecret = typeof result.client_secret === "string" ? result.client_secret : "";
     if (!id || !clientSecret) {
@@ -127,7 +159,15 @@ export class StripeSdkProvider implements IStripeProvider {
     if (params.automatic_payment_methods === undefined && params.payment_method_types === undefined) {
       params.automatic_payment_methods = { enabled: true };
     }
-    const result = await this._client.setupIntents.create(params);
+    const idempotencyKey = this._buildIdempotencyKey?.({
+      operation: "createSetupIntent",
+      mode: "setup",
+      options: opts,
+    });
+    const result = await this._client.setupIntents.create(
+      params,
+      idempotencyKey ? { idempotencyKey } : undefined,
+    );
     const id = typeof result.id === "string" ? result.id : "";
     const clientSecret = typeof result.client_secret === "string" ? result.client_secret : "";
     if (!id || !clientSecret) {

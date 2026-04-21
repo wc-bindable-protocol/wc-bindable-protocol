@@ -14,7 +14,11 @@
  */
 export { StripeCore } from "./core/StripeCore.js";
 export { StripeSdkProvider } from "./providers/StripeSdkProvider.js";
-export type { StripeNodeLike } from "./providers/StripeSdkProvider.js";
+export type {
+  StripeNodeLike,
+  StripeSdkProviderOptions,
+  StripeSdkProviderIdempotencyContext,
+} from "./providers/StripeSdkProvider.js";
 export type {
   IStripeProvider, StripeMode, StripeStatus, StripeAmount, StripePaymentMethod, StripeError,
   StripeEvent, StripeIntentView, IntentRequestHint, IntentRequest, IntentBuilder,

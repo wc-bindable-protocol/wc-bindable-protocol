@@ -29,7 +29,10 @@ import Stripe from "stripe";
 import { StripeCore, StripeSdkProvider } from "@wc-bindable/hawc-stripe/server";
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
-const provider = new StripeSdkProvider(stripe);
+const provider = new StripeSdkProvider(stripe, {
+  // Optional but recommended: make intent creation idempotent per cart/user.
+  buildIdempotencyKey: ({ operation }) => `${operation}:${authenticatedUser.sub}:${activeCartId}`,
+});
 
 const core = new StripeCore(provider, {
   webhookSecret: process.env.STRIPE_WEBHOOK_SECRET,
@@ -107,7 +110,7 @@ The Quick Start is **deliberately minimal** and **not production-ready**. Before
 - **Authenticate the WebSocket / HTTP session** that backs the Core.
 - **Compute the intent amount server-side** in `registerIntentBuilder` from authenticated user context. Never trust `request.hint.amountValue`.
 - **Preserve the raw webhook body** before any JSON parser touches it — signature verification requires the exact bytes Stripe sent.
-- **Attach an idempotency key** when wrapping `StripeSdkProvider` (or your own `IStripeProvider`). The default provider calls `paymentIntents.create` / `setupIntents.create` / `paymentIntents.cancel` without one — on network flake the Shell's retry can create a second intent for the same cart and charge the user twice. Subclass or compose the provider to pass `{ idempotencyKey: ... }` keyed on cart id + user id.
+- **Enable idempotent intent creation** by supplying `buildIdempotencyKey` to `StripeSdkProvider` (or implement it in your own `IStripeProvider`). On network flake, retries without a key can create multiple intents for the same cart/user.
 - **Prefer `await el.abort()` before removing the element** when you need deterministic cancel of the active PaymentIntent. Automatic disconnect teardown is best-effort; in a narrow window (disconnect during in-flight intent create), the intent may survive until Stripe natural expiry.
 - **Keep webhook handlers idempotent** even with Core dedup enabled. Core suppresses duplicate `event.id` deliveries only within an in-memory per-process window; multi-process routing and process restarts still require DB-backed idempotency keyed by `event.id`.
 - **Consider `registerResumeAuthorizer`** for multi-tenant deployments so a leaked `client_secret` alone cannot resume a foreign user's intent.
