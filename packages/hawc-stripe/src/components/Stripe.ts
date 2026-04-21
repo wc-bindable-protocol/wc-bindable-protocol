@@ -626,6 +626,9 @@ export class Stripe extends HTMLElementCtor {
     if (v) {
       this._trigger = true;
       this.dispatchEvent(new CustomEvent("hawc-stripe:trigger-changed", { detail: true, bubbles: true }));
+      // Fire-and-forget by design: trigger is a declarative pulse, not an
+      // imperative API surface. Rejections are surfaced through `error`
+      // state / `hawc-stripe:error`; this setter only toggles the pulse.
       this.submit().catch(() => {}).finally(() => {
         this._trigger = false;
         this.dispatchEvent(new CustomEvent("hawc-stripe:trigger-changed", { detail: false, bubbles: true }));
@@ -701,6 +704,8 @@ export class Stripe extends HTMLElementCtor {
     const params = new URLSearchParams(globalThis.location?.search ?? "");
     const hasPayment = !!params.get("payment_intent") && !!params.get("payment_intent_client_secret");
     const hasSetup = !!params.get("setup_intent") && !!params.get("setup_intent_client_secret");
+    // Malformed URLs that carry both tuples are treated as post-redirect;
+    // `_resumeFromRedirect()` applies deterministic payment-first precedence.
     return hasPayment || hasSetup;
   }
 
@@ -1171,6 +1176,18 @@ export class Stripe extends HTMLElementCtor {
 
   // --- Confirmation result helpers ---
 
+  /**
+   * Sanitize Stripe.js-originated errors before putting them into Shell state
+   * and sending `reportConfirmation` to Core.
+   *
+   * Unlike Core's `_sanitizeError` (which handles arbitrary server-side
+   * throwables), this path only receives objects produced by Stripe.js
+   * confirm/retrieve flows in the browser. We therefore trust Stripe.js's own
+   * client-side sanitization contract for `message` and keep it when present.
+   *
+   * If this function is ever reused for non-Stripe.js inputs, DO NOT keep this
+   * policy: align with Core's stricter allowlist-gated message forwarding.
+   */
   private _sanitizeStripeJsError(err: Record<string, unknown>): StripeError {
     return {
       code: typeof err.code === "string" ? err.code : undefined,
@@ -1321,6 +1338,8 @@ export class Stripe extends HTMLElementCtor {
     let intentId: string | null = null;
     let clientSecret: string | null = null;
     let mode: StripeMode | null = null;
+    // Deterministic tie-break for malformed URLs containing both tuples:
+    // prefer payment so behavior is stable across runs.
     if (paymentIntentId && paymentSecret) {
       intentId = paymentIntentId;
       clientSecret = paymentSecret;

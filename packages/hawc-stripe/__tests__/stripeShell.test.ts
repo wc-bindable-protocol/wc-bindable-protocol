@@ -866,6 +866,25 @@ describe("<hawc-stripe> Shell", () => {
       expect(el.status).toBe("succeeded");
     });
 
+    it("when both redirect tuples are present, resume deterministically prefers payment", async () => {
+      setUrlSearch(
+        "?payment_intent=pi_both&payment_intent_client_secret=pi_both_secret_ok&setup_intent=seti_both&setup_intent_client_secret=seti_both_secret_ok"
+      );
+      provider.retrieveResult = {
+        id: "pi_both",
+        status: "succeeded",
+        mode: "payment",
+        clientSecret: "pi_both_secret_ok",
+      };
+      // URL redirect tuple decides resume mode; element `mode` attribute is ignored here.
+      el = createEl({ mode: "setup", "publishable-key": "pk_test_123" });
+      el.attachLocalCore(core);
+      await new Promise(r => setTimeout(r, 0));
+      await new Promise(r => setTimeout(r, 0));
+      expect(provider.retrieveCalls).toEqual([{ mode: "payment", id: "pi_both" }]);
+      expect(el.intentId).toBe("pi_both");
+    });
+
     it("rejects a foreign intent id when the client_secret does not match (permission-bypass regression)", async () => {
       // Attacker constructs a URL with a valid victim intent id but a
       // guessed/forged client_secret. Stripe retrieves the real intent,

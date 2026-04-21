@@ -124,6 +124,7 @@ UI を `loading` に直結すると、サーバーサイドの intent 作成や 
 1. URL のクエリから intent id **と** Stripe 発行の `client_secret` の**両方**を読む(Stripe は redirect URL に必ず両方を載せる):
    - `payment_intent=pi_xxx` + `payment_intent_client_secret=pi_xxx_secret_yyy`
    - または `setup_intent=seti_xxx` + `setup_intent_client_secret=seti_xxx_secret_yyy`
+  - 万一 malformed URL で両方の tuple が同時に存在する場合、Shell は決定的に payment tuple を優先する
 2. `StripeCore.resumeIntent(intentId, mode, clientSecret)` RPC を呼ぶ。
 3. Core は server-side で `provider.retrieveIntent` を叩き、**retrieve された intent の `client_secret` と Shell から渡された `clientSecret` が一致すること**を検証する(default-secure、常時有効)。
 4. 追加で `registerResumeAuthorizer` が登録されていればそれを呼び、`false` なら reject(defense-in-depth、任意)。
@@ -358,6 +359,7 @@ Core の succeeded 分岐は、`report.paymentMethod` が欠けており `this._
 
 追加の非 property イベント:
 - `hawc-stripe:appearance-warning` — `appearance` setter の hot-swap (`elements.update({ appearance })`) が throw したとき。`detail: { message, error }` を通知しつつ、setter 自体は throw せず次回 mount での反映にフォールバック
+- `hawc-stripe:trigger-changed` — `trigger` の declarative pulse の開始/終了。`detail: true` で submit 開始、`detail: false` で終了。内部 `submit()` の reject はここでは再 throw せず、通常の `error` state / `hawc-stripe:error` で観測する
 
 ### 7.5 disconnectedCallback の契約
 

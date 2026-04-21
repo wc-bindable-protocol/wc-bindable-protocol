@@ -984,6 +984,7 @@ export class StripeCore extends EventTarget {
     const active = this._activeIntent;
     if (!active) return;
     const obj = event.data?.object as Record<string, unknown> | undefined;
+    if (!obj) return;
     const objId = obj && typeof obj.id === "string" ? obj.id : undefined;
     if (!objId || objId !== active.id) return;
     // Snapshot the generation at entry. Any branch below that awaits must
@@ -1039,7 +1040,7 @@ export class StripeCore extends EventTarget {
       }
       case "payment_intent.payment_failed":
       case "setup_intent.setup_failed": {
-        const le = obj!.last_payment_error ?? obj!.last_setup_error;
+        const le = obj.last_payment_error ?? obj.last_setup_error;
         if (le) this._setError(this._sanitizeError(le));
         this._setStatus("failed");
         this._setLoading(false);
@@ -1068,7 +1069,7 @@ export class StripeCore extends EventTarget {
         // error` that explains why (declined attempt that preceded the
         // cancel, for example). Without this, cancellation-by-failure
         // arrives on the Shell as a silent "failed" with no diagnostic.
-        const le = obj!.last_payment_error ?? obj!.last_setup_error;
+        const le = obj.last_payment_error ?? obj.last_setup_error;
         if (le) this._setError(this._sanitizeError(le));
         this._setStatus("failed");
         this._setLoading(false);
