@@ -246,6 +246,8 @@ export class Stripe extends HTMLElementCtor {
    * `hawc-stripe:stale-config` event.
    */
   private _preparedMode: StripeMode | null = null;
+  /** Intent id returned by the prepare-time requestIntent call. */
+  private _preparedIntentId: string | null = null;
 
   private get _isRemote(): boolean {
     return this._proxy !== null;
@@ -829,6 +831,7 @@ export class Stripe extends HTMLElementCtor {
     // `_preparedMode` is scoped to the mounted Elements lifetime — same
     // as clientSecret. A fresh prepare() reassigns it.
     this._preparedMode = null;
+    this._preparedIntentId = null;
   }
 
   private async _mountElements(clientSecret: string): Promise<void> {
@@ -948,6 +951,7 @@ export class Stripe extends HTMLElementCtor {
         throw new Error("[@wc-bindable/hawc-stripe] prepare() superseded.");
       }
       this._preparedMode = preparedMode;
+      this._preparedIntentId = creation.intentId;
     })();
     this._preparePromise = promise;
     // Clear the slot on both branches so a rejected prepare does not
@@ -1055,6 +1059,7 @@ export class Stripe extends HTMLElementCtor {
     const submitGen = this._prepareGeneration;
     const confirmMode = this._preparedMode ?? this.mode;
     let result: { paymentIntent?: Record<string, unknown>; setupIntent?: Record<string, unknown>; error?: Record<string, unknown> };
+    const intentIdForReport = this._preparedIntentId ?? this.intentId ?? "";
     try {
       result = confirmMode === "payment"
         ? await stripeJs.confirmPayment(common)
@@ -1069,7 +1074,7 @@ export class Stripe extends HTMLElementCtor {
       if (submitGen !== this._prepareGeneration) return;
       this._setErrorStateFromUnknown(e);
       await this._reportConfirmation({
-        intentId: this.intentId ?? "",
+        intentId: intentIdForReport,
         outcome: "failed",
         error: { message: e instanceof Error ? e.message : "confirm threw." },
       }).catch(() => {});
@@ -1078,7 +1083,6 @@ export class Stripe extends HTMLElementCtor {
 
     if (submitGen !== this._prepareGeneration) return;
 
-    const intentIdForReport = this.intentId ?? "";
     if (result.error) {
       const err = this._sanitizeStripeJsError(result.error);
       this._setErrorState(err);

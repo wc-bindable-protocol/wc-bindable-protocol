@@ -169,6 +169,16 @@ describe("<hawc-stripe> Shell", () => {
       expect(fakes.mountCalls).toHaveLength(1);
     });
 
+    it("sets prepared intent id on prepare and clears it on reset", async () => {
+      el = createEl({ mode: "payment", "publishable-key": "pk_test_123" });
+      el.attachLocalCore(core);
+      await el.prepare();
+      expect((el as any)._preparedIntentId).toBe("pi_shell");
+
+      el.reset();
+      expect((el as any)._preparedIntentId).toBeNull();
+    });
+
     it("prepare() without publishable-key throws", async () => {
       el = createEl({ mode: "payment" });
       el.attachLocalCore(core);
@@ -202,6 +212,37 @@ describe("<hawc-stripe> Shell", () => {
       expect(fakes.mountCalls).toHaveLength(1);
       expect(el.status).toBe("collecting");
       expect(el.intentId).toBe("pi_shell");
+    });
+
+    it("superseded prepare does not commit _preparedIntentId", async () => {
+      // If a parked prepare is superseded (reset/abort/disconnect), late
+      // requestIntent resolution must NOT commit the stale intent id.
+      let releasePi!: (v: IntentCreationResult) => void;
+      provider.createPaymentIntent = () => new Promise<IntentCreationResult>((resolve) => {
+        releasePi = resolve;
+      });
+
+      el = createEl({ mode: "payment", "publishable-key": "pk_test_123" });
+      el.attachLocalCore(core);
+      await new Promise(r => setTimeout(r, 0));
+      await new Promise(r => setTimeout(r, 0));
+
+      const parked = (el as any)._preparePromise as Promise<void> | null;
+      expect(parked).not.toBeNull();
+
+      el.reset();
+      releasePi({
+        intentId: "pi_stale",
+        clientSecret: "cs_stale",
+        mode: "payment",
+        amount: { value: 1980, currency: "jpy" },
+      });
+
+      await parked!.catch(() => {});
+      await new Promise(r => setTimeout(r, 0));
+
+      expect((el as any)._preparedIntentId).toBeNull();
+      expect(provider.cancelCalls).toContain("pi_stale");
     });
 
     it("publishable-key change invalidates cached Stripe.js (regression: key-cache bug)", async () => {
@@ -1361,6 +1402,190 @@ describe("<hawc-stripe> Shell", () => {
         // would have raced `_coreReset` ahead of the supersede cancel
         // and left pi_shell uncanceled.
         expect(freshProvider.cancelCalls).toContain("pi_shell");
+      } finally {
+        shellProxy.dispose();
+      }
+    });
+
+    it("remote submit reports using prepare-time intent id when update frame is delayed (regression: intentIdForReport race)", async () => {
+      // Reproduce the narrow window where requestIntent returns to the
+      // client, prepare() resolves, but the corresponding `intentId`
+      // update frame has not been delivered yet.
+      setUrlSearch("");
+      const freshProvider = new FakeProvider();
+      const freshCore = new StripeCore(freshProvider, { webhookSecret: "whsec_test" });
+      freshCore.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+
+      let clientHandler: ((msg: ServerMessage) => void) | null = null;
+      let serverHandler: ((msg: ClientMessage) => void) | null = null;
+      let delayUpdates = false;
+      const delayedUpdates: ServerMessage[] = [];
+      const client: ClientTransport = {
+        send: (msg) => { if (serverHandler) Promise.resolve().then(() => serverHandler!(msg)); },
+        onMessage: (h) => { clientHandler = h; },
+      };
+      const server: ServerTransport = {
+        send: (msg) => {
+          Promise.resolve().then(() => {
+            if (delayUpdates && msg.type === "update") {
+              delayedUpdates.push(msg);
+              return;
+            }
+            clientHandler?.(msg);
+          });
+        },
+        onMessage: (h) => { serverHandler = h; },
+      };
+
+      const releaseUpdates = (): void => {
+        const pending = delayedUpdates.splice(0);
+        for (const m of pending) clientHandler?.(m);
+      };
+
+      // No publishable-key at connect time: avoid auto-prepare and drive
+      // this test with an explicit prepare/submit sequence.
+      el = createEl({ mode: "payment" });
+      const shellProxy = new RemoteShellProxy(freshCore, server);
+      try {
+        el._connectRemote(client);
+        await flushTransport(2);
+
+        el.setAttribute("publishable-key", "pk_test_submit_race");
+        delayUpdates = true;
+        await el.prepare();
+
+        // requestIntent succeeded on Core, but update frames are parked.
+        expect(freshCore.intentId).toBe("pi_shell");
+        expect(el.intentId).toBeNull();
+
+        await el.submit();
+
+        // Without the fix, reportConfirmation carried intentId="" and
+        // Core silently dropped the outcome. With the fix, Core reaches
+        // terminal state even while client updates are delayed.
+        expect(freshCore.status).toBe("succeeded");
+
+        delayUpdates = false;
+        releaseUpdates();
+        await flushTransport(2);
+      } finally {
+        shellProxy.dispose();
+      }
+    });
+
+    it("remote submit confirm throw path still reports with prepare-time intent id when update is delayed", async () => {
+      setUrlSearch("");
+      const freshProvider = new FakeProvider();
+      const freshCore = new StripeCore(freshProvider, { webhookSecret: "whsec_test" });
+      freshCore.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+
+      let clientHandler: ((msg: ServerMessage) => void) | null = null;
+      let serverHandler: ((msg: ClientMessage) => void) | null = null;
+      let delayUpdates = false;
+      const delayedUpdates: ServerMessage[] = [];
+      const client: ClientTransport = {
+        send: (msg) => { if (serverHandler) Promise.resolve().then(() => serverHandler!(msg)); },
+        onMessage: (h) => { clientHandler = h; },
+      };
+      const server: ServerTransport = {
+        send: (msg) => {
+          Promise.resolve().then(() => {
+            if (delayUpdates && msg.type === "update") {
+              delayedUpdates.push(msg);
+              return;
+            }
+            clientHandler?.(msg);
+          });
+        },
+        onMessage: (h) => { serverHandler = h; },
+      };
+      const releaseUpdates = (): void => {
+        const pending = delayedUpdates.splice(0);
+        for (const m of pending) clientHandler?.(m);
+      };
+
+      fakes.stripeJs.confirmPayment = (async () => {
+        throw new Error("confirm blew");
+      }) as typeof fakes.stripeJs.confirmPayment;
+
+      el = createEl({ mode: "payment" });
+      const shellProxy = new RemoteShellProxy(freshCore, server);
+      try {
+        el._connectRemote(client);
+        await flushTransport(2);
+
+        el.setAttribute("publishable-key", "pk_test_submit_throw_race");
+        delayUpdates = true;
+        await el.prepare();
+        expect(el.intentId).toBeNull();
+
+        await expect(el.submit()).rejects.toThrow(/confirm blew/);
+        expect(freshCore.status).toBe("failed");
+
+        delayUpdates = false;
+        releaseUpdates();
+        await flushTransport(2);
+      } finally {
+        shellProxy.dispose();
+      }
+    });
+
+    it("remote submit result.error path reports with prepare-time intent id when update is delayed", async () => {
+      setUrlSearch("");
+      const freshProvider = new FakeProvider();
+      const freshCore = new StripeCore(freshProvider, { webhookSecret: "whsec_test" });
+      freshCore.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+
+      let clientHandler: ((msg: ServerMessage) => void) | null = null;
+      let serverHandler: ((msg: ClientMessage) => void) | null = null;
+      let delayUpdates = false;
+      const delayedUpdates: ServerMessage[] = [];
+      const client: ClientTransport = {
+        send: (msg) => { if (serverHandler) Promise.resolve().then(() => serverHandler!(msg)); },
+        onMessage: (h) => { clientHandler = h; },
+      };
+      const server: ServerTransport = {
+        send: (msg) => {
+          Promise.resolve().then(() => {
+            if (delayUpdates && msg.type === "update") {
+              delayedUpdates.push(msg);
+              return;
+            }
+            clientHandler?.(msg);
+          });
+        },
+        onMessage: (h) => { serverHandler = h; },
+      };
+      const releaseUpdates = (): void => {
+        const pending = delayedUpdates.splice(0);
+        for (const m of pending) clientHandler?.(m);
+      };
+
+      fakes.setConfirmResult({
+        error: {
+          code: "card_declined",
+          message: "Declined.",
+        },
+      });
+
+      el = createEl({ mode: "payment" });
+      const shellProxy = new RemoteShellProxy(freshCore, server);
+      try {
+        el._connectRemote(client);
+        await flushTransport(2);
+
+        el.setAttribute("publishable-key", "pk_test_submit_error_race");
+        delayUpdates = true;
+        await el.prepare();
+        expect(el.intentId).toBeNull();
+
+        await el.submit();
+        expect(freshCore.status).toBe("failed");
+        expect(freshCore.error?.code).toBe("card_declined");
+
+        delayUpdates = false;
+        releaseUpdates();
+        await flushTransport(2);
       } finally {
         shellProxy.dispose();
       }
