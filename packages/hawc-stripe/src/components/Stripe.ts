@@ -44,7 +44,7 @@ export interface StripePaymentElementLike {
   mount(target: HTMLElement | string): void;
   unmount(): void;
   destroy(): void;
-  on(event: string, cb: (ev: Record<string, unknown>) => void): void;
+  on(event: "ready" | "change", cb: (ev: Record<string, unknown>) => void): void;
 }
 
 /**
