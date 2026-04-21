@@ -211,6 +211,14 @@ export class StripeSdkProvider implements IStripeProvider {
     await this._client.paymentIntents.cancel(id);
   }
 
+  async cancelSetupIntent(id: string): Promise<void> {
+    if (!id) raiseError("id is required.");
+    if (typeof this._client.setupIntents.cancel !== "function") {
+      raiseError("stripe.setupIntents.cancel is not available on this client.");
+    }
+    await this._client.setupIntents.cancel(id);
+  }
+
   verifyWebhook(rawBody: string, signatureHeader: string, secret: string): StripeEvent {
     // Delegates to stripe-node's constructEvent, which performs the HMAC-SHA256
     // over the raw body + timestamp check. It throws on failure — we let the

@@ -8,6 +8,7 @@ function createFakeClient(overrides: Partial<Record<string, any>> = {}): {
     siCreate: { params: Record<string, unknown>; opts?: Record<string, unknown> }[];
     piRetrieve: { id: string; opts?: Record<string, unknown> }[];
     siRetrieve: { id: string; opts?: Record<string, unknown> }[];
+    siCancel: string[];
   };
 } {
   const calls = {
@@ -15,6 +16,7 @@ function createFakeClient(overrides: Partial<Record<string, any>> = {}): {
     siCreate: [] as { params: Record<string, unknown>; opts?: Record<string, unknown> }[],
     piRetrieve: [] as { id: string; opts?: Record<string, unknown> }[],
     siRetrieve: [] as { id: string; opts?: Record<string, unknown> }[],
+    siCancel: [] as string[],
   };
   const client: StripeNodeLike = {
     paymentIntents: {
@@ -42,6 +44,10 @@ function createFakeClient(overrides: Partial<Record<string, any>> = {}): {
       async retrieve(id, opts) {
         calls.siRetrieve.push({ id, opts });
         return overrides.siRetrieveResult ?? { id, status: "succeeded", payment_method: "pm_string_only" };
+      },
+      async cancel(id) {
+        calls.siCancel.push(id);
+        return { id, status: "canceled" };
       },
     },
     webhooks: {
@@ -160,5 +166,19 @@ describe("StripeSdkProvider", () => {
     const provider = new StripeSdkProvider(client);
     const view = await provider.retrieveIntent("payment", "pi_abc");
     expect(view.paymentMethod).toBeUndefined();
+  });
+
+  it("delegates cancelSetupIntent to setupIntents.cancel", async () => {
+    const { client, calls } = createFakeClient();
+    const provider = new StripeSdkProvider(client);
+    await provider.cancelSetupIntent("seti_abc");
+    expect(calls.siCancel).toEqual(["seti_abc"]);
+  });
+
+  it("throws when setupIntents.cancel is not available on the client", async () => {
+    const { client } = createFakeClient();
+    delete (client.setupIntents as any).cancel;
+    const provider = new StripeSdkProvider(client);
+    await expect(provider.cancelSetupIntent("seti_x")).rejects.toThrow(/not available/);
   });
 });

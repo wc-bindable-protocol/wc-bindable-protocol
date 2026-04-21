@@ -10,6 +10,7 @@ class FakeProvider implements IStripeProvider {
   createSetupCalls: SetupIntentOptions[] = [];
   retrieveCalls: { mode: StripeMode; id: string }[] = [];
   cancelCalls: string[] = [];
+  cancelSetupCalls: string[] = [];
   nextPaymentIntentId: string = "pi_123";
   nextSetupIntentId: string = "seti_123";
   nextClientSecret: string = "secret_abc";
@@ -45,6 +46,10 @@ class FakeProvider implements IStripeProvider {
 
   async cancelPaymentIntent(id: string): Promise<void> {
     this.cancelCalls.push(id);
+  }
+
+  async cancelSetupIntent(id: string): Promise<void> {
+    this.cancelSetupCalls.push(id);
   }
 
   verifyWebhook(_body: string, _sig: string, _secret: string): StripeEvent {
@@ -341,7 +346,57 @@ describe("StripeCore", () => {
       await c.requestIntent({ mode: "setup", hint: {} });
       await c.cancelIntent("seti_123");
       expect(provider.cancelCalls).toHaveLength(0);
+      expect(provider.cancelSetupCalls).toHaveLength(0);
       expect(c.status).toBe("idle");
+    });
+
+    it("calls provider.cancelSetupIntent when cancelSetupIntents opt-in is enabled", async () => {
+      const c = new StripeCore(provider, { cancelSetupIntents: true });
+      c.registerIntentBuilder(() => ({ mode: "setup" }));
+      await c.requestIntent({ mode: "setup", hint: {} });
+      await c.cancelIntent("seti_123");
+      expect(provider.cancelSetupCalls).toEqual(["seti_123"]);
+      expect(c.status).toBe("idle");
+      expect(c.intentId).toBeNull();
+    });
+
+    it("falls through to state-only reset when cancelSetupIntent is not implemented even with opt-in", async () => {
+      (provider as any).cancelSetupIntent = undefined;
+      const c = new StripeCore(provider as IStripeProvider, { cancelSetupIntents: true });
+      c.registerIntentBuilder(() => ({ mode: "setup" }));
+      await c.requestIntent({ mode: "setup", hint: {} });
+      await c.cancelIntent("seti_123");
+      expect(c.status).toBe("idle");
+      expect(c.intentId).toBeNull();
+    });
+
+    it("preserves _activeIntent for setup mode when provider cancelSetupIntent fails", async () => {
+      const c = new StripeCore(provider, { cancelSetupIntents: true });
+      c.registerIntentBuilder(() => ({ mode: "setup" }));
+      await c.requestIntent({ mode: "setup", hint: {} });
+      const cancelErr = Object.assign(new Error("Connection to api.stripe.com lost."), {
+        type: "StripeConnectionError",
+      });
+      let calls = 0;
+      provider.cancelSetupIntent = async (id: string) => {
+        calls++;
+        provider.cancelSetupCalls.push(id);
+        if (calls === 1) throw cancelErr;
+      };
+
+      await expect(c.cancelIntent("seti_123")).rejects.toThrow(/Connection to api\.stripe\.com/);
+      expect(c.error?.message).toMatch(/Connection to api\.stripe\.com/);
+      expect(c.intentId).toBe("seti_123");
+      expect(c.status).toBe("collecting");
+
+      await c.reportConfirmation({ intentId: "seti_123", outcome: "succeeded" });
+      expect(c.status).toBe("succeeded");
+
+      await c.cancelIntent("seti_123");
+      expect(calls).toBe(2);
+      expect(c.status).toBe("idle");
+      expect(c.intentId).toBeNull();
+      expect(c.error).toBeNull();
     });
 
     it("slow cancel does NOT clobber a newer session started during the await (regression: key-change race)", async () => {

@@ -289,6 +289,7 @@ export interface IStripeProvider {
   createSetupIntent(opts: SetupIntentOptions): Promise<IntentCreationResult>;
   retrieveIntent(mode: StripeMode, id: string): Promise<StripeIntentView>;
   cancelPaymentIntent(id: string): Promise<void>;
+  cancelSetupIntent?(id: string): Promise<void>;
   verifyWebhook(rawBody: string, signatureHeader: string, secret: string): StripeEvent;
 }
 

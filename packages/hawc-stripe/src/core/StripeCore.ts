@@ -60,6 +60,7 @@ export class StripeCore extends EventTarget {
   private _provider: IStripeProvider;
   private _webhookSecret: string | null;
   private _userContext: UserContext | undefined;
+  private _cancelSetupIntents: boolean;
 
   private _mode: StripeMode = "payment";
   private _amountValueHint: number | null = null;
@@ -118,6 +119,7 @@ export class StripeCore extends EventTarget {
       webhookSecret?: string;
       userContext?: UserContext;
       target?: EventTarget;
+      cancelSetupIntents?: boolean;
     } = {},
   ) {
     super();
@@ -126,6 +128,7 @@ export class StripeCore extends EventTarget {
     this._webhookSecret = opts.webhookSecret ?? null;
     this._userContext = opts.userContext;
     this._target = opts.target ?? this;
+    this._cancelSetupIntents = opts.cancelSetupIntents === true;
   }
 
   // --- Inputs ---
@@ -650,10 +653,12 @@ export class StripeCore extends EventTarget {
   }
 
   /**
-   * Cancel the active PaymentIntent. For SetupIntents, this Core
-   * intentionally avoids calling Stripe's cancel API and relies on natural
-   * expiry / explicit reset semantics instead, so we transition to `idle`
-   * without a provider call.
+  * Cancel the active PaymentIntent. For SetupIntents, this Core defaults
+  * to no Stripe API call (natural expiry / explicit reset semantics) and
+  * transitions to `idle` locally. Apps can opt in to explicit
+  * `setupIntents.cancel` by constructing StripeCore with
+  * `{ cancelSetupIntents: true }` and providing `cancelSetupIntent` on the
+  * provider.
    *
    * (Stripe DOES support `setupIntents.cancel` 窶・skipping it here is a
    * cost optimization: SetupIntents carry no reserved balance, so a stale
@@ -694,6 +699,15 @@ export class StripeCore extends EventTarget {
         // Only surface the error if THIS cancel still owns the session.
         // If another requestIntent / reset has already taken over, the
         // user-visible truth is the new session, not our dead intent.
+        if (this._activeIntent?.generation === activeGen) {
+          this._setError(this._sanitizeError(e));
+        }
+        throw e;
+      }
+    } else if (this._cancelSetupIntents && this._provider.cancelSetupIntent) {
+      try {
+        await this._provider.cancelSetupIntent(intentId);
+      } catch (e: unknown) {
         if (this._activeIntent?.generation === activeGen) {
           this._setError(this._sanitizeError(e));
         }

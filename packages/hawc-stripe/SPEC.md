@@ -397,7 +397,7 @@ wc-bindable-protocol remote の既存ワイヤ形式に乗る(新しい message 
   - `paymentMethod?: { id, brand, last4 }` — `confirmPayment` の戻りが expand 済み object のときのみ Shell が同梱。id 文字列のみの場合は omit し、Core の succeeded 分岐が server-side retrieve で補完する(§6.4)。
   - `error?: { code?, declineCode?, message, type? }` — `outcome: "failed"` 時に `StripeError` の sanitized 形で同梱。`failureCode` のような flat 文字列ではない。`message` のみ必須。
 - `cancelIntent` — `args: [intentId: string]` → `return.value: undefined`
-  - 引数は intent id 文字列そのもの(オブジェクトで包まない)。PaymentIntent は Stripe の cancel を叩き、SetupIntent は Core 側の状態 reset のみ(Stripe API 上は `setupIntents.cancel` が存在するが、Core は金額を保持しない SetupIntent の stale row を放置しても実害がないため、コスト最適化として呼ばない。明示的に cancel したいアプリはカスタム `IStripeProvider` で実装できる)。
+  - 引数は intent id 文字列そのもの(オブジェクトで包まない)。PaymentIntent は Stripe の cancel を叩く。SetupIntent はデフォルトでは Core 側の状態 reset のみ(コスト最適化)だが、`new StripeCore(provider, { cancelSetupIntents: true })` を指定し、provider が `cancelSetupIntent(id)` を実装していれば `setupIntents.cancel` を呼ぶ。
 - `resumeIntent` — `args: [intentId: string, mode: "payment"|"setup", clientSecret: string]` → `return.value: undefined`
   - 3DS redirect 戻り時に Shell が呼ぶ。`clientSecret` は Stripe の redirect URL から抽出した所有権証明として必須(§9.2 / §2.6 authorization model)。
 - `reset` — `args: []` → `return.value: undefined`

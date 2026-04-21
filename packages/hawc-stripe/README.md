@@ -37,6 +37,9 @@ const provider = new StripeSdkProvider(stripe, {
 const core = new StripeCore(provider, {
   webhookSecret: process.env.STRIPE_WEBHOOK_SECRET,
   userContext: authenticatedUser,
+  // Optional: also cancel SetupIntents on abort/cancelIntent.
+  // Default is false (state-only reset for SetupIntents).
+  cancelSetupIntents: true,
 });
 
 // REQUIRED — server decides the final amount/currency/metadata from the
@@ -112,6 +115,7 @@ The Quick Start is **deliberately minimal** and **not production-ready**. Before
 - **Preserve the raw webhook body** before any JSON parser touches it — signature verification requires the exact bytes Stripe sent.
 - **Enable idempotent intent creation** by supplying `buildIdempotencyKey` to `StripeSdkProvider` (or implement it in your own `IStripeProvider`). On network flake, retries without a key can create multiple intents for the same cart/user.
 - **Prefer `await el.abort()` before removing the element** when you need deterministic cancel of the active PaymentIntent. Automatic disconnect teardown is best-effort; in a narrow window (disconnect during in-flight intent create), the intent may survive until Stripe natural expiry.
+- **Understand SetupIntent cancel defaults**: by default `cancelIntent` does not call Stripe's `setupIntents.cancel` (state-only reset). If dashboard cleanup of stale SetupIntents matters, set `cancelSetupIntents: true` on `StripeCore` and use a provider that implements `cancelSetupIntent`.
 - **Keep webhook handlers idempotent** even with Core dedup enabled. Core suppresses duplicate `event.id` deliveries only within an in-memory per-process window; multi-process routing and process restarts still require DB-backed idempotency keyed by `event.id`.
 - **Consider `registerResumeAuthorizer`** for multi-tenant deployments so a leaked `client_secret` alone cannot resume a foreign user's intent.
 - **Sanitize errors** that cross the wire: the built-in sanitizer keeps `code` / `decline_code` / `type` and forwards `message` only for Stripe-shaped errors (type starts with `Stripe` or ends with `_error`) and our own `[@wc-bindable/hawc-stripe]`-prefixed internals — anything else collapses to a generic `"Payment failed."` so a raw `new Error("FATAL: ...")` from an `IntentBuilder` does not reach the browser. Custom handlers you add (webhook fulfillment, authorizers) must be equally careful.
