@@ -1867,11 +1867,9 @@ describe("<hawc-stripe> Shell", () => {
   });
 
   describe("appearance hot-swap", () => {
-    // The setter's try/catch silently swallows errors to survive providers
-    // whose Elements group predates the `update` method. Verifying the
-    // happy path (update called once with the new appearance) and the
-    // tolerance path (setter does not throw when update is absent) catches
-    // silent regressions in the hot-swap channel.
+    // The setter keeps best-effort behavior to survive providers whose
+    // Elements group predates `update`, but now emits an observability
+    // warning event when `update` exists and throws.
     it("forwards a post-mount appearance change to elements.update()", async () => {
       const updateCalls: Record<string, unknown>[] = [];
       const paymentElement: StripePaymentElementLike = {
@@ -1914,6 +1912,38 @@ describe("<hawc-stripe> Shell", () => {
         el.appearance = { theme: "stripe" };
       }).not.toThrow();
       expect(el.appearance).toEqual({ theme: "stripe" });
+    });
+
+    it("dispatches hawc-stripe:appearance-warning when elements.update throws", async () => {
+      const warnings: CustomEvent[] = [];
+      const paymentElement: StripePaymentElementLike = {
+        mount() {}, unmount() {}, destroy() {}, on() {},
+      };
+      const elements = {
+        create() { return paymentElement; },
+        getElement() { return paymentElement; },
+        update() { throw new Error("unsupported appearance"); },
+      } as StripeElementsLike;
+      const stripeJs: StripeJsLike = {
+        elements: () => elements,
+        async confirmPayment() { return { paymentIntent: { id: "pi_shell", status: "succeeded" } }; },
+        async confirmSetup() { return { setupIntent: { id: "seti_shell", status: "succeeded" } }; },
+        async retrievePaymentIntent() { return { paymentIntent: { id: "pi_shell", status: "succeeded" } }; },
+        async retrieveSetupIntent() { return { setupIntent: { id: "seti_shell", status: "succeeded" } }; },
+      };
+      WcsStripe.setLoader(async () => stripeJs);
+
+      el = createEl({ mode: "payment", "publishable-key": "pk_test_123" });
+      el.addEventListener("hawc-stripe:appearance-warning", (e) => warnings.push(e as CustomEvent));
+      el.attachLocalCore(core);
+      await el.prepare();
+
+      expect(() => {
+        el.appearance = { theme: "night" };
+      }).not.toThrow();
+      expect(warnings).toHaveLength(1);
+      expect((warnings[0].detail as any).message).toContain("Failed to apply appearance");
+      expect((warnings[0].detail as any).error).toBeInstanceOf(Error);
     });
   });
 });

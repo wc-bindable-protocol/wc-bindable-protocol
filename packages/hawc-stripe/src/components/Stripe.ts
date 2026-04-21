@@ -569,7 +569,17 @@ export class Stripe extends HTMLElementCtor {
     // before requestIntent); it will be picked up on the next mount.
     const el = this._elements as unknown as { update?: (opts: Record<string, unknown>) => void } | null;
     if (el && typeof el.update === "function") {
-      try { el.update({ appearance: value }); } catch { /* best-effort */ }
+      try {
+        el.update({ appearance: value });
+      } catch (error: unknown) {
+        this.dispatchEvent(new CustomEvent("hawc-stripe:appearance-warning", {
+          detail: {
+            message: "Failed to apply appearance via elements.update(); value will take effect on next mount.",
+            error,
+          },
+          bubbles: true,
+        }));
+      }
     }
   }
 
