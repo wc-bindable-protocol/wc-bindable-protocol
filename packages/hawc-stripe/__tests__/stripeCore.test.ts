@@ -868,6 +868,51 @@ describe("StripeCore", () => {
       expect(attempts).toBe(2);
     });
 
+    it("folds succeeded state before fatal throw, and Stripe retry keeps state idempotent", async () => {
+      // Prepare an active intent so webhook folding is eligible.
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 1200, currency: "usd" }));
+      await core.requestIntent({ mode: "payment", hint: {} });
+      const pmEvents: unknown[] = [];
+      core.addEventListener("hawc-stripe:paymentMethod-changed", (e) => {
+        pmEvents.push((e as CustomEvent).detail);
+      });
+
+      let attempts = 0;
+      core.registerWebhookHandler("payment_intent.succeeded", () => {
+        attempts++;
+        if (attempts === 1) throw new Error("fulfillment db timeout");
+      }, { fatal: true });
+
+      provider.webhookEvent = {
+        id: "evt_fold_then_fatal",
+        type: "payment_intent.succeeded",
+        created: 1,
+        data: {
+          object: {
+            id: "pi_123",
+            payment_method: {
+              id: "pm_fold",
+              card: { brand: "visa", last4: "4242" },
+            },
+          },
+        },
+      };
+
+      // First delivery: fold runs first (UI moves to succeeded), then fatal
+      // handler throws so the HTTP route can return 5xx and Stripe retries.
+      await expect(core.handleWebhook("raw", "sig")).rejects.toThrow(/fulfillment db timeout/);
+      expect(core.status).toBe("succeeded");
+      expect(core.loading).toBe(false);
+      expect(core.paymentMethod).toEqual({ id: "pm_fold", brand: "visa", last4: "4242" });
+
+      // Retry delivery: fold is idempotent and handler now succeeds.
+      await core.handleWebhook("raw", "sig");
+      expect(attempts).toBe(2);
+      expect(core.status).toBe("succeeded");
+      expect(core.paymentMethod).toEqual({ id: "pm_fold", brand: "visa", last4: "4242" });
+      expect(pmEvents).toHaveLength(1);
+    });
+
     it("keeps dedup window on non-fatal throw (duplicate does not re-run handlers)", async () => {
       let attempts = 0;
       const warnings: CustomEvent[] = [];
