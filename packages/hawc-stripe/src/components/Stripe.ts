@@ -2,8 +2,15 @@ import { getConfig, getRemoteCoreUrl } from "../config.js";
 import {
   IWcBindable, StripeStatus, StripeAmount, StripePaymentMethod, StripeError,
   StripeMode, IntentCreationResult, ConfirmationReport, IntentRequestHint,
+  UnknownStatusDetail,
 } from "../types.js";
-import { StripeCore } from "../core/StripeCore.js";
+// `StripeCore` itself is a node-only module (imports `node:crypto`). We only
+// need the TYPE here — `_core: StripeCore | null`, `attachLocalCore(core:
+// StripeCore)` — so `import type` keeps the Shell's browser module graph
+// from transitively pulling `StripeCore.ts` at module-evaluation time.
+// Runtime references go through `STRIPE_CORE_WC_BINDABLE` imported below.
+import type { StripeCore } from "../core/StripeCore.js";
+import { STRIPE_CORE_WC_BINDABLE } from "../core/wcBindable.js";
 import { extractCardPaymentMethod } from "../internal/paymentMethodShape.js";
 import { raiseError } from "../raiseError.js";
 import {
@@ -119,10 +126,15 @@ export class Stripe extends HTMLElementCtor {
     protocol: "wc-bindable",
     version: 1,
     properties: [
-      ...StripeCore.wcBindable.properties,
+      ...STRIPE_CORE_WC_BINDABLE.properties,
       { name: "trigger", event: "hawc-stripe:trigger-changed" },
     ],
-    inputs: StripeCore.wcBindable.inputs,
+    // Shallow-copy (not reference-share) so a caller that mutates
+    // `Stripe.wcBindable.inputs` via an `as any` cast cannot also mutate
+    // `STRIPE_CORE_WC_BINDABLE.inputs` and thereby alter Core's contract.
+    // TypeScript `readonly` is only a compile-time guard; the runtime
+    // copy closes the hole. Symmetric with the `...spread` above.
+    inputs: STRIPE_CORE_WC_BINDABLE.inputs ? [...STRIPE_CORE_WC_BINDABLE.inputs] : undefined,
     // Deliberately NOT forwarding the Core's full command surface. Only the
     // four orchestration methods the Shell itself implements publicly:
     // `prepare()` (create intent + mount Elements), `submit()` (confirm),
@@ -444,12 +456,19 @@ export class Stripe extends HTMLElementCtor {
     if (!this._hasLocalError) return;
     this._hasLocalError = false;
     this._errorState = null;
+    // `detail` uses `this.error` (not `null`) intentionally. In remote
+    // mode, clearing the LOCAL error layer may still leave a Core-
+    // authoritative `error` on `_remoteValues.error`; dispatching `null`
+    // here would mislead listeners into thinking the Core has gone clean
+    // when it has not. Other `-changed` setters dispatch the new value
+    // directly because they own the single source of truth; this setter
+    // is asymmetric because error has two layers (local / remote).
     this.dispatchEvent(new CustomEvent("hawc-stripe:error", { detail: this.error, bubbles: true }));
   }
 
   /** @internal — visible for testing */
   _connectRemote(transport: ClientTransport): void {
-    this._proxy = createRemoteCoreProxy(StripeCore.wcBindable, transport);
+    this._proxy = createRemoteCoreProxy(STRIPE_CORE_WC_BINDABLE, transport);
     this._unbind = bind(this._proxy, (name, value) => {
       this._remoteValues[name] = value;
       if (name === "error") {
@@ -604,7 +623,6 @@ export class Stripe extends HTMLElementCtor {
   /** Stripe Elements Appearance API payload. JS-only — not attribute-reflected. */
   get appearance(): Record<string, unknown> | undefined { return this._appearance; }
   set appearance(value: Record<string, unknown> | undefined) {
-    this._appearance = value;
     // Hot-swap if Elements is already mounted. `elements.update({ appearance })`
     // is the documented path — but it only exists on the Elements group, not
     // the loader. Skip if we have no active Elements (user sets appearance
@@ -613,20 +631,32 @@ export class Stripe extends HTMLElementCtor {
     // `elements.update({ appearance: undefined })` is unspecified and has
     // no "unset" semantics — a fresh mount is the supported path to
     // revert to defaults.
-    if (value === undefined) return;
+    if (value === undefined) {
+      this._appearance = value;
+      return;
+    }
     const el = this._elements as unknown as { update?: (opts: Record<string, unknown>) => void } | null;
     if (el && typeof el.update === "function") {
+      // Assign AFTER update succeeds so a throwing appearance is not
+      // latched on `this._appearance` and re-applied at the next mount
+      // (which would repeat the same error in a loop until the caller
+      // happens to overwrite with a valid value).
       try {
         el.update({ appearance: value });
+        this._appearance = value;
       } catch (error: unknown) {
         this.dispatchEvent(new CustomEvent("hawc-stripe:appearance-warning", {
           detail: {
-            message: "Failed to apply appearance via elements.update(); value will take effect on next mount.",
+            message: "Failed to apply appearance via elements.update(); previous appearance retained.",
             error,
           },
           bubbles: true,
         }));
       }
+    } else {
+      // No mounted Elements yet — store for next mount. No update call
+      // to fail, so no risk of latching a broken value.
+      this._appearance = value;
     }
   }
 
@@ -659,7 +689,23 @@ export class Stripe extends HTMLElementCtor {
 
   get error(): StripeError | null {
     if (this._isRemote) {
+      // Local layer wins when set: a transport-only rejection (cmd-send
+      // throw, proxy timeout) never reached the Core and is only visible
+      // locally. Covers the case where the Core-authoritative `error`
+      // update is stale from a prior unrelated failure.
       if (this._hasLocalError) return this._errorState;
+      // The `"error" in _remoteValues` discriminator distinguishes three
+      // states:
+      //   - not present: no remote sync has delivered an `error` frame
+      //     yet on this session. Fall back to the local slot so a
+      //     transport error set BEFORE the first sync stays observable.
+      //   - present + non-null: Core published an error — return it.
+      //   - present + null: Core published `error = null` (cleared). The
+      //     ternary returns null, which is the intended authoritative
+      //     "no error" signal.
+      // `_disposeRemote` resets `_remoteValues = {}`, returning this
+      // getter to the "not present" branch — correct because after
+      // dispose there is no authoritative remote state any more.
       return "error" in this._remoteValues ? (this._remoteValues.error as StripeError | null) : this._errorState;
     }
     return this._core?.error ?? this._errorState;
@@ -1091,20 +1137,22 @@ export class Stripe extends HTMLElementCtor {
     this._clearErrorState();
 
     if (this._preparePromise) {
-      try { await this._preparePromise; }
-      catch { /* already surfaced via _setErrorState */ }
+      // Propagate the prior prepare's rejection instead of swallowing it.
+      // The old behavior — swallow + fall through to a second `prepare()`
+      // call below — would create a second PaymentIntent while the first
+      // prepare's best-effort `_cancelIntent(creation.intentId)` is still
+      // in flight, leaving the app with one canceled + one live intent
+      // and the original failure hidden from the caller.
+      await this._preparePromise;
     }
     if (!this._paymentElement || !this._elements || !this._clientSecret) {
-      // Auto-prepare as an ergonomic fallback. Users who set attrs before
-      // appendChild get auto-prepare for free in connectedCallback; this
-      // branch covers the path where attrs arrive later and the user then
-      // calls `submit()` directly without an explicit `prepare()`.
-      try { await this.prepare(); }
-      catch (e: unknown) {
-        // prepare already set the error state; re-throw so the caller
-        // sees the rejection.
-        throw e;
-      }
+      // Auto-prepare as an ergonomic fallback. Only reachable when no
+      // prior `prepare()` was in flight (the await above already either
+      // succeeded or threw). Users who set attrs before appendChild get
+      // auto-prepare for free in connectedCallback; this branch covers
+      // the path where attrs arrive later and the user then calls
+      // `submit()` directly without an explicit `prepare()`.
+      await this.prepare();
     }
     if (!this._paymentElement || !this._elements || !this._clientSecret) {
       const err = new Error("[@wc-bindable/hawc-stripe] Elements not mounted — prepare() did not complete.");
@@ -1172,6 +1220,16 @@ export class Stripe extends HTMLElementCtor {
     const confirmMode = this._preparedMode ?? this.mode;
     let result: { paymentIntent?: Record<string, unknown>; setupIntent?: Record<string, unknown>; error?: Record<string, unknown> };
     const intentIdForReport = this._preparedIntentId ?? this.intentId ?? "";
+    // Defense: by this point we have passed the `!_paymentElement` gate
+    // above, so `_preparedIntentId` is expected to be set. If some future
+    // refactor ever lets an empty id slip through, downstream
+    // `_applyIntentOutcome` would unconditionally call `_setErrorState`
+    // in the `requires_payment_method` / `canceled` branches even though
+    // Core drops the report for an unmatched id — leaving a ghost error
+    // observable on `this.error`. Fail loud here before that happens.
+    if (!intentIdForReport) {
+      raiseError("submit() reached confirm with no intent id — prepare() invariant violated.");
+    }
     try {
       result = confirmMode === "payment"
         ? await stripeJs.confirmPayment(common)
@@ -1213,11 +1271,12 @@ export class Stripe extends HTMLElementCtor {
       // not leave the UI wedged on `processing` / `loading=true`. Surface
       // the anomaly for observability and fall back to a processing
       // report so the webhook path can still reconcile terminal state.
-      this.dispatchEvent(new CustomEvent("hawc-stripe:unknown-status", {
+      this.dispatchEvent(new CustomEvent<UnknownStatusDetail>("hawc-stripe:unknown-status", {
         detail: {
+          source: "shell-malformed",
           intentId: intentIdForReport,
+          mode: this._preparedMode ?? this.mode,
           status: "",
-          preparedMode: this._preparedMode ?? this.mode,
           reason: "stripe.confirm returned no intent and no error",
         },
         bubbles: true,
@@ -1278,6 +1337,14 @@ export class Stripe extends HTMLElementCtor {
     //      becomes a no-op.
     const preparePromise = this._preparePromise;
     if (preparePromise) {
+      // Deliberate asymmetry with `_submitImpl`'s `await this._preparePromise`
+      // (which propagates). `abort()` is a best-effort teardown path — the
+      // caller has already said "discard the attempt" and wants a clean
+      // element state regardless of prepare's outcome. Propagating prepare's
+      // reject would skip the `_teardownElements` + cancel-or-reset cleanup
+      // below and leave the element in whatever half-mounted state prepare
+      // died in. Swallow and continue; any lingering error is already on
+      // `this.error` via prepare's own `_setErrorState`.
       await preparePromise.catch(() => { /* supersede / prior failure */ });
     }
     const id = this.intentId;
@@ -1368,11 +1435,12 @@ export class Stripe extends HTMLElementCtor {
         break;
       }
       default: {
-        this.dispatchEvent(new CustomEvent("hawc-stripe:unknown-status", {
+        this.dispatchEvent(new CustomEvent<UnknownStatusDetail>("hawc-stripe:unknown-status", {
           detail: {
+            source: "shell-confirm",
             intentId,
+            mode: this._preparedMode ?? this.mode,
             status,
-            preparedMode: this._preparedMode ?? this.mode,
           },
           bubbles: true,
         }));
@@ -1645,6 +1713,16 @@ export class Stripe extends HTMLElementCtor {
       case "customerId":
         this._core.customerId = value as string | null;
         return;
+      default: {
+        // Exhaustiveness check. If a new bindable input is added to the
+        // Core's wcBindable.inputs, the type narrowing above catches the
+        // missing branch at compile time; this runtime assertion
+        // additionally catches a caller passing a string outside the
+        // declared union (e.g. via a dynamic cast). Silent drop was the
+        // old behavior — surfacing makes the misuse debuggable.
+        const exhaustive: never = name;
+        raiseError(`_syncInput: unknown input name: ${JSON.stringify(exhaustive as unknown)}.`);
+      }
     }
   }
 

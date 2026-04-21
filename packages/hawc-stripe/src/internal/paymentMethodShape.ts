@@ -23,10 +23,15 @@ export function extractCardPaymentMethod(obj: Record<string, unknown>): StripePa
     const card = pmObj.card;
     if (card && typeof card === "object") {
       const c = card as Record<string, unknown>;
-      const id = typeof pmObj.id === "string" ? pmObj.id : "";
-      const brand = typeof c.brand === "string" ? c.brand : "";
-      const last4 = typeof c.last4 === "string" ? c.last4 : "";
-      if (id) return { id, brand, last4 };
+      const id = typeof pmObj.id === "string" && pmObj.id ? pmObj.id : undefined;
+      const brand = typeof c.brand === "string" && c.brand ? c.brand : undefined;
+      const last4 = typeof c.last4 === "string" && c.last4 ? c.last4 : undefined;
+      // Require all three. SPEC §5.1 types `brand` / `last4` as non-empty
+      // strings for a reason: UIs render `"Visa •• 4242"` and an empty
+      // brand or last4 produces a nonsensical `"•• "` display. Better to
+      // fall back to the webhook / retrieve channel that CAN populate
+      // them than to emit a half-populated shape that lies to the UI.
+      if (id && brand && last4) return { id, brand, last4 };
     }
   }
   return undefined;

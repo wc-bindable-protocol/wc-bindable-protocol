@@ -178,26 +178,59 @@ export function getConfig(): IConfig {
 
 export function setConfig(partialConfig: IWritableConfig): void {
   validatePartialConfig(partialConfig);
-  // Only copy known keys. `Object.assign(_config.tagNames, partialConfig.tagNames)`
-  // would silently persist unexpected keys like `evil` onto the internal
-  // config, growing the schema by stealth and potentially shadowing future
-  // well-known keys.
+  // Build the post-merge state in a staging object BEFORE touching `_config`,
+  // validate the merged state, and commit atomically. Otherwise a partial
+  // merge that later fails post-merge validation would leave `_config`
+  // half-written — e.g. `setConfig({ remote: { enableRemote: true } })`
+  // under default URL="" would set `enableRemote=true` on `_config` and
+  // THEN throw on the empty-URL check, so a subsequent
+  // `setConfig({ remote: { remoteCoreUrl: "ws://..." } })` would quietly
+  // run against the leaked `enableRemote=true` and succeed. Atomic commit
+  // closes that window.
+  const staged = {
+    tagNames: { stripe: _config.tagNames.stripe },
+    remote: {
+      enableRemote: _config.remote.enableRemote,
+      remoteSettingType: _config.remote.remoteSettingType,
+      remoteCoreUrl: _config.remote.remoteCoreUrl,
+    },
+  };
+  // Only copy known keys. `Object.assign` would silently persist unexpected
+  // keys like `evil` into `staged`, growing the schema by stealth.
   if (partialConfig.tagNames) {
     if (partialConfig.tagNames.stripe !== undefined) {
-      _config.tagNames.stripe = partialConfig.tagNames.stripe;
+      staged.tagNames.stripe = partialConfig.tagNames.stripe;
     }
   }
   if (partialConfig.remote) {
     if (partialConfig.remote.enableRemote !== undefined) {
-      _config.remote.enableRemote = partialConfig.remote.enableRemote;
+      staged.remote.enableRemote = partialConfig.remote.enableRemote;
     }
     if (partialConfig.remote.remoteSettingType !== undefined) {
-      _config.remote.remoteSettingType = partialConfig.remote.remoteSettingType;
+      staged.remote.remoteSettingType = partialConfig.remote.remoteSettingType;
     }
     if (partialConfig.remote.remoteCoreUrl !== undefined) {
-      _config.remote.remoteCoreUrl = partialConfig.remote.remoteCoreUrl;
+      staged.remote.remoteCoreUrl = partialConfig.remote.remoteCoreUrl;
     }
   }
+  // Fail-loud for the common misconfiguration: `enableRemote: true` without
+  // a URL source. The check is limited to `remoteSettingType === "config"`
+  // because the `"env"` path resolves at runtime from `process.env` /
+  // `globalThis.STRIPE_REMOTE_CORE_URL`, which may be injected AFTER the
+  // `setConfig` call (server start, bundler-injected globals). For env mode
+  // the fail-loud still occurs later, at `_initRemote` / `getRemoteCoreUrl`.
+  if (staged.remote.enableRemote
+    && staged.remote.remoteSettingType === "config"
+    && !staged.remote.remoteCoreUrl) {
+    raiseError('config.remote.enableRemote is true but remoteCoreUrl is empty. Set remoteCoreUrl, or set remoteSettingType to "env" to read from STRIPE_REMOTE_CORE_URL at runtime.');
+  }
+  // Atomic commit. Field-wise assignment preserves the identity of the
+  // nested objects (`_config.tagNames`, `_config.remote`) so any code
+  // holding a long-lived reference continues to observe updates.
+  _config.tagNames.stripe = staged.tagNames.stripe;
+  _config.remote.enableRemote = staged.remote.enableRemote;
+  _config.remote.remoteSettingType = staged.remote.remoteSettingType;
+  _config.remote.remoteCoreUrl = staged.remote.remoteCoreUrl;
   frozenConfig = null;
 }
 

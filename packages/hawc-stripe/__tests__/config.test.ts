@@ -116,6 +116,30 @@ describe("config", () => {
       expect(config.remote.enableRemote).toBe(true);
       expect(config.remote.remoteCoreUrl).toBe("ws://before/");
     });
+
+    it("leaves config unchanged when POST-merge validation fails (atomic commit, regression)", () => {
+      // Regression: setConfig used to merge into `_config` first and
+      // only run the `enableRemote + empty URL` check afterward. A
+      // throw at the post-merge check would leave `_config.remote.
+      // enableRemote = true` stuck, so a later "legitimate" setConfig
+      // that only supplies the URL would quietly succeed against the
+      // leaked state. The staging + atomic-commit fix ensures a failed
+      // setConfig has zero effect.
+      expect(config.remote.enableRemote).toBe(false);
+      expect(config.remote.remoteCoreUrl).toBe("");
+      expect(() => {
+        // enableRemote=true with no URL must fail AND not leak state.
+        setConfig({ remote: { enableRemote: true } });
+      }).toThrow(/remoteCoreUrl is empty/);
+      // enableRemote must still be false afterwards.
+      expect(config.remote.enableRemote).toBe(false);
+      expect(config.remote.remoteCoreUrl).toBe("");
+      // A URL-only setConfig that SHOULD be a no-op-for-enableRemote
+      // must remain so: enableRemote does not magically turn true.
+      setConfig({ remote: { remoteCoreUrl: "ws://later/" } });
+      expect(config.remote.enableRemote).toBe(false);
+      expect(config.remote.remoteCoreUrl).toBe("ws://later/");
+    });
   });
 
   describe("getRemoteCoreUrl", () => {

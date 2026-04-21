@@ -19,4 +19,5 @@ export type {
   IntentBuilderResult, IntentCreationResult, ConfirmationReport,
   PaymentIntentOptions, SetupIntentOptions, WebhookHandler, WebhookRegisterOptions,
   ResumeAuthorizer, UserContext, WcsStripeCoreValues, WcsStripeValues,
+  UnknownStatusDetail,
 } from "./types.js";

@@ -108,6 +108,21 @@ type StripeStatus =
   | "failed";         // Stripe から失敗が返った、または client-side error
 ```
 
+### Stripe 側 status との対応
+
+Stripe の PaymentIntent/SetupIntent ネイティブ status から `StripeStatus` へのマッピング:
+
+| Stripe status | StripeStatus | 備考 |
+|---|---|---|
+| `succeeded` | `succeeded` | チャージ確定 |
+| `requires_capture` | `succeeded` | **manual-capture flow** (`capture_method: "manual"`)。charge は authorized + hold 済で、ユーザー側の UX 完了。キャプチャは merchant 側で `paymentIntents.capture()` を別途呼ぶ。browser 観察面は "payment complete" 相当 |
+| `requires_action` | `requires_action` | 3DS 等 |
+| `requires_confirmation` | `requires_action` | `_reconcileFromIntentView` (retrieve side) で観測。Bank debit 系で稀に発生 |
+| `processing` | `processing` | 非同期決済 (bank debit 等) の中間 |
+| `requires_payment_method` | `failed` | 直前の attempt が decline 等で失敗し PM 再入力要 |
+| `canceled` | `failed` | `last_payment_error` があれば error に反映 |
+| 上記以外 | **unchanged** | `hawc-stripe:unknown-status` を dispatch し status は現状維持 (webhook 権威) |
+
 ### loading は別軸
 
 `loading: boolean` は **何らかの非同期操作が進行中** であることを示し、`status` とは直交する(hawc-s3 の `loading` / `uploading` 分離と同じ)。具体的には次のいずれかで `true` となる:
@@ -312,16 +327,48 @@ class StripeCore extends EventTarget {
 HTTP ルートは 5xx を返して Stripe retry が走る。これは意図的な eventual consistency で、
 UI の即時反映を優先しつつ、配送確定(ack)の最終判定は handler 側の永続化成功/失敗に委ねる。
 
+**Fold の冪等性**: fatal handler が throw したとき、Core は該当 `event.id` を dedup window から**取り除き** Stripe の再送を受け入れる。再送時は fold が 2 度実行される — 従って fold は常に idempotent でなければならない。具体的には:
+
+- `_setStatus(v)` / `_setLoading(v)` / `_setAmount(a)` / `_setPaymentMethod(pm)` / `_setError(err)` は同一値の 2 回目呼び出しで `dispatchEvent` を抑制する (setter 内 dedup)。
+- 従って `payment_intent.succeeded` が 2 回配送されても、状態が既に `succeeded` ならイベント再発火はない。
+- アプリ側 webhook handler は **別途** `event.id` + DB uniqueness でべき等化すること (SPEC §6.2 の原則)。
+
+**並列 webhook の直列化**: `_foldWebhookIntoState` は succeeded 分岐で `await this._provider.retrieveIntent(...)` を持つ。同一 PaymentIntent に対して `payment_intent.processing` → `payment_intent.succeeded` が短時間連続で配送され、**HTTP ルート側で並列に処理された場合** (Fastify の並列リスナ、µWebSockets 系、個別 request を独立 goroutine 風に扱うフレームワーク)、retrieve await を跨いだ fold 間で finalize 順が逆転する余地がある。具体的には:
+
+- A (`processing` 配送) が fold 同期プレフィクス実行 → 同期完
+- B (`succeeded` 配送) が interleave し `retrieveIntent` await 中
+- C (`processing` もう 1 件) が Flow A のあと着弾 → 古いステータスで上書きしうる
+
+Express デフォルト / 単一プロセス Node の request 直列化運用では顕在化しないが、**高並列 HTTP フレームワーク利用時は HTTP ルート側で webhook を intent-id 単位にシリアライズすることを推奨** (単純には Mutex / in-memory queue、水平スケール時は DB 行ロック or Stripe の `event.id` を key にしたキュー消化)。Core 側は **シリアライズ済み配送を前提に fold 正当性を保証**している。並列配送対応の per-intent-id mutex を Core に内蔵する案は v1 スコープ外 — アプリ側の運用層で解決する。
+
 ### 6.4 `reportConfirmation` の paymentMethod 補完
 
 Stripe.js の `confirmPayment` が返す `paymentIntent.payment_method` は **id 文字列のみ**(expand 指定なしのため)であることが多い。Shell はその場合 `paymentMethod` を omit して `reportConfirmation` を投げる。
 
 Core の succeeded 分岐は、`report.paymentMethod` が欠けており `this._paymentMethod` が未セットなら、`provider.retrieveIntent` を best-effort で叩いて補完する。Provider 側の `retrieveIntent` は `expand: ["payment_method"]` を付けて Stripe を呼ぶので、brand / last4 を得られる。失敗しても UI は succeeded のまま、webhook 経由でさらに補完される。
 
+#### 6.4.1 Stripe.js 異常応答時のフォールバック
+
+Stripe.js の契約上、`confirmPayment` / `confirmSetup` の戻り値は `{ paymentIntent }` / `{ setupIntent }` / `{ error }` のいずれか。これが壊れて **3 つとも不在**で返ってきた場合 (stripe.js の未知バグや互換性非互換の前向きな変化)、Shell は UI を `processing` / `loading=true` のまま塩漬けにしないため以下のフォールバックを取る:
+
+1. `hawc-stripe:unknown-status` を `detail: { intentId, status: "", preparedMode, reason: "stripe.confirm returned no intent and no error" }` で dispatch
+2. Core に `reportConfirmation({ outcome: "processing" })` を送る
+
+結果、UI は `status=processing` / `loading=true` で webhook の着信を待つ形になり、webhook path が終局状態を反映する。アプリは `hawc-stripe:unknown-status` を subscribe してタイムアウト/エスカレーション policy を実装する。
+
 ### 6.3 IntentBuilder 必須のふるまい
 
 - 未登録時、`requestIntent` RPC は `{ code: "intent_builder_not_registered", message: "..." }` で即時失敗。
 - これは hawc-s3 の presign がデフォルトで通る挙動より**厳しい**方針。決済は誤設定が直接金額事故になるため fail-loud を選ぶ。
+
+#### なぜ `IntentBuilder` は必須で `buildIdempotencyKey` は optional なのか
+
+両方とも「多重請求 / 重複処理」を抑える安全弁だが、**必要性のレベルが異なる** ため設計上の扱いを分けている:
+
+- **`IntentBuilder` は「正しく動くため」に必須**: 金額・通貨・customer はサーバー側で権威的に決定する責任の置き場であって、Shell 由来のヒントを素通しで Stripe API に投げると「ブラウザが金額を自由に改竄できる」という即時・致命的な脆弱性になる。未登録で動く仕様は安全に成立しない ─ fail-loud 一択。
+- **`buildIdempotencyKey` は「転送失敗時の二重化を抑える」オプション**: 正常系では重複発行は発生しない。ネットワーク再送・tab 二重サブミット等のリトライ経路で PaymentIntent が二重作成されるのを防ぐための追加防衛層であり、**未設定でも決済フロー自体は成立する**。small-scale / retry 事象が稀な環境では運用上問題が無いので、全員に強制する代わりに optional にしている (README §Security の "Enable idempotent intent creation" 推奨枠)。
+
+この非対称は `hawc-s3` の registerPresign (必須) / registerPostProcess (optional) と同じ哲学 — プロダクトが破綻する装備は必須、運用ヘッジの装備は opt-in。多重化の実測リスクが高いアプリは必ず設定すること、という README の推奨文言が運用上の整合点。
 
 #### 6.3.1 IntentBuilder / サードパーティ例外の運用契約
 
@@ -374,12 +421,12 @@ Core の succeeded 分岐は、`report.paymentMethod` が欠けており `this._
 追加の非 property イベント:
 
 **Shell (`<hawc-stripe>` エレメント) 経由で dispatch されるもの:**
-- `hawc-stripe:trigger-changed` — `trigger` の declarative pulse の開始/終了。`detail: true` で submit 開始、`detail: false` で終了。内部 `submit()` の reject はここでは再 throw せず、通常の `error` state / `hawc-stripe:error` で観測する
+- `hawc-stripe:trigger-changed` — `trigger` の declarative pulse の開始/終了。`detail: true` で submit 開始、`detail: false` で終了。**エッジトリガ**: `false → true` の遷移でのみ submit を開始し、`true` が連続書き込まれても再発火しない (React / Vue の controlled prop で毎レンダ `el.trigger = true` を書いても二重送信にならない)。内部 `submit()` の reject はここでは再 throw せず、通常の `error` state / `hawc-stripe:error` で観測する。`reset()` / `abort()` が cancel パスで、trigger 自体に cancel セマンティクスはない (`el.trigger = false` は読み戻し整合のみ)。
 - `hawc-stripe:appearance-warning` — `appearance` setter の hot-swap (`elements.update({ appearance })`) が throw したとき。`detail: { message, error }` を通知しつつ、setter 自体は throw せず次回 mount での反映にフォールバック
 - `hawc-stripe:element-ready` — Stripe Elements の Payment Element が `ready` を発火したとき。`detail` なし
 - `hawc-stripe:element-change` — Payment Element の `change` イベント。`detail: { complete: boolean }` のみ (入力値そのものは PCI スコープを避けるため転送しない)
 - `hawc-stripe:stale-config` — `prepare()` 成功後に `mode` / `amount-value` / `amount-currency` / `customer-id` 属性が変更されたとき。現在の mounted Elements はその時点の値に束縛されているため、変更を効かせるには `reset()` / `abort()` + 再 `prepare()` が必要。`detail: { field, message }`
-- `hawc-stripe:unknown-status` — Stripe.js confirm 結果または retrieve の `status` が既知ユニオン外だったとき。`detail: { intentId, status, preparedMode, reason? }`。webhook 権威に委ねる運用のためエラーとは扱わないが、webhook 未配送時のタイムアウト / エスカレーション判断に使える
+- `hawc-stripe:unknown-status` — Stripe.js confirm 結果または retrieve の `status` が既知ユニオン外だったとき、あるいは Stripe.js が `{ paymentIntent, setupIntent, error }` いずれも返さない malformed レスポンスを返したとき。`detail: UnknownStatusDetail = { source, intentId, mode, status, reason? }`。`source` で派生を識別: `"shell-confirm"` (Shell `_applyIntentOutcome` default) / `"shell-malformed"` (Stripe.js 異常応答) / `"core"` (Core `_reconcileFromIntentView` default, retrieve 由来)。webhook 権威に委ねる運用のためエラーとは扱わないが、webhook 未配送時のタイムアウト / エスカレーション判断に使える
 - `hawc-stripe:missing-return-url-warning` — `submit()` 到達時点で `return-url` 未設定かつ `mode="payment"` だった場合に一度だけ発火 (prepare ライフサイクルごとに再武装)。redirect を要する PM (3DS cards, Konbini, wallets, Klarna, 等) では confirm 時に Stripe.js が throw する
 - `hawc-stripe:dispose-warning` — remote モードの disconnect 時 best-effort cleanup (`cancelIntent` / `reset` / `unbind` / `proxy.dispose` / `ws.close`) が失敗したときに、`detail: { phase, error }` で通知。要素は DOM-detached 直前のため、`el.addEventListener` で先行登録された listener (テスト / オブザーバビリティ) のみが受け取る
 
@@ -477,14 +524,31 @@ wc-bindable-protocol remote の既存ワイヤ形式に乗る(新しい message 
 
 hawc-auth0 における token 非露出と同じ哲学。
 
+**dispose 後の残留禁止**: `StripeCore.dispose()` は以下を null 化する:
+
+- `_webhookSecret` (webhook signing secret)
+- `_userContext` (認証済みユーザーコンテキスト)
+- `_provider` (`STRIPE_SECRET_KEY` を間接的に保持する `IStripeProvider` 実装への参照)
+
+マルチテナントサーバで tenant 単位に Core を生成 / 破棄する運用で、disposed Core への stray reference が残っても heap dump に secret が載らないことを保証する。`_target` (`EventTarget`) は secret を持たないため保持継続 (late-dispatch の target を維持)。`_disposed` flag が全 public command の入口で `raiseError` するため、null 化された `_provider` が誤って dereference される経路は閉じている。
+
 ### 9.3 Your Responsibilities
 
 - **WebSocket の認証**: session cookie or bearer を upgrade 時に検証。未認証接続からの `createIntent` を許さない。
+
+  **Core の wcBindable surface は wire に直接露出している**: `StripeCore.wcBindable.commands` には `requestIntent` / `reportConfirmation` / `cancelIntent` / `resumeIntent` / `reset` の 5 つが並び、Shell が内部的に叩く RPC がそのまま remote proxy 経由で wire にも公開される。Shell の public 4 コマンド (`prepare` / `submit` / `reset` / `abort`) は **ブラウザ側のエレメント API** であって wire プロトコルではない ─ 認証されていない(あるいは認証された別ユーザーの) WebSocket から `reportConfirmation({ intentId: "pi_victim", outcome: "succeeded" })` を直打ちされる攻撃面は残る。Core が更新するのは observable state のみで実際の入金判定は webhook ハンドラ + DB 整合性で行うため決済事故には直結しないが、`cancelIntent` / `resumeIntent` は実害 (他ユーザー intent の cancel や hydrate) があるため、WebSocket セッションのユーザー識別 + `UserContext` に基づく intent 所有権チェック (`registerResumeAuthorizer`、または IntentBuilder 内で `metadata.userId` を set しておく) が必須。
 - **`registerIntentBuilder` でサーバー側 amount 算出**: Shell からの `amountValue` / `amountCurrency` は**ヒント**であり、カート / 商品 DB / 割引計算の結果をサーバーが最終決定する。Shell 値をそのまま渡すと、ブラウザから金額改竄ができる。
 - **Webhook endpoint の raw body 保全**: body-parser が JSON parse する前に生文字列を確保(Express なら `express.raw({ type: 'application/json' })`)。parse 後に再 stringify した body は署名検証に通らない。
 - **Idempotency key の付与**: 同一ユーザーからの連続 `requestIntent` に対し idempotency を保つ(Stripe 側の idempotency-key を使う or アプリ側でレート制限)。
 - **Error sanitization**: Stripe が返す `code` / `decline_code` はそのまま返してよいが、Stripe の内部 error message、stack trace、PaymentIntent オブジェクト全体を error.message に入れて wire に流さない。
 - **User 分離**: `registerIntentBuilder` に渡る `UserContext` は認証済み前提。ここで customer / metadata を他ユーザーのものに向けない検証を行う。
+- **Remote 切断時の再接続はアプリ側責務**: `<hawc-stripe>` の remote モード (`config.remote.enableRemote === true`) は `new WebSocket(url)` を 1 回だけ張り、`error` / `close` いずれかで `_disposeRemote` して Shell を transport 不能状態に確定させる。**自動再接続は行わない**。モバイル端末の回線瞬断 / サーバ rolling deploy / LB idle timeout 等で切断された後、ユーザーが `submit()` を叩くと proxy が null の `raiseError` 経路に落ちる。復旧は以下のいずれか:
+
+  1. 切断 event (`hawc-stripe:error` with `code: "transport_unavailable"`) を listen し、アプリ側で element を `removeChild` → `appendChild` で再マウント (推奨)。
+  2. ページ全体を reload する。
+  3. 将来的に `reconnect-on-close="true"` 等の opt-in 属性が提供される可能性はあるが v1 では実装しない。
+
+  ポリシー: 自動再接続を Shell に埋めると、(a) 指数 backoff / jitter 等の選択がアプリに押し付けられ、(b) 接続中の `_preparePromise` / `_submitPromise` の扱いが hawc-s3 側 presign と整合せず、(c) 無限リトライで Stripe API を叩き続けるリスクが発生する。アプリが明示的に再マウントする方が副作用を観察しやすい。
 
 ### 9.4 Threat model(短縮版)
 

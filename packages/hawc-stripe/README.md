@@ -24,6 +24,31 @@ See [SPEC.md](./SPEC.md) for the full protocol — state machine, wcBindable sur
 
 Server-side code **must** import from the `/server` subpath. The bare package name `@wc-bindable/hawc-stripe` is the browser barrel — it re-exports `<hawc-stripe>` (a Custom Element built on `HTMLElement`). The component guards its `HTMLElement` base with a `typeof` fallback so the barrel *evaluates* under plain Node without crashing (useful for SSR pre-render, test pre-scanners, and bundler graph walks that touch the root specifier), but the component is **not functional on the server** — there is no `customElements` registry, no DOM, no Stripe.js. `StripeCore` / `StripeSdkProvider` are exported **only** from `/server` so Node-side code reaches the headless pieces through the entry intended for it, not through the browser surface.
 
+> ⚠️ **Lifecycle note**: this Quick Start shows the Core wired up **at request / connection time** — `authenticatedUser` and `activeCartId` are per-request values resolved by your auth middleware. Do NOT build a single module-level `StripeCore` at server startup and try to close over request-scoped variables — that pattern captures `undefined` at module-eval time and, worse, shares one `userContext` across every tenant. Two production-safe shapes:
+>
+> 1. **Per-connection Core (recommended for multi-tenant WebSocket servers)**: build `provider` + `core` inside the WS `upgrade` handler once per authenticated session, and `core.dispose()` on `close`. Each session gets its own `userContext` / `buildIdempotencyKey` closure.
+> 2. **One Core per process + per-request metadata**: keep `core` / `provider` at module scope and pass request-scoped data through the `IntentBuilder`'s return value — set `metadata: { userId, cartId }` on the intent options, then read it in `buildIdempotencyKey` via `ctx.options.metadata`:
+>
+>    ```ts
+>    // IntentBuilder — embed the request-scoped keys into Stripe metadata
+>    core.registerIntentBuilder((request, ctx) => ({
+>      mode: "payment",
+>      amount,
+>      currency,
+>      metadata: { userId: ctx.sub, cartId: cart.id },
+>    }));
+>
+>    // buildIdempotencyKey — read back the same fields
+>    new StripeSdkProvider(stripe, {
+>      buildIdempotencyKey: ({ operation, options }) => {
+>        const meta = options.metadata as { userId?: string; cartId?: string } | undefined;
+>        return `${operation}:${meta?.userId ?? "anon"}:${meta?.cartId ?? "none"}`;
+>      },
+>    });
+>    ```
+>
+> The example below assumes shape 1 — `authenticatedUser` / `activeCartId` are in scope because the block is conceptually inside a per-connection handler.
+
 ```ts
 import Stripe from "stripe";
 import { StripeCore, StripeSdkProvider } from "@wc-bindable/hawc-stripe/server";
@@ -31,6 +56,8 @@ import { StripeCore, StripeSdkProvider } from "@wc-bindable/hawc-stripe/server";
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
 const provider = new StripeSdkProvider(stripe, {
   // Optional but recommended: make intent creation idempotent per cart/user.
+  // `authenticatedUser` / `activeCartId` are per-request values — see the
+  // lifecycle note above for multi-tenant patterns.
   buildIdempotencyKey: ({ operation }) => `${operation}:${authenticatedUser.sub}:${activeCartId}`,
 });
 
@@ -118,6 +145,7 @@ The Quick Start is **deliberately minimal** and **not production-ready**. Before
 - **Understand SetupIntent cancel defaults**: by default `cancelIntent` does not call Stripe's `setupIntents.cancel` (state-only reset). If dashboard cleanup of stale SetupIntents matters, set `cancelSetupIntents: true` on `StripeCore` and use a provider that implements `cancelSetupIntent`.
 - **Keep webhook handlers idempotent** even with Core dedup enabled. Core suppresses duplicate `event.id` deliveries only within an in-memory per-process window; multi-process routing and process restarts still require DB-backed idempotency keyed by `event.id`.
 - **Consider `registerResumeAuthorizer`** for multi-tenant deployments so a leaked `client_secret` alone cannot resume a foreign user's intent.
+- **Handle WebSocket disconnects in your app** (remote mode only). The `<hawc-stripe>` element connects once per mount and does NOT auto-reconnect on `close` / `error` events (mobile network drop, server rolling deploy, LB idle timeout). Subscribe to `hawc-stripe:error` and, on `code: "transport_unavailable"`, remove + re-append the element — or prompt the user to retry. See SPEC §9.3 for the rationale (auto-reconnect would push backoff policy, in-flight promise handling, and infinite-retry safety onto the library).
 - **Sanitize errors** that cross the wire: the built-in sanitizer keeps `code` / `decline_code` / `type` and forwards `message` only for Stripe-shaped errors (type starts with `Stripe` or matches a known Stripe taxonomy token like `card_error` / `invalid_request_error`) and our own `[@wc-bindable/hawc-stripe]`-prefixed internals — anything else collapses to a generic `"Payment failed."` so a raw `new Error("FATAL: ...")` from an `IntentBuilder` does not reach the browser. **Do not fake Stripe type tokens on your own errors** (`Object.assign(err, { type: "card_error" })`) — that bypasses the allowlist. Custom handlers you add (webhook fulfillment, authorizers) must be equally careful. See SPEC §6.3.1.
 - **Keep `publishable-key` and the server Core's secret key aligned to the same Stripe account**. The Shell (browser) is bound to `publishable-key`, the Core (server) holds the secret key via its injected `IStripeProvider`. A `publishable-key` swap invalidates cached Stripe.js and cancels the orphan intent on the *previously active* account, but it does NOT reconfigure the Core — the Core will keep creating intents under the old secret key until you construct a new `StripeCore` with a provider pointing at the new account. For multi-account routing, build one Core per account and route requests before they reach `requestIntent`.
 

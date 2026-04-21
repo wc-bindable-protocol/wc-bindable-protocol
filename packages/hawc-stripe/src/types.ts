@@ -333,3 +333,35 @@ export interface WcsStripeCoreValues {
 export interface WcsStripeValues extends WcsStripeCoreValues {
   trigger: boolean;
 }
+
+/**
+ * Detail payload for `hawc-stripe:unknown-status` events.
+ *
+ * Fires from three sites — all three share this shape so listeners can
+ * branch on `source` without having to probe for differently-named fields:
+ *
+ * - `source: "core"` — Core's `_reconcileFromIntentView` saw a Stripe
+ *   status outside the known union (e.g. a newly introduced value). The
+ *   observable status is left unchanged; the webhook path remains the
+ *   authority.
+ * - `source: "shell-confirm"` — Shell's `_applyIntentOutcome` saw a
+ *   Stripe.js confirm result with an unknown `status`. Shell reports
+ *   `outcome: "processing"` to the Core so webhook can resolve terminal
+ *   state.
+ * - `source: "shell-malformed"` — Stripe.js returned a result with
+ *   neither `paymentIntent` / `setupIntent` nor `error`. Shell reports
+ *   `outcome: "processing"` with `reason` set so an operator can trace
+ *   back to the broken Stripe.js response.
+ *
+ * `intentId` can be null on the core path if the Core has no
+ * `_activeIntent` at dispatch time. `status` is the raw string Stripe
+ * returned, or `""` for the shell-malformed path. `reason` is optional,
+ * set only when there is additional diagnostic context beyond `status`.
+ */
+export interface UnknownStatusDetail {
+  source: "core" | "shell-confirm" | "shell-malformed";
+  intentId: string | null;
+  mode: StripeMode;
+  status: string;
+  reason?: string;
+}
