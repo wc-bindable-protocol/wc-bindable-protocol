@@ -105,6 +105,42 @@ describe("StripeCore", () => {
       expect(c.amount).toEqual({ value: 1980, currency: "jpy" });
     });
 
+    it("passes through extended Stripe intent fields from IntentBuilder", async () => {
+      core.registerIntentBuilder((req) => {
+        if (req.mode === "payment") {
+          return {
+            mode: "payment",
+            amount: 2500,
+            currency: "usd",
+            application_fee_amount: 250,
+            transfer_data: { destination: "acct_123" },
+            confirm: true,
+          };
+        }
+        return {
+          mode: "setup",
+          payment_method: "pm_123",
+          mandate_data: { customer_acceptance: { type: "online" } },
+        };
+      });
+
+      await core.requestIntent({ mode: "payment", hint: {} });
+      await core.requestIntent({ mode: "setup", hint: {} });
+
+      expect(provider.createPaymentCalls).toHaveLength(1);
+      expect(provider.createPaymentCalls[0]).not.toHaveProperty("mode");
+      expect(provider.createPaymentCalls[0].application_fee_amount).toBe(250);
+      expect(provider.createPaymentCalls[0].confirm).toBe(true);
+      expect(provider.createPaymentCalls[0].transfer_data).toEqual({ destination: "acct_123" });
+
+      expect(provider.createSetupCalls).toHaveLength(1);
+      expect(provider.createSetupCalls[0]).not.toHaveProperty("mode");
+      expect(provider.createSetupCalls[0].payment_method).toBe("pm_123");
+      expect(provider.createSetupCalls[0].mandate_data).toEqual({
+        customer_acceptance: { type: "online" },
+      });
+    });
+
     it("clears stale payment amount when switching to setup mode on the same Core", async () => {
       // First request: payment mode — amount lands on observable state.
       core.registerIntentBuilder(() => ({ mode: "payment", amount: 1980, currency: "jpy" }));

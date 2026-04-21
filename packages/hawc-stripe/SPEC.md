@@ -212,13 +212,15 @@ interface PaymentIntentOptions {
   customer?: string;
   metadata?: Record<string, string>;
   setup_future_usage?: "off_session" | "on_session";
-  // ... Stripe が受け付けるフィールド
+  // ... common subset (typed)
+  [key: string]: unknown; // additional Stripe create params are pass-through
 }
 
 interface SetupIntentOptions {
   customer?: string;
   metadata?: Record<string, string>;
   usage?: "on_session" | "off_session";
+  [key: string]: unknown; // additional Stripe create params are pass-through
 }
 
 interface IntentRequest {

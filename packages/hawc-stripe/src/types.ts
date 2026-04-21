@@ -153,6 +153,9 @@ export interface PaymentIntentOptions {
   capture_method?: "automatic" | "manual";
   payment_method_types?: string[];
   automatic_payment_methods?: { enabled: boolean; allow_redirects?: "always" | "never" };
+  // Permit Stripe create-param pass-through (e.g. Connect fields such as
+  // application_fee_amount / transfer_data) while keeping common keys typed.
+  [key: string]: unknown;
 }
 
 export interface SetupIntentOptions {
@@ -162,6 +165,8 @@ export interface SetupIntentOptions {
   usage?: "on_session" | "off_session";
   payment_method_types?: string[];
   automatic_payment_methods?: { enabled: boolean; allow_redirects?: "always" | "never" };
+  // Permit additional Stripe SetupIntent create params from IntentBuilder.
+  [key: string]: unknown;
 }
 
 export type IntentBuilderResult =
