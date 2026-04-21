@@ -12,15 +12,26 @@ interface IInternalConfig extends IConfig {
   };
 }
 
+interface EnvGlobals {
+  readonly process?: { readonly env?: Readonly<Record<string, string | undefined>> };
+  readonly STRIPE_REMOTE_CORE_URL?: string;
+}
+
 function resolveRemoteCoreUrl(cfg: IInternalConfig): string {
   if (cfg.remote.remoteSettingType === "env") {
     // Mirror hawc-s3's resolution order: process.env first, then a global
     // hook for browser bundles that inject the URL before scripts execute.
-    return (
-      (globalThis as any).process?.env?.STRIPE_REMOTE_CORE_URL ??
-      (globalThis as any).STRIPE_REMOTE_CORE_URL ??
-      ""
-    );
+    // Narrow typed cast instead of `any` so an accidental read against a
+    // different shape (e.g. `(globalThis as any).process.exit(1)`) is a
+    // type error rather than a silent pass.
+    const g = globalThis as unknown as EnvGlobals;
+    const fromProcess = typeof g.process?.env?.STRIPE_REMOTE_CORE_URL === "string"
+      ? g.process.env.STRIPE_REMOTE_CORE_URL
+      : undefined;
+    const fromGlobal = typeof g.STRIPE_REMOTE_CORE_URL === "string"
+      ? g.STRIPE_REMOTE_CORE_URL
+      : undefined;
+    return fromProcess ?? fromGlobal ?? "";
   }
   return cfg.remote.remoteCoreUrl;
 }

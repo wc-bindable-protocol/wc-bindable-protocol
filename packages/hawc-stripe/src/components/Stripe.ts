@@ -5,6 +5,7 @@ import {
 } from "../types.js";
 import { StripeCore } from "../core/StripeCore.js";
 import { extractCardPaymentMethod } from "../internal/paymentMethodShape.js";
+import { raiseError } from "../raiseError.js";
 import {
   createRemoteCoreProxy,
   WebSocketClientTransport,
@@ -96,11 +97,11 @@ export class Stripe extends HTMLElementCtor {
     const mod = await import("@stripe/stripe-js");
     const loadStripe = (mod as { loadStripe?: (k: string) => Promise<unknown> }).loadStripe;
     if (!loadStripe) {
-      throw new Error("[@wc-bindable/hawc-stripe] @stripe/stripe-js has no loadStripe export.");
+      raiseError("@stripe/stripe-js has no loadStripe export.");
     }
     const s = await loadStripe(key);
     if (!s) {
-      throw new Error("[@wc-bindable/hawc-stripe] loadStripe returned null (blocked / offline / invalid key).");
+      raiseError("loadStripe returned null (blocked / offline / invalid key).");
     }
     return s as StripeJsLike;
   };
@@ -280,7 +281,7 @@ export class Stripe extends HTMLElementCtor {
   private _initRemote(): void {
     const url = getRemoteCoreUrl();
     if (!url) {
-      throw new Error("[@wc-bindable/hawc-stripe] remote.enableRemote is true but remoteCoreUrl is empty. Set remote.remoteCoreUrl or STRIPE_REMOTE_CORE_URL.");
+      raiseError("remote.enableRemote is true but remoteCoreUrl is empty. Set remote.remoteCoreUrl or STRIPE_REMOTE_CORE_URL.");
     }
     const ws = new WebSocket(url);
     this._ws = ws;
@@ -360,6 +361,18 @@ export class Stripe extends HTMLElementCtor {
     this._localErrorSeqSync = 0;
     this._ws = null;
 
+    // Observability helper. The element is about to be DOM-detached, so
+    // dispatching on `this` only reaches listeners that were attached
+    // directly via `el.addEventListener(...)` — but that is exactly the
+    // surface a debugger / test can grab, which is what this event is
+    // for. Silent failures in this cleanup block are otherwise invisible.
+    const reportFailure = (phase: string, error: unknown): void => {
+      this.dispatchEvent(new CustomEvent("hawc-stripe:dispose-warning", {
+        detail: { phase, error },
+        bubbles: true,
+      }));
+    };
+
     void (async () => {
       if (preparePromise) {
         await preparePromise.catch(() => { /* supersede / prior failure */ });
@@ -369,18 +382,18 @@ export class Stripe extends HTMLElementCtor {
       // already-known intent id exists at teardown entry.
       if (orphanIdAtEntry && proxy) {
         await proxy.invokeWithOptions("cancelIntent", [orphanIdAtEntry], { timeoutMs: 0 })
-          .catch(() => {});
+          .catch((e: unknown) => { reportFailure("cancelIntent", e); });
       }
 
-      await proxy?.invoke("reset").catch(() => {});
+      await proxy?.invoke("reset").catch((e: unknown) => { reportFailure("reset", e); });
       if (unbind) {
-        try { unbind(); } catch { /* already unbound */ }
+        try { unbind(); } catch (e) { reportFailure("unbind", e); }
       }
       if (proxy) {
-        try { proxy.dispose(); } catch { /* already disposed */ }
+        try { proxy.dispose(); } catch (e) { reportFailure("proxy.dispose", e); }
       }
       if (ws) {
-        try { ws.close(); } catch { /* already closed */ }
+        try { ws.close(); } catch (e) { reportFailure("ws.close", e); }
       }
     })();
   }
@@ -533,8 +546,8 @@ export class Stripe extends HTMLElementCtor {
     // old Core are invisible. Either reset the prior Core first or pass
     // the same instance — both require an explicit user action.
     if (this._core && this._core !== core) {
-      throw new Error(
-        "[@wc-bindable/hawc-stripe] attachLocalCore called with a different core instance; reset() the prior core and detach before re-attaching.",
+      raiseError(
+        "attachLocalCore called with a different core instance; reset() the prior core and detach before re-attaching.",
       );
     }
     this._core = core;
@@ -691,7 +704,7 @@ export class Stripe extends HTMLElementCtor {
     if (this._isRemote) {
       return await this._proxy!.invokeWithOptions("requestIntent", [request], { timeoutMs: 0 }) as IntentCreationResult;
     }
-    if (!this._core) throw new Error("[@wc-bindable/hawc-stripe] no core attached.");
+    if (!this._core) raiseError("no core attached.");
     return await this._core.requestIntent(request);
   }
 
@@ -700,7 +713,7 @@ export class Stripe extends HTMLElementCtor {
       await this._proxy!.invokeWithOptions("reportConfirmation", [report], { timeoutMs: 0 });
       return;
     }
-    if (!this._core) throw new Error("[@wc-bindable/hawc-stripe] no core attached.");
+    if (!this._core) raiseError("no core attached.");
     await this._core.reportConfirmation(report);
   }
 
@@ -709,7 +722,7 @@ export class Stripe extends HTMLElementCtor {
       await this._proxy!.invokeWithOptions("cancelIntent", [intentId], { timeoutMs: 0 });
       return;
     }
-    if (!this._core) throw new Error("[@wc-bindable/hawc-stripe] no core attached.");
+    if (!this._core) raiseError("no core attached.");
     await this._core.cancelIntent(intentId);
   }
 
@@ -726,7 +739,7 @@ export class Stripe extends HTMLElementCtor {
       await this._proxy!.invokeWithOptions("resumeIntent", [intentId, mode, clientSecret], { timeoutMs: 0 });
       return;
     }
-    if (!this._core) throw new Error("[@wc-bindable/hawc-stripe] no core attached.");
+    if (!this._core) raiseError("no core attached.");
     await this._core.resumeIntent(intentId, mode, clientSecret);
   }
 
@@ -836,7 +849,7 @@ export class Stripe extends HTMLElementCtor {
   private async _ensureStripeJs(): Promise<StripeJsLike> {
     const key = this.publishableKey;
     if (!key) {
-      throw new Error("[@wc-bindable/hawc-stripe] publishable-key is required before prepare().");
+      raiseError("publishable-key is required before prepare().");
     }
     // Self-consistency: if the cached instance was built for a different
     // key, drop it. `attributeChangedCallback` proactively invalidates on
@@ -856,9 +869,7 @@ export class Stripe extends HTMLElementCtor {
     // Fail loud; the outer prepare()'s supersede guard catches this and
     // `_maybeAutoPrepare` re-fires with the new key afterward.
     if (this.publishableKey !== key) {
-      throw new Error(
-        "[@wc-bindable/hawc-stripe] publishable-key changed during Stripe.js load — aborting prepare().",
-      );
+      raiseError("publishable-key changed during Stripe.js load — aborting prepare().");
     }
     this._stripeJs = loaded;
     this._stripeJsKey = key;
@@ -950,7 +961,7 @@ export class Stripe extends HTMLElementCtor {
       return;
     }
     if (!this.publishableKey) {
-      throw new Error("[@wc-bindable/hawc-stripe] publishable-key is required before prepare().");
+      raiseError("publishable-key is required before prepare().");
     }
     // Early format check. Stripe publishable keys always have the `pk_`
     // prefix (`pk_live_...` / `pk_test_...` / future `pk_*_...` variants).
@@ -959,9 +970,7 @@ export class Stripe extends HTMLElementCtor {
     // message — the local fail-loud here turns a DX cliff into an
     // `[@wc-bindable/hawc-stripe]`-prefixed diagnostic.
     if (!this.publishableKey.startsWith("pk_")) {
-      throw new Error(
-        "[@wc-bindable/hawc-stripe] publishable-key must be a Stripe publishable key (starts with \"pk_\").",
-      );
+      raiseError('publishable-key must be a Stripe publishable key (starts with "pk_").');
     }
 
     // Snapshot the mode at the top of prepare so that an attribute flip
@@ -1001,7 +1010,7 @@ export class Stripe extends HTMLElementCtor {
       // whether to auto-retry based on the supersede reason.
       if (gen !== this._prepareGeneration) {
         this._cancelIntent(creation.intentId).catch(() => {});
-        throw new Error("[@wc-bindable/hawc-stripe] prepare() superseded.");
+        raiseError("prepare() superseded.");
       }
       this._clientSecret = creation.clientSecret;
       try {
@@ -1025,7 +1034,7 @@ export class Stripe extends HTMLElementCtor {
       if (gen !== this._prepareGeneration) {
         this._teardownElements();
         this._cancelIntent(creation.intentId).catch(() => {});
-        throw new Error("[@wc-bindable/hawc-stripe] prepare() superseded.");
+        raiseError("prepare() superseded.");
       }
       this._preparedMode = preparedMode;
       this._preparedIntentId = creation.intentId;
@@ -1602,11 +1611,40 @@ export class Stripe extends HTMLElementCtor {
     }));
   }
 
-  private _syncInput(name: string, value: unknown): void {
+  /**
+   * Proxy a declarative input from the Shell attribute surface to the
+   * Core (local mode) or to the wire (remote mode). `name` is restricted
+   * to the four bindable inputs declared in `wcBindable.inputs` — any
+   * other value is a bug, not a runtime concern, so we raise rather than
+   * silently dropping.
+   *
+   * Dispatching via a typed switch (not a dynamic `(core as any)[name] = v`)
+   * keeps the call site under TypeScript's checker — a rename of
+   * `amountValue` on the Core would surface here as a compile error
+   * instead of a runtime null-write at the end of a long chain.
+   */
+  private _syncInput(
+    name: "mode" | "amountValue" | "amountCurrency" | "customerId",
+    value: unknown,
+  ): void {
     if (this._isRemote && this._proxy) {
       this._proxy.setWithAck(name, value).catch((e: unknown) => this._setErrorStateFromUnknown(e));
-    } else if (this._core) {
-      (this._core as unknown as Record<string, unknown>)[name] = value;
+      return;
+    }
+    if (!this._core) return;
+    switch (name) {
+      case "mode":
+        this._core.mode = value as StripeMode;
+        return;
+      case "amountValue":
+        this._core.amountValue = value as number | null;
+        return;
+      case "amountCurrency":
+        this._core.amountCurrency = value as string | null;
+        return;
+      case "customerId":
+        this._core.customerId = value as string | null;
+        return;
     }
   }
 

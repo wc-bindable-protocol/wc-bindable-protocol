@@ -55,6 +55,14 @@ export class StripeCore extends EventTarget {
   // 96 allows hierarchical dotted variants (e.g. "payment_intent.authentication_required").
   private static readonly _STRIPE_ERROR_CODE_RE = /^[a-z0-9_.]{1,96}$/i;
   /**
+   * Stripe SDK error class names: `StripeCardError`, `StripeAPIError`,
+   * `StripeConnectionError`, `StripeInvalidRequestError`,
+   * `StripeIdempotencyError`, etc. Tight shape requirement (PascalCase
+   * body + `Error` suffix) so a stray `StripeLeak` on a forged error
+   * cannot pass the `startsWith("Stripe")` check.
+   */
+  private static readonly _STRIPE_CLASS_NAME_RE = /^Stripe[A-Z][A-Za-z]*Error$/;
+  /**
    * Known-safe Stripe error type tokens. `message` is only forwarded when
    * `type` matches one of these (or the "Stripe<ClassName>" SDK shape) — a
    * lax `*_error` suffix match would let an app throw
@@ -409,12 +417,13 @@ export class StripeCore extends EventTarget {
    * returned) that must not cross the WebSocket unredacted 窶・SPEC ﾂｧ9.3.
    *
    * Message-copy policy: the `message` field is only forwarded when the
-   * error looks like (a) a Stripe SDK error 窶・`type` starts with "Stripe"
-   * (class-name shape: StripeCardError, StripeAPIError, ...) or is one of
-   * the known Stripe API object tokens in `_STRIPE_KNOWN_TYPES`
-   * (card_error, invalid_request_error, api_error, ...) 窶・or (b) one of
-   * our own `[@wc-bindable/hawc-stripe]`-prefixed internal errors whose
-   * messages are hand-curated. Anything else
+   * error looks like (a) a Stripe SDK error 窶・`type` matches the tight
+   * class-name regex `_STRIPE_CLASS_NAME_RE` (StripeCardError,
+   * StripeAPIError, …) or is one of the known Stripe API object tokens
+   * in `_STRIPE_KNOWN_TYPES` (card_error, invalid_request_error,
+   * api_error, …) 窶・or (b) one of our own
+   * `[@wc-bindable/hawc-stripe]`-prefixed internal errors whose messages
+   * are hand-curated. Anything else
    * (IntentBuilder throwing a raw `new Error("DB auth failed for user=...")`,
    * a network-layer exception whose `.message` contains internal hostnames,
    * etc.) is replaced with a generic "Payment failed." so the observable
@@ -440,7 +449,7 @@ export class StripeCore extends EventTarget {
       const type = sanitizeToken(e.type);
       const rawMessage = typeof e.message === "string" ? e.message : undefined;
       const stripeShaped = type !== undefined
-        && (type.startsWith("Stripe") || StripeCore._STRIPE_KNOWN_TYPES.has(type));
+        && (StripeCore._STRIPE_CLASS_NAME_RE.test(type) || StripeCore._STRIPE_KNOWN_TYPES.has(type));
       const internal = rawMessage !== undefined
         && rawMessage.startsWith("[@wc-bindable/hawc-stripe]");
       const safeMessage = (stripeShaped || internal) && rawMessage !== undefined

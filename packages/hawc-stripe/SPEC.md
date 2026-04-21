@@ -372,8 +372,24 @@ Core の succeeded 分岐は、`report.paymentMethod` が欠けており `this._
 `error` は他と違い `-changed` サフィックスを持たない(Core の `wcBindable.properties` 宣言と一致)。
 
 追加の非 property イベント:
-- `hawc-stripe:appearance-warning` — `appearance` setter の hot-swap (`elements.update({ appearance })`) が throw したとき。`detail: { message, error }` を通知しつつ、setter 自体は throw せず次回 mount での反映にフォールバック
+
+**Shell (`<hawc-stripe>` エレメント) 経由で dispatch されるもの:**
 - `hawc-stripe:trigger-changed` — `trigger` の declarative pulse の開始/終了。`detail: true` で submit 開始、`detail: false` で終了。内部 `submit()` の reject はここでは再 throw せず、通常の `error` state / `hawc-stripe:error` で観測する
+- `hawc-stripe:appearance-warning` — `appearance` setter の hot-swap (`elements.update({ appearance })`) が throw したとき。`detail: { message, error }` を通知しつつ、setter 自体は throw せず次回 mount での反映にフォールバック
+- `hawc-stripe:element-ready` — Stripe Elements の Payment Element が `ready` を発火したとき。`detail` なし
+- `hawc-stripe:element-change` — Payment Element の `change` イベント。`detail: { complete: boolean }` のみ (入力値そのものは PCI スコープを避けるため転送しない)
+- `hawc-stripe:stale-config` — `prepare()` 成功後に `mode` / `amount-value` / `amount-currency` / `customer-id` 属性が変更されたとき。現在の mounted Elements はその時点の値に束縛されているため、変更を効かせるには `reset()` / `abort()` + 再 `prepare()` が必要。`detail: { field, message }`
+- `hawc-stripe:unknown-status` — Stripe.js confirm 結果または retrieve の `status` が既知ユニオン外だったとき。`detail: { intentId, status, preparedMode, reason? }`。webhook 権威に委ねる運用のためエラーとは扱わないが、webhook 未配送時のタイムアウト / エスカレーション判断に使える
+- `hawc-stripe:missing-return-url-warning` — `submit()` 到達時点で `return-url` 未設定かつ `mode="payment"` だった場合に一度だけ発火 (prepare ライフサイクルごとに再武装)。redirect を要する PM (3DS cards, Konbini, wallets, Klarna, 等) では confirm 時に Stripe.js が throw する
+- `hawc-stripe:dispose-warning` — remote モードの disconnect 時 best-effort cleanup (`cancelIntent` / `reset` / `unbind` / `proxy.dispose` / `ws.close`) が失敗したときに、`detail: { phase, error }` で通知。要素は DOM-detached 直前のため、`el.addEventListener` で先行登録された listener (テスト / オブザーバビリティ) のみが受け取る
+
+**Core (`StripeCore` の EventTarget) 経由で dispatch されるもの:**
+- `hawc-stripe:webhook-deduped` — 同一 `event.id` の webhook が dedup window でスキップされたとき。`detail: { eventId, type }`
+- `hawc-stripe:webhook-warning` — `fatal: false` で登録された webhook handler が throw したとき。`detail: { error, event }`
+- `hawc-stripe:authorizer-error` — `registerResumeAuthorizer` が登録した authorizer が throw したとき。`detail: { error, intentId, mode }` (server-side 運用者向け; 生例外は wire には流さず denial として扱う)
+- `hawc-stripe:unknown-status` — Core 側の `_reconcileFromIntentView` が未知 Stripe status を観測したとき。`detail: { source: "core", intentId, mode, status }`
+
+`error` は `-changed` サフィックスを持たない (Core の `wcBindable.properties` 宣言と一致)。`-warning` 接尾辞は「UI を壊さない補足情報」の共通ファミリー (`appearance-warning` / `webhook-warning` / `missing-return-url-warning` / `dispose-warning`)。
 
 ### 7.5 disconnectedCallback の契約
 
