@@ -804,6 +804,128 @@ describe("StripeCore", () => {
     });
   });
 
+  describe("setter dispatch dedup", () => {
+    it("does not dispatch duplicate amount/paymentMethod/intentId/error events for same values", () => {
+      const c = new StripeCore(provider, { webhookSecret: "whsec_test" });
+      const counts = {
+        amount: 0,
+        paymentMethod: 0,
+        intentId: 0,
+        error: 0,
+      };
+      c.addEventListener("hawc-stripe:amount-changed", () => { counts.amount++; });
+      c.addEventListener("hawc-stripe:paymentMethod-changed", () => { counts.paymentMethod++; });
+      c.addEventListener("hawc-stripe:intentId-changed", () => { counts.intentId++; });
+      c.addEventListener("hawc-stripe:error", () => { counts.error++; });
+
+      (c as any)._setAmount({ value: 1000, currency: "usd" });
+      (c as any)._setAmount({ value: 1000, currency: "usd" });
+      expect(counts.amount).toBe(1);
+
+      (c as any)._setPaymentMethod({ id: "pm_1", brand: "visa", last4: "4242" });
+      (c as any)._setPaymentMethod({ id: "pm_1", brand: "visa", last4: "4242" });
+      expect(counts.paymentMethod).toBe(1);
+
+      (c as any)._setIntentId("pi_123");
+      (c as any)._setIntentId("pi_123");
+      expect(counts.intentId).toBe(1);
+
+      (c as any)._setError({ code: "card_declined", message: "Declined." });
+      (c as any)._setError({ code: "card_declined", message: "Declined." });
+      expect(counts.error).toBe(1);
+    });
+
+    it("_setAmount does not re-dispatch on identical value/currency through requestIntent", async () => {
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 1980, currency: "jpy" }));
+      const events: unknown[] = [];
+      core.addEventListener("hawc-stripe:amount-changed", (e) => events.push((e as CustomEvent).detail));
+
+      await core.requestIntent({ mode: "payment", hint: {} });
+      const before = events.length;
+      await core.requestIntent({ mode: "payment", hint: {} });
+      expect(events.length).toBe(before);
+    });
+
+    it("_setIntentId does not re-dispatch on identical intentId through requestIntent", async () => {
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      const events: unknown[] = [];
+      core.addEventListener("hawc-stripe:intentId-changed", (e) => events.push((e as CustomEvent).detail));
+
+      provider.nextPaymentIntentId = "pi_same";
+      await core.requestIntent({ mode: "payment", hint: {} });
+      const before = events.length;
+      provider.nextPaymentIntentId = "pi_same";
+      await core.requestIntent({ mode: "payment", hint: {} });
+      expect(events.length).toBe(before);
+    });
+
+    it("_setPaymentMethod does not re-dispatch on identical payment method through reportConfirmation", async () => {
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      const events: unknown[] = [];
+      core.addEventListener("hawc-stripe:paymentMethod-changed", (e) => events.push((e as CustomEvent).detail));
+
+      await core.requestIntent({ mode: "payment", hint: {} });
+      await core.reportConfirmation({
+        intentId: "pi_123",
+        outcome: "succeeded",
+        paymentMethod: { id: "pm_1", brand: "visa", last4: "4242" },
+      });
+      const before = events.length;
+      await core.reportConfirmation({
+        intentId: "pi_123",
+        outcome: "succeeded",
+        paymentMethod: { id: "pm_1", brand: "visa", last4: "4242" },
+      });
+      expect(events.length).toBe(before);
+    });
+
+    it("_setError does not re-dispatch on identical error through reportConfirmation", async () => {
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      const events: unknown[] = [];
+      core.addEventListener("hawc-stripe:error", (e) => events.push((e as CustomEvent).detail));
+
+      await core.requestIntent({ mode: "payment", hint: {} });
+      await core.reportConfirmation({
+        intentId: "pi_123",
+        outcome: "failed",
+        error: { code: "card_declined", message: "Declined." },
+      });
+      const before = events.length;
+      await core.reportConfirmation({
+        intentId: "pi_123",
+        outcome: "failed",
+        error: { code: "card_declined", message: "Declined." },
+      });
+      expect(events.length).toBe(before);
+    });
+
+    it("re-dispatches paymentMethod after null reset even when card fields are identical", async () => {
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      const events: unknown[] = [];
+      core.addEventListener("hawc-stripe:paymentMethod-changed", (e) => events.push((e as CustomEvent).detail));
+
+      await core.requestIntent({ mode: "payment", hint: {} });
+      await core.reportConfirmation({
+        intentId: "pi_123",
+        outcome: "succeeded",
+        paymentMethod: { id: "pm_1", brand: "visa", last4: "4242" },
+      });
+      const beforeReset = events.length;
+
+      core.reset();
+      await core.requestIntent({ mode: "payment", hint: {} });
+      await core.reportConfirmation({
+        intentId: "pi_123",
+        outcome: "succeeded",
+        paymentMethod: { id: "pm_1", brand: "visa", last4: "4242" },
+      });
+
+      expect(events.length).toBe(beforeReset + 2);
+      expect(events[beforeReset]).toBeNull();
+      expect(events[beforeReset + 1]).toEqual({ id: "pm_1", brand: "visa", last4: "4242" });
+    });
+  });
+
   describe("resumeIntent (regression: finding #1 + clientSecret authorization)", () => {
     it("rebuilds _activeIntent when clientSecret matches the retrieved intent", async () => {
       provider.retrieveResult = {

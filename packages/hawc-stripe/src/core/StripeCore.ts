@@ -276,21 +276,39 @@ export class StripeCore extends EventTarget {
   }
 
   private _setAmount(a: StripeAmount | null): void {
+    const prev = this._amount;
+    if (prev === a) return;
+    if (prev && a && prev.value === a.value && prev.currency === a.currency) return;
     this._amount = a;
     this._target.dispatchEvent(new CustomEvent("hawc-stripe:amount-changed", { detail: a ? { ...a } : null, bubbles: true }));
   }
 
   private _setPaymentMethod(pm: StripePaymentMethod | null): void {
+    const prev = this._paymentMethod;
+    if (prev === pm) return;
+    if (prev && pm && prev.id === pm.id && prev.brand === pm.brand && prev.last4 === pm.last4) return;
     this._paymentMethod = pm;
     this._target.dispatchEvent(new CustomEvent("hawc-stripe:paymentMethod-changed", { detail: pm ? { ...pm } : null, bubbles: true }));
   }
 
   private _setIntentId(id: string | null): void {
+    if (this._intentId === id) return;
     this._intentId = id;
     this._target.dispatchEvent(new CustomEvent("hawc-stripe:intentId-changed", { detail: id, bubbles: true }));
   }
 
   private _setError(err: StripeError | null): void {
+    const prev = this._error;
+    if (prev === err) return;
+    // NOTE: Compare all StripeError fields explicitly. If StripeError gains
+    // new fields in the future, update this check as well.
+    if (
+      prev && err
+      && prev.code === err.code
+      && prev.declineCode === err.declineCode
+      && prev.type === err.type
+      && prev.message === err.message
+    ) return;
     this._error = err;
     this._target.dispatchEvent(new CustomEvent("hawc-stripe:error", { detail: err, bubbles: true }));
   }
