@@ -1,8 +1,9 @@
 import {
   IStripeProvider, IntentCreationResult, PaymentIntentOptions, SetupIntentOptions,
-  StripeMode, StripeIntentView, StripeEvent, StripeAmount, StripePaymentMethod, StripeError,
+  StripeMode, StripeIntentView, StripeEvent, StripeAmount, StripeError,
 } from "../types.js";
 import { raiseError } from "../raiseError.js";
+import { extractCardPaymentMethod } from "../internal/paymentMethodShape.js";
 
 /**
  * Minimal structural view of the subset of the `stripe` (stripe-node) package
@@ -61,23 +62,6 @@ function extractAmount(obj: Record<string, unknown>): StripeAmount | undefined {
   return undefined;
 }
 
-function extractPaymentMethod(obj: Record<string, unknown>): StripePaymentMethod | undefined {
-  const pm = obj.payment_method;
-  // Expanded PaymentMethod object (when the caller used `?expand[]=payment_method`).
-  if (pm && typeof pm === "object") {
-    const pmObj = pm as Record<string, unknown>;
-    const card = pmObj.card;
-    if (card && typeof card === "object") {
-      const c = card as Record<string, unknown>;
-      const id = typeof pmObj.id === "string" ? pmObj.id : "";
-      const brand = typeof c.brand === "string" ? c.brand : "";
-      const last4 = typeof c.last4 === "string" ? c.last4 : "";
-      if (id) return { id, brand, last4 };
-    }
-  }
-  return undefined;
-}
-
 function extractLastPaymentError(obj: Record<string, unknown>): StripeError | undefined {
   const err = obj.last_payment_error ?? obj.last_setup_error;
   if (err && typeof err === "object") {
@@ -120,8 +104,12 @@ export class StripeSdkProvider implements IStripeProvider {
   }
 
   async createPaymentIntent(opts: PaymentIntentOptions): Promise<IntentCreationResult> {
-    if (!Number.isFinite(opts.amount) || opts.amount <= 0) {
-      raiseError(`amount must be a positive number, got ${opts.amount}.`);
+    // Stripe expects amount in the smallest currency unit (cents / yen /
+    // minor-unit integer). A fractional value would be rejected by the
+    // Stripe API with an opaque server-side error; reject locally for
+    // faster feedback and a clearer diagnostic.
+    if (!Number.isInteger(opts.amount) || opts.amount <= 0) {
+      raiseError(`amount must be a positive integer in the smallest currency unit, got ${opts.amount}.`);
     }
     if (!opts.currency) raiseError("currency is required.");
     // Default to automatic_payment_methods when the caller did not opt out —
@@ -139,7 +127,12 @@ export class StripeSdkProvider implements IStripeProvider {
     });
     const result = await this._client.paymentIntents.create(
       params,
-      idempotencyKey ? { idempotencyKey } : undefined,
+      // Forward when the builder returned a string (including ""). A
+      // truthiness check would silently drop an empty-string key, turning
+      // a buggy builder into a hard-to-debug no-op. Stripe will reject
+      // empty keys with a clear API-side error, which is better than
+      // silent degradation to non-idempotent behavior.
+      idempotencyKey !== undefined ? { idempotencyKey } : undefined,
     );
     const id = typeof result.id === "string" ? result.id : "";
     const clientSecret = typeof result.client_secret === "string" ? result.client_secret : "";
@@ -166,7 +159,12 @@ export class StripeSdkProvider implements IStripeProvider {
     });
     const result = await this._client.setupIntents.create(
       params,
-      idempotencyKey ? { idempotencyKey } : undefined,
+      // Forward when the builder returned a string (including ""). A
+      // truthiness check would silently drop an empty-string key, turning
+      // a buggy builder into a hard-to-debug no-op. Stripe will reject
+      // empty keys with a clear API-side error, which is better than
+      // silent degradation to non-idempotent behavior.
+      idempotencyKey !== undefined ? { idempotencyKey } : undefined,
     );
     const id = typeof result.id === "string" ? result.id : "";
     const clientSecret = typeof result.client_secret === "string" ? result.client_secret : "";
@@ -196,7 +194,7 @@ export class StripeSdkProvider implements IStripeProvider {
       status: typeof result.status === "string" ? result.status : "unknown",
       mode,
       amount: extractAmount(result),
-      paymentMethod: extractPaymentMethod(result),
+      paymentMethod: extractCardPaymentMethod(result),
       lastPaymentError: extractLastPaymentError(result),
       // Stripe's PaymentIntent/SetupIntent retrieve returns `client_secret`
       // on every call. The Core uses it exclusively to validate that a
@@ -225,9 +223,21 @@ export class StripeSdkProvider implements IStripeProvider {
     // throw propagate so StripeCore.handleWebhook returns the error to the
     // HTTP route unchanged (4xx → Stripe stops retrying a forged request).
     const event = this._client.webhooks.constructEvent(rawBody, signatureHeader, secret);
+    // Stripe's contract guarantees `id` and `type` on every event that
+    // passes signature verification. A missing value here means the SDK
+    // contract is broken (or something tampered post-verify); downgrading
+    // to an empty string would bypass the dedup window (empty id never
+    // matches) and silently skip every handler (empty type dispatches
+    // nothing). Fail loud instead.
+    if (typeof event.id !== "string" || event.id === "") {
+      raiseError("verifyWebhook: Stripe event has no id after signature verification.");
+    }
+    if (typeof event.type !== "string" || event.type === "") {
+      raiseError("verifyWebhook: Stripe event has no type after signature verification.");
+    }
     return {
-      id: typeof event.id === "string" ? event.id : "",
-      type: typeof event.type === "string" ? event.type : "",
+      id: event.id as string,
+      type: event.type as string,
       data: (event.data as { object: Record<string, unknown> }) ?? { object: {} },
       created: typeof event.created === "number" ? event.created : 0,
     };

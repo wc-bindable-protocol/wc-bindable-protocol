@@ -56,12 +56,49 @@ function deepClone<T>(obj: T): T {
 
 let frozenConfig: IConfig | null = null;
 
-export const config: IConfig = _config as IConfig;
+/**
+ * Live read-only view of module configuration. All internal reads should go
+ * through `getConfig()` (which returns a deep-frozen clone); this export is
+ * retained as a convenience for reads only.
+ *
+ * Implementation: `Object.defineProperties` with getter-only, non-configurable
+ * descriptors on a real object, then `Object.freeze` at the top level. Writes
+ * and deletes fail with the engine's native TypeError under strict mode.
+ * Enumeration (`Object.keys`, spread, `JSON.stringify`) sees the declared
+ * properties directly — a Proxy trapping `ownKeys` /
+ * `getOwnPropertyDescriptor` would report frozen descriptors for properties
+ * that do not exist on the empty target and violate the ECMAScript proxy
+ * invariant at enumeration time, so this shape is used instead.
+ *
+ * Every getter returns a value off the deep-frozen `getConfig()` snapshot, so
+ * deep mutations (`config.remote.remoteCoreUrl = "x"`) also fail.
+ */
+export const config: IConfig = Object.freeze(
+  Object.defineProperties({} as IConfig, {
+    tagNames: {
+      enumerable: true,
+      configurable: false,
+      get: () => getConfig().tagNames,
+    },
+    remote: {
+      enumerable: true,
+      configurable: false,
+      get: () => getConfig().remote,
+    },
+  }),
+);
 
 function validatePartialConfig(partialConfig: IWritableConfig): void {
   const rec = partialConfig as Record<string, unknown>;
 
   if ("tagNames" in rec && partialConfig.tagNames !== undefined) {
+    // `null` slips past `!== undefined` but breaks the `in` operator below
+    // with a TypeError whose message predates raiseError's formatting. Reject
+    // non-object shapes explicitly so callers see the consistent
+    // `[@wc-bindable/hawc-stripe]`-prefixed error.
+    if (typeof partialConfig.tagNames !== "object" || partialConfig.tagNames === null) {
+      raiseError("config.tagNames must be an object.");
+    }
     const t = partialConfig.tagNames as Record<string, unknown>;
     if ("stripe" in t && t.stripe !== undefined && typeof t.stripe !== "string") {
       raiseError("config.tagNames.stripe must be a string.");
@@ -69,6 +106,9 @@ function validatePartialConfig(partialConfig: IWritableConfig): void {
   }
 
   if ("remote" in rec && partialConfig.remote !== undefined) {
+    if (typeof partialConfig.remote !== "object" || partialConfig.remote === null) {
+      raiseError("config.remote must be an object.");
+    }
     const r = partialConfig.remote as Record<string, unknown>;
     if ("enableRemote" in r && r.enableRemote !== undefined && typeof r.enableRemote !== "boolean") {
       raiseError("config.remote.enableRemote must be a boolean.");
@@ -93,11 +133,25 @@ export function getConfig(): IConfig {
 
 export function setConfig(partialConfig: IWritableConfig): void {
   validatePartialConfig(partialConfig);
+  // Only copy known keys. `Object.assign(_config.tagNames, partialConfig.tagNames)`
+  // would silently persist unexpected keys like `evil` onto the internal
+  // config, growing the schema by stealth and potentially shadowing future
+  // well-known keys.
   if (partialConfig.tagNames) {
-    Object.assign(_config.tagNames, partialConfig.tagNames);
+    if (partialConfig.tagNames.stripe !== undefined) {
+      _config.tagNames.stripe = partialConfig.tagNames.stripe;
+    }
   }
   if (partialConfig.remote) {
-    Object.assign(_config.remote, partialConfig.remote);
+    if (partialConfig.remote.enableRemote !== undefined) {
+      _config.remote.enableRemote = partialConfig.remote.enableRemote;
+    }
+    if (partialConfig.remote.remoteSettingType !== undefined) {
+      _config.remote.remoteSettingType = partialConfig.remote.remoteSettingType;
+    }
+    if (partialConfig.remote.remoteCoreUrl !== undefined) {
+      _config.remote.remoteCoreUrl = partialConfig.remote.remoteCoreUrl;
+    }
   }
   frozenConfig = null;
 }

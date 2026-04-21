@@ -1,9 +1,10 @@
-import { config, getRemoteCoreUrl } from "../config.js";
+import { getConfig, getRemoteCoreUrl } from "../config.js";
 import {
   IWcBindable, StripeStatus, StripeAmount, StripePaymentMethod, StripeError,
   StripeMode, IntentCreationResult, ConfirmationReport, IntentRequestHint,
 } from "../types.js";
 import { StripeCore } from "../core/StripeCore.js";
+import { extractCardPaymentMethod } from "../internal/paymentMethodShape.js";
 import {
   createRemoteCoreProxy,
   WebSocketClientTransport,
@@ -138,7 +139,11 @@ export class Stripe extends HTMLElementCtor {
   };
 
   static get observedAttributes(): string[] {
-    return ["mode", "amount-value", "amount-currency", "customer-id", "publishable-key", "return-url"];
+    // `return-url` intentionally absent — it is read inside `submit()`
+    // (`this.returnUrl`), never synced to Core or cached on change, so
+    // observing it would just pay the mutation-tick cost for a no-op
+    // branch.
+    return ["mode", "amount-value", "amount-currency", "customer-id", "publishable-key"];
   }
 
   private _core: StripeCore | null = null;
@@ -236,6 +241,12 @@ export class Stripe extends HTMLElementCtor {
    * alongside the one Stripe already charged on the prior page load.
    */
   private _resuming: boolean = false;
+  /**
+   * Set once a resume has run to terminal (successful `_coreResume` OR a
+   * swallowed error) on this element instance. Prevents re-resume when
+   * `attachLocalCore` is called after `_connectRemote` or vice versa.
+   */
+  private _resumed: boolean = false;
   /**
    * Mode ("payment" | "setup") captured at prepare() success. submit()
    * uses this — NOT `this.mode` — to pick confirmPayment vs confirmSetup.
@@ -508,6 +519,17 @@ export class Stripe extends HTMLElementCtor {
 
   /** @internal — tests / advanced setups to inject a local Core */
   attachLocalCore(core: StripeCore): void {
+    // Re-attaching to the SAME core is a harmless no-op (tests / HMR).
+    // Swapping to a DIFFERENT core silently strands the prior one:
+    // registered webhook handlers on the old Core keep firing, but this
+    // Shell no longer observes any of them, and in-flight intents on the
+    // old Core are invisible. Either reset the prior Core first or pass
+    // the same instance — both require an explicit user action.
+    if (this._core && this._core !== core) {
+      throw new Error(
+        "[@wc-bindable/hawc-stripe] attachLocalCore called with a different core instance; reset() the prior core and detach before re-attaching.",
+      );
+    }
     this._core = core;
     if (this.hasAttribute("mode")) core.mode = this.mode;
     if (this.hasAttribute("amount-value")) core.amountValue = this.amountValue;
@@ -567,6 +589,11 @@ export class Stripe extends HTMLElementCtor {
     // is the documented path — but it only exists on the Elements group, not
     // the loader. Skip if we have no active Elements (user sets appearance
     // before requestIntent); it will be picked up on the next mount.
+    // Also skip when clearing (`undefined`): Stripe.js's reaction to
+    // `elements.update({ appearance: undefined })` is unspecified and has
+    // no "unset" semantics — a fresh mount is the supported path to
+    // revert to defaults.
+    if (value === undefined) return;
     const el = this._elements as unknown as { update?: (opts: Record<string, unknown>) => void } | null;
     if (el && typeof el.update === "function") {
       try {
@@ -633,6 +660,12 @@ export class Stripe extends HTMLElementCtor {
         this._trigger = false;
         this.dispatchEvent(new CustomEvent("hawc-stripe:trigger-changed", { detail: false, bubbles: true }));
       });
+    } else if (this._trigger) {
+      // Keep read-back aligned with the written value so frameworks that
+      // assign `el.trigger = false` observe the update. Does NOT cancel
+      // a pending submit() 窶・reset()/abort() are the cancellation APIs.
+      this._trigger = false;
+      this.dispatchEvent(new CustomEvent("hawc-stripe:trigger-changed", { detail: false, bubbles: true }));
     }
   }
 
@@ -1110,7 +1143,27 @@ export class Stripe extends HTMLElementCtor {
     }
 
     const intent = (result.paymentIntent ?? result.setupIntent) as Record<string, unknown> | undefined;
-    if (!intent) return;
+    if (!intent) {
+      // Stripe.js is contracted to return one of {paymentIntent, setupIntent, error};
+      // reaching this branch means a malformed result slipped through. Do
+      // not leave the UI wedged on `processing` / `loading=true`. Surface
+      // the anomaly for observability and fall back to a processing
+      // report so the webhook path can still reconcile terminal state.
+      this.dispatchEvent(new CustomEvent("hawc-stripe:unknown-status", {
+        detail: {
+          intentId: intentIdForReport,
+          status: "",
+          preparedMode: this._preparedMode ?? this.mode,
+          reason: "stripe.confirm returned no intent and no error",
+        },
+        bubbles: true,
+      }));
+      await this._reportConfirmation({
+        intentId: intentIdForReport,
+        outcome: "processing",
+      }).catch(() => {});
+      return;
+    }
     await this._applyIntentOutcome(intent, intentIdForReport);
   }
 
@@ -1213,7 +1266,7 @@ export class Stripe extends HTMLElementCtor {
    */
   private async _applyIntentOutcome(intent: Record<string, unknown>, intentId: string): Promise<void> {
     const status = typeof intent.status === "string" ? intent.status : "";
-    const pm = this._extractPaymentMethod(intent);
+    const pm = extractCardPaymentMethod(intent);
 
     switch (status) {
       case "succeeded":
@@ -1268,27 +1321,6 @@ export class Stripe extends HTMLElementCtor {
     }
   }
 
-  private _extractPaymentMethod(intent: Record<string, unknown>): StripePaymentMethod | undefined {
-    // `payment_method` is either a pm_... id string or an expanded object
-    // depending on how the intent was created. Non-expanded returns are
-    // the default; in that case we still surface the id but cannot surface
-    // brand/last4 without a second round-trip. Skip paymentMethod entirely
-    // in that case — the webhook path will fill it in server-side where
-    // the app can do the retrieve with its secret key.
-    const pm = intent.payment_method;
-    if (pm && typeof pm === "object") {
-      const pmObj = pm as Record<string, unknown>;
-      const card = pmObj.card;
-      if (card && typeof card === "object") {
-        const c = card as Record<string, unknown>;
-        const id = typeof pmObj.id === "string" ? pmObj.id : "";
-        const brand = typeof c.brand === "string" ? c.brand : "";
-        const last4 = typeof c.last4 === "string" ? c.last4 : "";
-        if (id) return { id, brand, last4 };
-      }
-    }
-    return undefined;
-  }
 
   // --- 3DS redirect return ---
 
@@ -1309,13 +1341,6 @@ export class Stripe extends HTMLElementCtor {
    * before folding state, so the resumed session can receive subsequent
    * webhook updates and `cancelIntent` calls normally.
    */
-  /**
-   * Set once a resume has run to terminal (successful `_coreResume` OR a
-   * swallowed error) on this element instance. Prevents re-resume when
-   * `attachLocalCore` is called after `_connectRemote` or vice versa.
-   */
-  private _resumed: boolean = false;
-
   private async _resumeFromRedirect(): Promise<void> {
     if (this._resumed || this._resuming) return;
     // No Core attached yet. Leave the call to the next trigger point
@@ -1406,7 +1431,7 @@ export class Stripe extends HTMLElementCtor {
   // --- Lifecycle ---
 
   connectedCallback(): void {
-    if (config.remote.enableRemote && !this._isRemote) {
+    if (getConfig().remote.enableRemote && !this._isRemote) {
       try {
         this._initRemote();
         this._clearErrorState();
@@ -1454,7 +1479,17 @@ export class Stripe extends HTMLElementCtor {
       // typically belong to different Stripe accounts/environments;
       // reusing a pk_A-bound `_stripeJs` under a pk_B configuration
       // would route payment method submissions to the wrong account.
-      if (oldValue != null && newValue !== oldValue) {
+      // Treat an empty OLD value as "no key" — a framework that stages
+      // the element with `publishable-key=""` before setting the real
+      // key would otherwise trip `_invalidateForKeyChange` on a purely
+      // initial transition (wasted teardown + coreReset work).
+      //
+      // An empty NEW value, by contrast, is a real "clear the key"
+      // action — the caller wants Elements torn down so a subsequent
+      // prepare() does not early-return on the stale `_paymentElement`
+      // that is still bound to pk_OLD. Do NOT skip invalidation in
+      // that direction.
+      if (oldValue != null && oldValue !== "" && newValue !== oldValue) {
         this._invalidateForKeyChange();
       }
       this._maybeAutoPrepare();
@@ -1530,7 +1565,15 @@ export class Stripe extends HTMLElementCtor {
     if (this._isRemote) {
       this._disposeRemoteWithBestEffortReset();
     } else {
+      // Reset state on the attached Core, then drop our reference.
+      // Keeping the reference would otherwise cause a re-mount followed
+      // by `attachLocalCore(newCore)` to trip the "different core"
+      // guard in `attachLocalCore`, making lifecycle re-use impossible.
+      // The Core's own registrations (webhook handlers, intent builder)
+      // survive — the caller is responsible for reusing the same Core
+      // or explicitly disposing the old one before passing a new one.
       this._core?.reset();
+      this._core = null;
     }
   }
 }
