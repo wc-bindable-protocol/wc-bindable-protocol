@@ -267,6 +267,14 @@ class StripeCore extends EventTarget {
    * fatal: true (default) の hook が throw した場合、handleWebhook は reject し、
    * アプリの HTTP ルートは Stripe に 5xx を返すべき(Stripe が再送)。
    * fatal: false は audit / notification など副次的用途。
+    *
+    * Core は署名検証後の `event.id` に対して best-effort の in-memory dedup
+    * window(1024件)を持つ。duplicate delivery は正常扱いで抑止されるが、
+    * これは process-local で durable ではない(マルチプロセス/再起動を跨がない)。
+    * handler 側は引き続き `event.id` をキーに冪等化すること。
+    *
+    * fatal handler が throw した場合は、当該 `event.id` を dedup window から
+    * evict して re-throw する。これにより HTTP 5xx + Stripe retry で再配送可能。
    */
   registerWebhookHandler(type: string, handler: WebhookHandler, opts?: WebhookRegisterOptions): () => void;
 
@@ -347,6 +355,26 @@ Core の succeeded 分岐は、`report.paymentMethod` が欠けており `this._
 - `hawc-stripe:stale-config` — `prepare()` 後に mode / amount / customer 属性が変わったとき。`detail: { field, message }`。`submit()` は prepared mode を使い続けるので、切り替えたい場合は `reset()` か `abort()` を挟む必要があることの通知
 - `hawc-stripe:authorizer-error` — Core のみ(Shell には届かない)。resume authorizer が throw したときの raw 例外を operator ログ向けに surface
 - `hawc-stripe:webhook-warning` — Core のみ。non-fatal webhook handler が throw したとき
+- `hawc-stripe:webhook-deduped` — Core のみ。`detail: { eventId, type }`。署名検証済み webhook が dedup window 内の重複として抑止されたとき
+
+### 7.5 disconnectedCallback の契約
+
+要素 DOM 削除時、Shell は以下の順序で graceful shutdown を行う:
+
+1. `_markSupersede(true)` で parked prepare を中止マーク
+2. `_teardownElements()` で Stripe Elements iframe を同期破棄
+3. remote モードの場合:
+  - 現 proxy/ws ハンドルをローカル変数にキャプチャ
+  - インスタンスフィールドを即時 null 化(rapid reconnect 対応)
+  - 非同期 cleanup で: in-flight prepare 待機 → (known orphan id があれば) `cancelIntent` → `reset` RPC → unbind → proxy dispose → ws close
+
+3 の即時 null 化により、同期的 `removeChild` + `appendChild` の連続呼び出しでも
+`connectedCallback` が新セッションを起動できる。
+
+既知の制約: `requestIntent` RPC in-flight 中に disconnect が起きると、
+Core が作成した intent が Stripe 自然 expiry まで残存する可能性がある。
+Core の `reset` は Stripe API cancel を叩かない設計であるため。実害はないが
+stale row が気になるアプリは DOM 削除前に `await el.abort()` を呼ぶ。
 
 ---
 
@@ -363,7 +391,7 @@ wc-bindable-protocol remote の既存ワイヤ形式に乗る(新しい message 
   - `paymentMethod?: { id, brand, last4 }` — `confirmPayment` の戻りが expand 済み object のときのみ Shell が同梱。id 文字列のみの場合は omit し、Core の succeeded 分岐が server-side retrieve で補完する(§6.4)。
   - `error?: { code?, declineCode?, message, type? }` — `outcome: "failed"` 時に `StripeError` の sanitized 形で同梱。`failureCode` のような flat 文字列ではない。`message` のみ必須。
 - `cancelIntent` — `args: [intentId: string]` → `return.value: undefined`
-  - 引数は intent id 文字列そのもの(オブジェクトで包まない)。PaymentIntent は Stripe の cancel を叩き、SetupIntent は Core 側の状態 reset のみ(Stripe SetupIntent は cancelable でない)。
+  - 引数は intent id 文字列そのもの(オブジェクトで包まない)。PaymentIntent は Stripe の cancel を叩き、SetupIntent は Core 側の状態 reset のみ(Stripe API 上は `setupIntents.cancel` が存在するが、Core は金額を保持しない SetupIntent の stale row を放置しても実害がないため、コスト最適化として呼ばない。明示的に cancel したいアプリはカスタム `IStripeProvider` で実装できる)。
 - `resumeIntent` — `args: [intentId: string, mode: "payment"|"setup", clientSecret: string]` → `return.value: undefined`
   - 3DS redirect 戻り時に Shell が呼ぶ。`clientSecret` は Stripe の redirect URL から抽出した所有権証明として必須(§9.2 / §2.6 authorization model)。
 - `reset` — `args: []` → `return.value: undefined`

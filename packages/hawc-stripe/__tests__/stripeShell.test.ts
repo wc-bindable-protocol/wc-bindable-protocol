@@ -903,6 +903,117 @@ describe("<hawc-stripe> Shell", () => {
     // behaviors that only show up once Core events have to cross the wire
     // (initial `sync`, `setWithAck` ordering, `invoke` + update interleave).
 
+    it("remote disconnect teardown waits in-flight prepare before reset/dispose", async () => {
+      el = createEl({ mode: "payment" });
+      const order: string[] = [];
+      let releasePrepare!: () => void;
+      const parkedPrepare = new Promise<void>((resolve) => { releasePrepare = resolve; });
+
+      const proxy = {
+        invoke: async (name: string) => { order.push(`invoke:${name}`); },
+        invokeWithOptions: async (name: string) => { order.push(`invokeWithOptions:${name}`); },
+        dispose: () => { order.push("dispose"); },
+      } as unknown as { invoke: (n: string) => Promise<void>; invokeWithOptions: (n: string) => Promise<void>; dispose: () => void };
+
+      (el as unknown as { _proxy: unknown })._proxy = proxy;
+      (el as unknown as { _preparePromise: Promise<void> | null })._preparePromise = parkedPrepare;
+      (el as unknown as { _unbind: (() => void) | null })._unbind = () => { order.push("unbind"); };
+      (el as unknown as { _ws: { close: () => void } | null })._ws = { close: () => { order.push("ws.close"); } };
+
+      el.remove();
+
+      // Sync detach: new sessions can start immediately.
+      expect((el as unknown as { _proxy: unknown })._proxy).toBeNull();
+      expect(order).toEqual([]);
+
+      releasePrepare();
+      await flushTransport(4);
+
+      expect(order[0]).toBe("invoke:reset");
+      expect(order.indexOf("invoke:reset")).toBeLessThan(order.indexOf("unbind"));
+      expect(order.indexOf("unbind")).toBeLessThan(order.indexOf("dispose"));
+      expect(order.indexOf("dispose")).toBeLessThan(order.indexOf("ws.close"));
+    });
+
+    it("remote disconnect nulls _proxy synchronously (rapid reconnect precondition)", async () => {
+      el = createEl({ mode: "payment" });
+      (el as unknown as { _proxy: unknown })._proxy = {
+        invoke: async () => {},
+        invokeWithOptions: async () => {},
+        dispose: () => {},
+      };
+      expect((el as unknown as { _isRemote: boolean })._isRemote).toBe(true);
+      el.remove();
+      expect((el as unknown as { _proxy: unknown })._proxy).toBeNull();
+      expect((el as unknown as { _isRemote: boolean })._isRemote).toBe(false);
+      await flushTransport(2);
+    });
+
+    it("remote disconnect cleanup stays scoped to captured old proxy", async () => {
+      el = createEl({ mode: "payment" });
+      const oldCalls: string[] = [];
+      const newCalls: string[] = [];
+
+      let releasePrepare!: () => void;
+      const parkedPrepare = new Promise<void>((resolve) => { releasePrepare = resolve; });
+
+      const oldProxy = {
+        invoke: async (name: string) => { oldCalls.push(`invoke:${name}`); },
+        invokeWithOptions: async (name: string) => { oldCalls.push(`invokeWithOptions:${name}`); },
+        dispose: () => { oldCalls.push("dispose"); },
+      };
+      const newProxy = {
+        invoke: async (name: string) => { newCalls.push(`invoke:${name}`); },
+        invokeWithOptions: async (name: string) => { newCalls.push(`invokeWithOptions:${name}`); },
+        dispose: () => { newCalls.push("dispose"); },
+      };
+
+      (el as unknown as { _proxy: unknown })._proxy = oldProxy;
+      (el as unknown as { _preparePromise: Promise<void> | null })._preparePromise = parkedPrepare;
+      (el as unknown as { _unbind: (() => void) | null })._unbind = () => { oldCalls.push("unbind"); };
+      (el as unknown as { _ws: { close: () => void } | null })._ws = { close: () => { oldCalls.push("ws.close"); } };
+
+      el.remove();
+      // Simulate rapid reconnect attaching a different session object.
+      (el as unknown as { _proxy: unknown })._proxy = newProxy;
+
+      releasePrepare();
+      await flushTransport(4);
+
+      expect(oldCalls).toContain("invoke:reset");
+      expect(oldCalls).toContain("dispose");
+      expect(newCalls).toHaveLength(0);
+    });
+
+    it("remote disconnect proactively cancels known orphan intent via captured proxy", async () => {
+      el = createEl({ mode: "payment" });
+      const calls: Array<{ name: string; args: unknown[] }> = [];
+      const proxy = {
+        invoke: async (name: string) => { calls.push({ name, args: [] }); },
+        invokeWithOptions: async (name: string, args: unknown[]) => {
+          calls.push({ name, args });
+        },
+        dispose: () => {},
+      };
+
+      (el as unknown as { _proxy: unknown })._proxy = proxy;
+      (el as unknown as { _remoteValues: Record<string, unknown> })._remoteValues = {
+        intentId: "pi_orphan_disconnect",
+      };
+      (el as unknown as { _unbind: (() => void) | null })._unbind = () => {};
+      (el as unknown as { _ws: { close: () => void } | null })._ws = { close: () => {} };
+
+      el.remove();
+      await flushTransport(4);
+
+      const cancelIdx = calls.findIndex(c => c.name === "cancelIntent");
+      const resetIdx = calls.findIndex(c => c.name === "reset");
+      expect(cancelIdx).toBeGreaterThanOrEqual(0);
+      expect(resetIdx).toBeGreaterThanOrEqual(0);
+      expect(cancelIdx).toBeLessThan(resetIdx);
+      expect(calls[cancelIdx].args[0]).toBe("pi_orphan_disconnect");
+    });
+
     it("connect-time input sync: declarative attrs reach the Core via setWithAck", async () => {
       // Deliberately omit publishable-key so auto-prepare bails — the test
       // isolates the input-sync path without an intent-creation round-trip

@@ -23,6 +23,13 @@ export interface StripeNodeLike {
   setupIntents: {
     create(params: Record<string, unknown>): Promise<Record<string, unknown>>;
     retrieve(id: string, opts?: Record<string, unknown>): Promise<Record<string, unknown>>;
+    /**
+     * Present on real stripe-node clients but optional here so tests/mocks
+     * are not forced to implement it. The default StripeCore policy
+     * intentionally does not call SetupIntent cancel (cost optimization);
+     * apps that want explicit cleanup can implement it in a custom provider.
+     */
+    cancel?(id: string): Promise<Record<string, unknown>>;
   };
   webhooks: {
     constructEvent(payload: string, header: string, secret: string): Record<string, unknown>;

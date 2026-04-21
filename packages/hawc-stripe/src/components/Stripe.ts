@@ -305,6 +305,66 @@ export class Stripe extends HTMLElementCtor {
     }
   }
 
+  /**
+   * Graceful teardown for a remote-bound session.
+   *
+   * Order matters:
+   * 1) capture current handles,
+   * 2) synchronously detach instance fields so rapid re-connect can boot
+   *    a fresh session,
+   * 3) asynchronously wait any in-flight prepare, then issue reset,
+   *    unbind, dispose, close.
+   *
+   * Known trade-off: if disconnect happens while requestIntent is in
+   * flight and the intent is created before reset lands, the intent may
+   * survive as `requires_payment_method` until Stripe natural expiry.
+   * This has no financial impact because nothing was confirmed. Apps that
+   * require deterministic cancel should prefer `await el.abort()` before
+   * removing the element.
+   */
+  private _disposeRemoteWithBestEffortReset(): void {
+    const unbind = this._unbind;
+    const proxy = this._proxy;
+    const ws = this._ws;
+    const preparePromise = this._preparePromise;
+    const orphanIdAtEntry = typeof this._remoteValues.intentId === "string"
+      ? this._remoteValues.intentId
+      : undefined;
+
+    // Detach local state immediately so a rapid re-connect can establish
+    // a fresh remote session without waiting on network teardown.
+    this._unbind = null;
+    this._proxy = null;
+    this._remoteValues = {};
+    this._remoteErrorSeq = 0;
+    this._localErrorSeqSync = 0;
+    this._ws = null;
+
+    void (async () => {
+      if (preparePromise) {
+        await preparePromise.catch(() => { /* supersede / prior failure */ });
+      }
+
+      // Best-effort orphan cleanup for the disconnect path where an
+      // already-known intent id exists at teardown entry.
+      if (orphanIdAtEntry && proxy) {
+        await proxy.invokeWithOptions("cancelIntent", [orphanIdAtEntry], { timeoutMs: 0 })
+          .catch(() => {});
+      }
+
+      await proxy?.invoke("reset").catch(() => {});
+      if (unbind) {
+        try { unbind(); } catch { /* already unbound */ }
+      }
+      if (proxy) {
+        try { proxy.dispose(); } catch { /* already disposed */ }
+      }
+      if (ws) {
+        try { ws.close(); } catch { /* already closed */ }
+      }
+    })();
+  }
+
   private _resetRemoteBusyState(): void {
     if (this._remoteValues.loading) {
       this._remoteValues.loading = false;
@@ -1101,6 +1161,20 @@ export class Stripe extends HTMLElementCtor {
     };
   }
 
+  /**
+   * Map Stripe.js confirm/retrieve intent status strings onto Core
+   * `reportConfirmation` outcomes.
+   *
+   * Unknown statuses are treated as `processing` (not `failed`) and emit
+   * `hawc-stripe:unknown-status` for observability. This keeps the flow on
+   * the webhook-authoritative path so newly introduced Stripe statuses can
+   * converge to a terminal result without false-failure retries.
+   *
+   * In environments where webhooks are disabled/misconfigured, an unknown
+   * status can therefore remain `processing`/loading until app policy times
+   * out. Subscribe to `hawc-stripe:unknown-status` and apply an app-level
+   * timeout/escalation policy.
+   */
   private async _applyIntentOutcome(intent: Record<string, unknown>, intentId: string): Promise<void> {
     const status = typeof intent.status === "string" ? intent.status : "";
     const pm = this._extractPaymentMethod(intent);
@@ -1137,6 +1211,21 @@ export class Stripe extends HTMLElementCtor {
           intentId,
           outcome: "failed",
           error: err,
+        }).catch(() => {});
+        break;
+      }
+      default: {
+        this.dispatchEvent(new CustomEvent("hawc-stripe:unknown-status", {
+          detail: {
+            intentId,
+            status,
+            preparedMode: this._preparedMode ?? this.mode,
+          },
+          bubbles: true,
+        }));
+        await this._reportConfirmation({
+          intentId,
+          outcome: "processing",
         }).catch(() => {});
         break;
       }
@@ -1401,8 +1490,7 @@ export class Stripe extends HTMLElementCtor {
     this._markSupersede(true);
     this._teardownElements();
     if (this._isRemote) {
-      this._proxy!.invoke("reset").catch(() => {});
-      this._disposeRemote();
+      this._disposeRemoteWithBestEffortReset();
     } else {
       this._core?.reset();
     }

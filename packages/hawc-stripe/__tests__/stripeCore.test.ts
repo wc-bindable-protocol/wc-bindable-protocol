@@ -639,6 +639,152 @@ describe("StripeCore", () => {
       expect(warnings).toHaveLength(1);
       expect((warnings[0].detail as any).error.message).toMatch(/boom/);
     });
+
+    it("silently drops duplicate event.id and does not re-run handlers", async () => {
+      const calls: string[] = [];
+      core.registerWebhookHandler("payment_intent.succeeded", (ev) => {
+        calls.push(ev.id);
+      });
+
+      provider.verifyWebhook = () => ({
+        id: "evt_dup_1",
+        type: "payment_intent.succeeded",
+        data: { object: { id: "pi_1" } },
+        created: 1,
+      });
+
+      await core.handleWebhook("raw", "sig");
+      await core.handleWebhook("raw", "sig");
+
+      expect(calls).toEqual(["evt_dup_1"]);
+    });
+
+    it("dispatches hawc-stripe:webhook-deduped on duplicate", async () => {
+      let deduped: unknown = null;
+      core.addEventListener("hawc-stripe:webhook-deduped", (e: Event) => {
+        deduped = (e as CustomEvent).detail;
+      });
+
+      provider.verifyWebhook = () => ({
+        id: "evt_dup_2",
+        type: "x.y",
+        data: { object: {} },
+        created: 1,
+      });
+
+      await core.handleWebhook("raw", "sig");
+      await core.handleWebhook("raw", "sig");
+
+      expect(deduped).toEqual({ eventId: "evt_dup_2", type: "x.y" });
+    });
+
+    it("evicts the oldest id when capacity is exceeded", async () => {
+      for (let i = 0; i < 1025; i++) {
+        provider.verifyWebhook = () => ({
+          id: `evt_${i}`,
+          type: "x.y",
+          data: { object: {} },
+          created: i,
+        });
+        await core.handleWebhook("raw", "sig");
+      }
+
+      let calls = 0;
+      core.registerWebhookHandler("x.y", () => { calls++; });
+      provider.verifyWebhook = () => ({
+        id: "evt_0",
+        type: "x.y",
+        data: { object: {} },
+        created: 0,
+      });
+      await core.handleWebhook("raw", "sig");
+      expect(calls).toBe(1);
+    });
+
+    it("does not add to dedup window when signature verification fails", async () => {
+      provider.verifyWebhook = () => { throw new Error("bad signature"); };
+      for (let i = 0; i < 10; i++) {
+        await expect(core.handleWebhook("raw", "sig")).rejects.toThrow(/bad signature/);
+      }
+
+      let calls = 0;
+      core.registerWebhookHandler("x.y", () => { calls++; });
+      provider.verifyWebhook = () => ({
+        id: "evt_valid",
+        type: "x.y",
+        data: { object: {} },
+        created: 1,
+      });
+      await core.handleWebhook("raw", "sig");
+      expect(calls).toBe(1);
+    });
+
+    it("evicts id when fatal handler throws, allowing Stripe retry", async () => {
+      let attempts = 0;
+      core.registerWebhookHandler("x.y", () => {
+        attempts++;
+        if (attempts === 1) throw new Error("transient DB lock");
+      }, { fatal: true });
+
+      provider.verifyWebhook = () => ({
+        id: "evt_retry",
+        type: "x.y",
+        data: { object: {} },
+        created: 1,
+      });
+
+      await expect(core.handleWebhook("raw", "sig")).rejects.toThrow(/transient DB lock/);
+      await core.handleWebhook("raw", "sig");
+      expect(attempts).toBe(2);
+    });
+
+    it("keeps dedup window on non-fatal throw (duplicate does not re-run handlers)", async () => {
+      let attempts = 0;
+      const warnings: CustomEvent[] = [];
+      core.addEventListener("hawc-stripe:webhook-warning", (e) => warnings.push(e as CustomEvent));
+      core.registerWebhookHandler("x.y", () => {
+        attempts++;
+        throw new Error("ancillary failure");
+      }, { fatal: false });
+
+      provider.verifyWebhook = () => ({
+        id: "evt_nonfatal_dup",
+        type: "x.y",
+        data: { object: {} },
+        created: 1,
+      });
+
+      await core.handleWebhook("raw", "sig");
+      await core.handleWebhook("raw", "sig");
+
+      expect(attempts).toBe(1);
+      expect(warnings).toHaveLength(1);
+    });
+
+    it("bypasses dedup when event.id is empty or undefined", async () => {
+      let calls = 0;
+      core.registerWebhookHandler("x.y", () => { calls++; });
+
+      provider.verifyWebhook = () => ({
+        id: "",
+        type: "x.y",
+        data: { object: {} },
+        created: 1,
+      });
+      await core.handleWebhook("raw", "sig");
+      await core.handleWebhook("raw", "sig");
+
+      provider.verifyWebhook = () => ({
+        id: undefined,
+        type: "x.y",
+        data: { object: {} },
+        created: 2,
+      } as unknown as StripeEvent);
+      await core.handleWebhook("raw", "sig");
+      await core.handleWebhook("raw", "sig");
+
+      expect(calls).toBe(4);
+    });
   });
 
   describe("reset", () => {
@@ -1139,6 +1285,42 @@ describe("StripeCore", () => {
       await c.handleWebhook("{}", "t=0,v1=abc");
       expect(c.error?.message).toBe("Your card was declined.");
       expect(c.error?.type).toBe("card_error");
+    });
+
+    it("drops non-taxonomy code/declineCode values while preserving Stripe-shaped message policy", async () => {
+      const c = new StripeCore(provider);
+      c.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      await c.requestIntent({ mode: "payment", hint: {} });
+      await c.reportConfirmation({
+        intentId: "pi_123",
+        outcome: "failed",
+        error: {
+          type: "card_error",
+          code: "card_declined<script>",
+          declineCode: "insufficient_funds;DROP",
+          message: "Your card was declined.",
+        },
+      });
+      expect(c.error?.message).toBe("Your card was declined.");
+      expect(c.error?.type).toBe("card_error");
+      expect(c.error?.code).toBeUndefined();
+      expect(c.error?.declineCode).toBeUndefined();
+    });
+
+    it("rejects Stripe-shaped type impostors so their message does not pass through", async () => {
+      const c = new StripeCore(provider);
+      c.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      await c.requestIntent({ mode: "payment", hint: {} });
+      await c.reportConfirmation({
+        intentId: "pi_123",
+        outcome: "failed",
+        error: {
+          type: "card_error<img src=x>_error",
+          message: "sensitive server-side hostname leak",
+        },
+      });
+      expect(c.error?.type).toBeUndefined();
+      expect(c.error?.message).toBe("Payment failed.");
     });
 
     it("forwards our own [@wc-bindable/hawc-stripe]-prefixed internal errors", async () => {
