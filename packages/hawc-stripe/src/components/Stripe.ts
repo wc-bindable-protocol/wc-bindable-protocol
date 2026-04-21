@@ -55,6 +55,25 @@ export interface StripePaymentElementLike {
 export type StripeJsLoader = (publishableKey: string) => Promise<StripeJsLike>;
 
 /**
+ * Node-safe `HTMLElement` base. The `<hawc-stripe>` Shell is a browser
+ * component — under a browser (and under jsdom in tests) this resolves to
+ * the real `HTMLElement` constructor and behavior is unchanged. In plain
+ * Node (SSR frameworks, test pre-scanners, tooling that walks module graphs
+ * through the browser barrel), `HTMLElement` is undefined and the raw
+ * `class X extends HTMLElement` form crashes at module-evaluation time with
+ * `ReferenceError: HTMLElement is not defined`. Swapping in an empty class
+ * on that path lets the module evaluate without error; `customElements` is
+ * also absent in plain Node, so the class still cannot actually be used as
+ * a DOM custom element — the fallback only keeps `import` from exploding,
+ * it does not pretend the component works on the server. The `/server`
+ * subpath remains the supported Node-side entry.
+ */
+const HTMLElementCtor: typeof HTMLElement =
+  typeof HTMLElement !== "undefined"
+    ? HTMLElement
+    : (class {} as unknown as typeof HTMLElement);
+
+/**
  * Browser shell for `<hawc-stripe>`. Mounts Stripe's Payment Element in a
  * slot inside this component, drives the confirmation flow, and reports
  * outcomes back to the Core over the wc-bindable wire.
@@ -64,7 +83,7 @@ export type StripeJsLoader = (publishableKey: string) => Promise<StripeJsLike>;
  * clientSecret (in memory, never observable) and the non-sensitive result
  * (paymentMethod id + brand + last4).
  */
-export class Stripe extends HTMLElement {
+export class Stripe extends HTMLElementCtor {
   /**
    * Shared Stripe.js loader. Swapped in tests via `Stripe.setLoader(mock)`.
    * Default path lazy-imports `@stripe/stripe-js` so the peer dep only
@@ -958,6 +977,17 @@ export class Stripe extends HTMLElement {
     // an opaque "clientSecret does not match the intent type" error. We
     // already emitted `hawc-stripe:stale-config` when the attribute
     // changed; silent mis-dispatch on top of that would be worse.
+    // Snapshot the supersede counter BEFORE confirm. `reset()` / `abort()` /
+    // `disconnectedCallback()` all call `_markSupersede(true)` which bumps
+    // `_prepareGeneration`. A late confirm result (success, decline, or
+    // network throw) arriving after the user has asked to discard the
+    // attempt must NOT leak back into observable state — the Core already
+    // drops the stale `reportConfirmation` via its `_activeIntent == null`
+    // guard, but the Shell's own `_setErrorState` / error-event dispatch
+    // runs before that RPC and would otherwise paint `this.error` with
+    // `card_declined` (or similar) after `reset()` cleared it. Mirrors the
+    // same supersede discipline prepare() already uses around its awaits.
+    const submitGen = this._prepareGeneration;
     const confirmMode = this._preparedMode ?? this.mode;
     let result: { paymentIntent?: Record<string, unknown>; setupIntent?: Record<string, unknown>; error?: Record<string, unknown> };
     try {
@@ -965,6 +995,13 @@ export class Stripe extends HTMLElement {
         ? await stripeJs.confirmPayment(common)
         : await stripeJs.confirmSetup(common);
     } catch (e: unknown) {
+      // Superseded mid-confirm (abort / reset / disconnect). The user-
+      // visible truth is their terminate request — swallow the confirm
+      // throw entirely rather than surface it through `this.error` or a
+      // `hawc-stripe:error` event, and skip the Core report (Core will
+      // drop it anyway; calling it on a null `_activeIntent` would still
+      // add a no-op round-trip across the remote transport).
+      if (submitGen !== this._prepareGeneration) return;
       this._setErrorStateFromUnknown(e);
       await this._reportConfirmation({
         intentId: this.intentId ?? "",
@@ -973,6 +1010,8 @@ export class Stripe extends HTMLElement {
       }).catch(() => {});
       throw e;
     }
+
+    if (submitGen !== this._prepareGeneration) return;
 
     const intentIdForReport = this.intentId ?? "";
     if (result.error) {

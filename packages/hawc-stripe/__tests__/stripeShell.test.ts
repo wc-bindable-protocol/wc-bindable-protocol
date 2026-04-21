@@ -575,6 +575,125 @@ describe("<hawc-stripe> Shell", () => {
       expect((warnings[0].detail as any).field).toBe("mode");
     });
 
+    describe("abort() / reset() during in-flight confirm (regression)", () => {
+      // Contract: once the user has asked to discard the attempt
+      // (reset/abort) the late confirm outcome must not leak into observable
+      // state. The user's intent is "terminate this flow" — a subsequent
+      // `hawc-stripe:error` event, a populated `el.error`, or a status flip
+      // to succeeded/failed would all contradict that. The Core already
+      // drops stale `reportConfirmation` via its `_activeIntent == null`
+      // guard, but the Shell's own `_errorState` / error event dispatch
+      // path bypasses that guard and is what these tests pin down.
+      /**
+       * Swap `confirmPayment` for a gate that parks on a Promise until we
+       * resolve it. Returns a `resolve(value)` function; awaiting it yields
+       * a second-level resolver that releases the gated confirm with the
+       * supplied mock result. Lets a test inject abort()/reset() AFTER
+       * confirmPayment has actually been called but BEFORE it resolves.
+       */
+      function gateConfirm(): Promise<(v: unknown) => void> {
+        return new Promise((resolveOuter) => {
+          fakes.stripeJs.confirmPayment = ((opts: unknown) => {
+            fakes.confirmCalls.push({ kind: "payment", opts });
+            return new Promise((resolveInner) => resolveOuter(resolveInner));
+          }) as typeof fakes.stripeJs.confirmPayment;
+        });
+      }
+
+      it("abort() during in-flight confirm: late decline does not leak to error/status", async () => {
+        await el.prepare();
+        const gate = gateConfirm();
+        const errorEvents: CustomEvent[] = [];
+        el.addEventListener("hawc-stripe:error", (e) => errorEvents.push(e as CustomEvent));
+        const submitP = el.submit();
+        const release = await gate; // wait until confirmPayment is in flight
+        const abortP = el.abort();
+        // Stripe returns a decline AFTER abort has already cancelled pi_X
+        // server-side. The Shell must not set `error` from this result.
+        release({ error: { code: "card_declined", message: "Declined." } });
+        await submitP;
+        await abortP;
+        expect(el.status).toBe("idle");
+        expect(el.error).toBeNull();
+        // No new error event from the post-abort confirm result.
+        expect(errorEvents.filter(e => (e.detail as any)?.code === "card_declined")).toHaveLength(0);
+        // The intent that was in flight is canceled server-side.
+        expect(provider.cancelCalls).toContain("pi_shell");
+      });
+
+      it("abort() during in-flight confirm: late success does not flip status to succeeded", async () => {
+        await el.prepare();
+        const gate = gateConfirm();
+        const submitP = el.submit();
+        const release = await gate;
+        const abortP = el.abort();
+        release({ paymentIntent: { id: "pi_shell", status: "succeeded" } });
+        await submitP;
+        await abortP;
+        // User asked to terminate — the in-flight confirm's succeeded result
+        // must not paint observable state as succeeded. Best-effort cancel
+        // was already issued server-side; if Stripe rejected it because the
+        // charge went through, that is an edge case the app handles via
+        // webhooks, not via a surprise "succeeded" in observable state.
+        expect(el.status).toBe("idle");
+        expect(el.error).toBeNull();
+      });
+
+      it("abort() during in-flight confirm that throws: error is swallowed, not surfaced", async () => {
+        await el.prepare();
+        const rejectGate: Promise<(e: unknown) => void> = new Promise((resolveOuter) => {
+          fakes.stripeJs.confirmPayment = ((opts: unknown) => {
+            fakes.confirmCalls.push({ kind: "payment", opts });
+            return new Promise((_, rejectInner) => resolveOuter(rejectInner));
+          }) as typeof fakes.stripeJs.confirmPayment;
+        });
+        const submitP = el.submit().catch(() => { /* user-initiated abort swallows */ });
+        const reject = await rejectGate;
+        const abortP = el.abort();
+        reject(new Error("network flaked mid-confirm"));
+        await submitP;
+        await abortP;
+        expect(el.status).toBe("idle");
+        expect(el.error).toBeNull();
+      });
+
+      it("reset() during in-flight confirm: late decline does not leak to error/status", async () => {
+        await el.prepare();
+        const gate = gateConfirm();
+        const errorEvents: CustomEvent[] = [];
+        el.addEventListener("hawc-stripe:error", (e) => errorEvents.push(e as CustomEvent));
+        const submitP = el.submit();
+        const release = await gate;
+        el.reset();
+        release({ error: { code: "card_declined", message: "Declined." } });
+        await submitP;
+        expect(el.status).toBe("idle");
+        expect(el.error).toBeNull();
+        expect(errorEvents.filter(e => (e.detail as any)?.code === "card_declined")).toHaveLength(0);
+      });
+
+      it("reset() during in-flight confirm: terminal paymentIntent status (requires_payment_method) does not leak", async () => {
+        // _applyIntentOutcome's requires_payment_method branch calls
+        // `_setErrorState(err)` directly — separate leak path from the
+        // result.error branch above. Pin it down explicitly.
+        await el.prepare();
+        const gate = gateConfirm();
+        const submitP = el.submit();
+        const release = await gate;
+        el.reset();
+        release({
+          paymentIntent: {
+            id: "pi_shell",
+            status: "requires_payment_method",
+            last_payment_error: { code: "card_declined", message: "Declined." },
+          },
+        });
+        await submitP;
+        expect(el.status).toBe("idle");
+        expect(el.error).toBeNull();
+      });
+    });
+
     it("reset() + re-prepare lets mode change take effect", async () => {
       // Rebuild the core with a mode-responsive builder so switching modes
       // between prepares is legal (the default builder only returns payment).

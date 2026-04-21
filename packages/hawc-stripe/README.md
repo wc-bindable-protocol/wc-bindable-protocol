@@ -22,6 +22,8 @@ See [SPEC.md](./SPEC.md) for the full protocol — state machine, wcBindable sur
 
 ### Server
 
+Server-side code **must** import from the `/server` subpath. The bare package name `@wc-bindable/hawc-stripe` is the browser barrel — it re-exports `<hawc-stripe>` (a Custom Element built on `HTMLElement`). The component guards its `HTMLElement` base with a `typeof` fallback so the barrel *evaluates* under plain Node without crashing (useful for SSR pre-render, test pre-scanners, and bundler graph walks that touch the root specifier), but the component is **not functional on the server** — there is no `customElements` registry, no DOM, no Stripe.js. `StripeCore` / `StripeSdkProvider` are exported **only** from `/server` so Node-side code reaches the headless pieces through the entry intended for it, not through the browser surface.
+
 ```ts
 import Stripe from "stripe";
 import { StripeCore, StripeSdkProvider } from "@wc-bindable/hawc-stripe/server";

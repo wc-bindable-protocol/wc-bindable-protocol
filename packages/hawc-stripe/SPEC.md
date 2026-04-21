@@ -352,22 +352,40 @@ Core の succeeded 分岐は、`report.paymentMethod` が欠けており `this._
 
 ## 8. Control Plane Messages
 
-wc-bindable-protocol remote の既存ワイヤ形式に乗る(新しい message type は足さない)。
+wc-bindable-protocol remote の既存ワイヤ形式に乗る(新しい message type は足さない)。独自 Shell を実装する場合はこの節が wire 契約のソース。型は [types.ts](./src/types.ts) の `IntentRequest` / `IntentRequestHint` / `IntentCreationResult` / `ConfirmationReport` / `StripeError` / `StripePaymentMethod` / `StripeAmount` と一対一に対応する。
 
-### 8.1 Shell → Core
+### 8.1 Shell → Core(`cmd` / 戻りは `return`)
 
-- `{ type: "cmd", name: "requestIntent", id, args: [{ mode, hint }] }` → `{ type: "return", id, value: { intentId, clientSecret, amount?, currency? } }`
-- `{ type: "cmd", name: "reportConfirmation", id, args: [{ intentId, outcome: "succeeded" | "requires_action" | "failed", failureCode? }] }`
-- `{ type: "cmd", name: "cancelIntent", id, args: [{ intentId }] }`
+- `requestIntent` — `args: [{ mode: "payment"|"setup", hint: { amountValue?, amountCurrency?, customerId? } }]` → `return.value: { intentId, clientSecret, mode, amount?: { value, currency } }`
+  - `hint` は助言扱い(SPEC §9.3)。`amount` は payment mode のみ返る可能性があり、`{ value, currency }` の入れ子で `value` は最小通貨単位の整数。
+- `reportConfirmation` — `args: [{ intentId, outcome, paymentMethod?, error? }]` → `return.value: undefined`
+  - `outcome: "succeeded" | "requires_action" | "processing" | "failed"` — `processing` は Stripe が非同期決済(bank debit 等)で返す状態で、Core は `processing` 分岐で `retrieveIntent` を一度叩いた後 webhook 経由の終局を待つ。
+  - `paymentMethod?: { id, brand, last4 }` — `confirmPayment` の戻りが expand 済み object のときのみ Shell が同梱。id 文字列のみの場合は omit し、Core の succeeded 分岐が server-side retrieve で補完する(§6.4)。
+  - `error?: { code?, declineCode?, message, type? }` — `outcome: "failed"` 時に `StripeError` の sanitized 形で同梱。`failureCode` のような flat 文字列ではない。`message` のみ必須。
+- `cancelIntent` — `args: [intentId: string]` → `return.value: undefined`
+  - 引数は intent id 文字列そのもの(オブジェクトで包まない)。PaymentIntent は Stripe の cancel を叩き、SetupIntent は Core 側の状態 reset のみ(Stripe SetupIntent は cancelable でない)。
+- `resumeIntent` — `args: [intentId: string, mode: "payment"|"setup", clientSecret: string]` → `return.value: undefined`
+  - 3DS redirect 戻り時に Shell が呼ぶ。`clientSecret` は Stripe の redirect URL から抽出した所有権証明として必須(§9.2 / §2.6 authorization model)。
+- `reset` — `args: []` → `return.value: undefined`
+  - Shell の `reset()` / `abort()` / `disconnectedCallback` 経由で Core を idle に戻す。Stripe API は叩かない(cancel は `cancelIntent` の役割)。
 
-### 8.2 Core → Shell
+### 8.2 Core → Shell(`update`)
 
-- `{ type: "update", name: "status", value: "succeeded" }` — webhook 起因で Core が主導する更新
-- `{ type: "update", name: "paymentMethod", value: { id, brand, last4 } }`
+`StripeCore.wcBindable.properties` が宣言する 6 プロパティが、変更時に `{ type: "update", name, value }` として流れる:
+
+- `status` — `"idle" | "collecting" | "processing" | "requires_action" | "succeeded" | "failed"`
+- `loading` — `boolean`
+- `amount` — `{ value: number, currency: string } | null`(payment mode のみ populate)
+- `paymentMethod` — `{ id, brand, last4 } | null`
+- `intentId` — `string | null`
+- `error` — `{ code?, declineCode?, message, type? } | null`
+
+駆動元は Shell 経由の RPC 結果、webhook handler の fold、および 3DS resume の view 反映(§6.2 / §6.4)。
 
 ### 8.3 禁止事項
 
 - card number / CVC / exp を含む message は**一切定義しない**。将来の拡張でもこれに触れない。
+- `clientSecret` は `requestIntent` の `return.value` と `resumeIntent` の `args` でしか現れない。`update` / CustomEvent detail / `data-wcs` 等の observable / wire 上の他チャネルに乗せない(§5.2 / §9.2)。
 
 ---
 
