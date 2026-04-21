@@ -47,6 +47,11 @@ function deepFreeze<T>(obj: T): T {
 
 function deepClone<T>(obj: T): T {
   if (obj === null || typeof obj !== "object") return obj;
+  // Array support keeps the helper correct if config grows an array-typed
+  // entry later (e.g. `remote.origins: string[]`). Without this branch a
+  // future clone would produce a `{0: "...", 1: "..."}` object, not an
+  // array, and break `Array.isArray(getConfig().remote.origins)` checks.
+  if (Array.isArray(obj)) return (obj.map(v => deepClone(v)) as unknown) as T;
   const clone: Record<string, unknown> = {};
   for (const key of Object.keys(obj)) {
     clone[key] = deepClone((obj as Record<string, unknown>)[key]);
@@ -60,6 +65,12 @@ let frozenConfig: IConfig | null = null;
  * Live read-only view of module configuration. All internal reads should go
  * through `getConfig()` (which returns a deep-frozen clone); this export is
  * retained as a convenience for reads only.
+ *
+ * TODO(v2): consolidate on `getConfig()` and drop this export. The only
+ * remaining consumer is the `__tests__/config.test.ts` readback assertions,
+ * which keep the private module state reachable through a public-looking
+ * binding. Migrating tests to `getConfig()` unblocks removal and shrinks
+ * the publish surface to the three setter/getter functions.
  *
  * Implementation: `Object.defineProperties` with getter-only, non-configurable
  * descriptors on a real object, then `Object.freeze` at the top level. Writes
@@ -88,8 +99,21 @@ export const config: IConfig = Object.freeze(
   }),
 );
 
+const KNOWN_TOP_LEVEL_KEYS = new Set(["tagNames", "remote"]);
+const KNOWN_TAG_NAME_KEYS = new Set(["stripe"]);
+const KNOWN_REMOTE_KEYS = new Set(["enableRemote", "remoteSettingType", "remoteCoreUrl"]);
+
 function validatePartialConfig(partialConfig: IWritableConfig): void {
   const rec = partialConfig as Record<string, unknown>;
+
+  // Reject unknown top-level keys up-front. A silent accept of typos
+  // (`tagNms`, `remotee`) would ship misconfiguration to prod without
+  // any signal — catching it at setConfig time is the cheapest feedback.
+  for (const k of Object.keys(rec)) {
+    if (!KNOWN_TOP_LEVEL_KEYS.has(k)) {
+      raiseError(`config: unknown key "${k}". Allowed: ${[...KNOWN_TOP_LEVEL_KEYS].join(", ")}.`);
+    }
+  }
 
   if ("tagNames" in rec && partialConfig.tagNames !== undefined) {
     // `null` slips past `!== undefined` but breaks the `in` operator below
@@ -100,6 +124,11 @@ function validatePartialConfig(partialConfig: IWritableConfig): void {
       raiseError("config.tagNames must be an object.");
     }
     const t = partialConfig.tagNames as Record<string, unknown>;
+    for (const k of Object.keys(t)) {
+      if (!KNOWN_TAG_NAME_KEYS.has(k)) {
+        raiseError(`config.tagNames: unknown key "${k}".`);
+      }
+    }
     if ("stripe" in t && t.stripe !== undefined && typeof t.stripe !== "string") {
       raiseError("config.tagNames.stripe must be a string.");
     }
@@ -110,6 +139,11 @@ function validatePartialConfig(partialConfig: IWritableConfig): void {
       raiseError("config.remote must be an object.");
     }
     const r = partialConfig.remote as Record<string, unknown>;
+    for (const k of Object.keys(r)) {
+      if (!KNOWN_REMOTE_KEYS.has(k)) {
+        raiseError(`config.remote: unknown key "${k}".`);
+      }
+    }
     if ("enableRemote" in r && r.enableRemote !== undefined && typeof r.enableRemote !== "boolean") {
       raiseError("config.remote.enableRemote must be a boolean.");
     }

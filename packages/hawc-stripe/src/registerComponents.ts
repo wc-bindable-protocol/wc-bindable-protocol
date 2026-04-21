@@ -14,7 +14,19 @@ export function registerComponents(): void {
     raiseError("registerComponents() requires a browser — customElements is undefined. Use @wc-bindable/hawc-stripe/server for Node.");
   }
   const tag = getConfig().tagNames.stripe;
-  if (!customElements.get(tag)) {
-    customElements.define(tag, Stripe);
+  const existing = customElements.get(tag);
+  if (existing === Stripe) {
+    // Same class, already registered: idempotent / HMR-safe no-op.
+    return;
   }
+  if (existing !== undefined) {
+    // Same tag, different class. That is almost certainly a
+    // configuration mistake — another copy of the package was installed
+    // under the same tag name, or the app called
+    // `customElements.define("hawc-stripe", SomethingElse)` first.
+    // Either way, silently continuing would leave our Shell uninstalled
+    // and the user with an inert `<hawc-stripe>` element; fail loud.
+    raiseError(`registerComponents(): custom element "${tag}" is already registered with a different class. Check for a duplicate package install or a conflicting customElements.define() call.`);
+  }
+  customElements.define(tag, Stripe);
 }

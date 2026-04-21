@@ -259,6 +259,13 @@ export class Stripe extends HTMLElementCtor {
   private _preparedMode: StripeMode | null = null;
   /** Intent id returned by the prepare-time requestIntent call. */
   private _preparedIntentId: string | null = null;
+  /**
+   * Latched flag so the `hawc-stripe:missing-return-url-warning` event
+   * fires at most once per prepare lifecycle (cleared in
+   * `_teardownElements`). Prevents a click-heavy checkout flow from
+   * drowning listeners in repeat warnings.
+   */
+  private _warnedMissingReturnUrl: boolean = false;
 
   private get _isRemote(): boolean {
     return this._proxy !== null;
@@ -650,7 +657,15 @@ export class Stripe extends HTMLElementCtor {
   get trigger(): boolean { return this._trigger; }
   set trigger(value: boolean) {
     const v = !!value;
-    if (v) {
+    // Edge-triggered on the false→true transition only. Controlled-prop
+    // frameworks (React, Vue) re-run assignments on every render, and a
+    // non-edge-guarded setter would re-dispatch `trigger-changed` on
+    // every pass — noisy for listeners and harder to reason about.
+    // Submit itself has its own `_submitPromise` dedup so a redundant
+    // true-on-true write is still a no-op for the network, but
+    // suppressing the duplicate event here keeps the public surface
+    // clean.
+    if (v && !this._trigger) {
       this._trigger = true;
       this.dispatchEvent(new CustomEvent("hawc-stripe:trigger-changed", { detail: true, bubbles: true }));
       // Fire-and-forget by design: trigger is a declarative pulse, not an
@@ -660,7 +675,7 @@ export class Stripe extends HTMLElementCtor {
         this._trigger = false;
         this.dispatchEvent(new CustomEvent("hawc-stripe:trigger-changed", { detail: false, bubbles: true }));
       });
-    } else if (this._trigger) {
+    } else if (!v && this._trigger) {
       // Keep read-back aligned with the written value so frameworks that
       // assign `el.trigger = false` observe the update. Does NOT cancel
       // a pending submit() 窶・reset()/abort() are the cancellation APIs.
@@ -880,6 +895,9 @@ export class Stripe extends HTMLElementCtor {
     // as clientSecret. A fresh prepare() reassigns it.
     this._preparedMode = null;
     this._preparedIntentId = null;
+    // Re-arm the return-url warning so the next prepare lifecycle can
+    // fire it again if the caller has still not set a return-url.
+    this._warnedMissingReturnUrl = false;
   }
 
   private async _mountElements(clientSecret: string): Promise<void> {
@@ -933,6 +951,17 @@ export class Stripe extends HTMLElementCtor {
     }
     if (!this.publishableKey) {
       throw new Error("[@wc-bindable/hawc-stripe] publishable-key is required before prepare().");
+    }
+    // Early format check. Stripe publishable keys always have the `pk_`
+    // prefix (`pk_live_...` / `pk_test_...` / future `pk_*_...` variants).
+    // Without this, a mispasted secret key (`sk_live_...`) gets all the
+    // way to Stripe.js before failing with an opaque "Invalid API Key"
+    // message — the local fail-loud here turns a DX cliff into an
+    // `[@wc-bindable/hawc-stripe]`-prefixed diagnostic.
+    if (!this.publishableKey.startsWith("pk_")) {
+      throw new Error(
+        "[@wc-bindable/hawc-stripe] publishable-key must be a Stripe publishable key (starts with \"pk_\").",
+      );
     }
 
     // Snapshot the mode at the top of prepare so that an attribute flip
@@ -1076,6 +1105,32 @@ export class Stripe extends HTMLElementCtor {
 
     const stripeJs = this._stripeJs!;
     const returnUrl = this.returnUrl;
+    // DX warning: `redirect: "if_required"` + no return_url is a valid
+    // combination for strictly inline flows, but if Stripe.js decides
+    // a redirect IS required at confirm time it throws with an opaque
+    // "Invalid confirmParams" message. Dispatch a single observability
+    // event when this configuration is reached in payment mode so apps
+    // can listen and surface the risk — listen to nothing and the flow
+    // still behaves exactly as before.
+    //
+    // Scoped to `payment` mode for now: SetupIntent flows CAN also redirect
+    // (iDEAL / Bancontact mandates), but forgotten `return-url` on setup is
+    // empirically rare and Stripe.js's error there is clearer. Broaden if
+    // that assumption changes.
+    if (!returnUrl && (this._preparedMode ?? this.mode) === "payment" && !this._warnedMissingReturnUrl) {
+      this._warnedMissingReturnUrl = true;
+      this.dispatchEvent(new CustomEvent("hawc-stripe:missing-return-url-warning", {
+        detail: {
+          // Cover the full class of affected payment methods: 3DS cards
+          // AND non-card redirect-based PMs (Konbini, Alipay, WeChat Pay,
+          // Klarna, PayPay, …) that `automatic_payment_methods: { enabled: true }`
+          // can present. Naming only 3DS would misroute the reader into
+          // thinking card-only accounts are immune.
+          message: "submit() reached without a return-url. Redirect-required payment methods (3DS cards, Konbini, wallets, Klarna, etc.) will fail at confirm time with an opaque error. Set return-url if any payment method in the account may require a redirect.",
+        },
+        bubbles: true,
+      }));
+    }
     const common = {
       elements: this._elements!,
       clientSecret: this._clientSecret,

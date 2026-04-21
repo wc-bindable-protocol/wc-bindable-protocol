@@ -6,6 +6,29 @@ import {
   PaymentIntentOptions, SetupIntentOptions, IntentBuilderResult, ResumeAuthorizer,
 } from "../types.js";
 import { extractCardPaymentMethod } from "../internal/paymentMethodShape.js";
+import { timingSafeEqual } from "node:crypto";
+
+/**
+ * Constant-time equality for the clientSecret match in `resumeIntent`.
+ * The Stripe-issued clientSecret is a bearer credential on the resume path,
+ * so a naive `===` would leak the length of the match prefix through CPU
+ * branch timing (measurable over many probes even through network noise).
+ *
+ * Length comparison itself leaks size, so equalize work by running a dummy
+ * `timingSafeEqual(a, a)` when lengths differ 窶・that still returns false
+ * without an early exit that the attacker's clock could observe.
+ */
+function clientSecretEquals(a: string, b: string): boolean {
+  const aBuf = Buffer.from(a, "utf8");
+  const bBuf = Buffer.from(b, "utf8");
+  if (aBuf.length !== bBuf.length) {
+    // Keep the work profile roughly constant by doing *some* constant-time
+    // comparison before the length-based reject.
+    timingSafeEqual(aBuf, aBuf);
+    return false;
+  }
+  return timingSafeEqual(aBuf, bBuf);
+}
 
 /**
  * Headless Stripe payments core.
@@ -92,6 +115,7 @@ export class StripeCore extends EventTarget {
   private _paymentMethod: StripePaymentMethod | null = null;
   private _intentId: string | null = null;
   private _error: StripeError | null = null;
+  private _disposed: boolean = false;
 
   private _intentBuilder: IntentBuilder | null = null;
   private _webhookHandlers: Map<string, { handler: WebhookHandler; fatal: boolean }[]> = new Map();
@@ -239,6 +263,7 @@ export class StripeCore extends EventTarget {
    * amount/currency must have a single source of truth.
    */
   registerIntentBuilder(builder: IntentBuilder): () => void {
+    if (this._disposed) raiseError("StripeCore has been disposed.");
     if (typeof builder !== "function") raiseError("builder must be a function.");
     this._intentBuilder = builder;
     return () => {
@@ -277,6 +302,7 @@ export class StripeCore extends EventTarget {
     handler: WebhookHandler,
     options: WebhookRegisterOptions = {},
   ): () => void {
+    if (this._disposed) raiseError("StripeCore has been disposed.");
     if (!type || typeof type !== "string") raiseError("type must be a non-empty string.");
     if (typeof handler !== "function") raiseError("handler must be a function.");
     const entry = { handler, fatal: options.fatal !== false };
@@ -306,6 +332,7 @@ export class StripeCore extends EventTarget {
    * Calling twice replaces the prior authorizer; returns a disposer.
    */
   registerResumeAuthorizer(authorizer: ResumeAuthorizer): () => void {
+    if (this._disposed) raiseError("StripeCore has been disposed.");
     if (typeof authorizer !== "function") raiseError("authorizer must be a function.");
     this._resumeAuthorizer = authorizer;
     return () => {
@@ -356,13 +383,21 @@ export class StripeCore extends EventTarget {
     // are covered without having to remember to update this check.
     // Identity above already covers the `null === null` shortcut, so here
     // only one-null-one-not needs to fall through to dispatch.
+    //
+    // Use set-based equality so a shape like
+    //   prev = { code: "X", message: "m" }
+    //   err  = { type: "X", message: "m" }
+    // is correctly detected as different (same length, different keys)
+    // rather than coincidentally equal via an `undefined` lookup on the
+    // missing key.
     if (prev && err) {
       const prevKeys = Object.keys(prev) as (keyof StripeError)[];
       const errKeys = Object.keys(err) as (keyof StripeError)[];
-      if (
-        prevKeys.length === errKeys.length
-        && prevKeys.every(k => prev[k] === err[k])
-      ) return;
+      if (prevKeys.length === errKeys.length) {
+        const errSet = new Set<string>(errKeys as string[]);
+        const sameShape = prevKeys.every(k => errSet.has(k as string));
+        if (sameShape && prevKeys.every(k => prev[k] === err[k])) return;
+      }
     }
     this._error = err;
     this._target.dispatchEvent(new CustomEvent("hawc-stripe:error", { detail: err, bubbles: true }));
@@ -440,6 +475,7 @@ export class StripeCore extends EventTarget {
    * `idle`.
    */
   async requestIntent(request: IntentRequest): Promise<IntentCreationResult> {
+    if (this._disposed) raiseError("StripeCore has been disposed.");
     if (!request || typeof request !== "object") raiseError("request is required.");
     const mode = request.mode ?? this._mode;
     if (mode !== "payment" && mode !== "setup") {
@@ -450,7 +486,13 @@ export class StripeCore extends EventTarget {
         code: "intent_builder_not_registered",
         message: "StripeCore.registerIntentBuilder() must be called before requestIntent.",
       };
+      // Preserve the "every error path lands on idle / loading=false"
+      // invariant that downstream error branches already honor. A caller
+      // that reached this with status=collecting from a prior session
+      // would otherwise stay wedged on a stale status after the throw.
       this._setError(err);
+      this._setStatus("idle");
+      this._setLoading(false);
       throw Object.assign(new Error(err.message), { code: err.code });
     }
 
@@ -557,6 +599,7 @@ export class StripeCore extends EventTarget {
    * was already superseded and the current one is the source of truth.
    */
   async reportConfirmation(report: ConfirmationReport): Promise<void> {
+    if (this._disposed) raiseError("StripeCore has been disposed.");
     if (!report || typeof report !== "object") raiseError("report is required.");
     const active = this._activeIntent;
     if (!active) return; // no active intent 窶・stale/late report, drop.
@@ -677,7 +720,14 @@ export class StripeCore extends EventTarget {
         this._setStatus("processing");
         break;
       case "requires_payment_method":
-        if (view.lastPaymentError) this._setError(view.lastPaymentError);
+        // Sanitize even though `view.lastPaymentError` comes from the
+        // provider's retrieve path and should already be shaped like a
+        // clean Stripe error. A custom `IStripeProvider` (or a future
+        // Stripe response change) could still produce a shape that the
+        // allowlist would reject; routing through `_sanitizeError` keeps
+        // wire-bound `message` / `code` under the same policy as every
+        // other error sink on the Core.
+        if (view.lastPaymentError) this._setError(this._sanitizeError(view.lastPaymentError));
         this._setStatus("failed");
         this._setLoading(false);
         break;
@@ -687,7 +737,7 @@ export class StripeCore extends EventTarget {
         // (declined card, authentication fail, etc). Surface it so UI
         // can show *why* 窶・otherwise the caller only sees a silent
         // `failed`. Symmetric with requires_payment_method above.
-        if (view.lastPaymentError) this._setError(view.lastPaymentError);
+        if (view.lastPaymentError) this._setError(this._sanitizeError(view.lastPaymentError));
         this._setStatus("failed");
         this._setLoading(false);
         break;
@@ -724,6 +774,7 @@ export class StripeCore extends EventTarget {
    * elsewhere.
    */
   async cancelIntent(intentId: string): Promise<void> {
+    if (this._disposed) raiseError("StripeCore has been disposed.");
     if (!intentId) raiseError("intentId is required.");
     const active = this._activeIntent;
     if (!active) return;
@@ -819,6 +870,7 @@ export class StripeCore extends EventTarget {
    * CustomEvent detail, not reflected to an attribute) remains intact.
    */
   async resumeIntent(intentId: string, mode: StripeMode, clientSecret: string): Promise<void> {
+    if (this._disposed) raiseError("StripeCore has been disposed.");
     if (!intentId) raiseError("intentId is required.");
     if (mode !== "payment" && mode !== "setup") {
       raiseError(`mode must be "payment" or "setup", got ${JSON.stringify(mode)}.`);
@@ -855,7 +907,8 @@ export class StripeCore extends EventTarget {
     // for the intent; the caller must have been handed that same string by
     // Stripe's redirect URL. Any mismatch (tampered URL, foreign intent id,
     // provider that forgot to populate clientSecret) is a hard reject.
-    if (!view.clientSecret || view.clientSecret !== clientSecret) {
+    // Constant-time compare to avoid leaking prefix length via timing.
+    if (!view.clientSecret || !clientSecretEquals(view.clientSecret, clientSecret)) {
       const err: StripeError = {
         code: "resume_client_secret_mismatch",
         message: "clientSecret does not match the retrieved intent 窶・resume denied.",
@@ -944,6 +997,7 @@ export class StripeCore extends EventTarget {
    * when the component is reused for a new transaction.
    */
   reset(): void {
+    if (this._disposed) raiseError("StripeCore has been disposed.");
     this._generation++;
     this._activeIntent = null;
     this._setError(null);
@@ -952,6 +1006,38 @@ export class StripeCore extends EventTarget {
     this._setAmount(null);
     this._setStatus("idle");
     this._setLoading(false);
+  }
+
+  /**
+   * Permanently decommission this Core. After dispose(), further command
+   * calls (requestIntent / reportConfirmation / cancelIntent / resumeIntent
+   * / reset / handleWebhook) `raiseError`, and all in-memory registrations
+   * (intent builder, resume authorizer, webhook handlers, webhook dedup
+   * window, active intent) are cleared.
+   *
+   * Intended for:
+   *   - test teardown, so a Core from an earlier test cannot silently
+   *     receive events meant for a later test's Core.
+   *   - multi-tenant servers that build a Core per tenant and need to
+   *     release registrations when the tenant is removed.
+   *
+   * Idempotent 窶・calling dispose twice is a no-op. Does NOT notify Stripe
+   * (no API call), so any still-pending intents at Stripe expire naturally.
+   * Use cancelIntent first if you need deterministic remote cleanup.
+   */
+  dispose(): void {
+    if (this._disposed) return;
+    this._disposed = true;
+    // Bump generation so any in-flight reportConfirmation / webhook fold
+    // landing after this point is treated as a supersede and dropped by
+    // the standard `gen !== this._generation` guards.
+    this._generation++;
+    this._activeIntent = null;
+    this._intentBuilder = null;
+    this._resumeAuthorizer = null;
+    this._webhookHandlers.clear();
+    this._seenWebhookIds.clear();
+    this._seenWebhookOrder = [];
   }
 
   // --- Webhook ingress ---
@@ -969,6 +1055,7 @@ export class StripeCore extends EventTarget {
    * 菫晏・").
    */
   async handleWebhook(rawBody: string, signatureHeader: string): Promise<void> {
+    if (this._disposed) raiseError("StripeCore has been disposed.");
     if (!this._webhookSecret) {
       raiseError("handleWebhook called but StripeCore was constructed without webhookSecret.");
     }
@@ -1117,14 +1204,11 @@ export class StripeCore extends EventTarget {
       }
       case "payment_intent.requires_action":
       case "setup_intent.requires_action":
-      // Some bank-debit payment methods (SEPA / ACH) occasionally emit a
-      // `requires_confirmation` webhook before the final action step —
-      // treat the same as requires_action so the UI hands control back
-      // to the user rather than sitting wedged on `processing`.
-      // `_reconcileFromIntentView` already maps the retrieve-side
-      // equivalent; this keeps the webhook-authoritative path in sync.
-      case "payment_intent.requires_confirmation":
-      case "setup_intent.requires_confirmation":
+      // Note: `*.requires_confirmation` is a valid intent STATUS (visible
+      // via retrieve and handled in `_reconcileFromIntentView`), but it
+      // is NOT a webhook event type per Stripe's event-types catalog.
+      // `_foldWebhookIntoState` therefore deliberately does not branch
+      // on it.
         this._setStatus("requires_action");
         // Mirror reportConfirmation's requires_action branch: the
         // user is now owning the flow (3DS challenge, redirect, etc),

@@ -323,6 +323,20 @@ Core の succeeded 分岐は、`report.paymentMethod` が欠けており `this._
 - 未登録時、`requestIntent` RPC は `{ code: "intent_builder_not_registered", message: "..." }` で即時失敗。
 - これは hawc-s3 の presign がデフォルトで通る挙動より**厳しい**方針。決済は誤設定が直接金額事故になるため fail-loud を選ぶ。
 
+#### 6.3.1 IntentBuilder / サードパーティ例外の運用契約
+
+`IntentBuilder` が throw する Error は Core の `_sanitizeError` を通り、Shell 経由でブラウザ側へ到達しうる。`_sanitizeError` は Stripe SDK 由来の型トークン (`card_error`, `invalid_request_error`, …) および `Stripe*Error` クラス名形式を allowlist し、該当する場合に限り `message` フィールドを wire に転送する。したがって **IntentBuilder の実装者は次の契約を守ること**:
+
+- **Stripe の型トークンを人工的に付与しない**。例:
+  - ❌ `throw Object.assign(new Error("DB credentials at 10.0.0.5 rejected"), { type: "card_error" });`
+  - `type: "card_error"` を捏造すると、本来 wire 転送しない内部メッセージが allowlist を通過してしまう。
+- **DB / 外部サービス由来の生例外はサニタイズしてから throw する**。例:
+  - ✅ `throw Object.assign(new Error("[@wc-bindable/hawc-stripe] builder: cart lookup failed"), {});`
+  - ✅ `try { ... } catch { raiseError("builder: unable to resolve amount for cart"); }`
+- Stripe SDK が自然に throw する `StripeCardError` 等は **そのまま** 通して良い。Stripe 側のメッセージはユーザー向けに設計されている。
+
+この契約が破られた場合、`_sanitizeError` は Stripe API エラーとの区別がつかないため内部メッセージが wire へ漏れる。Core 側では検知できないため、アプリ実装側の責務となる。
+
 ---
 
 ## 7. Shell API(Browser)
