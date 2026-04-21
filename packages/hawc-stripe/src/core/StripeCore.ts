@@ -276,22 +276,38 @@ export class StripeCore extends EventTarget {
    * errors carry internals (request IDs, stack traces, the HTTP body Stripe
    * returned) that must not cross the WebSocket unredacted — SPEC §9.3.
    *
-   * Extracts `code` / `decline_code` / `type` when the object exposes them
-   * via the conventional stripe-node shape, otherwise falls back to a
-   * generic message. Deliberately simple: do not introspect further (e.g.
-   * reading `raw.body`), because any field we copy is a field we commit to
-   * passing over the wire.
+   * Message-copy policy: the `message` field is only forwarded when the
+   * error looks like (a) a Stripe SDK error — `type` starts with "Stripe"
+   * (class-name shape: StripeCardError, StripeAPIError, ...) or ends with
+   * "_error" (Stripe API object shape: card_error, invalid_request_error,
+   * ...) — or (b) one of our own `[@wc-bindable/hawc-stripe]`-prefixed
+   * internal errors whose messages are hand-curated. Anything else
+   * (IntentBuilder throwing a raw `new Error("DB auth failed for user=...")`,
+   * a network-layer exception whose `.message` contains internal hostnames,
+   * etc.) is replaced with a generic "Payment failed." so the observable
+   * `error` property and the wire-serialized throw do not leak server-side
+   * details to the browser. `code` / `decline_code` / `type` are still
+   * copied through when present — those are stable Stripe taxonomy values.
    */
   private _sanitizeError(err: unknown): StripeError {
     if (err && typeof err === "object") {
       const e = err as Record<string, unknown>;
+      const type = typeof e.type === "string" ? e.type : undefined;
+      const rawMessage = typeof e.message === "string" ? e.message : undefined;
+      const stripeShaped = type !== undefined
+        && (type.startsWith("Stripe") || type.endsWith("_error"));
+      const internal = rawMessage !== undefined
+        && rawMessage.startsWith("[@wc-bindable/hawc-stripe]");
+      const safeMessage = (stripeShaped || internal) && rawMessage !== undefined
+        ? rawMessage
+        : "Payment failed.";
       return {
         code: typeof e.code === "string" ? e.code : undefined,
         declineCode: typeof e.decline_code === "string"
           ? e.decline_code
           : typeof e.declineCode === "string" ? e.declineCode : undefined,
-        type: typeof e.type === "string" ? e.type : undefined,
-        message: typeof e.message === "string" ? e.message : "Payment failed.",
+        type,
+        message: safeMessage,
       };
     }
     return { message: "Payment failed." };
@@ -487,8 +503,14 @@ export class StripeCore extends EventTarget {
         } catch { /* ignore — webhook or next confirmation will resolve */ }
         return;
       }
-      default:
-        raiseError(`unknown outcome: ${JSON.stringify((report as any).outcome)}.`);
+      default: {
+        // Compile-time exhaustiveness check: every union member must be
+        // handled by the cases above. The runtime could still carry a
+        // value outside the union (malformed cmd payload from a broken
+        // client) — surface it in the error message to aid debugging.
+        const exhaustive: never = report.outcome;
+        raiseError(`unknown outcome: ${JSON.stringify(exhaustive as unknown)}.`);
+      }
     }
   }
 

@@ -104,8 +104,9 @@ The Quick Start is **deliberately minimal** and **not production-ready**. Before
 - **Authenticate the WebSocket / HTTP session** that backs the Core.
 - **Compute the intent amount server-side** in `registerIntentBuilder` from authenticated user context. Never trust `request.hint.amountValue`.
 - **Preserve the raw webhook body** before any JSON parser touches it — signature verification requires the exact bytes Stripe sent.
+- **Attach an idempotency key** when wrapping `StripeSdkProvider` (or your own `IStripeProvider`). The default provider calls `paymentIntents.create` / `setupIntents.create` / `paymentIntents.cancel` without one — on network flake the Shell's retry can create a second intent for the same cart and charge the user twice. Subclass or compose the provider to pass `{ idempotencyKey: ... }` keyed on cart id + user id.
 - **Consider `registerResumeAuthorizer`** for multi-tenant deployments so a leaked `client_secret` alone cannot resume a foreign user's intent.
-- **Sanitize errors** that cross the wire: the built-in sanitizer keeps `code` / `decline_code` but your custom handlers must be equally careful.
+- **Sanitize errors** that cross the wire: the built-in sanitizer keeps `code` / `decline_code` / `type` and forwards `message` only for Stripe-shaped errors (type starts with `Stripe` or ends with `_error`) and our own `[@wc-bindable/hawc-stripe]`-prefixed internals — anything else collapses to a generic `"Payment failed."` so a raw `new Error("FATAL: ...")` from an `IntentBuilder` does not reach the browser. Custom handlers you add (webhook fulfillment, authorizers) must be equally careful.
 
 ## Install
 

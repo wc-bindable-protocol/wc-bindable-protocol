@@ -1487,4 +1487,55 @@ describe("<hawc-stripe> Shell", () => {
       expect(submitSpy).toHaveBeenCalled();
     });
   });
+
+  describe("appearance hot-swap", () => {
+    // The setter's try/catch silently swallows errors to survive providers
+    // whose Elements group predates the `update` method. Verifying the
+    // happy path (update called once with the new appearance) and the
+    // tolerance path (setter does not throw when update is absent) catches
+    // silent regressions in the hot-swap channel.
+    it("forwards a post-mount appearance change to elements.update()", async () => {
+      const updateCalls: Record<string, unknown>[] = [];
+      const paymentElement: StripePaymentElementLike = {
+        mount() {}, unmount() {}, destroy() {}, on() {},
+      };
+      const elements = {
+        create() { return paymentElement; },
+        getElement() { return paymentElement; },
+        update(opts: Record<string, unknown>) { updateCalls.push(opts); },
+      } as StripeElementsLike;
+      const stripeJs: StripeJsLike = {
+        elements: () => elements,
+        async confirmPayment() { return { paymentIntent: { id: "pi_shell", status: "succeeded" } }; },
+        async confirmSetup() { return { setupIntent: { id: "seti_shell", status: "succeeded" } }; },
+        async retrievePaymentIntent() { return { paymentIntent: { id: "pi_shell", status: "succeeded" } }; },
+        async retrieveSetupIntent() { return { setupIntent: { id: "seti_shell", status: "succeeded" } }; },
+      };
+      WcsStripe.setLoader(async () => stripeJs);
+
+      el = createEl({ mode: "payment", "publishable-key": "pk_test_123" });
+      el.attachLocalCore(core);
+      await el.prepare();
+
+      const nextAppearance = { theme: "night", variables: { colorPrimary: "#09f" } };
+      el.appearance = nextAppearance;
+
+      expect(updateCalls).toHaveLength(1);
+      expect(updateCalls[0]).toEqual({ appearance: nextAppearance });
+    });
+
+    it("tolerates an Elements group that does not implement update()", async () => {
+      // Older/custom Stripe.js surfaces may not expose `update`. Setting
+      // appearance after mount must not throw — the new value is simply
+      // picked up on the next mount. Guards the silent try/catch in the
+      // setter from becoming a hard failure.
+      el = createEl({ mode: "payment", "publishable-key": "pk_test_123" });
+      el.attachLocalCore(core);
+      await el.prepare();
+      expect(() => {
+        el.appearance = { theme: "stripe" };
+      }).not.toThrow();
+      expect(el.appearance).toEqual({ theme: "stripe" });
+    });
+  });
 });

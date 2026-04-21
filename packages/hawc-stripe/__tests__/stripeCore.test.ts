@@ -361,7 +361,13 @@ describe("StripeCore", () => {
 
     it("preserves _activeIntent when provider cancel fails so retry is still possible", async () => {
       await core.requestIntent({ mode: "payment", hint: {} });
-      const cancelErr = new Error("network down");
+      // stripe-node wraps transport failures as `StripeConnectionError` —
+      // the sanitizer recognizes that shape and surfaces the message.
+      // (A plain `new Error("network down")` would now collapse to the
+      // generic "Payment failed." by design — see SPEC §9.3.)
+      const cancelErr = Object.assign(new Error("Connection to api.stripe.com lost."), {
+        type: "StripeConnectionError",
+      });
       let calls = 0;
       provider.cancelPaymentIntent = async (id: string) => {
         calls++;
@@ -369,11 +375,11 @@ describe("StripeCore", () => {
         if (calls === 1) throw cancelErr;
       };
 
-      await expect(core.cancelIntent("pi_123")).rejects.toThrow(/network down/);
+      await expect(core.cancelIntent("pi_123")).rejects.toThrow(/Connection to api\.stripe\.com/);
       // The error must be surfaced, but state is otherwise intact — the
       // intent still exists at Stripe, so dropping ownership would make
       // subsequent reports/webhooks silently unroutable.
-      expect(core.error?.message).toMatch(/network down/);
+      expect(core.error?.message).toMatch(/Connection to api\.stripe\.com/);
       expect(core.intentId).toBe("pi_123");
       expect(core.status).toBe("collecting");
 
@@ -1070,6 +1076,89 @@ describe("StripeCore", () => {
       await core.handleWebhook("{}", "sig");
       expect(core.paymentMethod).toEqual({ id: "pm_already", brand: "visa", last4: "4242" });
       expect(provider.retrieveCalls.length).toBe(retrievesBefore);
+    });
+  });
+
+  describe("error sanitization (SPEC §9.3)", () => {
+    it("redacts the message of a non-Stripe error thrown by the IntentBuilder", async () => {
+      // A user-supplied IntentBuilder might throw with an internal message
+      // (DB auth error, stack trace, hostnames) that must not reach the
+      // browser via observable `error` or the cmd-throw wire. The sanitizer
+      // replaces non-Stripe, non-internal messages with a generic string.
+      const c = new StripeCore(provider);
+      c.registerIntentBuilder(() => {
+        throw new Error("FATAL: auth failed for user=admin@example.com via 10.0.0.5");
+      });
+      await expect(c.requestIntent({ mode: "payment", hint: {} })).rejects.toThrow();
+      expect(c.error?.message).toBe("Payment failed.");
+      expect(c.error?.message).not.toMatch(/admin/);
+      expect(c.error?.message).not.toMatch(/10\.0\.0\.5/);
+    });
+
+    it("forwards the message of a Stripe SDK error (class-name shape)", async () => {
+      // stripe-node throws instances whose `.type` is the class name
+      // ("StripeCardError", "StripeAPIError", etc). Those messages are
+      // Stripe-curated and safe to surface.
+      const c = new StripeCore(provider);
+      c.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      provider.paymentError = Object.assign(new Error("Your card was declined."), {
+        type: "StripeCardError",
+        code: "card_declined",
+        decline_code: "insufficient_funds",
+      });
+      await expect(c.requestIntent({ mode: "payment", hint: {} })).rejects.toThrow();
+      expect(c.error?.message).toBe("Your card was declined.");
+      expect(c.error?.code).toBe("card_declined");
+      expect(c.error?.declineCode).toBe("insufficient_funds");
+      expect(c.error?.type).toBe("StripeCardError");
+    });
+
+    it("forwards the message of a Stripe API error object (webhook last_payment_error shape)", async () => {
+      // Webhook payloads carry `last_payment_error` as a Stripe API error
+      // object whose `.type` uses the snake_case "*_error" shape. Those are
+      // also Stripe-curated and safe to surface — covers the sanitizer call
+      // from the webhook fold path (StripeCore.ts `_foldWebhookIntoState`).
+      const c = new StripeCore(provider, { webhookSecret: "whsec_test" });
+      c.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      await c.requestIntent({ mode: "payment", hint: {} });
+      provider.webhookEvent = {
+        id: "evt_1",
+        type: "payment_intent.payment_failed",
+        created: 0,
+        data: {
+          object: {
+            id: "pi_123",
+            last_payment_error: {
+              type: "card_error",
+              code: "card_declined",
+              message: "Your card was declined.",
+            },
+          },
+        },
+      };
+      await c.handleWebhook("{}", "t=0,v1=abc");
+      expect(c.error?.message).toBe("Your card was declined.");
+      expect(c.error?.type).toBe("card_error");
+    });
+
+    it("forwards our own [@wc-bindable/hawc-stripe]-prefixed internal errors", async () => {
+      // Internal errors are hand-curated and carry useful programmer-facing
+      // info (e.g. "provider returned no id/client_secret"). They are not
+      // Stripe-shaped (no .type) so they would otherwise collapse to the
+      // generic message, hurting debuggability.
+      const c = new StripeCore(provider);
+      c.registerIntentBuilder(() => {
+        throw new Error("[@wc-bindable/hawc-stripe] builder invariant violated.");
+      });
+      await expect(c.requestIntent({ mode: "payment", hint: {} })).rejects.toThrow();
+      expect(c.error?.message).toBe("[@wc-bindable/hawc-stripe] builder invariant violated.");
+    });
+
+    it("falls back to generic message when the thrown value has no usable shape", async () => {
+      const c = new StripeCore(provider);
+      c.registerIntentBuilder(() => { throw "plain string rejection"; });
+      await expect(c.requestIntent({ mode: "payment", hint: {} })).rejects.toBeDefined();
+      expect(c.error?.message).toBe("Payment failed.");
     });
   });
 
