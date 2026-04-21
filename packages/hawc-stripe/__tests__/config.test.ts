@@ -77,6 +77,45 @@ describe("config", () => {
       // A fresh snapshot reflects the new value.
       expect(getConfig().remote.remoteCoreUrl).toBe("ws://after/");
     });
+
+    it("throws when remoteSettingType is outside enum", () => {
+      expect(() => {
+        setConfig({ remote: { remoteSettingType: "weird" as any } });
+      }).toThrow(/remoteSettingType/);
+    });
+
+    it("throws when remoteCoreUrl is not a string", () => {
+      expect(() => {
+        setConfig({ remote: { remoteCoreUrl: 123 as any } });
+      }).toThrow(/remoteCoreUrl/);
+    });
+
+    it("throws when enableRemote is not a boolean", () => {
+      expect(() => {
+        setConfig({ remote: { enableRemote: "true" as any } });
+      }).toThrow(/enableRemote/);
+    });
+
+    it("throws when tagNames.stripe is not a string", () => {
+      expect(() => {
+        setConfig({ tagNames: { stripe: 123 as any } });
+      }).toThrow(/tagNames\.stripe/);
+    });
+
+    it("throws when tagNames.stripe is null", () => {
+      expect(() => {
+        setConfig({ tagNames: { stripe: null as any } });
+      }).toThrow(/tagNames\.stripe/);
+    });
+
+    it("leaves config unchanged when validation fails", () => {
+      setConfig({ remote: { enableRemote: true, remoteCoreUrl: "ws://before/" } });
+      expect(() => {
+        setConfig({ remote: { remoteCoreUrl: 123 as any, enableRemote: false } });
+      }).toThrow();
+      expect(config.remote.enableRemote).toBe(true);
+      expect(config.remote.remoteCoreUrl).toBe("ws://before/");
+    });
   });
 
   describe("getRemoteCoreUrl", () => {
