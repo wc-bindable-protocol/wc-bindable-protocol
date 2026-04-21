@@ -28,6 +28,8 @@ import {
  */
 export class StripeCore extends EventTarget {
   private static readonly _STRIPE_TAXONOMY_TOKEN_RE = /^[a-z0-9_]{1,64}$/i;
+  // 96 allows hierarchical dotted variants (e.g. "payment_intent.authentication_required").
+  private static readonly _STRIPE_ERROR_CODE_RE = /^[a-z0-9_.]{1,96}$/i;
   static wcBindable: IWcBindable = {
     protocol: "wc-bindable",
     version: 1,
@@ -336,9 +338,12 @@ export class StripeCore extends EventTarget {
    * renderers must treat error text as plain text (not trusted HTML).
    */
   private _sanitizeError(err: unknown): StripeError {
-    const sanitizeToken = (value: unknown): string | undefined => {
+    const sanitizeToken = (
+      value: unknown,
+      allowedPattern: RegExp = StripeCore._STRIPE_TAXONOMY_TOKEN_RE,
+    ): string | undefined => {
       if (typeof value !== "string") return undefined;
-      return StripeCore._STRIPE_TAXONOMY_TOKEN_RE.test(value) ? value : undefined;
+      return allowedPattern.test(value) ? value : undefined;
     };
 
     if (err && typeof err === "object") {
@@ -353,8 +358,9 @@ export class StripeCore extends EventTarget {
         ? rawMessage
         : "Payment failed.";
       return {
-        code: sanitizeToken(e.code),
-        declineCode: sanitizeToken(e.decline_code) ?? sanitizeToken(e.declineCode),
+        code: sanitizeToken(e.code, StripeCore._STRIPE_ERROR_CODE_RE),
+        declineCode: sanitizeToken(e.decline_code, StripeCore._STRIPE_ERROR_CODE_RE)
+          ?? sanitizeToken(e.declineCode, StripeCore._STRIPE_ERROR_CODE_RE),
         type,
         message: safeMessage,
       };
@@ -909,9 +915,16 @@ export class StripeCore extends EventTarget {
       }
     }
 
-    // Reflect common event types into observable state. Only the currently-
-    // active intent is folded in; events for other intents (different user,
-    // old session) pass through to handlers but do not move UI state.
+    // Reflect common event types into observable state BEFORE app handlers.
+    // Trade-off: if a fatal handler throws, UI may transiently observe a
+    // terminal state (e.g. succeeded) while the webhook HTTP route returns
+    // 5xx and Stripe retries. This is intentional eventual consistency:
+    // retries re-run fold idempotently, while handler-side durability still
+    // controls acknowledgement semantics.
+    //
+    // Only the currently-active intent is folded in; events for other intents
+    // (different user, old session) pass through to handlers but do not move
+    // UI state.
     await this._foldWebhookIntoState(event);
 
     // Dispatch to registered handlers. Fatal/non-fatal semantics mirror

@@ -298,11 +298,16 @@ class StripeCore extends EventTarget {
    * アプリの HTTP ルートから呼ぶ。
    * rawBody は Buffer/string(body-parser の前段で保全されたもの)。
    * signatureHeader は `stripe-signature` ヘッダの値。
-   * 署名検証 → event ディスパッチ → 登録済み handler 実行 → status プロパティ更新。
+  * 署名検証 → event ディスパッチ → status fold → 登録済み handler 実行。
    */
   handleWebhook(rawBody: string, signatureHeader: string): Promise<void>;
 }
 ```
+
+設計トレードオフ: Core は webhook を受けると handler 実行前に observable state を fold する。
+そのため fatal handler が throw した場合でも UI は先に `succeeded` などを観測しうる一方、
+HTTP ルートは 5xx を返して Stripe retry が走る。これは意図的な eventual consistency で、
+UI の即時反映を優先しつつ、配送確定(ack)の最終判定は handler 側の永続化成功/失敗に委ねる。
 
 ### 6.4 `reportConfirmation` の paymentMethod 補完
 

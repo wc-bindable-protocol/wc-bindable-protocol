@@ -622,6 +622,25 @@ describe("StripeCore", () => {
       expect(order).toEqual(["a"]);
     });
 
+    it("folds observable state before handlers; fatal throw still leaves folded status", async () => {
+      core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      await core.requestIntent({ mode: "payment", hint: {} });
+      expect(core.status).toBe("collecting");
+
+      core.registerWebhookHandler("payment_intent.succeeded", () => {
+        throw new Error("boom");
+      });
+      provider.webhookEvent = {
+        id: "evt_before_handler_fold",
+        type: "payment_intent.succeeded",
+        data: { object: { id: "pi_123" } },
+        created: 0,
+      };
+
+      await expect(core.handleWebhook("{}", "sig")).rejects.toThrow(/boom/);
+      expect(core.status).toBe("succeeded");
+    });
+
     it("non-fatal handler continues chain and dispatches warning", async () => {
       const order: string[] = [];
       const warnings: CustomEvent[] = [];
@@ -1427,6 +1446,48 @@ describe("StripeCore", () => {
       expect(c.error?.type).toBe("card_error");
       expect(c.error?.code).toBeUndefined();
       expect(c.error?.declineCode).toBeUndefined();
+    });
+
+    it("keeps dot-separated code/declineCode tokens while still dropping unsafe punctuation", async () => {
+      const c = new StripeCore(provider);
+      c.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      await c.requestIntent({ mode: "payment", hint: {} });
+      await c.reportConfirmation({
+        intentId: "pi_123",
+        outcome: "failed",
+        error: {
+          type: "card_error",
+          code: "payment_intent.authentication_required",
+          declineCode: "issuer.authentication_required<script>",
+          message: "Authentication required.",
+        },
+      });
+      expect(c.error?.type).toBe("card_error");
+      expect(c.error?.code).toBe("payment_intent.authentication_required");
+      expect(c.error?.declineCode).toBeUndefined();
+    });
+
+    it("keeps dotted webhook decline_code (snake_case) from last_payment_error", async () => {
+      const c = new StripeCore(provider, { webhookSecret: "whsec_test" });
+      c.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      await c.requestIntent({ mode: "payment", hint: {} });
+      provider.webhookEvent = {
+        id: "evt_decline_dot",
+        type: "payment_intent.payment_failed",
+        created: 0,
+        data: {
+          object: {
+            id: "pi_123",
+            last_payment_error: {
+              type: "card_error",
+              decline_code: "issuer.insufficient_funds",
+              message: "Declined.",
+            },
+          },
+        },
+      };
+      await c.handleWebhook("{}", "t=0,v1=abc");
+      expect(c.error?.declineCode).toBe("issuer.insufficient_funds");
     });
 
     it("rejects Stripe-shaped type impostors so their message does not pass through", async () => {
