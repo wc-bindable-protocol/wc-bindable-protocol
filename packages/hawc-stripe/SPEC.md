@@ -358,6 +358,7 @@ Core の succeeded 分岐は、`report.paymentMethod` が欠けており `this._
 - `hawc-stripe:element-ready` — Stripe Elements の mount 完了
 - `hawc-stripe:element-change` — Elements の入力完全性のみ(card 情報は含まない)。`detail: { complete: boolean }`
 - `hawc-stripe:stale-config` — `prepare()` 後に mode / amount / customer 属性が変わったとき。`detail: { field, message }`。`submit()` は prepared mode を使い続けるので、切り替えたい場合は `reset()` か `abort()` を挟む必要があることの通知
+- `hawc-stripe:unknown-status` — Shell/Core 両方で発火しうる unknown status 観測イベント。Shell は `detail: { intentId, status, preparedMode }`、Core は `detail: { source: "core", intentId, mode, status }` を送る(いずれも status は変更しない)
 - `hawc-stripe:authorizer-error` — Core のみ(Shell には届かない)。resume authorizer が throw したときの raw 例外を operator ログ向けに surface
 - `hawc-stripe:webhook-warning` — Core のみ。non-fatal webhook handler が throw したとき
 - `hawc-stripe:webhook-deduped` — Core のみ。`detail: { eventId, type }`。署名検証済み webhook が dedup window 内の重複として抑止されたとき

@@ -582,8 +582,9 @@ export class StripeCore extends EventTarget {
    *   canceled                           竊・"failed"
   *
   * Unknown Stripe statuses are intentionally left unchanged here (default
-  * branch) so resolution stays webhook-authoritative. Shell-side unknown
-  * statuses should emit `hawc-stripe:unknown-status`; applications should
+  * branch) so resolution stays webhook-authoritative. For observability,
+  * Core dispatches `hawc-stripe:unknown-status` on its target with
+  * `{ source: "core", intentId, mode, status }`. Applications should
   * subscribe and apply a timeout/escalation policy for webhook-less or
   * misconfigured webhook environments.
    */
@@ -634,7 +635,17 @@ export class StripeCore extends EventTarget {
         this._setStatus("failed");
         this._setLoading(false);
         break;
-      // default: leave status unchanged (unrecognized Stripe status string).
+      default:
+        this._target.dispatchEvent(new CustomEvent("hawc-stripe:unknown-status", {
+          detail: {
+            source: "core",
+            intentId: this._intentId,
+            mode,
+            status: view.status,
+          },
+          bubbles: true,
+        }));
+      // leave status unchanged (unrecognized Stripe status string).
     }
   }
 

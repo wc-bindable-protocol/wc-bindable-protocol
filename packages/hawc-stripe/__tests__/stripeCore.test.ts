@@ -226,6 +226,26 @@ describe("StripeCore", () => {
       expect(core.status).toBe("succeeded");
     });
 
+    it("emits hawc-stripe:unknown-status from core when polled intent status is unrecognized", async () => {
+      await core.requestIntent({ mode: "payment", hint: {} });
+      const unknown: CustomEvent[] = [];
+      core.addEventListener("hawc-stripe:unknown-status", (e) => unknown.push(e as CustomEvent));
+      provider.retrieveResult = {
+        id: "pi_123",
+        status: "requires_capture",
+        mode: "payment",
+      };
+
+      await core.reportConfirmation({ intentId: "pi_123", outcome: "processing" });
+
+      expect(core.status).toBe("processing");
+      expect(unknown).toHaveLength(1);
+      expect((unknown[0].detail as any).source).toBe("core");
+      expect((unknown[0].detail as any).intentId).toBe("pi_123");
+      expect((unknown[0].detail as any).mode).toBe("payment");
+      expect((unknown[0].detail as any).status).toBe("requires_capture");
+    });
+
     it("clears stale error on processing → succeeded poll path (fail-then-processing-then-succeed, regression)", async () => {
       // Same failure-then-success contract, but this time success
       // arrives through `_reconcileFromIntentView` (reportConfirmation
