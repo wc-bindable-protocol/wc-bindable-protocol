@@ -69,14 +69,14 @@ describe("AuthCore", () => {
     it("domain未指定時にエラーをスローする", () => {
       const core = new AuthCore();
       expect(() => core.initialize({ domain: "", clientId: "id" })).toThrow(
-        "[@wc-bindable/hawc-auth0] domain attribute is required."
+        "[@wc-bindable/hawc-auth0] domain is required."
       );
     });
 
     it("clientId未指定時にエラーをスローする", () => {
       const core = new AuthCore();
       expect(() => core.initialize({ domain: "test.auth0.com", clientId: "" })).toThrow(
-        "[@wc-bindable/hawc-auth0] client-id attribute is required."
+        "[@wc-bindable/hawc-auth0] clientId is required."
       );
     });
 
@@ -146,11 +146,19 @@ describe("AuthCore", () => {
       expect(core.token).toBeNull();
     });
 
-    it("トークン取得失敗時もエラーにならない", async () => {
+    it("トークン取得失敗時も authenticated は維持され、error にエラーが公開される", async () => {
+      // Cycle 7 contract change (I-004): `_syncState()` now publishes
+      // the Auth0 SDK rejection via `_setError` so subscribers can
+      // distinguish "authenticated but no token yet" from "authenticated
+      // with a working token". Mirrors the error contract of `getToken()`
+      // and prevents the silent authenticated=true/token=null/error=null
+      // state that previously stranded Authorization-header flows without
+      // any observable signal.
+      const tokenError = new Error("token error");
       const mockClient = createMockAuth0Client({
         isAuthenticated: vi.fn().mockResolvedValue(true),
         getUser: vi.fn().mockResolvedValue({ sub: "auth0|123" }),
-        getTokenSilently: vi.fn().mockRejectedValue(new Error("token error")),
+        getTokenSilently: vi.fn().mockRejectedValue(tokenError),
       });
       createAuth0Client.mockResolvedValueOnce(mockClient);
 
@@ -159,7 +167,35 @@ describe("AuthCore", () => {
 
       expect(core.authenticated).toBe(true);
       expect(core.token).toBeNull();
-      expect(core.error).toBeNull();
+      expect(core.error).toBe(tokenError);
+    });
+
+    it("_syncState トークン取得失敗時に hawc-auth0:error が発火する (I-004)", async () => {
+      // Regression: previously `_syncState`'s catch block was bare
+      // (`catch (_e)`) so no error event was dispatched. Subscribers
+      // binding through `hawc-auth0:error` would never learn the token
+      // fetch failed — now the event fires with the normalised error
+      // as its detail, mirroring `getToken()`'s event contract.
+      const tokenError = new Error("login_required");
+      const mockClient = createMockAuth0Client({
+        isAuthenticated: vi.fn().mockResolvedValue(true),
+        getUser: vi.fn().mockResolvedValue({ sub: "auth0|123" }),
+        getTokenSilently: vi.fn().mockRejectedValue(tokenError),
+      });
+      createAuth0Client.mockResolvedValueOnce(mockClient);
+
+      const core = new AuthCore();
+      const errorEvents: unknown[] = [];
+      core.addEventListener("hawc-auth0:error", (e) => {
+        errorEvents.push((e as CustomEvent).detail);
+      });
+      await core.initialize({ domain: "test.auth0.com", clientId: "client-id" });
+
+      // Event sequence: _doInitialize clears error at start (null), then
+      // _syncState publishes the token-fetch failure.
+      expect(errorEvents[0]).toBeNull();
+      expect(errorEvents[errorEvents.length - 1]).toBe(tokenError);
+      expect(core.error).toBe(tokenError);
     });
 
     it("initPromiseが設定される", async () => {
@@ -221,6 +257,43 @@ describe("AuthCore", () => {
 
         expect(mockClient.handleRedirectCallback).toHaveBeenCalled();
         expect(replaceStateSpy).toHaveBeenCalled();
+      } finally {
+        Object.defineProperty(globalThis.location, "search", { value: savedSearch, configurable: true });
+        Object.defineProperty(globalThis.location, "href", { value: savedHref, configurable: true });
+        replaceStateSpy.mockRestore();
+      }
+    });
+
+    it("`code`/`state` を部分文字列として含むクエリ（promo_code/session_state 等）では handleRedirectCallback を呼ばない", async () => {
+      // 素の `query.includes("code=") && query.includes("state=")` 判定だと
+      // `?promo_code=abc&session_state=xyz` のようなクーポン/UTM クエリを
+      // 誤検知して Auth0 の handleRedirectCallback を走らせ、"Invalid state"
+      // で初期化が失敗する。`URLSearchParams.has()` に揃えて回避済みであることを
+      // 保証する回帰テスト。
+      const mockClient = createMockAuth0Client();
+      createAuth0Client.mockResolvedValueOnce(mockClient);
+
+      const savedHref = globalThis.location.href;
+      const savedSearch = globalThis.location.search;
+
+      Object.defineProperty(globalThis.location, "search", {
+        value: "?promo_code=abc&session_state=xyz&no_code=1&my_state=2",
+        configurable: true,
+      });
+      Object.defineProperty(globalThis.location, "href", {
+        value: "http://localhost/?promo_code=abc&session_state=xyz&no_code=1&my_state=2",
+        configurable: true,
+      });
+
+      const replaceStateSpy = vi.spyOn(globalThis.history, "replaceState");
+
+      try {
+        const core = new AuthCore();
+        await core.initialize({ domain: "test.auth0.com", clientId: "client-id" });
+
+        // 本物の ?code=&state= ではないので callback 経路は踏まないはず
+        expect(mockClient.handleRedirectCallback).not.toHaveBeenCalled();
+        expect(replaceStateSpy).not.toHaveBeenCalled();
       } finally {
         Object.defineProperty(globalThis.location, "search", { value: savedSearch, configurable: true });
         Object.defineProperty(globalThis.location, "href", { value: savedHref, configurable: true });

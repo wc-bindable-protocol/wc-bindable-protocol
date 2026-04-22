@@ -108,4 +108,69 @@ describe("verifyAuth0Token", () => {
     expect(result.permissions).toEqual([]);
     expect(result.roles).toEqual([]);
   });
+
+  it("reads roles from `rolesClaim` when supplied (namespaced custom claim)", async () => {
+    // SPEC-REMOTE §4.2 documents the default shape as
+    // `payload["https://{namespace}/roles"]` — Auth0 reserves the
+    // non-namespaced `roles` claim for its own use, so out-of-the-box
+    // RBAC emits roles under the namespaced URI. When consumers pass
+    // that URI as `rolesClaim`, the namespaced key wins.
+    const NS = "https://api.example.com/roles";
+    jwtVerify.mockResolvedValue({
+      payload: {
+        sub: "auth0|ghi",
+        [NS]: ["editor", "admin"],
+        roles: ["ignored"], // non-namespaced value must be ignored when namespaced one is present
+      },
+    });
+
+    const result = await verifyAuth0Token("token-7", {
+      domain: `rolesclaim-${Date.now()}.auth0.com`,
+      audience: "aud",
+      rolesClaim: NS,
+    });
+
+    expect(result.roles).toEqual(["editor", "admin"]);
+  });
+
+  it("falls back to `payload.roles` when `rolesClaim` is set but absent from payload", async () => {
+    // Back-compat guardrail: a tenant that has configured `rolesClaim`
+    // for new tokens but still has legacy tokens in flight (or a custom
+    // Action that emits under the non-namespaced key) should keep
+    // seeing roles rather than silently dropping them.
+    const NS = "https://api.example.com/roles";
+    jwtVerify.mockResolvedValue({
+      payload: {
+        sub: "auth0|jkl",
+        roles: ["legacy-role"],
+      },
+    });
+
+    const result = await verifyAuth0Token("token-8", {
+      domain: `rolesfallback-${Date.now()}.auth0.com`,
+      audience: "aud",
+      rolesClaim: NS,
+    });
+
+    expect(result.roles).toEqual(["legacy-role"]);
+  });
+
+  it("uses `payload.roles` when `rolesClaim` is unset (back-compat)", async () => {
+    // Existing deployments that use a custom Action to emit `roles`
+    // under the non-namespaced key must continue working with no
+    // code changes — `rolesClaim` is opt-in.
+    jwtVerify.mockResolvedValue({
+      payload: {
+        sub: "auth0|mno",
+        roles: ["admin"],
+      },
+    });
+
+    const result = await verifyAuth0Token("token-9", {
+      domain: `rolesdefault-${Date.now()}.auth0.com`,
+      audience: "aud",
+    });
+
+    expect(result.roles).toEqual(["admin"]);
+  });
 });

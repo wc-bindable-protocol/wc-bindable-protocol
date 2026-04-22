@@ -80,7 +80,7 @@ describe("UserCore", () => {
     it("dispatches permissions-changed only when permissions differ", () => {
       const core = new UserCore(mockUser);
       const events: string[] = [];
-      core.addEventListener("hawc-auth0:permissions-changed", () => events.push("perm"));
+      core.addEventListener("hawc-auth0-user:permissions-changed", () => events.push("perm"));
 
       core.updateUser({ ...mockUser });
       expect(events).toEqual([]);
@@ -92,7 +92,7 @@ describe("UserCore", () => {
     it("dispatches roles-changed only when roles differ", () => {
       const core = new UserCore(mockUser);
       const events: string[] = [];
-      core.addEventListener("hawc-auth0:roles-changed", () => events.push("role"));
+      core.addEventListener("hawc-auth0-user:roles-changed", () => events.push("role"));
 
       core.updateUser({ ...mockUser });
       expect(events).toEqual([]);
@@ -104,7 +104,7 @@ describe("UserCore", () => {
     it("dispatches user-changed only when sub/email/name differ", () => {
       const core = new UserCore(mockUser);
       const events: Array<{ sub: string }> = [];
-      core.addEventListener("hawc-auth0:user-changed", (e) => {
+      core.addEventListener("hawc-auth0-user:user-changed", (e) => {
         events.push((e as CustomEvent).detail);
       });
 
@@ -123,7 +123,7 @@ describe("UserCore", () => {
     it("event detail for permissions is a fresh copy (not the internal array)", () => {
       const core = new UserCore(mockUser);
       let detail: string[] | null = null;
-      core.addEventListener("hawc-auth0:permissions-changed", (e) => {
+      core.addEventListener("hawc-auth0-user:permissions-changed", (e) => {
         detail = (e as CustomEvent).detail;
       });
 
@@ -141,8 +141,8 @@ describe("UserCore", () => {
         roles,
       });
       const events: string[] = [];
-      core.addEventListener("hawc-auth0:permissions-changed", () => events.push("perm"));
-      core.addEventListener("hawc-auth0:roles-changed", () => events.push("role"));
+      core.addEventListener("hawc-auth0-user:permissions-changed", () => events.push("perm"));
+      core.addEventListener("hawc-auth0-user:roles-changed", () => events.push("role"));
 
       core.updateUser({
         ...mockUser,
@@ -156,8 +156,8 @@ describe("UserCore", () => {
     it("does not emit array-change events when arrays have identical contents", () => {
       const core = new UserCore(mockUser);
       const events: string[] = [];
-      core.addEventListener("hawc-auth0:permissions-changed", () => events.push("perm"));
-      core.addEventListener("hawc-auth0:roles-changed", () => events.push("role"));
+      core.addEventListener("hawc-auth0-user:permissions-changed", () => events.push("perm"));
+      core.addEventListener("hawc-auth0-user:roles-changed", () => events.push("role"));
 
       core.updateUser({
         ...mockUser,

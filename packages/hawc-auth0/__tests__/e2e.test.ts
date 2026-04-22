@@ -49,6 +49,7 @@ vi.mock("jose", async () => {
 import { createAuthenticatedWSS } from "../src/server/createAuthenticatedWSS";
 import { PROTOCOL_PREFIX } from "../src/protocolPrefix";
 import { AuthCore } from "../src/core/AuthCore";
+import { _clearJwksCache } from "../src/server/verifyAuth0Token";
 
 // --- key + JWT helpers ---------------------------------------------------
 
@@ -202,6 +203,10 @@ describe("e2e: real JWT + JWKS + Sec-WebSocket-Protocol + refresh", () => {
 
   afterAll(() => {
     activeJwksResolver = null;
+    // Drop the module-level JWKS resolver cache so later test files
+    // mocking `createRemoteJWKSet` with a fresh `activeJwksResolver`
+    // do not accidentally reuse this suite's stubbed thunk.
+    _clearJwksCache();
   });
 
   it("happy path: real RSA-signed JWT in Sec-WebSocket-Protocol opens the connection", async () => {
@@ -398,11 +403,11 @@ describe("e2e: AuthCore redirect callback", () => {
   // is invoked when the URL has `code` + `state`, (b) those query params
   // are scrubbed via history.replaceState, (c) auth state is then synced
   // from the (stubbed) Auth0 client.
-  let originalLocation: typeof globalThis.location;
+  let originalHref: string;
   let replaceStateSpy: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
-    originalLocation = globalThis.location;
+    originalHref = globalThis.location.href;
     // happy-dom provides a writable `location.href`. Set search params
     // that look like an Auth0 redirect callback.
     globalThis.history.replaceState({}, "", "/cb?code=AUTHZCODE&state=STATEVAL&keep=1");
@@ -411,10 +416,13 @@ describe("e2e: AuthCore redirect callback", () => {
   });
 
   afterEach(() => {
-    // Restore. happy-dom keeps the location object stable; we only reset
-    // the URL so other tests do not see leftover query params.
-    globalThis.history.replaceState({}, "", "/");
-    if (originalLocation) globalThis.location = originalLocation;
+    // Restore. happy-dom keeps the location object stable; we only
+    // reset the URL via `history.replaceState`. An earlier version
+    // did `globalThis.location = originalLocation`, but `location`
+    // is a read-only property under happy-dom (and all real runtimes)
+    // so that assignment was a silent no-op — we rely entirely on
+    // `replaceState` to scrub leftover query params.
+    globalThis.history.replaceState({}, "", originalHref);
   });
 
   it("invokes handleRedirectCallback and scrubs code+state from the URL", async () => {

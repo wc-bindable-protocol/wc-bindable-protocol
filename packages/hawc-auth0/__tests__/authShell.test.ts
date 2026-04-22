@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { AuthShell } from "../src/shell/AuthShell";
+import { isOwnershipError, OWNERSHIP_ERROR_MARKER } from "../src/raiseError";
 
 function createMockAuth0Client(overrides: Record<string, any> = {}) {
   return {
@@ -411,6 +412,33 @@ describe("AuthShell", () => {
         ).rejects.toThrow(/Connection Ownership/);
       });
 
+      // Cycle 7 (I-003): AuthSession previously recognised ownership
+      // violations by `message.includes("§3.7")`, which would silently
+      // break if the wording ever drifted. The stable identifier is now
+      // `_hawcOwnership === true` on the Error itself. Lock it in here
+      // so the producer's contract cannot regress unnoticed.
+      it("tags the ownership-violation Error with _hawcOwnership sentinel (I-003)", async () => {
+        const mockClient = createMockAuth0Client({
+          getTokenSilently: vi.fn().mockResolvedValue("token"),
+        });
+        createAuth0Client.mockResolvedValue(mockClient);
+
+        const shell = new AuthShell();
+        await shell.initialize({ domain: "d", clientId: "c", audience: "a" });
+
+        await shell.connect("ws://localhost:3000");
+
+        let caught: unknown = null;
+        try {
+          await shell.connect("ws://localhost:3001", { failIfConnected: true });
+        } catch (err) {
+          caught = err;
+        }
+        expect(caught).toBeInstanceOf(Error);
+        expect((caught as Record<string, unknown>)[OWNERSHIP_ERROR_MARKER]).toBe(true);
+        expect(isOwnershipError(caught)).toBe(true);
+      });
+
       it("rejects fast when a handshake is already in flight (TOCTOU guard)", async () => {
         // Regression: without `failIfConnected`, a synchronous
         // `auth.connected === false` check followed by `await
@@ -768,7 +796,14 @@ describe("AuthShell", () => {
         // out synchronously (before any await inside reconnect) so
         // the first can complete cleanly.
         const pA = shell.reconnect();
-        await expect(shell.reconnect()).rejects.toThrow(/Connection Ownership/);
+        const rejection = shell.reconnect().catch((err) => err);
+        const caught = await rejection;
+        expect(caught).toBeInstanceOf(Error);
+        expect((caught as Error).message).toMatch(/Connection Ownership/);
+        // Cycle 7 (I-003): reconnect ownership error also carries the
+        // `_hawcOwnership` sentinel, same as connect's failIfConnected.
+        expect(isOwnershipError(caught)).toBe(true);
+
         await expect(pA).resolves.toBeDefined();
 
         // After settling, a subsequent reconnect is allowed again

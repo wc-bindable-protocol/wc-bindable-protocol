@@ -16,6 +16,24 @@ export function extractTokenFromProtocol(
     throw new Error("[@wc-bindable/hawc-auth0] Missing Sec-WebSocket-Protocol header.");
   }
 
+  // The declared input type is `string | string[] | undefined`, but
+  // custom server plumbing (raw `http` upgrade handlers, Deno / Bun
+  // adapters, unusual reverse proxies) can still hand us a `Buffer`,
+  // a plain object, or some other shape — the TypeScript contract is
+  // only enforced at compile time for the usual `ws` caller. Without
+  // this guard, `protocolHeader.split(",")` would throw a confusing
+  // `TypeError: X.split is not a function` deep inside the parse path,
+  // and `Array.isArray(Buffer)` returns `false` so we would silently
+  // call `.split` on a Buffer and crash. Rejecting explicitly keeps
+  // the error surface uniform with the other "malformed header" paths.
+  if (typeof protocolHeader !== "string" && !Array.isArray(protocolHeader)) {
+    throw new Error(
+      "[@wc-bindable/hawc-auth0] Sec-WebSocket-Protocol header must be a string or string[]; got " +
+        (protocolHeader === null ? "null" : typeof protocolHeader) +
+        ".",
+    );
+  }
+
   // The header may be a comma-separated string or an array. Trim each
   // entry in BOTH branches — the `ws` library normalises whitespace
   // for us, but other server environments (undici, custom proxies,

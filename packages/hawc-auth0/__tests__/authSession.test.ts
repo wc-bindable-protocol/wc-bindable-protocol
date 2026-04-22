@@ -10,6 +10,7 @@ import {
   getCoreDeclaration,
   _clearCoreRegistry,
 } from "../src/coreRegistry";
+import { isOwnershipError, OWNERSHIP_ERROR_MARKER } from "../src/raiseError";
 
 vi.mock("@auth0/auth0-spa-js", () => ({
   createAuth0Client: vi.fn(),
@@ -133,10 +134,16 @@ describe("AuthSession (hawc-auth0-session)", () => {
       ]);
     });
 
-    it("attributeChangedCallback is a no-op (no re-init)", () => {
+    it("attributeChangedCallback is a no-op when the element is not connected", () => {
       const el = document.createElement("hawc-auth0-session") as AuthSession;
-      // Just exercising the method — no observable side effect.
+      // Spy on the private worker that the callback would trigger if
+      // it were NOT a no-op under disconnect. We assert on `_startWatching`
+      // so the test actually catches a regression that reintroduces
+      // re-init on detached elements.
+      const spy = vi.spyOn(el as any, "_startWatching");
       el.attributeChangedCallback("target", null, "x");
+      expect(spy).not.toHaveBeenCalled();
+      spy.mockRestore();
     });
 
     it("recovers when target/core are stamped AFTER connect (late-bound attrs)", async () => {
@@ -688,6 +695,14 @@ describe("AuthSession (hawc-auth0-session)", () => {
       expect(el.transport).toBeNull();
     });
     it("ignores connected-changed(false) when no session state is active", async () => {
+      // NB: This test deliberately fires `connected-changed` manually on
+      // the Auth element — it verifies the LOCAL contract that the
+      // session's listener is a no-op when no transport/ready/connecting
+      // state exists. The end-to-end propagation chain (AuthShell._
+      // setConnected → Auth element → AuthSession listener) is locked
+      // in separately by the K-001 regression test further down; the
+      // two concerns are intentionally tested in isolation so a bug in
+      // one surface does not mask the other.
       const mockClient = createMockAuth0Client();
       createAuth0Client.mockResolvedValue(mockClient);
 
@@ -712,6 +727,104 @@ describe("AuthSession (hawc-auth0-session)", () => {
       expect(el.transport).toBeNull();
       expect(el.ready).toBe(false);
       expect(el.connecting).toBe(false);
+    });
+
+    // Cycle 9 (K-001): AuthShell._setConnected previously dispatched
+    // `hawc-auth0:connected-changed` on `this` (the AuthShell instance),
+    // but AuthSession registers the listener on the Auth element. The
+    // event therefore landed on the wrong EventTarget and the session
+    // never saw transport loss (4401/4403/1008/1006/network). This
+    // regression locks in the end-to-end propagation chain — if anyone
+    // reverts the dispatch target back to `this`, the assertion fails.
+    //
+    // Coverage: (a) ready=true is flipped via the normal connect path
+    // (not manually), (b) transport loss is triggered by invoking the
+    // real `_setConnected(false)` on the shell — NOT by dispatching
+    // the event on the Auth element manually — so the test fails if
+    // and only if `_setConnected` dispatches on the wrong target.
+    it("tears down when transport is lost via shell._setConnected(false) (K-001)", async () => {
+      const mockClient = createMockAuth0Client({
+        isAuthenticated: vi.fn().mockResolvedValue(true),
+        getUser: vi.fn().mockResolvedValue({ sub: "u" }),
+        getTokenSilently: vi.fn().mockResolvedValue("jwt-token"),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const authEl = document.createElement("hawc-auth0") as Auth;
+      authEl.id = "auth-k001";
+      authEl.setAttribute("domain", "d.auth0.com");
+      authEl.setAttribute("client-id", "c");
+      authEl.setAttribute("remote-url", "wss://example.com/ws");
+      document.body.appendChild(authEl);
+      await authEl.connectedCallbackPromise;
+
+      // Stub only AuthShell.connect (not the low-level _setConnected
+      // surface) so the session's internal state advances through the
+      // real connect path: _transport set, proxy installed, ready flips
+      // true after the first sync batch. Critically we do NOT stub
+      // `_setConnected` — that is exactly the function K-001 moves,
+      // and we need the real implementation to fire on teardown.
+      const shell = (authEl as any)._shell;
+      const connectSpy = vi.spyOn(shell, "connect").mockImplementation(async () => {
+        shell._setConnected(true);
+        return { send: vi.fn(), onMessage: vi.fn(), onClose: vi.fn() } as any;
+      });
+
+      const el = document.createElement("hawc-auth0-session") as AuthSession;
+      el.target = "auth-k001";
+      el.core = "app-core";
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      (el.proxy as any)._simulateSync({ currentUser: { sub: "u" }, items: [] });
+      await Promise.resolve();
+
+      expect(connectSpy).toHaveBeenCalled();
+      expect(el.ready).toBe(true);
+      expect(el.transport).not.toBeNull();
+      expect(el.proxy).not.toBeNull();
+
+      // Simulate transport loss via the SHELL's own _setConnected(false)
+      // — the real production path that fires on 4401/4403/1008/1006
+      // close codes. If `_setConnected` dispatched on the shell instance
+      // (the K-001 bug), the event would not reach the Auth element,
+      // AuthSession's listener would never fire, and the session would
+      // linger in ready=true pointing at a dead transport.
+      shell._setConnected(false);
+
+      expect(el.ready).toBe(false);
+      expect(el.transport).toBeNull();
+      expect(el.proxy).toBeNull();
+    });
+
+    // Cycle 9 (K-001 complement): the listener AuthSession registers
+    // on the Auth element must receive the event when AuthShell
+    // _setConnected fires. This is a thinner check than the E2E
+    // teardown test above — it asserts only that the listener fires
+    // at all with the correct `detail`, catching future regressions
+    // even if the session's teardown logic changes.
+    it("AuthShell._setConnected reaches listeners on the Auth element (K-001)", async () => {
+      const mockClient = createMockAuth0Client();
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const authEl = document.createElement("hawc-auth0") as Auth;
+      authEl.id = "auth-propagation";
+      authEl.setAttribute("domain", "d.auth0.com");
+      authEl.setAttribute("client-id", "c");
+      authEl.setAttribute("remote-url", "wss://example.com/ws");
+      document.body.appendChild(authEl);
+      await authEl.connectedCallbackPromise;
+
+      const events: boolean[] = [];
+      authEl.addEventListener("hawc-auth0:connected-changed", (e) => {
+        events.push((e as CustomEvent).detail);
+      });
+
+      const shell = (authEl as any)._shell;
+      shell._setConnected(true);
+      shell._setConnected(false);
+
+      expect(events).toEqual([true, false]);
     });
   });
 
@@ -751,6 +864,75 @@ describe("AuthSession (hawc-auth0-session)", () => {
       expect(el.error).toBeInstanceOf(Error);
       expect(el.error?.message).toContain("target is already connected");
       expect(el.error?.message).toContain("§3.7");
+      // Cycle 7 (I-003): the ownership error carries the stable
+      // `_hawcOwnership` sentinel so `_startWatching` can preserve
+      // it across auto-restarts without relying on message matching.
+      expect((el.error as unknown as Record<string, unknown>)[OWNERSHIP_ERROR_MARKER]).toBe(true);
+      expect(isOwnershipError(el.error)).toBe(true);
+    });
+
+    it("preserves a standing ownership error across attribute-driven restarts (I-003)", async () => {
+      // Regression: a framework that restamps `target` / `core` / `url`
+      // after the first run triggers `attributeChangedCallback` ->
+      // `_startWatching`, which used to clear the just-shown ownership
+      // error. The stable `_hawcOwnership` sentinel lets
+      // `isOwnershipError()` recognise it and preserve it across the
+      // coalesced restart — even if the human-readable message drifts.
+      const mockClient = createMockAuth0Client({
+        isAuthenticated: vi.fn().mockResolvedValue(true),
+        getUser: vi.fn().mockResolvedValue({ sub: "u" }),
+        getTokenSilently: vi.fn().mockResolvedValue("jwt-token"),
+      });
+      createAuth0Client.mockResolvedValue(mockClient);
+
+      const authEl = document.createElement("hawc-auth0") as Auth;
+      authEl.id = "auth";
+      authEl.setAttribute("domain", "d.auth0.com");
+      authEl.setAttribute("client-id", "c");
+      authEl.setAttribute("remote-url", "wss://example.com/ws");
+      document.body.appendChild(authEl);
+      await authEl.connectedCallbackPromise;
+
+      const shell = (authEl as any)._shell;
+      shell._setConnected(true);
+      vi.spyOn(shell, "connect")
+        .mockResolvedValue({ send: vi.fn(), onMessage: vi.fn(), onClose: vi.fn() });
+
+      const el = document.createElement("hawc-auth0-session") as AuthSession;
+      el.target = "auth";
+      el.core = "app-core";
+      document.body.appendChild(el);
+      await el.connectedCallbackPromise;
+
+      const firstError = el.error;
+      expect(firstError).toBeInstanceOf(Error);
+      expect(isOwnershipError(firstError)).toBe(true);
+
+      // Re-stamping the URL should coalesce through
+      // attributeChangedCallback. Since there's no live transport the
+      // restart fires, and the preserved ownership error must survive
+      // through the `_setError(null)` that would otherwise clear it.
+      // The ownership condition is still true after the restart, so
+      // `_connect` re-sets a (new) ownership error — what matters is
+      // that the error surface never flipped to `null` mid-restart,
+      // which would have been visible as an error-changed event with
+      // `null` detail. Capture dispatched events to assert that.
+      const errorEvents: Array<Error | null> = [];
+      el.addEventListener("hawc-auth0-session:error", (e) => {
+        errorEvents.push((e as CustomEvent).detail);
+      });
+
+      el.setAttribute("url", "wss://alt.example.com/ws");
+      await el.connectedCallbackPromise;
+      // Flush the microtask-coalesced restart queue.
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // The preserved-error path never fires an error-changed(null)
+      // event: a message-substring match would have broken silently,
+      // but the `_hawcOwnership` sentinel keeps the guard intact.
+      expect(errorEvents.every((e) => e !== null)).toBe(true);
+      expect(isOwnershipError(el.error)).toBe(true);
     });
 
     it("passes failIfConnected:true through to AuthShell.connect (TOCTOU guard)", async () => {
@@ -1258,7 +1440,7 @@ describe("AuthSession (hawc-auth0-session)", () => {
 
       vi.spyOn(el as any, "_resolveAuth").mockReturnValue(authEl);
 
-      const pending = (el as any)._startWatching(1);
+      const pending = (el as any)._startWatching();
       (el as any)._generation = 2;
       resolveInit();
       await pending;

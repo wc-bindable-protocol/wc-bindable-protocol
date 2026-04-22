@@ -189,8 +189,22 @@ interface AuthShellOptions {
   domain: string;
   /** Auth0 application Client ID */
   clientId: string;
-  /** Auth0 API identifier (audience for the access token) */
-  audience: string;
+  /**
+   * Auth0 API identifier (audience for the access token).
+   *
+   * Optional at the type level so purely local integrations (no API
+   * backend, no remote WebSocket, no RBAC claim consumption) can omit
+   * it. **Effectively required** in three cases:
+   *   (a) application code attaches `Authorization: Bearer` headers to
+   *       a backend API,
+   *   (b) `mode: "remote"` — the server's `verifyAuth0Token` enforces
+   *       an `aud` match, so a missing audience makes
+   *       `AuthShell.connect()` throw synchronously (see §3.1 Note)
+   *       before the handshake is even attempted,
+   *   (c) application code reads Auth0 RBAC `permissions` / `roles`
+   *       claims from the access token.
+   */
+  audience?: string;
   /** OAuth scope (default: "openid profile email") */
   scope?: string;
   /** Redirect URI (default: window.location.origin) */
@@ -199,8 +213,27 @@ interface AuthShellOptions {
   cacheLocation?: "memory" | "localstorage";
   /** Whether to use Refresh Tokens (default: true — recommended) */
   useRefreshTokens?: boolean;
+  /**
+   * Deployment mode (default: `"local"`).
+   *
+   * - `"local"`: Auth0-only. `.token` / `getToken()` are JS-reachable so
+   *   the application can attach `Authorization: Bearer` headers.
+   * - `"remote"`: access token is held inside AuthShell and sent on the
+   *   wire only at the WebSocket handshake and during in-band
+   *   `auth:refresh`. `.token` returns `null`, `getToken()` throws.
+   *
+   * See the §3.1 Note for why `audience` is required in remote mode.
+   */
+  mode?: "local" | "remote";
 }
 ```
+
+> **Note**: In `mode: "remote"` the `audience` field is effectively
+> required. `AuthShell.connect()` / `reconnect()` throw synchronously
+> when it is missing, because the server's `verifyAuth0Token` rejects
+> the handshake on `aud` mismatch and we want the failure to surface at
+> the call site rather than via a later `1008 Unauthorized` close — see
+> §3.1 Note and `README-REMOTE.md` §State Surface (`audience`).
 
 ### 3.3 connect() Detailed Specification
 
@@ -417,7 +450,7 @@ transport.onMessage((msg) => {
 
 - **Required** when the Core surfaces any token-derived claim as bindable state (e.g. `UserCore.permissions`, `roles`) and those claims can change across refreshes. Omitting the hook leaves the Core holding the claims from the initial token indefinitely, even though the server session has advanced.
 - **Not required** when the Core only depends on the identity (`sub`) and the server only uses the token for session expiry enforcement. Identity mismatch between refreshes is already rejected (`4403 Token subject mismatch`).
-- For the reference `UserCore`, wire it as `(core, user) => core.updateUser(user)`. `updateUser` dispatches `hawc-auth0:permissions-changed` / `roles-changed` / `user-changed` only when the corresponding field actually changed, so the client sees exactly the deltas the new token implies and nothing more.
+- For the reference `UserCore`, wire it as `(core, user) => core.updateUser(user)`. `updateUser` dispatches `hawc-auth0-user:permissions-changed` / `roles-changed` / `user-changed` only when the corresponding field actually changed, so the client sees exactly the deltas the new token implies and nothing more. The `hawc-auth0-user:` prefix separates UserCore's server-side events from `AuthCore`'s `hawc-auth0:user-changed` (which carries the client-side ID-token profile).
 - **Async hooks are supported.** The handler may return `Promise<void>` (e.g. to consult an external authorization service before publishing new claims). The connection handler awaits it; commit only proceeds on resolve. A rejection rolls the refresh back exactly like a sync throw and is reported as `auth:refresh-failure`.
 
 **Usage pattern (exp-based scheduling):**
@@ -636,19 +669,19 @@ export class Auth extends HTMLElement {
 
   static get observedAttributes(): string[] {
     return [
-      "domain", "client-id", "audience", "scope",
-      "redirect-uri", "cache-location", "use-refresh-tokens",
-      "remote-url",  // additional attribute for remote HAWC
+      "domain", "client-id", "redirect-uri", "audience", "scope",
+      "remote-url", "mode", "cache-location", "use-refresh-tokens",
     ];
   }
 }
 ```
 
-**Additional attribute**:
+**Additional attributes**:
 
 | Attribute     | Description                            | Example                        |
 |---------------|----------------------------------------|--------------------------------|
 | `remote-url`  | WebSocket URL of the Core server. **Setting this does NOT make `<hawc-auth0>` auto-connect** — it only provides the default URL used by `connect()` / `<hawc-auth0-session>`. See §3.7. For mode inference, only a **non-empty** value implies `mode="remote"`; `remote-url=""` is treated as unset so a transient empty binding does not flip the element into a broken remote state (use explicit `mode="remote"` to override). | `wss://api.example.com/hawc` |
+| `mode`        | Deployment mode. Accepts `"local"` or `"remote"`; default is `"local"`. In `"remote"` mode both `audience` and `remote-url` are effectively required — `AuthShell.connect()` / `reconnect()` throw synchronously when `audience` is missing (§3.1 Note, §3.2), and the default connect URL is taken from `remote-url`. An empty `remote-url` attribute is treated as unset for mode inference; set `mode="remote"` explicitly to override. | `local` / `remote` |
 
 ### 3.7 Connection Ownership (mutual exclusion)
 
@@ -696,6 +729,21 @@ interface AuthenticatedConnectionOptions {
   auth0Domain: string;
   /** Auth0 API identifier */
   auth0Audience: string;
+  /**
+   * JWT claim key that holds the Auth0 RBAC roles array. Forwarded
+   * verbatim to `verifyAuth0Token` — see `VerifyTokenOptions.rolesClaim`
+   * for the full rationale.
+   *
+   * Auth0's out-of-the-box RBAC "Add Permissions in the Access Token"
+   * flow emits roles under a namespaced URI because Auth0 reserves
+   * non-namespaced claims for its own OIDC payload. Leaving this
+   * unset on such a tenant therefore leaves `UserContext.roles` empty
+   * and fails every `roles.includes(...)` check closed — set this to
+   * the namespaced URI (e.g. `"https://api.example.com/roles"`) to
+   * surface those roles. Leave unset for tenants whose custom Action
+   * already emits `roles` under the non-namespaced key.
+   */
+  rolesClaim?: string;
   /** Core factory — generates Core(s) from verified user context */
   createCores: (user: UserContext) => EventTarget;
   /**
@@ -740,15 +788,29 @@ JWT verification (jose)
     ▼
 Build UserContext
     │
+    │  const rolesRaw = rolesClaim
+    │    ? payload[rolesClaim] ?? payload.roles   // namespaced key wins; fall back for legacy tokens
+    │    : payload.roles;                         // back-compat: tenants with custom Action on non-namespaced key
+    │
     │  {
     │    sub:         payload.sub,
     │    email:       payload.email,
     │    name:        payload.name,
-    │    permissions: payload.permissions ?? [],
-    │    roles:       payload["https://{namespace}/roles"] ?? [],
+    │    permissions: normalizeStringArray(payload.permissions),
+    │    roles:       normalizeStringArray(rolesRaw),
     │    orgId:       payload.org_id,
     │    raw:         payload,
     │  }
+    │
+    │  // `rolesClaim` corresponds to the namespaced URI Auth0's
+    │  // default RBAC flow uses (e.g. `https://{namespace}/roles`).
+    │  // It is opt-in so existing deployments whose custom Action
+    │  // emits `roles` under the non-namespaced key keep working.
+    │  // `normalizeStringArray` drops non-string / non-array claim
+    │  // values (fail-closed): a misconfigured Action emitting a
+    │  // bare string like `"admin_readonly"` would otherwise let
+    │  // `roles.includes("admin")` substring-match and silently
+    │  // grant admin access.
     ▼
 Invoke Core factory
     │
@@ -784,21 +846,24 @@ interface UserContext {
 
 ### 4.4 Provided Helper Functions
 
-#### `createAuthenticatedWSS(options): WebSocketServer`
+#### `createAuthenticatedWSS(options): Promise<WebSocketServer>`
 
-Helper to simplify WebSocket server construction.
+Helper to simplify WebSocket server construction. Returns a promise that
+resolves to a `ws.WebSocketServer` — the underlying `ws` package is
+imported lazily inside the helper, so the return value is asynchronous.
+The `port` is passed in `options`; the returned `WebSocketServer` is
+already bound by `ws` (no separate `.listen()` step).
 
 ```typescript
 import { createAuthenticatedWSS } from "@wc-bindable/hawc-auth0/server";
 
-const wss = createAuthenticatedWSS({
+const wss = await createAuthenticatedWSS({
+  port: 3000,
   auth0Domain: "your-tenant.auth0.com",
   auth0Audience: "https://api.example.com",
   allowedOrigins: ["https://app.example.com"],
   createCores: (user) => new AppCore(user),
 });
-
-wss.listen(3000);
 ```
 
 #### `verifyAuth0Token(token, options): Promise<UserContext>`
@@ -840,9 +905,13 @@ export class UserCore extends EventTarget {
     protocol: "wc-bindable",
     version: 1,
     properties: [
-      { name: "currentUser", event: "hawc-auth0:user-changed" },
-      { name: "permissions", event: "hawc-auth0:permissions-changed" },
-      { name: "roles",       event: "hawc-auth0:roles-changed" },
+      // `hawc-auth0-user:` namespace disambiguates these events from
+      // `AuthCore`'s `hawc-auth0:user-changed` (client-side ID-token
+      // profile), whose payload shape differs from the server-side
+      // `UserContext` projection that UserCore exposes.
+      { name: "currentUser", event: "hawc-auth0-user:user-changed" },
+      { name: "permissions", event: "hawc-auth0-user:permissions-changed" },
+      { name: "roles",       event: "hawc-auth0-user:roles-changed" },
     ],
   };
 
@@ -887,19 +956,19 @@ export class UserCore extends EventTarget {
       prev.email !== user.email ||
       prev.name  !== user.name;
     if (identityChanged) {
-      this.dispatchEvent(new CustomEvent("hawc-auth0:user-changed", {
+      this.dispatchEvent(new CustomEvent("hawc-auth0-user:user-changed", {
         detail: this.currentUser,
       }));
     }
 
     if (!_sameStringSet(prev.permissions, user.permissions)) {
-      this.dispatchEvent(new CustomEvent("hawc-auth0:permissions-changed", {
+      this.dispatchEvent(new CustomEvent("hawc-auth0-user:permissions-changed", {
         detail: this.permissions,
       }));
     }
 
     if (!_sameStringSet(prev.roles, user.roles)) {
-      this.dispatchEvent(new CustomEvent("hawc-auth0:roles-changed", {
+      this.dispatchEvent(new CustomEvent("hawc-auth0-user:roles-changed", {
         detail: this.roles,
       }));
     }
@@ -925,9 +994,9 @@ export class AppCore extends EventTarget {
     protocol: "wc-bindable",
     version: 1,
     properties: [
-      // Forward UserCore properties
-      { name: "currentUser", event: "hawc-auth0:user-changed" },
-      { name: "permissions", event: "hawc-auth0:permissions-changed" },
+      // Forward UserCore properties (server-side namespace)
+      { name: "currentUser", event: "hawc-auth0-user:user-changed" },
+      { name: "permissions", event: "hawc-auth0-user:permissions-changed" },
       // Forward other Core properties similarly
     ],
     commands: [
@@ -1203,11 +1272,16 @@ export interface AuthError {
 export interface AuthShellOptions {
   domain: string;
   clientId: string;
-  audience: string;
+  /** Auth0 API identifier. Optional at the type level, effectively
+   *  required in remote mode and when the application attaches
+   *  `Authorization: Bearer` headers or reads RBAC claims. See §3.2. */
+  audience?: string;
   scope?: string;
   redirectUri?: string;
   cacheLocation?: "memory" | "localstorage";
   useRefreshTokens?: boolean;
+  /** Deployment mode (default: `"local"`). See {@link AuthMode} and §3.2. */
+  mode?: "local" | "remote";
 }
 
 // --- Server side ---
@@ -1228,6 +1302,12 @@ export interface AuthenticatedConnectionOptions {
   auth0Domain: string;
   auth0Audience: string;
   allowedOrigins?: string[];
+  /** JWT claim key that holds the Auth0 RBAC roles array.
+   *  Forwarded to `verifyAuth0Token`; set to the namespaced URI
+   *  (e.g. `"https://api.example.com/roles"`) for Auth0's default
+   *  RBAC flow. Leave unset for tenants whose custom Action emits
+   *  `roles` under the non-namespaced key. */
+  rolesClaim?: string;
   createCores: (user: UserContext) => EventTarget;
   /** Propagate refreshed claims into the Core after `auth:refresh`.
    *  Required when claims the Core exposes can change across refreshes. */
@@ -1239,6 +1319,17 @@ export interface AuthenticatedConnectionOptions {
 export interface VerifyTokenOptions {
   domain: string;
   audience: string;
+  /** JWT claim key that holds the Auth0 RBAC roles array.
+   *  When set, `verifyAuth0Token` reads roles from this key first
+   *  and falls back to the non-namespaced `payload.roles` only if
+   *  the configured key is absent. When unset, the legacy
+   *  `payload.roles` lookup is used. Set to a namespaced URI
+   *  (e.g. `"https://api.example.com/roles"`) for Auth0's default
+   *  RBAC "Add Permissions in the Access Token" flow — the
+   *  non-namespaced key is reserved for Auth0's OIDC payload, so
+   *  default-RBAC tenants otherwise see `UserContext.roles === []`
+   *  and every `roles.includes(...)` check fails closed. */
+  rolesClaim?: string;
 }
 ```
 
@@ -1462,8 +1553,8 @@ const AppCoreDeclaration = {
   protocol: "wc-bindable" as const,
   version: 1 as const,
   properties: [
-    { name: "currentUser", event: "hawc-auth0:user-changed" },
-    { name: "permissions", event: "hawc-auth0:permissions-changed" },
+    { name: "currentUser", event: "hawc-auth0-user:user-changed" },
+    { name: "permissions", event: "hawc-auth0-user:permissions-changed" },
     { name: "objects",     event: "hawc-s3:objects-changed" },
   ],
   commands: [
@@ -1643,14 +1734,13 @@ function MainApp({ proxy }: { proxy: RemoteCoreProxy }) {
 import { createAuthenticatedWSS } from "@wc-bindable/hawc-auth0/server";
 import { AppCore } from "./AppCore.js";
 
-const wss = createAuthenticatedWSS({
+const wss = await createAuthenticatedWSS({
+  port: 3000,
   auth0Domain: "your-tenant.auth0.com",
   auth0Audience: "https://api.example.com",
   allowedOrigins: ["https://app.example.com"],
   createCores: (user) => new AppCore(user),
 });
-
-wss.listen(3000);
 console.log("HAWC Auth0 server listening on :3000");
 ```
 

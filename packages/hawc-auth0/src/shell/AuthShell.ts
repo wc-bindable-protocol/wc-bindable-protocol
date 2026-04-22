@@ -1,8 +1,8 @@
 import { WebSocketClientTransport } from "@wc-bindable/remote";
 import type { ClientTransport, ClientMessage, ServerMessage } from "@wc-bindable/remote";
 import { AuthCore } from "../core/AuthCore.js";
-import { raiseError } from "../raiseError.js";
-import { IWcBindable, AuthMode, AuthShellOptions } from "../types.js";
+import { raiseError, raiseOwnershipError } from "../raiseError.js";
+import { IWcBindable, AuthMode, AuthShellOptions, AuthError, AuthUser } from "../types.js";
 import { PROTOCOL_PREFIX } from "../protocolPrefix.js";
 
 let _nextRefreshId = 1;
@@ -32,6 +32,16 @@ export class AuthShell extends EventTarget {
   };
 
   private _core: AuthCore;
+  // Dispatch target for AuthShell-originated events (currently only
+  // `hawc-auth0:connected-changed`). Mirrors the target passed to
+  // AuthCore so that ALL hawc-auth0:* events fire on the same element —
+  // typically the `<hawc-auth0>` Auth element that wraps this shell.
+  // Without this, `connected-changed` uniquely fired on the AuthShell
+  // instance itself while authenticated-changed / user-changed /
+  // loading-changed / error / token-changed all fired on Auth, making
+  // AuthSession's `connected-changed` listener on the Auth element a
+  // silent no-op (K-001).
+  private _target: EventTarget;
   private _connected: boolean = false;
   private _ws: WebSocket | null = null;
   private _transport: InterceptingClientTransport | null = null;
@@ -54,7 +64,12 @@ export class AuthShell extends EventTarget {
     super();
     // AuthCore dispatches events on the provided target, so passing `this`
     // means authenticated/user/loading/error events fire on the AuthShell.
-    this._core = new AuthCore(target ?? this);
+    // Cache the SAME target for `_setConnected`'s `connected-changed`
+    // dispatch — if we dispatched on `this` instead, the event would
+    // land on the AuthShell and never reach the outer Auth element that
+    // AuthSession (and any application listener) registered against.
+    this._target = target ?? this;
+    this._core = new AuthCore(this._target);
   }
 
   // --- Delegated getters ---------------------------------------------------
@@ -63,7 +78,7 @@ export class AuthShell extends EventTarget {
     return this._core.authenticated;
   }
 
-  get user() {
+  get user(): AuthUser | null {
     return this._core.user;
   }
 
@@ -71,7 +86,7 @@ export class AuthShell extends EventTarget {
     return this._core.loading;
   }
 
-  get error(): any {
+  get error(): AuthError | Error | null {
     return this._core.error;
   }
 
@@ -79,8 +94,17 @@ export class AuthShell extends EventTarget {
     return this._connected;
   }
 
-  /** Raw Auth0 client — exposed for advanced use only. */
-  get client(): any {
+  /**
+   * Raw Auth0 client — exposed for advanced use only.
+   *
+   * Typed as `unknown` rather than `any` so consumers cannot
+   * accidentally silently rely on the `@auth0/auth0-spa-js` surface
+   * (which is a *peer* dependency of this package, not a runtime dep).
+   * Callers that need the concrete `Auth0Client` interface should
+   * `import type { Auth0Client } from "@auth0/auth0-spa-js"` themselves
+   * and narrow via `as Auth0Client`.
+   */
+  get client(): unknown {
     return this._core.client;
   }
 
@@ -130,8 +154,21 @@ export class AuthShell extends EventTarget {
   /**
    * Initialise the Auth0 client. Converts AuthShellOptions into the
    * Auth0ClientOptions that AuthCore expects.
+   *
+   * `_mode` / `_audience` are published BEFORE delegating to
+   * `_core.initialize()` so that the rest of this method — and any
+   * listener awaiting `initPromise` — reads consistent state. If
+   * `_core.initialize()` throws synchronously (e.g. missing `domain`
+   * / `clientId` -> `raiseError`), we roll those writes back to the
+   * values they held on entry. Otherwise a hot-reload / test helper
+   * that calls `initialize()` with deliberately-bad options and then
+   * retries with good ones would see the bad-attempt's `_mode` /
+   * `_audience` leak into the retry, with the retry silently
+   * pass-through on a stale `audience` check in `connect()`.
    */
   initialize(options: AuthShellOptions): Promise<void> {
+    const prevMode = this._mode;
+    const prevAudience = this._audience;
     this._mode = options.mode ?? "local";
     this._audience = options.audience || undefined;
 
@@ -145,13 +182,23 @@ export class AuthShell extends EventTarget {
       authorizationParams.audience = options.audience;
     }
 
-    return this._core.initialize({
-      domain: options.domain,
-      clientId: options.clientId,
-      authorizationParams,
-      cacheLocation: options.cacheLocation,
-      useRefreshTokens: options.useRefreshTokens ?? true,
-    });
+    try {
+      return this._core.initialize({
+        domain: options.domain,
+        clientId: options.clientId,
+        authorizationParams,
+        cacheLocation: options.cacheLocation,
+        useRefreshTokens: options.useRefreshTokens ?? true,
+      });
+    } catch (err) {
+      // Synchronous `raiseError` from AuthCore.initialize (missing
+      // domain / clientId). Async rejections don't land here — they
+      // flow through the returned Promise — so post-init async
+      // failures deliberately keep the accepted `_mode` / `_audience`.
+      this._mode = prevMode;
+      this._audience = prevAudience;
+      throw err;
+    }
   }
 
   async login(options?: Record<string, any>): Promise<void> {
@@ -163,6 +210,13 @@ export class AuthShell extends EventTarget {
   }
 
   async logout(options?: Record<string, any>): Promise<void> {
+    // `_closeWebSocket()` severs the transport but does NOT fire
+    // `connected-changed` — the WebSocket's async close handler would
+    // get there, but only after its event loop tick, which is too late
+    // for subscribers that gate logout UX on `connected=false`. The
+    // explicit `_setConnected(false)` here publishes the transition
+    // synchronously; the inner equality guard prevents a duplicate
+    // event if the socket's close handler beat us to it.
     this._closeWebSocket();
     this._setConnected(false);
     return this._core.logout(options);
@@ -251,7 +305,7 @@ export class AuthShell extends EventTarget {
       options?.failIfConnected &&
       (this._connectInFlight || this._ws !== null || this._connected)
     ) {
-      raiseError(
+      raiseOwnershipError(
         "connect(): target already owns a connection or a handshake is in flight. " +
         "Another path (<hawc-auth0-session>, direct authEl.connect(), or an in-flight call) " +
         "is managing the transport — see SPEC-REMOTE §3.7 (Connection Ownership).",
@@ -276,6 +330,15 @@ export class AuthShell extends EventTarget {
       // handshake — see close handler below), we roll `_token` back to
       // this value so `getTokenExpiry()` and `token-changed` subscribers
       // never advertise a token the server never accepted.
+      //
+      // Limitation under concurrent connect() without `failIfConnected`:
+      // two callers that race through `fetchToken()` observe the same
+      // `_core.token` here, so the later caller's `priorToken` captures
+      // the pre-race value rather than the first caller's just-committed
+      // token. The spec (SPEC-REMOTE §3.7) already warns "last writer
+      // wins" in that configuration — applications that care about
+      // strict rollback ordering must opt into `failIfConnected: true`,
+      // which short-circuits the race at the ownership guard.
       const priorToken = this._core.token;
 
       this._closeWebSocket();
@@ -388,6 +451,13 @@ export class AuthShell extends EventTarget {
     const id = `auth-refresh-${_nextRefreshId++}`;
     const ws = this._ws;
     const transport = this._transport;
+    // The `raiseError(...): never` return type lets TypeScript narrow
+    // `transport` to `InterceptingClientTransport` (non-null) on every
+    // subsequent use inside this method — without that narrowing we'd
+    // have to either non-null-assert (`transport!`) or introduce a
+    // local `assertDefined(transport)` helper. Keeping the guard here
+    // preserves the invariant check AND the narrowing in one step;
+    // changing `raiseError` to return `void` would break this.
     if (!transport) {
       raiseError("No active connection. Call connect() first.");
     }
@@ -489,7 +559,7 @@ export class AuthShell extends EventTarget {
     // ownership error as a racing connect(failIfConnected), and the
     // first caller proceeds to completion without being torn down.
     if (this._connectInFlight) {
-      raiseError(
+      raiseOwnershipError(
         "reconnect(): another handshake (connect or reconnect) is already in flight. " +
         "See SPEC-REMOTE §3.7 (Connection Ownership).",
       );
@@ -573,17 +643,72 @@ export class AuthShell extends EventTarget {
   private _setConnected(value: boolean): void {
     if (this._connected === value) return;
     this._connected = value;
-    this.dispatchEvent(new CustomEvent("hawc-auth0:connected-changed", {
+    // Dispatch on `_target` (Auth element or the shell itself if no
+    // target was provided). Prior to K-001 this fired on `this`, so the
+    // event was stranded on the AuthShell instance and never reached
+    // AuthSession's listener, which registers on the Auth element and
+    // needs this event to tear down on transport loss (4401/4403/1008/
+    // 1006 close codes, network failure, server restart). Without the
+    // target-consistent dispatch, AuthSession would linger in
+    // `ready=true` pointing at a dead socket and the next proxy call
+    // would reject with `_disposedError`.
+    this._target.dispatchEvent(new CustomEvent("hawc-auth0:connected-changed", {
       detail: value,
       bubbles: true,
     }));
   }
 
+  /**
+   * Close the underlying WebSocket (if any) and dispose of the
+   * cached InterceptingClientTransport.
+   *
+   * Invariants observed by callers (logout, disconnect, connect /
+   * reconnect re-entry):
+   *   - `_ws` is nulled BEFORE `ws.close()` so the old socket's
+   *     async `close` handler observes `this._ws !== ws` and becomes
+   *     a no-op. Without this, the old close handler would stomp on
+   *     a newer socket that has already replaced it (via the
+   *     `_setConnected(false)` side effect).
+   *   - Idempotent: calling with no live connection is a no-op and
+   *     never throws. `logout()` and `disconnect()` rely on this.
+   *   - Does NOT dispatch `connected-changed` — callers that need a
+   *     synchronous `connected=false` event must call
+   *     `_setConnected(false)` themselves (logout / disconnect do;
+   *     connect / reconnect rely on their handshake paths instead).
+   *
+   * Close code `1000 Normal Closure` with a `"Client disconnect"`
+   * reason is sent explicitly. `ws.close()` with no arguments maps to
+   * close code `1005 (No Status Received)`, which the WebSocket
+   * protocol reserves for "no code was supplied" — that misleadingly
+   * suggests an incomplete close to the server side and conflicts
+   * with SPEC-REMOTE's close-code table, which expects 1000 for
+   * voluntary client-initiated closes (normal logout / SPA unmount /
+   * reconnect handshake). Explicit code + reason also give
+   * server-side observability (close logs, metrics) a clear signal to
+   * distinguish voluntary disconnect from network-level failure.
+   *
+   * `ws.close()` is wrapped in try/catch as defense-in-depth. Standard
+   * browser WebSocket and `ws` in Node never throw synchronously from
+   * `close()`, but alternative runtimes (Deno, Bun, custom polyfills,
+   * test doubles) have differed historically — and a synchronous
+   * throw here would propagate into callers that expect this helper
+   * to be infallible (logout, disconnect, connect's pre-connect
+   * cleanup), leaking a half-cleaned state where `_ws` stays non-null
+   * and the next `_closeWebSocket()` / `failIfConnected` guard fires
+   * against a dead socket.
+   */
   private _closeWebSocket(): void {
     if (this._ws) {
       const ws = this._ws;
       this._ws = null;
-      ws.close();
+      try {
+        ws.close(1000, "Client disconnect");
+      } catch {
+        // See JSDoc — swallow runtime-specific synchronous throws so
+        // the caller observes a clean teardown. The transport's own
+        // close path will still fire via the socket's async `close`
+        // event if the socket actually transitioned.
+      }
     }
     if (this._transport) {
       this._transport.dispose();

@@ -204,6 +204,15 @@ export interface AuthenticatedConnectionOptions {
   auth0Audience: string;
   /** Allowed Origin list (CSRF prevention). */
   allowedOrigins?: string[];
+  /**
+   * JWT claim key used to read Auth0 RBAC roles. Forwarded to
+   * `verifyAuth0Token` — see `VerifyTokenOptions.rolesClaim`. Leave
+   * unset for tenants whose custom Action emits `roles` under the
+   * non-namespaced key; set to a namespaced URI (e.g.
+   * `"https://api.example.com/roles"`) for the default Auth0 RBAC
+   * flow, which otherwise leaves `UserContext.roles` empty.
+   */
+  rolesClaim?: string;
   /** Core factory — generates Core(s) from verified user context. */
   createCores: (user: UserContext) => EventTarget;
   /**
@@ -228,4 +237,27 @@ export interface AuthenticatedConnectionOptions {
 export interface VerifyTokenOptions {
   domain: string;
   audience: string;
+  /**
+   * JWT claim key that holds the Auth0 RBAC roles array.
+   *
+   * Auth0's default RBAC configuration emits roles as a namespaced
+   * custom claim (e.g. `https://example.com/roles`) because Auth0
+   * reserves non-namespaced claims for its OIDC payload. SPEC-REMOTE
+   * §4.2 documents the expected shape as
+   * `payload["https://{namespace}/roles"]`.
+   *
+   * When this option is set, `verifyAuth0Token` reads roles from the
+   * given claim key first and falls back to the non-namespaced
+   * `payload.roles` only if the namespaced key is absent. When unset,
+   * the legacy `payload.roles` lookup is used, matching pre-existing
+   * deployments that emit roles through a custom Action into the
+   * non-namespaced key.
+   *
+   * Leave unset for Auth0 tenants that have a custom Action emitting
+   * `event.accessToken.setCustomClaim("roles", …)`; set to your
+   * namespaced URI (e.g. `"https://api.example.com/roles"`) for the
+   * out-of-the-box Auth0 RBAC "Add Permissions in the Access Token"
+   * flow combined with a namespaced roles claim.
+   */
+  rolesClaim?: string;
 }
