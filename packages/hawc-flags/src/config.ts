@@ -12,6 +12,17 @@ const _config: IInternalConfig = {
   },
 };
 
+/*
+ * Both `deepFreeze` and `deepClone` recurse without a visited-set
+ * cycle guard. This is intentional: {@link IInternalConfig}'s schema
+ * is closed and strictly tree-shaped (see {@link _config} below — a
+ * single `tagNames: { flags: string }` object of plain primitive
+ * leaves). Before extending this config with a non-tree-shaped
+ * structure (self-references, cross-branch links, or any value that
+ * could re-enter the same object), either redesign the shape or
+ * switch both helpers to a WeakSet-guarded walk — otherwise a cycle
+ * causes unbounded recursion and a stack overflow at first use.
+ */
 function deepFreeze<T>(obj: T): T {
   if (obj === null || typeof obj !== "object") return obj;
   Object.freeze(obj);

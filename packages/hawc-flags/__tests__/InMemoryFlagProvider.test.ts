@@ -142,6 +142,44 @@ describe("InMemoryFlagProvider", () => {
     expect(received[0]).toEqual({ a: false });
   });
 
+  it("evaluated maps are deep-frozen, isolating rule-defined values", async () => {
+    // Regression guard for [R1-06]: the older `Object.freeze(out)` did
+    // shallow-freeze only. A consumer writing `map.x.enabled = false`
+    // on a `{ enabled, value }`-shaped flag (or pushing into a
+    // rule-defined array) would silently succeed AND contaminate
+    // the Provider's source-of-truth rule definition, since the
+    // value slots were passed through by reference. deepCloneAndFreeze
+    // isolates both sides.
+    const shared = { enabled: true, value: "v1" };
+    const sharedArr = ["a", "b"];
+    const p = new InMemoryFlagProvider({
+      flags: [
+        { key: "obj", defaultValue: shared },
+        { key: "arr", defaultValue: sharedArr },
+      ],
+    });
+    const map = await p.identify(ID_ALICE);
+
+    // Outer map frozen.
+    expect(Object.isFrozen(map)).toBe(true);
+    // Nested values also frozen — no shallow-freeze escape hatch.
+    expect(Object.isFrozen(map.obj)).toBe(true);
+    expect(Object.isFrozen(map.arr)).toBe(true);
+    expect(() => {
+      (map.obj as { enabled: boolean }).enabled = false;
+    }).toThrow(TypeError);
+    expect(() => {
+      (map.arr as string[]).push("c");
+    }).toThrow(TypeError);
+
+    // Source rule definitions remain mutable AND un-contaminated — we
+    // cloned on the way out, so the Provider's own refs stay editable.
+    expect(Object.isFrozen(shared)).toBe(false);
+    expect(Object.isFrozen(sharedArr)).toBe(false);
+    shared.enabled = false;
+    expect((map.obj as { enabled: boolean }).enabled).toBe(true);
+  });
+
   it("dispose() clears subscribers and flags", async () => {
     const p = new InMemoryFlagProvider({ flags: [{ key: "a", defaultValue: true }] });
     let count = 0;

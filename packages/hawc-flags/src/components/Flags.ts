@@ -85,6 +85,13 @@ export class Flags extends HTMLElement {
   // / `.ready` are assigned imperatively later — property writes
   // are invisible to MutationObserver.
   private _pendingTargetPollTimer: ReturnType<typeof setInterval> | null = null;
+  // Hard cap on the rescue lifetime so a misconfigured `target`
+  // (pointing at an id that never arrives) does not keep a 200 ms
+  // interval alive forever — 30 s is generous for any plausible
+  // framework / SSR hydration cycle, yet short enough to bound
+  // wasted CPU/battery on long-lived pages with many mis-targeted
+  // `<hawc-flags>` elements. Paired with `_pendingTargetPollTimer`.
+  private _pendingTargetTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
 
   // --- Attributes -----------------------------------------------------------
 
@@ -285,6 +292,10 @@ export class Flags extends HTMLElement {
       clearInterval(this._pendingTargetPollTimer);
       this._pendingTargetPollTimer = null;
     }
+    if (this._pendingTargetTimeoutTimer) {
+      clearTimeout(this._pendingTargetTimeoutTimer);
+      this._pendingTargetTimeoutTimer = null;
+    }
   }
 
   /**
@@ -365,6 +376,24 @@ export class Flags extends HTMLElement {
     if (typeof t.unref === "function") t.unref();
     /* v8 ignore stop */
     this._pendingTargetPollTimer = poll;
+
+    // Hard cap the rescue: if `target` is pointed at an id that never
+    // arrives, we refuse to keep polling forever. 30 s is well past
+    // any plausible framework / SSR hydration cycle — a target that
+    // hasn't shown up by then is a configuration error, not a timing
+    // race. Tears down both triggers so CPU/battery stay bounded on
+    // long-lived pages with many mis-targeted elements.
+    const timeout = setTimeout(() => {
+      /* v8 ignore start -- defensive: _stopWaitingForTarget clears this timer before generation can drift, so a stale myGen here is not deterministically reachable */
+      if (this._generation !== myGen) return;
+      /* v8 ignore stop */
+      this._stopWaitingForTarget();
+    }, 30_000);
+    const tt = timeout as unknown as { unref?: () => void };
+    /* v8 ignore start -- `unref` is a Node-only extension; happy-dom / real browsers do not expose it */
+    if (typeof tt.unref === "function") tt.unref();
+    /* v8 ignore stop */
+    this._pendingTargetTimeoutTimer = timeout;
   }
 
   private _resolveSession(): SessionLike | null {
@@ -381,6 +410,20 @@ export class Flags extends HTMLElement {
   // --- State setters --------------------------------------------------------
 
   private _setFlags(next: FlagMap): void {
+    // Flags are re-dispatched on every push from the proxy — NOT
+    // deduped like `identified` / `loading`. Rationale:
+    //   1. The upstream `FlagsCore` already dedupes via its own
+    //      change-detection (providers only push when content
+    //      actually differs), so the proxy does not deliver spurious
+    //      duplicates in practice.
+    //   2. Doing a content-level dedupe here would require stable
+    //      serialization on the hot path — the cost dwarfs the
+    //      (usually nil) saved downstream work.
+    //   3. A missed dispatch is strictly worse than a redundant one:
+    //      consumers binding through `data-wcs` tolerate a redundant
+    //      assignment gracefully, but a silently dropped update is
+    //      a bug that only surfaces in the rare case where two
+    //      upstream snapshots happen to be ref-equal.
     this._flags = next;
     this.dispatchEvent(new CustomEvent("hawc-flags:flags-changed", {
       detail: next,
@@ -407,9 +450,11 @@ export class Flags extends HTMLElement {
   }
 
   private _setError(value: Error | null): void {
-    // Always re-dispatch a non-null error — a distinct failure should
-    // be observable even if by reference it happens to === a prior.
-    if (this._error === value && value === null) return;
+    // Dedupe only the null → null case. A non-null error is always
+    // re-dispatched — a distinct failure must stay observable even
+    // when it happens to === a prior by reference (the pathological
+    // but test-asserted case).
+    if (value === null && this._error === null) return;
     this._error = value;
     this.dispatchEvent(new CustomEvent("hawc-flags:error", {
       detail: value,

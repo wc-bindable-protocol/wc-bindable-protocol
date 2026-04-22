@@ -266,6 +266,34 @@ describe("<hawc-flags>", () => {
     }
   });
 
+  it("rescue stops itself after ~30s if the target never arrives", async () => {
+    // Regression guard for [R1-01]: without a lifetime cap, a
+    // `<hawc-flags target="gone">` whose target is misconfigured
+    // would keep a 200 ms setInterval running forever. 30 s is
+    // generous for any plausible hydration / SSR cycle; a target
+    // that hasn't appeared by then is a config bug, not a race.
+    vi.useFakeTimers();
+    try {
+      const el = makeFlagsEl("never-ever");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(el.error).not.toBeNull();
+
+      // Let the rescue run past its hard cap.
+      await vi.advanceTimersByTimeAsync(31_000);
+
+      // Now drop a matching session in — the rescue should NOT
+      // resurrect, because its triggers were torn down by the cap.
+      const sess = makeSession("never-ever");
+      sess.ready = true;
+      await vi.advanceTimersByTimeAsync(500);
+      // flags stays empty and error stays set: rescue really is off.
+      expect(el.flags).toEqual({});
+      expect(el.error).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("poll timer is cleared on disconnectedCallback even when target never arrives", async () => {
     vi.useFakeTimers();
     try {

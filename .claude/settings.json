@@ -1,10 +1,12 @@
 {
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
+  },
   "permissions": {
     "allow": [
       "Bash(npm install:*)",
       "Bash(npx vitest:*)",
-      "Bash(npx playwright:*)",
-      "Read(//c/Users/kikuzawa/Documents/git/**)"
+      "Bash(npx playwright:*)"
     ]
   }
 }

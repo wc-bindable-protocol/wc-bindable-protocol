@@ -1,4 +1,5 @@
 import type { FlagIdentity, FlagMap, FlagProvider, FlagUnsubscribe, FlagValue } from "../types.js";
+import { deepCloneAndFreeze } from "../freeze.js";
 
 /**
  * Simple per-identity flag rule. The first matching entry wins; if no
@@ -125,7 +126,16 @@ export class InMemoryFlagProvider implements FlagProvider {
       }
       out[def.key] = value;
     }
-    return Object.freeze(out);
+    // Deep-clone-and-freeze every level to match Flagsmith/Unleash
+    // providers: evaluated values here share references with the
+    // rule definitions stored in `this._flags`, so a shallow freeze
+    // would leak source-of-truth refs to consumers (e.g. arrays or
+    // `{ enabled, value }` objects could be mutated through the
+    // evaluated map and bleed into the next evaluation). FlagsCore
+    // does its own deep-clone as a final guard, but making every
+    // Provider emit isolated snapshots keeps the contract symmetric
+    // and avoids relying on the Core for safety.
+    return deepCloneAndFreeze(out);
   }
 
   private _notifyAll(): void {

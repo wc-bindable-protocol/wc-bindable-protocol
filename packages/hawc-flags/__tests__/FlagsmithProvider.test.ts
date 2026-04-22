@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { FlagsmithProvider } from "../src/providers/FlagsmithProvider";
+import { FlagsmithProvider, __resetRealtimeWarning } from "../src/providers/FlagsmithProvider";
 import type { FlagIdentity } from "../src/types";
 
 const ID_ALICE: FlagIdentity = { userId: "alice", attrs: { role: "admin" } };
@@ -83,9 +83,24 @@ describe("FlagsmithProvider", () => {
     });
 
     it("logs a warning when realtime is requested", () => {
+      __resetRealtimeWarning();
       const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
       new FlagsmithProvider({ environmentKey: "env_key", realtime: true });
       expect(warn).toHaveBeenCalled();
+      warn.mockRestore();
+    });
+
+    it("only logs the realtime warning once per process", () => {
+      // Regression guard for [R1-03]: frameworks that rebuild the
+      // provider on every request would flood the log stream with
+      // the same deprecation-style warning. Gate it behind a
+      // module-scope flag; subsequent constructions must stay silent.
+      __resetRealtimeWarning();
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      new FlagsmithProvider({ environmentKey: "env_key", realtime: true });
+      new FlagsmithProvider({ environmentKey: "env_key", realtime: true });
+      new FlagsmithProvider({ environmentKey: "env_key", realtime: true });
+      expect(warn).toHaveBeenCalledTimes(1);
       warn.mockRestore();
     });
   });
@@ -134,6 +149,71 @@ describe("FlagsmithProvider", () => {
       const p = new FlagsmithProvider({ environmentKey: "env_key" });
       const map = await p.identify(ID_ALICE);
       expect(map).toEqual({ named: { enabled: false, value: 0 } });
+    });
+
+    it("sanitizes identity.attrs before forwarding to the SDK", async () => {
+      // Regression guard for [R1-09]: `FlagIdentity.attrs` is typed
+      // `Record<string, unknown>` and reaches this Provider directly
+      // from user code. Without sanitization, nested objects,
+      // functions, or Symbols would be handed to Flagsmith's trait API
+      // — at best silently dropped by the SDK's JSON encoding, at
+      // worst leaked upstream. Keep only primitives; CSV-join arrays;
+      // drop nested objects / functions / symbols.
+      const p = new FlagsmithProvider({ environmentKey: "env_key" });
+      await p.identify({
+        userId: "alice",
+        attrs: {
+          email: "a@x",
+          orgId: 42,
+          active: true,
+          nil: null,
+          gone: undefined,
+          roles: ["admin", "ops"],
+          // Mixed-type array element coverage: the CSV join must
+          // stringify non-string elements (nested object, number) via
+          // JSON.stringify so they survive the scalar-only trait shape.
+          // Regression guard for [R2-01]: without this, the non-string
+          // branch of the element map is uncovered.
+          mixed: ["a", { k: "v" }, 1],
+          nested: { secret: "leaked?" },
+          handler: () => "nope",
+          tag: Symbol("no-thanks"),
+        },
+      });
+      expect(mockControl.getIdentityFlags).toHaveBeenCalledWith("alice", {
+        email: "a@x",
+        orgId: 42,
+        active: true,
+        nil: null,
+        roles: "admin,ops",
+        mixed: 'a,{"k":"v"},1',
+      });
+    });
+
+    it("passes `undefined` traits when no attrs are supplied", async () => {
+      // Baseline check: a bare identity (no attrs) reaches the SDK
+      // without a fabricated empty object — preserves the prior
+      // contract and keeps the SDK's own "no traits" codepath active.
+      const p = new FlagsmithProvider({ environmentKey: "env_key" });
+      await p.identify({ userId: "alice" });
+      expect(mockControl.getIdentityFlags).toHaveBeenCalledWith("alice", undefined);
+    });
+
+    it("passes `undefined` traits when every attr is filtered out", async () => {
+      // An attrs bag that consists only of values we drop (nested
+      // objects, functions, undefined) must not become an empty `{}` —
+      // an empty bag and an absent bag should be indistinguishable to
+      // the SDK.
+      const p = new FlagsmithProvider({ environmentKey: "env_key" });
+      await p.identify({
+        userId: "alice",
+        attrs: {
+          nested: { k: "v" },
+          fn: () => {},
+          gone: undefined,
+        },
+      });
+      expect(mockControl.getIdentityFlags).toHaveBeenCalledWith("alice", undefined);
     });
 
     it("forwards environmentKey / apiUrl / local-eval options to the SDK", async () => {

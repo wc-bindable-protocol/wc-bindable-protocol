@@ -176,6 +176,67 @@ describe("UnleashProvider", () => {
       expect(map).toEqual({ off: { enabled: false, value: null } });
     });
 
+    it("parses payload.type === 'json' into a structured value", async () => {
+      // Unleash JSON-typed payloads arrive on the wire as strings. Publishing
+      // the raw string forces every consumer to re-parse; surface the parsed
+      // structure directly so `values.flags.X.value.<path>` is usable.
+      const p = new UnleashProvider({ url: "http://u", appName: "app" });
+      const ident = p.identify(ID_ALICE);
+      await Promise.resolve();
+      mockControl.instance!.getFeatureToggleDefinitions.mockReturnValue([{ name: "cfg" }]);
+      mockControl.instance!.isEnabled.mockReturnValue(true);
+      mockControl.instance!.getVariant.mockReturnValue({
+        name: "layout_v2",
+        enabled: true,
+        payload: { type: "json", value: '{"limit":42,"features":["a","b"]}' },
+      });
+      const map = await ident;
+      expect(map).toEqual({
+        cfg: {
+          enabled: true,
+          value: { limit: 42, features: ["a", "b"] },
+        },
+      });
+    });
+
+    it("falls back to the raw string when a json payload fails to parse", async () => {
+      // A malformed JSON payload from the upstream is a vendor-side
+      // data issue — surface the raw string so consumers can observe
+      // and diagnose, rather than silently collapsing to null.
+      const p = new UnleashProvider({ url: "http://u", appName: "app" });
+      const ident = p.identify(ID_ALICE);
+      await Promise.resolve();
+      mockControl.instance!.getFeatureToggleDefinitions.mockReturnValue([{ name: "cfg" }]);
+      mockControl.instance!.isEnabled.mockReturnValue(true);
+      mockControl.instance!.getVariant.mockReturnValue({
+        name: "layout_v2",
+        enabled: true,
+        payload: { type: "json", value: "{not valid json" },
+      });
+      const map = await ident;
+      expect(map).toEqual({
+        cfg: { enabled: true, value: "{not valid json" },
+      });
+    });
+
+    it("keeps non-json payload types as raw strings", async () => {
+      // `"string"` / `"number"` / `"csv"` payloads are all delivered
+      // as strings on Unleash's wire; auto-coercing would surprise
+      // consumers expecting the documented native type of the variant.
+      const p = new UnleashProvider({ url: "http://u", appName: "app" });
+      const ident = p.identify(ID_ALICE);
+      await Promise.resolve();
+      mockControl.instance!.getFeatureToggleDefinitions.mockReturnValue([{ name: "num" }]);
+      mockControl.instance!.isEnabled.mockReturnValue(true);
+      mockControl.instance!.getVariant.mockReturnValue({
+        name: "v1",
+        enabled: true,
+        payload: { type: "number", value: "42" },
+      });
+      const map = await ident;
+      expect(map).toEqual({ num: { enabled: true, value: "42" } });
+    });
+
     it("produces value=null when the variant is disabled (multivariate miss)", async () => {
       const p = new UnleashProvider({ url: "http://u", appName: "app" });
       const ident = p.identify(ID_ALICE);
@@ -406,6 +467,35 @@ describe("UnleashProvider", () => {
       await ident;
       const ctx = mockControl.instance!.isEnabled.mock.calls[0][1] as any;
       expect(ctx.properties.payloads).toBe('{"a":1},{"b":2}');
+    });
+
+    it("drops function / symbol attrs rather than stringifying them", async () => {
+      // Regression guard for [R3-05]: the pre-fix `String(v)` catch-all
+      // stringified functions (emitting their full source into the
+      // upstream context — information leak) and Symbols (`Symbol(desc)`).
+      // Aligned with FlagsmithProvider's trait sanitizer: only
+      // string / number / boolean / bigint primitives fall through;
+      // exotic types are dropped outright. Booleans and bigints must
+      // still stringify so covered targeting rules keep working.
+      const p = new UnleashProvider({ url: "http://u", appName: "app" });
+      const ident = p.identify({
+        userId: "alice",
+        attrs: {
+          active: true,
+          count: 10n,
+          handler: () => "nope",
+          tag: Symbol("no-thanks"),
+        },
+      });
+      await Promise.resolve();
+      mockControl.instance!.getFeatureToggleDefinitions.mockReturnValue([{ name: "x" }]);
+      mockControl.instance!.isEnabled.mockReturnValue(false);
+      await ident;
+      const ctx = mockControl.instance!.isEnabled.mock.calls[0][1] as any;
+      expect(ctx.properties).toEqual({
+        active: "true",
+        count: "10",
+      });
     });
 
     it("contextBuilder option replaces the default mapper", async () => {

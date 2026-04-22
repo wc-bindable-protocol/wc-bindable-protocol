@@ -386,11 +386,11 @@ export class FlagsCore extends EventTarget {
   }
 
   private _setError(value: Error | null): void {
-    // Always dispatch when the value changes OR the new value is a
-    // non-null error — a successive distinct error should be
-    // observable even if `_error` happens to === the previous by
+    // Dedupe only the null → null case. A non-null error is always
+    // re-dispatched — a successive distinct failure must stay
+    // observable even when it happens to === the previous by
     // reference (pathological, but test frameworks do assert on it).
-    if (this._error === value && value === null) return;
+    if (value === null && this._error === null) return;
     this._error = value;
     this._target.dispatchEvent(new CustomEvent("hawc-flags:error", {
       detail: value,

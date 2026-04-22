@@ -13,6 +13,22 @@ const DEFAULT_POLLING_INTERVAL_MS = 30_000;
 const DEFAULT_ENVIRONMENT_REFRESH_SECONDS = 60;
 
 /**
+ * Module-scope flag gating the "realtime accepted but not implemented"
+ * warning to a single dispatch per process. Without this, every
+ * FlagsmithProvider construction with `realtime: true` re-logs — a
+ * framework that rebuilds the provider on every request would flood
+ * the log stream with the same warning per request. Exposed for tests
+ * via {@link __resetRealtimeWarning} so assertions on the warning's
+ * presence / absence can run independently.
+ */
+let _realtimeWarningLogged = false;
+
+/** Test-only reset of the one-shot realtime-warning guard. */
+export function __resetRealtimeWarning(): void {
+  _realtimeWarningLogged = false;
+}
+
+/**
  * Minimal shape we rely on from `flagsmith-nodejs`. Declared
  * structurally here rather than imported so the package compiles
  * without the peer dependency installed, and so future SDK releases
@@ -110,10 +126,10 @@ export class FlagsmithProvider implements FlagProvider {
       raiseError("FlagsmithProvider: `environmentKey` is required.");
     }
     this._options = options;
-    if (options.realtime) {
-      // eslint-disable-next-line no-console
+    if (options.realtime && !_realtimeWarningLogged) {
+      _realtimeWarningLogged = true;
       console.warn(
-        "[@wc-bindable/hawc-flags] FlagsmithProvider: `realtime` is accepted but not yet implemented — falling back to polling. Lower `pollingIntervalMs` for faster change detection.",
+        "[@wc-bindable/hawc-flags] FlagsmithProvider: `realtime` is accepted but not yet implemented — falling back to polling. Lower `pollingIntervalMs` for faster change detection. (This warning is logged once per process.)",
       );
     }
   }
@@ -292,7 +308,21 @@ export class FlagsmithProvider implements FlagProvider {
   }
 
   private async _fetch(client: FlagsmithClientLike, identity: FlagIdentity): Promise<FlagMap> {
-    const result = await client.getIdentityFlags(identity.userId, identity.attrs);
+    // Sanitize traits before they hit Flagsmith's wire. `identity.attrs`
+    // is typed `Record<string, unknown>` so user-code Providers /
+    // identify() callers could slip in anything — nested objects,
+    // functions, Symbols, raw tokens. Flagsmith's trait API only
+    // meaningfully consumes scalars, so passing arbitrary structures
+    // would at best be silently dropped by the SDK's JSON encoder and
+    // at worst leak values the caller never intended to ship upstream.
+    // Keep only primitives (string / number / boolean / null); arrays
+    // are CSV-joined to match the Unleash context mapping; nested
+    // objects are dropped rather than stringified — a stringified
+    // object entering a rule predicate as a single opaque string is
+    // a footgun, and the consumer should opt in explicitly if they
+    // want that shape.
+    const traits = _sanitizeTraits(identity.attrs);
+    const result = await client.getIdentityFlags(identity.userId, traits);
     return _flattenFlagsmithResult(result);
   }
 
@@ -336,6 +366,40 @@ export class FlagsmithProvider implements FlagProvider {
       entry.onChange(next);
     }
   }
+}
+
+/**
+ * Coerce a free-form `identity.attrs` bag into the scalar trait shape
+ * Flagsmith consumes. Arrays are CSV-joined (stringifying any nested
+ * objects); nested plain objects, functions, Symbols, and `undefined`
+ * values are dropped outright. Returns `undefined` when the sanitized
+ * bag is empty, so the underlying SDK call receives no traits argument
+ * rather than an empty object — matches the pre-sanitization behaviour
+ * for callers that never supplied attrs at all.
+ */
+function _sanitizeTraits(
+  attrs: Record<string, unknown> | undefined,
+): Record<string, string | number | boolean | null> | undefined {
+  if (!attrs) return undefined;
+  const out: Record<string, string | number | boolean | null> = {};
+  for (const k of Object.keys(attrs)) {
+    const v = attrs[k];
+    if (v === null) {
+      out[k] = null;
+    } else if (typeof v === "string" || typeof v === "number" || typeof v === "boolean") {
+      out[k] = v;
+    } else if (Array.isArray(v)) {
+      // CSV join, stringifying nested objects element-wise so the
+      // shape matches UnleashProvider's context mapping.
+      out[k] = v
+        .map((e) => (typeof e === "string" ? e : JSON.stringify(e)))
+        .join(",");
+    }
+    // Everything else (nested objects, functions, Symbols, undefined)
+    // is intentionally dropped rather than stringified — see comment
+    // at the call site for the rationale.
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 function _flattenFlagsmithResult(result: FlagsmithIdentityFlagsLike): FlagMap {

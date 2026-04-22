@@ -330,14 +330,7 @@ export class UnleashProvider implements FlagProvider {
       if (enabled) {
         const v = client.getVariant(def.name, context);
         if (v && v.enabled) {
-          // Prefer the payload value (config flag), fall back to the
-          // variant name (multivariate A/B/C experiments). Both are
-          // string-typed per Unleash's wire contract; the trailing
-          // `?? null` is defensive against a pathological variant with
-          // neither payload nor name (not emitted by the real SDK).
-          /* v8 ignore start -- `v.name` is always a string per Unleash's public schema */
-          value = v.payload?.value ?? v.name ?? null;
-          /* v8 ignore stop */
+          value = _extractVariantValue(v);
         }
       }
       out[def.name] = { enabled, value };
@@ -356,9 +349,23 @@ export class UnleashProvider implements FlagProvider {
         properties[k] = v.map((e) => (typeof e === "string" ? e : JSON.stringify(e))).join(",");
       } else if (typeof v === "object") {
         properties[k] = JSON.stringify(v);
-      } else {
+      } else if (
+        typeof v === "string" ||
+        typeof v === "number" ||
+        typeof v === "boolean" ||
+        typeof v === "bigint"
+      ) {
+        // Explicit allow-list for the primitive fall-through. The older
+        // `String(v)` catch-all also stringified functions (emitting
+        // their full source) and Symbols (emitting `Symbol(desc)`) —
+        // both are information-leak footguns when a caller accidentally
+        // routes e.g. a method reference through `attrs`. Aligning with
+        // FlagsmithProvider's `_sanitizeTraits`: non-primitive exotic
+        // types are dropped outright rather than stringified.
         properties[k] = String(v);
       }
+      // Everything else (function, symbol) is intentionally dropped —
+      // see the rationale above the primitive branch.
     }
     return {
       userId: identity.userId,
@@ -388,6 +395,48 @@ export class UnleashProvider implements FlagProvider {
     }
   }
 }
+
+/**
+ * Map an Unleash variant to the {@link FlagValue} published on the
+ * `value` slot of the emitted flag entry.
+ *
+ * - `payload.type === "json"`: attempt `JSON.parse(payload.value)` and
+ *   publish the parsed structure so downstream consumers don't have
+ *   to re-parse a nested JSON string themselves. On parse failure,
+ *   publish the raw string verbatim — an invalid JSON payload from
+ *   the SDK is a vendor-side data issue, not a reason to drop the
+ *   variant; the raw string lets the consumer log/inspect it.
+ * - Any other `payload.type` (`"string"`, `"number"`, `"csv"`, …):
+ *   publish `payload.value` as a string — Unleash's wire contract
+ *   delivers all payload values as strings regardless of declared
+ *   type, and auto-coercing e.g. `"number"` payloads would change
+ *   observable types under the consumer. Leaving them as strings is
+ *   aligned with LaunchDarkly's raw behaviour and requires only a
+ *   `Number(...)` at the call site if the consumer needs a number.
+ * - No payload at all: fall back to the variant name (Unleash's
+ *   multivariate A/B/C experiment surface — `bucket_A` / `bucket_B`
+ *   etc.). The trailing `?? null` is defensive against a
+ *   pathological variant with neither payload nor name (not emitted
+ *   by the real SDK).
+ */
+/* v8 ignore start -- `v.name` / `v.payload.value` are always strings per Unleash's public schema; the trailing nulls exist for SDK versions that stray from the contract */
+function _extractVariantValue(v: UnleashVariantLike): FlagValue {
+  const payload = v.payload;
+  if (payload && typeof payload.value === "string") {
+    if (payload.type === "json") {
+      try {
+        return JSON.parse(payload.value) as FlagValue;
+      } catch {
+        // Invalid JSON from the upstream — publish the raw string so
+        // the consumer can still observe it and diagnose.
+        return payload.value;
+      }
+    }
+    return payload.value;
+  }
+  return v.name ?? null;
+}
+/* v8 ignore stop */
 
 /**
  * Best-effort `client.off(event, listener)` used during cleanup paths.
