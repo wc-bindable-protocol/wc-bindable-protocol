@@ -1,5 +1,6 @@
 import { config, getRemoteCoreUrl } from "../config.js";
-import { IWcBindable, AiMessage } from "../types.js";
+import { warnApiKeyInRemoteMode } from "../debug.js";
+import { IWcBindable, AiMessage, AiHttpError } from "../types.js";
 import { AiCore } from "../core/AiCore.js";
 import { cloneMessage } from "../core/cloneMessage.js";
 import { validateMessages } from "../core/validateMessages.js";
@@ -32,13 +33,14 @@ export class Ai extends HTMLElement {
   private _unbind: (() => void) | null = null;
   private _ws: WebSocket | null = null;
   private _trigger: boolean = false;
+  private _warnedApiKeyLeak: boolean = false;
   private _prompt: string | import("../types.js").AiContentPart[] = "";
   private _tools: import("../types.js").AiTool[] | null = null;
   private _toolChoice: import("../types.js").AiToolChoice | undefined = undefined;
   private _maxToolRoundtrips: number | undefined = undefined;
   private _responseSchema: Record<string, any> | null = null;
   private _responseSchemaName: string | undefined = undefined;
-  private _errorState: any = null;
+  private _errorState: AiHttpError | Error | null = null;
   private _hasLocalError: boolean = false;
   private _lastProviderError: Error | null = null;
   private _providerUpdate: Promise<unknown> | null = null;
@@ -98,11 +100,23 @@ export class Ai extends HTMLElement {
     }
   }
 
-  private _setErrorState(error: any): void {
-    this._errorState = error;
+  private _setErrorState(error: unknown): void {
+    // Narrow to the public contract (AiHttpError | Error | null). Wrap
+    // anything else in an Error so el.error typing stays honest.
+    let narrowed: AiHttpError | Error | null;
+    if (error === null || error === undefined) {
+      narrowed = null;
+    } else if (error instanceof Error) {
+      narrowed = error;
+    } else if (typeof error === "object" && error !== null && "status" in error) {
+      narrowed = error as AiHttpError;
+    } else {
+      narrowed = new Error(String(error));
+    }
+    this._errorState = narrowed;
     this._hasLocalError = true;
     this.dispatchEvent(new CustomEvent("hawc-ai:error", {
-      detail: error,
+      detail: narrowed,
       bubbles: true,
     }));
   }
@@ -317,13 +331,16 @@ export class Ai extends HTMLElement {
     return this._core?.streaming ?? false;
   }
 
-  get error(): any {
+  get error(): AiHttpError | Error | null {
     if (this._isRemote) {
       // Client-side errors (from setWithAck / transport failures) take priority.
       if (this._hasLocalError) return this._errorState;
       // Otherwise return the server-synced value, falling back to _errorState
       // only before the first server sync.
-      return "error" in this._remoteValues ? this._remoteValues.error : this._errorState;
+      if ("error" in this._remoteValues) {
+        return this._remoteValues.error as AiHttpError | Error | null;
+      }
+      return this._errorState;
     }
     return this._core?.error ?? this._errorState;
   }
@@ -367,7 +384,16 @@ export class Ai extends HTMLElement {
         detail: true,
         bubbles: true,
       }));
-      this.send().catch(() => {}).finally(() => {
+      // send() normally surfaces failures through `hawc-ai:error` via the
+      // core / _setErrorState. Early-failure paths that reject *before* the
+      // core dispatches (e.g. remote mode unreachable, invalid provider in
+      // local mode) still reach here as a rejection — route them into the
+      // same error channel instead of swallowing silently.
+      this.send().catch((e: unknown) => {
+        if (!this._hasLocalError && this._core?.error == null) {
+          this._setErrorState(e);
+        }
+      }).finally(() => {
         this._trigger = false;
         this.dispatchEvent(new CustomEvent("hawc-ai:trigger-changed", {
           detail: false,
@@ -442,6 +468,17 @@ export class Ai extends HTMLElement {
         // JSON-encodable. The server resolves handlers by name from the
         // `registerTool()` registry at invocation time.
         const remoteTools = this._tools?.map(({ handler: _handler, ...rest }) => rest);
+        // In remote mode the server owns provider credentials. Surface a
+        // one-time dev warning when the client-side `api-key` attribute is
+        // still populated so authors don't silently ship the secret over
+        // the wire. The attribute is still included in the payload (so a
+        // remote deployment that intentionally relays per-request keys to
+        // a trusted proxy is not broken), but the warning flags the usual
+        // misuse: a forgotten dev-time attribute on a production element.
+        if (!this._warnedApiKeyLeak && this.apiKey) {
+          this._warnedApiKeyLeak = true;
+          warnApiKeyInRemoteMode();
+        }
         // Use invokeWithOptions with timeoutMs: 0 to disable the default 30s
         // timeout — AI inference and long streaming responses routinely exceed it.
         return await this._proxy!.invokeWithOptions("send", [this._prompt, {

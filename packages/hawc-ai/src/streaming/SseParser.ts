@@ -12,12 +12,13 @@ export class SseParser {
     this._buffer += chunk;
     const results: SseEvent[] = [];
 
-    const lines = this._buffer.split("\n");
+    // Per the SSE spec, a line is terminated by any of CRLF, LF, or a bare CR.
+    // Splitting on just "\n" and stripping a trailing "\r" misses servers /
+    // proxies that emit only "\r" between lines.
+    const lines = this._buffer.split(/\r\n|\r|\n/);
     this._buffer = lines.pop() || "";
 
-    for (const rawLine of lines) {
-      const line = rawLine.replace(/\r$/, "");
-
+    for (const line of lines) {
       if (line.startsWith(":")) {
         // SSE comment, ignore
         continue;
@@ -28,13 +29,19 @@ export class SseParser {
       } else if (line.startsWith("data:")) {
         const value = line.startsWith("data: ") ? line.slice(6) : line.slice(5);
         this._currentData.push(value);
-      } else if (line === "" && this._currentData.length > 0) {
-        results.push({
-          event: this._currentEvent,
-          data: this._currentData.join("\n"),
-        });
+      } else if (line === "") {
+        // End of an SSE event. Dispatch only when we have data (the spec's
+        // "if the data buffer is an empty string" rule), but always reset
+        // `_currentEvent` — otherwise an orphan `event:` line followed by a
+        // blank line would leak the event type into the *next* event.
+        if (this._currentData.length > 0) {
+          results.push({
+            event: this._currentEvent,
+            data: this._currentData.join("\n"),
+          });
+          this._currentData = [];
+        }
         this._currentEvent = undefined;
-        this._currentData = [];
       }
     }
 
@@ -43,7 +50,8 @@ export class SseParser {
 
   /** Flush any buffered but unterminated event (e.g. stream closed without trailing empty line). */
   flush(): SseEvent | null {
-    // Process any remaining partial line left in _buffer
+    // Process any remaining partial line left in _buffer. Strip a trailing
+    // CR so `data: hello\r` (no LF/CRLF) still parses the same as LF-only.
     if (this._buffer) {
       const line = this._buffer.replace(/\r$/, "");
       this._buffer = "";
