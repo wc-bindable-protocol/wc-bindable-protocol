@@ -181,4 +181,50 @@ describe("StripeSdkProvider", () => {
     const provider = new StripeSdkProvider(client);
     await expect(provider.cancelSetupIntent("seti_x")).rejects.toThrow(/not available/);
   });
+
+  it("treats payment_method_types: [] as unset on createPaymentIntent (regression)", async () => {
+    // Empty array is truthy in JS, so the previous `=== undefined` gate
+    // forwarded it to Stripe verbatim — Stripe then returns a 400
+    // ("payment_method_types[] is empty") that looks like a library bug.
+    // Both provider paths must strip the empty array and fall through to
+    // the automatic_payment_methods default.
+    const { client, calls } = createFakeClient();
+    const provider = new StripeSdkProvider(client);
+    await provider.createPaymentIntent({
+      amount: 500,
+      currency: "usd",
+      payment_method_types: [],
+    } as any);
+    expect(calls.piCreate).toHaveLength(1);
+    const params = calls.piCreate[0].params as Record<string, unknown>;
+    expect(params.payment_method_types).toBeUndefined();
+    expect(params.automatic_payment_methods).toEqual({ enabled: true });
+  });
+
+  it("treats payment_method_types: [] as unset on createSetupIntent (regression)", async () => {
+    const { client, calls } = createFakeClient();
+    const provider = new StripeSdkProvider(client);
+    await provider.createSetupIntent({
+      customer: "cus_x",
+      payment_method_types: [],
+    } as any);
+    expect(calls.siCreate).toHaveLength(1);
+    const params = calls.siCreate[0].params as Record<string, unknown>;
+    expect(params.payment_method_types).toBeUndefined();
+    expect(params.automatic_payment_methods).toEqual({ enabled: true });
+  });
+
+  it("still respects a non-empty payment_method_types by not overriding it with automatic_payment_methods", async () => {
+    const { client, calls } = createFakeClient();
+    const provider = new StripeSdkProvider(client);
+    await provider.createPaymentIntent({
+      amount: 500,
+      currency: "usd",
+      payment_method_types: ["card"],
+    } as any);
+    expect(calls.piCreate).toHaveLength(1);
+    const params = calls.piCreate[0].params as Record<string, unknown>;
+    expect(params.payment_method_types).toEqual(["card"]);
+    expect(params.automatic_payment_methods).toBeUndefined();
+  });
 });

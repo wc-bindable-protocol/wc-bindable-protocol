@@ -185,7 +185,16 @@ describe("createAuthenticatedWSS", () => {
     expect(jwtVerify).not.toHaveBeenCalled();
   });
 
-  it("normalizes non-Error protocol extraction failures in verifyClient before upgrade", async () => {
+  it("rejects non-string/non-array protocol headers in verifyClient with a structured error", async () => {
+    // Regression guard for the runtime shape check in
+    // `extractTokenFromProtocol`: a custom server that hands us a
+    // `Buffer` / plain object (the declared type is
+    // `string | string[] | undefined`, but TS is compile-time only and
+    // other HTTP upgrade plumbing can still pass those) used to crash
+    // inside `.split(",")` with a confusing native `TypeError`. Now it
+    // is rejected with a clear Error that names the offending shape,
+    // and `_normalizeError` still wraps any non-Error throw from the
+    // extraction path into an Error instance before `onEvent` fires.
     const events: Array<{ type: string; error?: Error }> = [];
     const wss: any = await createAuthenticatedWSS({
       auth0Domain: "test.auth0.com",
@@ -194,11 +203,7 @@ describe("createAuthenticatedWSS", () => {
       onEvent: (event) => events.push(event),
     });
 
-    const protocolHeader = {
-      split() {
-        throw "boom";
-      },
-    };
+    const protocolHeader = { foo: 1 };
 
     const verdict = await new Promise<{ allowed: boolean; code?: number; message?: string }>((resolve) => {
       wss.options.verifyClient(
@@ -214,7 +219,9 @@ describe("createAuthenticatedWSS", () => {
     expect(verdict).toEqual({ allowed: false, code: 401, message: "Unauthorized" });
     expect(events[0]?.type).toBe("auth:failure");
     expect(events[0]?.error).toBeInstanceOf(Error);
-    expect(events[0]?.error?.message).toContain("boom");
+    expect(events[0]?.error?.message).toMatch(
+      /Sec-WebSocket-Protocol header must be a string or string\[\]/,
+    );
     expect(jwtVerify).not.toHaveBeenCalled();
   });
 
@@ -358,5 +365,74 @@ describe("createAuthenticatedWSS", () => {
 
     expect(socket.close).not.toHaveBeenCalledWith(1008, "Unauthorized");
     expect(socket.close).not.toHaveBeenCalledWith(1008, "Forbidden origin");
+  });
+
+  it("propagates rolesClaim to the pre-handshake verifyClient verification path", async () => {
+    // End-to-end: rolesClaim must reach the pre-handshake
+    // verifyAuth0Token call inside verifyClient so that the
+    // preVerifiedUser stashed for the connection handler already
+    // carries the namespaced roles. A regression that drops
+    // `rolesClaim` from this path would silently surface
+    // `UserContext.roles === []` (or a legacy non-namespaced value)
+    // for every connection going through the default factory,
+    // even when the downstream handleConnection call site is wired
+    // correctly.
+    const NS = "https://api.example.com/roles";
+    jwtVerify.mockResolvedValue({
+      payload: {
+        sub: "auth0|rc-verify",
+        permissions: [],
+        [NS]: ["editor", "admin"],
+        roles: ["ignored-non-namespaced"],
+        exp: Math.floor(Date.now() / 1000) + 300,
+      },
+    });
+
+    const core = new EventTarget();
+    (core.constructor as any).wcBindable = {
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [],
+    };
+
+    const createCores = vi.fn(() => core);
+
+    const wss: any = await createAuthenticatedWSS({
+      auth0Domain: "test.auth0.com",
+      auth0Audience: "aud",
+      allowedOrigins: ["https://allowed.example.com"],
+      rolesClaim: NS,
+      createCores,
+    });
+
+    const req = {
+      headers: {
+        origin: "https://allowed.example.com",
+        "sec-websocket-protocol": "hawc-auth0.bearer." + makeJwt({
+          sub: "auth0|rc-verify",
+          exp: Math.floor(Date.now() / 1000) + 300,
+        }),
+      },
+    };
+
+    const verdict = await new Promise<{ allowed: boolean }>((resolve) => {
+      wss.options.verifyClient(
+        { origin: "https://allowed.example.com", secure: true, req },
+        (allowed: boolean) => resolve({ allowed }),
+      );
+    });
+    expect(verdict.allowed).toBe(true);
+
+    const socket = createSocket();
+    await wss.handlers.connection(socket, req);
+
+    // Only ONE verifyAuth0Token call should have happened (verifyClient's);
+    // the connection handler reuses the pre-verified user. That single
+    // call must have materialised the namespaced roles, which is
+    // observable through the user handed to `createCores`.
+    expect(jwtVerify).toHaveBeenCalledTimes(1);
+    expect(createCores).toHaveBeenCalledTimes(1);
+    const passedUser = createCores.mock.calls[0][0];
+    expect(passedUser.roles).toEqual(["editor", "admin"]);
   });
 });

@@ -31,7 +31,7 @@ export interface IWritableConfig {
 export interface IWcBindableProperty {
   readonly name: string;
   readonly event: string;
-  readonly getter?: (event: Event) => any;
+  readonly getter?: (event: Event) => unknown;
 }
 
 export interface IWcBindableInput {
@@ -295,7 +295,7 @@ export interface IStripeProvider {
   retrieveIntent(mode: StripeMode, id: string): Promise<StripeIntentView>;
   cancelPaymentIntent(id: string): Promise<void>;
   cancelSetupIntent?(id: string): Promise<void>;
-  verifyWebhook(rawBody: string, signatureHeader: string, secret: string): StripeEvent;
+  verifyWebhook(rawBody: string | Buffer | Uint8Array, signatureHeader: string, secret: string): StripeEvent;
 }
 
 export type WebhookHandler = (event: StripeEvent) => Promise<void> | void;

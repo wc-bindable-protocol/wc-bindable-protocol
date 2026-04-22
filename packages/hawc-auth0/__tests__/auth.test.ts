@@ -76,6 +76,99 @@ describe("config", () => {
     expect(frozen1).not.toBe(frozen2);
     setConfig({ autoTrigger: true });
   });
+
+  // Cycle 7 (I-002): empty / whitespace-only string fields in
+  // `setConfig()` previously slipped through and produced opaque
+  // downstream failures — `target.closest("[]")` throws SyntaxError,
+  // `customElements.define("")` throws on its own. Both errors fired
+  // far from the configuration call site, making them hard to trace.
+  // These assertions lock in the "fail fast at the configuration
+  // boundary" contract so the ERROR_PREFIX-wrapped message points
+  // at the offending field.
+  it("setConfig()で triggerAttribute に空文字列を渡すと raiseError する", () => {
+    expect(() => setConfig({ triggerAttribute: "" }))
+      .toThrow(/triggerAttribute.*non-empty/);
+    expect(() => setConfig({ triggerAttribute: "   " }))
+      .toThrow(/triggerAttribute.*non-empty/);
+    // Default must remain intact after the rejected call.
+    expect(config.triggerAttribute).toBe("data-authtarget");
+  });
+
+  it("setConfig()で tagNames.auth に空文字列を渡すと raiseError する", () => {
+    expect(() => setConfig({ tagNames: { auth: "" } }))
+      .toThrow(/tagNames\.auth.*non-empty/);
+    expect(() => setConfig({ tagNames: { authLogout: "  " } }))
+      .toThrow(/tagNames\.authLogout.*non-empty/);
+    expect(() => setConfig({ tagNames: { authSession: "" } }))
+      .toThrow(/tagNames\.authSession.*non-empty/);
+    // Defaults intact — no partial mutation leaked through a throw.
+    expect(config.tagNames.auth).toBe("hawc-auth0");
+    expect(config.tagNames.authLogout).toBe("hawc-auth0-logout");
+    expect(config.tagNames.authSession).toBe("hawc-auth0-session");
+  });
+
+  // Cycle 8 (J-001): sibling fields (`autoTrigger`, `triggerAttribute`)
+  // naturally skip explicit `undefined` via their
+  // `typeof === "boolean" | "string"` guards. The `tagNames` branch used
+  // to be asymmetric: its empty-string check guarded `typeof === "string"`,
+  // but then `Object.assign(_config.tagNames, partialConfig.tagNames)`
+  // copied the own-enumerable `undefined` onto the real config, silently
+  // clobbering the default tag names. A later `registerComponents()`
+  // would then call `customElements.define(undefined, ...)` — or
+  // autoTrigger / querySelector comparisons would silently miss.
+  // This test locks in the "explicit undefined is a no-op, symmetric
+  // with the other fields" contract.
+  it("setConfig()で tagNames の値に undefined を渡しても既定値が破壊されない", () => {
+    // Explicit undefined on each tagNames key must be a no-op.
+    // Cast through `any` because `IWritableTagNames.auth?: string` accepts
+    // omission but some strict callers may still ship `{ auth: undefined }`
+    // (e.g. spread from an optional field that happens to be unset).
+    setConfig({ tagNames: { auth: undefined } as any });
+    expect(config.tagNames.auth).toBe("hawc-auth0");
+    setConfig({ tagNames: { authLogout: undefined } as any });
+    expect(config.tagNames.authLogout).toBe("hawc-auth0-logout");
+    setConfig({ tagNames: { authSession: undefined } as any });
+    expect(config.tagNames.authSession).toBe("hawc-auth0-session");
+
+    // Mixed: a valid key + an undefined key in the same call. The valid
+    // key takes effect; the undefined key does not clobber its default.
+    setConfig({ tagNames: { auth: "my-auth", authLogout: undefined } as any });
+    expect(config.tagNames.auth).toBe("my-auth");
+    expect(config.tagNames.authLogout).toBe("hawc-auth0-logout");
+    // Restore default for subsequent tests.
+    setConfig({ tagNames: { auth: "hawc-auth0" } });
+    expect(config.tagNames.auth).toBe("hawc-auth0");
+  });
+
+  // Cycle 9 (K-002): the tagNames loop previously only rejected
+  // `undefined` and whitespace-only strings. Non-string values
+  // (null, numbers, objects, booleans) were assigned straight onto
+  // `_config.tagNames[key]` and surfaced as TypeErrors inside
+  // `customElements.define` at registration time — far from the
+  // offending `setConfig` call. This locks in symmetric rejection
+  // at the configuration boundary for every non-string type the
+  // caller might plausibly leak through (JSON-sourced config with
+  // a wrong field type, optional chaining that evaluates to null,
+  // etc.).
+  it("setConfig()で tagNames の値に非 string を渡すと raiseError する", () => {
+    // null
+    expect(() => setConfig({ tagNames: { auth: null as any } }))
+      .toThrow(/tagNames\.auth.*must be a string.*null/);
+    // number
+    expect(() => setConfig({ tagNames: { authLogout: 42 as any } }))
+      .toThrow(/tagNames\.authLogout.*must be a string.*number/);
+    // object
+    expect(() => setConfig({ tagNames: { authSession: {} as any } }))
+      .toThrow(/tagNames\.authSession.*must be a string.*object/);
+    // boolean
+    expect(() => setConfig({ tagNames: { auth: false as any } }))
+      .toThrow(/tagNames\.auth.*must be a string.*boolean/);
+
+    // Defaults intact — no partial mutation leaked through a throw.
+    expect(config.tagNames.auth).toBe("hawc-auth0");
+    expect(config.tagNames.authLogout).toBe("hawc-auth0-logout");
+    expect(config.tagNames.authSession).toBe("hawc-auth0-session");
+  });
 });
 
 describe("bootstrapAuth", () => {

@@ -62,13 +62,21 @@ export class AuthLogout extends HTMLElement {
     }
 
     // `logout()` is async and can reject (e.g. click fires before the
-    // target <hawc-auth0> has finished initialising). Swallow the
-    // rejection so we don't leak an unhandled-rejection into the host
-    // page's global handler — the failure is still observable via
-    // `authEl.error` / `hawc-auth0:error`, matching the trigger
-    // setter's contract.
-    authElement.logout(options).catch(() => {
-      /* error surfaces via authEl.error (AuthShell state) */
+    // target <hawc-auth0> has finished initialising, so AuthCore's
+    // `client` is null and `raiseError` rejects). The rejection is
+    // converted to a `console.warn` so the developer sees WHY the
+    // button appeared dead — previously the `.catch(() => {})` hid
+    // the failure and `authEl.error` stayed untouched (raiseError
+    // skips the observable error path), which surfaced as "logout
+    // button does nothing" with no diagnostic trail. The warn is
+    // one-shot per click; legitimate Auth0 SDK errors still publish
+    // through `authEl.error` / `hawc-auth0:error` as before, so
+    // application-level UI that observes those continues to work.
+    authElement.logout(options).catch((err: unknown) => {
+      console.warn(
+        "[@wc-bindable/hawc-auth0] <hawc-auth0-logout>: logout() failed.",
+        err,
+      );
     });
   };
 
@@ -77,7 +85,12 @@ export class AuthLogout extends HTMLElement {
     if (this.target) {
       const el = document.getElementById(this.target);
       if (el && el.tagName.toLowerCase() === config.tagNames.auth) {
-        return el as unknown as Auth;
+        // A node that carries the right tag name but has not yet
+        // upgraded (script still loading, custom element registry
+        // race) has no `logout` method; calling `.logout(...)` would
+        // throw a TypeError during click handling. Fall through as if
+        // the target did not resolve so the warn path above fires.
+        return _isAuth(el) ? (el as unknown as Auth) : null;
       }
       return null;
     }
@@ -85,11 +98,22 @@ export class AuthLogout extends HTMLElement {
     // 最寄りの<hawc-auth0>を探す
     const closest = this.closest(config.tagNames.auth);
     if (closest) {
-      return closest as unknown as Auth;
+      return _isAuth(closest) ? (closest as unknown as Auth) : null;
     }
 
     // ドキュメント内の最初の<hawc-auth0>を探す
     const first = document.querySelector(config.tagNames.auth);
-    return first as unknown as Auth | null;
+    if (first && _isAuth(first)) return first as unknown as Auth;
+    return null;
   }
+}
+
+/**
+ * Duck-type guard: treat an element as an upgraded `<hawc-auth0>`
+ * only once its `logout` method is a callable function. Keeps the
+ * caller from invoking a method on a freshly-parsed-but-not-yet-
+ * upgraded custom element.
+ */
+function _isAuth(el: Element): boolean {
+  return typeof (el as unknown as { logout?: unknown }).logout === "function";
 }

@@ -2,6 +2,7 @@ import { RemoteShellProxy, WebSocketServerTransport } from "@wc-bindable/remote"
 import type { ServerTransport } from "@wc-bindable/remote";
 import { verifyAuth0Token } from "./verifyAuth0Token.js";
 import { extractTokenFromProtocol } from "./extractTokenFromProtocol.js";
+import { base64UrlDecode } from "../jwtPayload.js";
 import { PROTOCOL_PREFIX } from "../protocolPrefix.js";
 import type { AuthenticatedConnectionOptions, UserContext } from "../types.js";
 
@@ -55,6 +56,15 @@ export interface AuthEvent {
 export interface HandleConnectionOptions {
   auth0Domain: string;
   auth0Audience: string;
+  /**
+   * JWT claim key used to read Auth0 RBAC roles. Forwarded to
+   * `verifyAuth0Token` — see `VerifyTokenOptions.rolesClaim` for the
+   * full rationale (Auth0's out-of-the-box RBAC emits roles as a
+   * namespaced custom claim; setting this option lets deployments
+   * using that default configuration surface roles in `UserContext`
+   * instead of `UserContext.roles` always being empty).
+   */
+  rolesClaim?: string;
   createCores: (user: UserContext) => EventTarget;
   proxyOptions?: AuthenticatedConnectionOptions["proxyOptions"];
   /** Observability hook — called for auth and connection lifecycle events. */
@@ -63,8 +73,15 @@ export interface HandleConnectionOptions {
    * Called after `auth:refresh` re-verifies a new token, before the
    * success response is sent to the client. Use this to propagate the
    * refreshed `UserContext` (e.g. updated permissions/roles) into the
-   * Core(s) returned by `createCores`. The library does not presume any
-   * particular Core shape.
+   * Core returned by `createCores`.
+   *
+   * `createCores` returns a SINGLE `EventTarget` per connection — the
+   * factory is named in the plural for historical reasons, but the
+   * wire protocol binds one proxy per connection, so composing
+   * multiple Cores is the caller's responsibility (typically behind a
+   * facade `EventTarget` that fans out events). This hook receives
+   * that one facade; if the facade owns multiple inner Cores, the
+   * implementation is free to forward the refresh to each of them.
    *
    * May be sync or async. When async, the handler is awaited and the
    * commit only proceeds if it resolves; any rejection (or sync throw)
@@ -167,6 +184,7 @@ export async function handleConnection(
       user = await verifyAuth0Token(token, {
         domain: options.auth0Domain,
         audience: options.auth0Audience,
+        rolesClaim: options.rolesClaim,
       });
     } catch (err) {
       onEvent?.({ type: "auth:failure", error: _normalizeError(err) });
@@ -226,6 +244,18 @@ export async function handleConnection(
 
   scheduleExpiryCheck();
 
+  // Serialise concurrent `auth:refresh` commands on the same connection.
+  // The handler captures `oldExpiresAt = sessionExpiresAt` BEFORE awaiting
+  // `onTokenRefresh`; a second refresh that interleaves the first one's
+  // `await` would capture a transiently-written-then-rolled-back value as
+  // its "previous deadline", producing inconsistent expiry / user /
+  // onTokenRefresh ordering on failure. SPEC-REMOTE §3.4.1 does not
+  // guarantee serialisation, and the client-side `refreshToken()` only
+  // fires one at a time, so rejecting concurrent refreshes is the
+  // simplest correct behaviour: clients that genuinely need parallel
+  // refreshes can queue them themselves.
+  let refreshInFlight = false;
+
   // Create a transport wrapper that intercepts auth:refresh
   const rawTransport: ServerTransport = new WebSocketServerTransport(socket as any);
 
@@ -248,12 +278,32 @@ export async function handleConnection(
   }
 
   const interceptingTransport: ServerTransport = {
-    send: rawTransport.send.bind(rawTransport),
+    // Route every outbound message through `_safeSend` — not just the
+    // refresh-path response. `rawTransport.send()` throws synchronously
+    // once the peer has transitioned to CLOSING / CLOSED (ws library
+    // behaviour), and the send paths that bypass the refresh interceptor
+    // (RemoteShellProxy property-change pushes, normal `cmd` responses)
+    // would otherwise propagate that throw into the RemoteShellProxy
+    // event loop. After a fast client disconnect the proxy's "property
+    // changed" notification races the socket close; an unguarded send
+    // there surfaces as an `unhandledRejection` / `uncaughtException`
+    // under Node and tears down the process. The transport's own close
+    // path still fires `dispose()` and the `connection:close` event, so
+    // swallowing the synchronous throw is safe and keeps the handler
+    // stable regardless of how the proxy chooses to send.
+    send: _safeSend,
     onMessage(handler) {
       rawTransport.onMessage((msg: any) => {
         // Intercept auth:refresh before it reaches RemoteShellProxy
         if (msg.type === "cmd" && msg.name === "auth:refresh") {
-          const newToken = msg.args?.[0] as string;
+          // Validate the refresh argument BEFORE handing it to
+          // `verifyAuth0Token`. The wire payload is untrusted — a
+          // client could send a non-string (number, object) or empty
+          // string; an unchecked cast would bubble a confusing jose
+          // error through `auth:refresh-failure` instead of the
+          // contract-named "Missing token argument" response.
+          const rawArg = msg.args?.[0];
+          const newToken = typeof rawArg === "string" ? rawArg : "";
           if (!newToken) {
             _safeSend({
               type: "throw",
@@ -262,15 +312,48 @@ export async function handleConnection(
             });
             return;
           }
+          // Reject concurrent refreshes rather than interleave their
+          // rollback paths. See `refreshInFlight` declaration above for
+          // the ordering hazard this avoids.
+          if (refreshInFlight) {
+            _safeSend({
+              type: "throw",
+              id: msg.id,
+              error: {
+                name: "Error",
+                message: "Token refresh already in progress",
+              },
+            });
+            return;
+          }
+          refreshInFlight = true;
           verifyAuth0Token(newToken, {
             domain: options.auth0Domain,
             audience: options.auth0Audience,
+            rolesClaim: options.rolesClaim,
           })
             .then(async (newUser) => {
               if (newUser.sub !== initialSub) {
                 onEvent?.({
                   type: "auth:refresh-failure",
                   error: new Error("Token subject mismatch"),
+                });
+                // Send a structured `throw` response BEFORE closing the
+                // socket so the client's `refreshToken()` promise rejects
+                // with a specific "Token subject mismatch" message rather
+                // than the generic "WebSocket closed before token refresh
+                // completed" that the close handler would otherwise
+                // synthesise. Without this, downstream code cannot
+                // distinguish a subject-mismatch (a policy failure the
+                // application might want to surface explicitly) from a
+                // transport-level close triggered by network loss / server
+                // restart. `_safeSend` swallows the case where the socket
+                // is already CLOSING/CLOSED so the subsequent `close()`
+                // remains the authoritative teardown step.
+                _safeSend({
+                  type: "throw",
+                  id: msg.id,
+                  error: { name: "Error", message: "Token subject mismatch" },
                 });
                 socket.close?.(4403, "Token subject mismatch");
                 return;
@@ -364,6 +447,13 @@ export async function handleConnection(
                 id: msg.id,
                 error: { name: "Error", message: "Token refresh failed" },
               });
+            })
+            .finally(() => {
+              // Release the re-entrancy guard whether we committed, rolled
+              // back, or failed verification. A subsequent `auth:refresh`
+              // on the same connection starts fresh against the now-stable
+              // `sessionExpiresAt` / `user` state.
+              refreshInFlight = false;
             });
           return; // Do not forward to RemoteShellProxy
         }
@@ -414,9 +504,23 @@ function _getExpFromToken(
       });
       return Infinity;
     }
-    const payload = JSON.parse(_base64UrlDecode(parts[1]));
-    if (typeof payload.exp === "number") {
-      return payload.exp * 1000 + graceMs;
+    // Guard against primitive / null payloads before accessing `exp`
+    // — a token like `eyJ...null...` would otherwise crash with
+    // `TypeError: Cannot read properties of null`, which the try/catch
+    // would then route to `auth:exp-parse-failure` but with a misleading
+    // "Cannot read properties of null" message that suggests a code bug
+    // rather than a malformed claim.
+    const payload: unknown = JSON.parse(base64UrlDecode(parts[1]));
+    if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+      onEvent?.({
+        type: "auth:exp-parse-failure",
+        error: new Error("JWT payload is not an object"),
+      });
+      return Infinity;
+    }
+    const exp = (payload as Record<string, unknown>).exp;
+    if (typeof exp === "number") {
+      return exp * 1000 + graceMs;
     }
     onEvent?.({
       type: "auth:exp-parse-failure",
@@ -432,34 +536,29 @@ function _getExpFromToken(
 }
 
 /**
- * Runtime-agnostic base64url decoder that returns a proper UTF-8
- * string. `atob` alone yields a "binary string" (one char per byte)
- * which would silently corrupt non-ASCII JWT claims and can make
- * `JSON.parse` throw. Today the caller only reads the numeric `exp`
- * claim, so binary decoding worked by accident; routing through
- * `TextDecoder` future-proofs the helper for any additional claim
- * we might start inspecting on the server (and for operator log
- * inspection of `auth:exp-parse-failure` error payloads).
- */
-function _base64UrlDecode(input: string): string {
-  const padded = input + "=".repeat((4 - (input.length % 4)) % 4);
-  const base64 = padded.replace(/-/g, "+").replace(/_/g, "/");
-  if (typeof atob === "function") {
-    const binary = atob(base64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    return new TextDecoder("utf-8").decode(bytes);
-  }
-  // Node ≤ 15 fallback (Node 16+ exposes a global `atob`).
-  return Buffer.from(base64, "base64").toString("utf-8");
-}
-
-/**
  * Convenience factory that creates a `ws.WebSocketServer` with built-in
  * Auth0 token verification, Core construction, in-band refresh, and
  * session expiry enforcement.
  *
  * Requires the `ws` package as a peer dependency.
+ *
+ * **Token-refresh / Core user propagation contract.**
+ * `createCores(user)` is invoked exactly ONCE per WebSocket connection,
+ * with the `UserContext` derived from the initial handshake token.
+ * Subsequent `auth:refresh` commands re-verify the token and update
+ * the server-side `user` binding used for `auth:refresh` event
+ * payloads and the `sub` consistency check — but the `EventTarget`
+ * returned by `createCores` is NOT reconstructed and does NOT
+ * automatically learn the refreshed claims. Any per-connection Core
+ * state derived from `UserContext.permissions` / `UserContext.roles`
+ * / custom claims is therefore **frozen at the initial token's
+ * claims** unless `onTokenRefresh` is wired.
+ *
+ * Wire `onTokenRefresh: (core, user) => core.updateUser(user)` (for
+ * the reference `UserCore`) whenever the Core surfaces
+ * token-derived bindable state that can change across refreshes.
+ * See SPEC-REMOTE §3.4.1 for the full contract and rollback
+ * semantics.
  */
 export async function createAuthenticatedWSS(
   options: AuthenticatedConnectionOptions & {
@@ -524,6 +623,7 @@ export async function createAuthenticatedWSS(
       verifyAuth0Token(token, {
         domain: options.auth0Domain,
         audience: options.auth0Audience,
+        rolesClaim: options.rolesClaim,
       })
         .then((user) => {
           preVerifiedUsers.set(info.req, user);
@@ -562,6 +662,7 @@ export async function createAuthenticatedWSS(
         {
           auth0Domain: options.auth0Domain,
           auth0Audience: options.auth0Audience,
+          rolesClaim: options.rolesClaim,
           createCores: options.createCores,
           proxyOptions: options.proxyOptions,
           onEvent: options.onEvent,

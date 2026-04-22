@@ -147,6 +147,16 @@ export class OpenAiProvider implements IAiProvider {
       const usage = parsed.usage ? this._parseUsage(parsed.usage) : undefined;
       const toolCallDeltas = this._extractToolCallDeltas(choice?.delta?.tool_calls);
       const finishReason = this._normalizeFinishReason(choice?.finish_reason);
+      // Asymmetry: only `tool_calls` ends the stream early here. For `stop`,
+      // `length`, `content_filter`, `function_call` the OpenAI (and
+      // OpenAI-compatible: Azure, Ollama, vLLM, LiteLLM) stream still emits
+      // a trailing usage-only chunk followed by the `[DONE]` sentinel, and
+      // AiCore relies on reading that usage before closing the turn. For
+      // `tool_calls` some proxies never emit `[DONE]` after the final
+      // arguments delta, so without an early `done` flag the read loop
+      // would hang until the server closed the socket. Usage is not
+      // available on `tool_calls` chunks on those proxies anyway, so the
+      // early exit loses nothing.
       const done = choice?.finish_reason === "tool_calls";
       return { delta, usage, toolCallDeltas, finishReason, done };
     } catch (error) {

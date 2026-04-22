@@ -39,7 +39,15 @@ export interface StripeNodeLike {
     cancel?(id: string): Promise<Record<string, unknown>>;
   };
   webhooks: {
-    constructEvent(payload: string, header: string, secret: string): Record<string, unknown>;
+    // `stripe-node` accepts string | Buffer | Uint8Array for `payload` —
+    // match that exactly so `express.raw()` (Buffer) and `bodyParser.text()`
+    // (string) both flow through without coercion. Keeps the verification
+    // HMAC over the exact bytes Stripe POSTed.
+    constructEvent(
+      payload: string | Buffer | Uint8Array,
+      header: string,
+      secret: string,
+    ): Record<string, unknown>;
   };
 }
 
@@ -116,7 +124,17 @@ export class StripeSdkProvider implements IStripeProvider {
     // it is Stripe's recommended path and it supports the widest range of
     // Elements-based confirmation flows without the app having to enumerate
     // payment_method_types.
+    //
+    // Treat `payment_method_types: []` the same as "unset": the empty array
+    // is truthy in JavaScript but conveys no real intent to Stripe, and
+    // forwarding it would trigger a hard 400 ("payment_method_types[] is
+    // empty") that looks like a Stripe API bug. Strip it and then apply
+    // the automatic_payment_methods default so the caller lands on the
+    // same well-defined path as if the field had been omitted entirely.
     const params: Record<string, unknown> = { ...opts };
+    if (Array.isArray(params.payment_method_types) && params.payment_method_types.length === 0) {
+      delete params.payment_method_types;
+    }
     if (params.automatic_payment_methods === undefined && params.payment_method_types === undefined) {
       params.automatic_payment_methods = { enabled: true };
     }
@@ -148,7 +166,13 @@ export class StripeSdkProvider implements IStripeProvider {
   }
 
   async createSetupIntent(opts: SetupIntentOptions): Promise<IntentCreationResult> {
+    // Symmetric with `createPaymentIntent`: treat an empty
+    // `payment_method_types` array as unset so the automatic-payment-methods
+    // default applies cleanly.
     const params: Record<string, unknown> = { ...opts };
+    if (Array.isArray(params.payment_method_types) && params.payment_method_types.length === 0) {
+      delete params.payment_method_types;
+    }
     if (params.automatic_payment_methods === undefined && params.payment_method_types === undefined) {
       params.automatic_payment_methods = { enabled: true };
     }
@@ -217,7 +241,7 @@ export class StripeSdkProvider implements IStripeProvider {
     await this._client.setupIntents.cancel(id);
   }
 
-  verifyWebhook(rawBody: string, signatureHeader: string, secret: string): StripeEvent {
+  verifyWebhook(rawBody: string | Buffer | Uint8Array, signatureHeader: string, secret: string): StripeEvent {
     // Delegates to stripe-node's constructEvent, which performs the HMAC-SHA256
     // over the raw body + timestamp check. It throws on failure — we let the
     // throw propagate so StripeCore.handleWebhook returns the error to the

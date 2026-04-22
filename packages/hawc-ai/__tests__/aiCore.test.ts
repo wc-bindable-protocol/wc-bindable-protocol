@@ -357,22 +357,6 @@ describe("AiCore", () => {
       expect(core.messages[5].finishReason).toBe("stop");
     });
 
-    it("存在しないメッセージの削除は無視される", () => {
-      const core = new AiCore();
-      const coreAny = core as any;
-      const events: any[] = [];
-
-      core.messages = [{ role: "user", content: "Hello" }];
-      core.addEventListener("hawc-ai:messages-changed", (e: Event) => {
-        events.push((e as CustomEvent).detail);
-      });
-
-      coreAny._removeMessage({ role: "assistant", content: "Missing" });
-
-      expect(core.messages).toEqual([{ role: "user", content: "Hello" }]);
-      expect(events).toEqual([]);
-    });
-
     describe("setterバリデーション", () => {
       const core = () => {
         const c = new AiCore();
@@ -611,7 +595,11 @@ describe("AiCore", () => {
 
       (core as any)._setError(error);
 
-      expect((error as any).toJSON()).toEqual({
+      // 呼び出し元の Error は mutate されない。core.error にはラッパが格納され、
+      // ラッパの toJSON が stack 空のときキーを省略する。
+      expect((error as any).toJSON).toBeUndefined();
+      expect(typeof (core.error as any).toJSON).toBe("function");
+      expect((core.error as any).toJSON()).toEqual({
         name: "Error",
         message: "boom",
       });
@@ -1127,8 +1115,14 @@ describe("AiCore", () => {
       const result = await core.send("Hello", { model: "gpt-4o", stream: false });
 
       expect(result).toBeNull();
-      expect(core.error).toBeInstanceOf(TypeError);
-      expect(core.error.message).toBe("Failed to fetch");
+      // AiCore wraps native Error subclasses (TypeError, DOMException, ...)
+      // in a serializable wrapper so JSON.stringify preserves name/message/stack
+      // without mutating the caller's Error. The wrapper extends Error and
+      // copies the original `name` so consumers branching on `error.name`
+      // (rather than `instanceof TypeError`) keep working.
+      expect(core.error).toBeInstanceOf(Error);
+      expect(core.error!.name).toBe("TypeError");
+      expect(core.error!.message).toBe("Failed to fetch");
       expect(core.messages).toEqual([]);
       expect(core.loading).toBe(false);
     });
@@ -1145,18 +1139,23 @@ describe("AiCore", () => {
       expect(core.messages).toEqual([]);
     });
 
-    it("ErrorにtoJSONが付与されリモート直列化で情報が保持される", async () => {
-      fetchSpy.mockRejectedValueOnce(new TypeError("Network error"));
+    it("Errorはラップされリモート直列化で情報が保持される", async () => {
+      const source = new TypeError("Network error");
+      fetchSpy.mockRejectedValueOnce(source);
 
       const core = new AiCore();
       core.provider = "openai";
       await core.send("Hello", { model: "gpt-4o", stream: false });
 
-      // instanceofが維持されている
-      expect(core.error).toBeInstanceOf(TypeError);
-      // toJSONが付与されている
-      expect(typeof core.error.toJSON).toBe("function");
-      // JSON.stringifyで情報が保持される
+      // Error インスタンスは AiCore 内部の serializable wrapper に差し替えられる。
+      // 呼び出し元の TypeError インスタンスは mutate されず、そのまま保持される。
+      expect(core.error).toBeInstanceOf(Error);
+      expect(core.error).not.toBe(source);
+      expect((source as any).toJSON).toBeUndefined();
+      // name は元の "TypeError" を引き継ぐので、name ベースの分岐は維持できる。
+      expect(core.error!.name).toBe("TypeError");
+      // toJSON 付きで JSON.stringify に情報が保持される
+      expect(typeof (core.error as any).toJSON).toBe("function");
       const serialized = JSON.parse(JSON.stringify(core.error));
       expect(serialized.name).toBe("TypeError");
       expect(serialized.message).toBe("Network error");

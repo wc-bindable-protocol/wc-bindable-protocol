@@ -822,6 +822,66 @@ describe("handleConnection", () => {
     expect(mismatchEvent?.error?.message).toBe("Token subject mismatch");
   });
 
+  it("sends structured throw response with 'Token subject mismatch' before closing", async () => {
+    // Regression guard: before this fix the server only called
+    // socket.close(4403, ...) on sub mismatch, so the client's
+    // refreshToken() promise rejected with the generic close-handler
+    // message "WebSocket closed before token refresh completed" and
+    // the application could not tell sub-mismatch from a network drop.
+    // We now send a `throw` response with the id of the refresh cmd
+    // FIRST, so the client's response interceptor surfaces the precise
+    // reason before the close path fires.
+    jwtVerify.mockResolvedValueOnce({
+      payload: { sub: "auth0|123", permissions: [] },
+    });
+
+    const socket = createMockSocket();
+    const core = new EventTarget();
+    (core.constructor as any).wcBindable = {
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [],
+    };
+
+    await handleConnection(
+      socket,
+      "hawc-auth0.bearer." + makeJwt({ sub: "auth0|123" }),
+      {
+        auth0Domain: "test.auth0.com",
+        auth0Audience: "https://api.example.com",
+        createCores: () => core,
+      },
+    );
+
+    jwtVerify.mockResolvedValueOnce({
+      payload: { sub: "auth0|999", permissions: [] },
+    });
+
+    const messageHandlers = socket._listeners["message"];
+    messageHandlers[0]({
+      data: JSON.stringify({
+        type: "cmd",
+        name: "auth:refresh",
+        id: "refresh-sub-mismatch-structured",
+        args: [makeJwt({ sub: "auth0|999" })],
+      }),
+    });
+
+    await new Promise((r) => setTimeout(r, 10));
+
+    // Find the throw response carrying our request id.
+    const throwCall = socket.send.mock.calls
+      .map((c: any[]) => JSON.parse(c[0]))
+      .find((m: any) => m.type === "throw" && m.id === "refresh-sub-mismatch-structured");
+
+    expect(throwCall).toBeDefined();
+    expect(throwCall.error.name).toBe("Error");
+    expect(throwCall.error.message).toBe("Token subject mismatch");
+
+    // The structured reply is sent BEFORE the close; both still happen.
+    expect(socket.close).toHaveBeenCalledWith(4403, "Token subject mismatch");
+  });
+
   it("forwards non-refresh messages to proxy transport handler", async () => {
     jwtVerify.mockResolvedValue({
       payload: { sub: "auth0|123", permissions: [] },
@@ -1739,5 +1799,115 @@ describe("handleConnection", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  describe("rolesClaim propagation", () => {
+    // End-to-end: rolesClaim must flow through BOTH the initial
+    // verifyAuth0Token call AND the auth:refresh re-verification call.
+    // If either wiring breaks, tenants using Auth0's default RBAC flow
+    // silently lose roles and every `roles.includes(...)` fails closed.
+    // Unit-testing `verifyAuth0Token` in isolation is not enough — it
+    // cannot catch a missed option hand-off in `handleConnection`.
+    const NS = "https://api.example.com/roles";
+
+    it("reads namespaced roles on initial verification", async () => {
+      jwtVerify.mockResolvedValue({
+        payload: {
+          sub: "auth0|rc-initial",
+          permissions: [],
+          [NS]: ["editor", "admin"],
+          roles: ["ignored-non-namespaced"],
+        },
+      });
+
+      const socket = createMockSocket();
+      const core = new EventTarget();
+      (core.constructor as any).wcBindable = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+      };
+
+      const createCores = vi.fn((user) => {
+        // Assert the factory receives the namespaced roles — this is
+        // the observable surface for the user's Core construction.
+        expect(user.roles).toEqual(["editor", "admin"]);
+        return core;
+      });
+
+      await handleConnection(
+        socket,
+        "hawc-auth0.bearer." + makeJwt({ sub: "auth0|rc-initial" }),
+        {
+          auth0Domain: "test.auth0.com",
+          auth0Audience: "https://api.example.com",
+          rolesClaim: NS,
+          createCores,
+        },
+      );
+
+      expect(createCores).toHaveBeenCalledTimes(1);
+    });
+
+    it("reads namespaced roles on auth:refresh re-verification", async () => {
+      // Initial verify: legacy-shaped token without the namespaced key.
+      jwtVerify.mockResolvedValueOnce({
+        payload: { sub: "auth0|rc-refresh", permissions: [] },
+      });
+
+      const socket = createMockSocket();
+      const core = new EventTarget();
+      (core.constructor as any).wcBindable = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+      };
+
+      const refreshed: Array<{ roles: string[] }> = [];
+
+      await handleConnection(
+        socket,
+        "hawc-auth0.bearer." + makeJwt({ sub: "auth0|rc-refresh" }),
+        {
+          auth0Domain: "test.auth0.com",
+          auth0Audience: "https://api.example.com",
+          rolesClaim: NS,
+          createCores: () => core,
+          onTokenRefresh: (_c, user) => {
+            refreshed.push({ roles: user.roles });
+          },
+        },
+      );
+
+      // Refresh verify: namespaced key present, non-namespaced must lose.
+      // The only way `user.roles` lands as the namespaced value here is
+      // if `rolesClaim` was forwarded into the refresh-path
+      // `verifyAuth0Token` call — a regression that drops it would
+      // leave `user.roles === ["ignored-non-namespaced"]` instead.
+      jwtVerify.mockResolvedValueOnce({
+        payload: {
+          sub: "auth0|rc-refresh",
+          permissions: [],
+          [NS]: ["editor", "admin"],
+          roles: ["ignored-non-namespaced"],
+          exp: Math.floor(Date.now() / 1000) + 300,
+        },
+      });
+
+      const messageHandlers = socket._listeners["message"];
+      messageHandlers[0]({
+        data: JSON.stringify({
+          type: "cmd",
+          name: "auth:refresh",
+          id: "refresh-roles-claim",
+          args: [makeJwt({ sub: "auth0|rc-refresh" })],
+        }),
+      });
+
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(refreshed).toHaveLength(1);
+      expect(refreshed[0].roles).toEqual(["editor", "admin"]);
+    });
   });
 });

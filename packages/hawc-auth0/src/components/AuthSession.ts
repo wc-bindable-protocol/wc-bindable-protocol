@@ -4,6 +4,7 @@ import type { RemoteCoreProxy } from "@wc-bindable/remote";
 import type { WcBindableDeclaration, UnbindFn } from "@wc-bindable/core";
 import { bind } from "@wc-bindable/core";
 import { config } from "../config.js";
+import { ERROR_PREFIX, OWNERSHIP_ERROR_MARKER, isOwnershipError } from "../raiseError.js";
 import { IWcBindable } from "../types.js";
 import { getCoreDeclaration } from "../coreRegistry.js";
 import type { Auth } from "./Auth.js";
@@ -126,11 +127,31 @@ export class AuthSession extends HTMLElement {
 
   // --- JS-only accessors ---------------------------------------------------
 
-  /** The `RemoteCoreProxy` once built. Applications bind to this directly. */
+  /**
+   * The `RemoteCoreProxy` once built. Applications bind to this directly.
+   *
+   * Lifecycle:
+   *   - `null` before the first successful `_connect()` completes.
+   *   - Points at a live proxy once the WebSocket handshake resolves
+   *     and `createRemoteCoreProxy` wires the transport. The switch
+   *     happens BEFORE `ready` flips true (`ready` waits for the
+   *     first sync batch; `proxy` becomes reachable as soon as the
+   *     transport is installed).
+   *   - Returns to `null` on teardown (logout, element removal,
+   *     auth-revoked, transport close). A teardown that races a
+   *     pending handshake yields `proxy === null` forever for that
+   *     handshake — the generation guard drops the late arrival.
+   */
   get proxy(): RemoteCoreProxy | null {
     return this._proxy;
   }
 
+  /**
+   * The `ClientTransport` underlying `proxy`, exposed for applications
+   * that need direct access (e.g. sending raw commands alongside
+   * proxy-bound state). Same lifecycle as `proxy` — the pair is
+   * installed and cleared atomically.
+   */
   get transport(): ClientTransport | null {
     return this._transport;
   }
@@ -152,6 +173,12 @@ export class AuthSession extends HTMLElement {
         });
       });
     }
+    // NB: when `autoConnect` is false, `_connectedCallbackPromise`
+    // keeps the already-resolved initial value. Applications that
+    // drive the session imperatively via `start()` observe the
+    // watching lifecycle through the returned promise from that
+    // call; `connectedCallbackPromise` deliberately does not block
+    // on a session that may never be started.
   }
 
   disconnectedCallback(): void {
@@ -201,7 +228,26 @@ export class AuthSession extends HTMLElement {
     // `_connect` from the previous cycle would race with the new one.
     this._unsubscribeAuth();
     this._teardown();
-    this._setError(null);
+    // Preserve a standing Connection Ownership violation (SPEC-REMOTE
+    // §3.7 "surfaces the mistake immediately") across auto-restarts
+    // triggered by attributeChangedCallback's microtask coalescer.
+    // Without this guard, a framework that re-stamps target / core /
+    // url after the initial run would restart `_startWatching`, hit
+    // `_setError(null)` here, and wipe the just-shown ownership
+    // warning one microtask after it appeared — so the developer
+    // never sees the mistake even though the underlying misconfig
+    // is still present. If ownership later clears (owner disconnects,
+    // config changes, etc.), `_connect` will either succeed or reset
+    // to a different error via its own `_setError` calls.
+    //
+    // Uses the stable `_hawcOwnership` sentinel property via
+    // `isOwnershipError()` rather than a message-substring match.
+    // The message wording can drift across refactors; the sentinel
+    // is the API contract the producers (`raiseOwnershipError()` in
+    // AuthShell, the `_connect` construction below) explicitly opt
+    // into.
+    const standingOwnershipError = isOwnershipError(this._error) ? this._error : null;
+    if (!standingOwnershipError) this._setError(null);
 
     // Capture generation AFTER teardown so this run is the active one.
     // A subsequent teardown / start() will move it forward and the
@@ -308,12 +354,20 @@ export class AuthSession extends HTMLElement {
     // proxy to a transport we did not create, and calling connect() again
     // would close theirs. Fail visibly instead of producing a silently
     // dead session.
+    //
+    // Tag the Error with `_hawcOwnership = true` so `_startWatching`'s
+    // standing-error preservation recognises it on the stable sentinel
+    // rather than a message-substring match. The sentinel is the same
+    // one `raiseOwnershipError()` stamps on AuthShell-originated
+    // ownership failures; both sources funnel into `isOwnershipError()`.
     if (auth.connected) {
-      this._setError(new Error(
-        "[@wc-bindable/hawc-auth0] <hawc-auth0-session>: target is already connected. " +
+      const ownershipErr = new Error(
+        `${ERROR_PREFIX} <hawc-auth0-session>: target is already connected. ` +
         "Use either <hawc-auth0-session> OR a manual authEl.connect() — not both. " +
         "See SPEC-REMOTE §3.7 (Connection Ownership).",
-      ));
+      );
+      (ownershipErr as unknown as Record<string, boolean>)[OWNERSHIP_ERROR_MARKER] = true;
+      this._setError(ownershipErr);
       return;
     }
 
@@ -448,6 +502,23 @@ export class AuthSession extends HTMLElement {
     }));
   }
 
+  /**
+   * Update the session's error state and dispatch `error` when the
+   * value actually changes. The comparison is reference equality —
+   * deliberate, not a bug:
+   *
+   *   - The main caller pattern is `_setError(null)` at `_connect()`
+   *     start, then `_setError(err)` on failure. Reference equality
+   *     of `null === null` suppresses the redundant "clear" event
+   *     when the session starts from an already-clear state,
+   *     without ever suppressing a real error→error transition
+   *     (two different Error instances, even with the same
+   *     message, compare unequal).
+   *   - Conversely, "same Error instance set twice" genuinely is
+   *     idempotent — not a legitimate case in current callers, but
+   *     coalescing it keeps `hawc-auth0-session:error` from firing
+   *     spurious duplicate payloads.
+   */
   private _setError(value: Error | null): void {
     if (this._error === value) return;
     this._error = value;

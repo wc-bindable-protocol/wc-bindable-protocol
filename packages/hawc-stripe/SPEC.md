@@ -192,6 +192,14 @@ raw な authorizer 例外(ACL lookup 失敗、DB エラー、stack trace など)
 | `publishableKey` | `publishable-key` | `pk_live_...` or `pk_test_...` |
 | `returnUrl` | `return-url` | 3DS redirect 後の戻り先 URL |
 
+**wcBindable.inputs との差異について**: 上表 7 項目のうち、`wcBindable.inputs`(`src/core/wcBindable.ts`)には `mode` / `amountValue` / `amountCurrency` / `customerId` の 4 つのみが登録される。これは **Core の観測可能入力**(= Remote 経由で Shell↔Core 間を双方向同期する値)だけを wcBindable protocol に乗せるという意図的な設計であり、残り 3 項目は Shell ローカルな Stripe.js 設定だから除外している:
+
+- `appearance` — Stripe Elements の UI テーマ設定。Core はこの値を一切読まない (iframe 内で Stripe.js が直接消費する)。Remote 経由で送っても Core の挙動に影響しないため、input に載せない。
+- `publishableKey` — ブラウザ側の Stripe.js インスタンスを構築するためのキー。Core は `STRIPE_SECRET_KEY` しか使わない(Shell と対になる別経路)。Remote モードでも Shell は自前で Stripe.js を起動するため、Core に送る意味がない。
+- `returnUrl` — 3DS redirect の戻り先 URL。Shell の `submit()` が `stripe.confirmPayment({ confirmParams: { return_url } })` に渡すだけで、Core 側には到達しない。
+
+したがって `wcBindable.inputs` と本セクションの表が不一致なのは仕様通りであり、Shell 側ローカル設定は `Stripe.observedAttributes` で attribute 変化を監視しつつ、Core への入力同期は行わない。
+
 ### 5.4 Commands(Shell が外部公開)
 
 | name | 説明 |
@@ -248,12 +256,27 @@ interface IntentRequest {
   };
 }
 
+interface IntentCreationResult {
+  intentId: string;
+  clientSecret: string;
+  mode: "payment" | "setup";
+  amount?: { value: number; currency: string };  // payment モード時のみ
+}
+
 interface IStripeProvider {
-  createPaymentIntent(opts: PaymentIntentOptions): Promise<{ id: string; clientSecret: string; amount: number; currency: string }>;
-  createSetupIntent(opts: SetupIntentOptions): Promise<{ id: string; clientSecret: string }>;
-  retrieveIntent(mode: "payment" | "setup", id: string): Promise<StripeIntent>;
+  createPaymentIntent(opts: PaymentIntentOptions): Promise<IntentCreationResult>;
+  createSetupIntent(opts: SetupIntentOptions): Promise<IntentCreationResult>;
+  retrieveIntent(mode: "payment" | "setup", id: string): Promise<StripeIntentView>;
   cancelPaymentIntent(id: string): Promise<void>;
-  verifyWebhook(payload: string, signature: string, secret: string): StripeEvent;
+  cancelSetupIntent?(id: string): Promise<void>;
+  // rawBody は Buffer / Uint8Array / string のいずれか。Express の
+  // `express.raw()` が返す Buffer も、生文字列を渡す手書き router も
+  // 両方サポートする。HMAC は渡されたバイト列そのものに対して計算する。
+  verifyWebhook(
+    rawBody: string | Buffer | Uint8Array,
+    signatureHeader: string,
+    secret: string,
+  ): StripeEvent;
 }
 
 type IntentBuilder = (req: IntentRequest, ctx: UserContext) => PaymentIntentOptions | SetupIntentOptions | Promise<...>;
@@ -318,7 +341,7 @@ class StripeCore extends EventTarget {
    * signatureHeader は `stripe-signature` ヘッダの値。
   * 署名検証 → event ディスパッチ → status fold → 登録済み handler 実行。
    */
-  handleWebhook(rawBody: string, signatureHeader: string): Promise<void>;
+  handleWebhook(rawBody: string | Buffer | Uint8Array, signatureHeader: string): Promise<void>;
 }
 ```
 

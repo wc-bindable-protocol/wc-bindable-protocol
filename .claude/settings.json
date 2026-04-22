@@ -8,5 +8,8 @@
       "Bash(npx vitest:*)",
       "Bash(npx playwright:*)"
     ]
-  }
+  },
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
+  }  
 }

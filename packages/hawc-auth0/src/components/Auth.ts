@@ -1,6 +1,6 @@
 import type { ClientTransport } from "@wc-bindable/remote";
 import { config } from "../config.js";
-import { IWcBindable, AuthMode } from "../types.js";
+import { IWcBindable, AuthMode, AuthError, AuthUser } from "../types.js";
 import { AuthShell } from "../shell/AuthShell.js";
 import { registerAutoTrigger, unregisterAutoTrigger } from "../autoTrigger.js";
 
@@ -142,7 +142,7 @@ export class Auth extends HTMLElement {
     return this._shell.authenticated;
   }
 
-  get user(): any {
+  get user(): AuthUser | null {
     return this._shell.user;
   }
 
@@ -166,7 +166,7 @@ export class Auth extends HTMLElement {
     return this._shell.loading;
   }
 
-  get error(): any {
+  get error(): AuthError | Error | null {
     return this._shell.error;
   }
 
@@ -174,7 +174,14 @@ export class Auth extends HTMLElement {
     return this._shell.connected;
   }
 
-  get client(): any {
+  /**
+   * Raw Auth0 client — exposed for advanced use only. Typed as
+   * `unknown` because `@auth0/auth0-spa-js` is a peer dependency of
+   * this package and the public API surface must not silently leak
+   * that type to consumers who have not installed it. Narrow in the
+   * calling code via `as Auth0Client` if you need the SDK methods.
+   */
+  get client(): unknown {
     return this._shell.client;
   }
 
@@ -190,6 +197,14 @@ export class Auth extends HTMLElement {
 
   set trigger(value: boolean) {
     const v = !!value;
+    // Guard against double-trigger: a second `trigger=true` while a
+    // previous login() is still in flight would queue a parallel
+    // login() call (the `.finally()` handler has not yet fired, so
+    // `_trigger` is still true). Auth0's `loginWithRedirect` tolerates
+    // re-entry but the visible UX is two back-to-back navigations
+    // racing each other; ignoring the redundant `true` keeps the
+    // single-in-flight contract.
+    if (v && this._trigger) return;
     if (v) {
       this._trigger = true;
       this._connectedCallbackPromise
@@ -313,6 +328,17 @@ export class Auth extends HTMLElement {
     // Keep the shell's mode in sync with the live attribute so that
     // token / getToken() / connect() honour post-init mode changes in
     // both directions (local→remote AND remote→local).
+    //
+    // We deliberately DO NOT re-run `initialize()` when `mode`,
+    // `audience`, `scope`, `redirect-uri`, `cache-location`, or
+    // `use-refresh-tokens` change post-init. The Auth0 SPA SDK owns
+    // refresh-token / session storage keyed by those options; swapping
+    // them mid-session would orphan the stored session and force a
+    // silent-auth fallback. Applications that truly need to reconfigure
+    // must tear down the element and mount a fresh one — `connect()` /
+    // `reconnect()` will fail fast for a remote-mode mismatch
+    // (missing audience) so the operator sees the mistake at the call
+    // site rather than via a 1008 close.
     if (_name === "mode" || _name === "remote-url") {
       this._shell.mode = this.mode;
     }

@@ -53,4 +53,19 @@ describe("extractTokenFromProtocol", () => {
       "Empty token",
     );
   });
+
+  it("throws a clear error when the header is not a string/string[] at runtime", () => {
+    // The declared input type is `string | string[] | undefined`, but
+    // custom servers (raw http upgrade handlers, Deno/Bun adapters) can
+    // still hand us a `Buffer` or plain object at runtime. Without the
+    // runtime-shape guard, `protocolHeader.split(",")` throws a confusing
+    // `TypeError: X.split is not a function` deep in the parse path.
+    const buffer = Buffer.from("hawc-auth0.bearer.my-jwt");
+    expect(() => extractTokenFromProtocol(buffer as unknown as string)).toThrow(
+      /Sec-WebSocket-Protocol header must be a string or string\[\]/,
+    );
+    expect(() => extractTokenFromProtocol({ foo: 1 } as unknown as string)).toThrow(
+      /Sec-WebSocket-Protocol header must be a string or string\[\]/,
+    );
+  });
 });

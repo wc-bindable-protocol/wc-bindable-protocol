@@ -351,7 +351,8 @@ The server accepts WebSocket connections, extracts the token from `Sec-WebSocket
 ```ts
 import { createAuthenticatedWSS } from "@wc-bindable/hawc-auth0/server";
 
-createAuthenticatedWSS({
+const wss = await createAuthenticatedWSS({
+  port: 3000,
   auth0Domain: "example.auth0.com",
   auth0Audience: "https://api.example.com",
   allowedOrigins: ["https://app.example.com"],
@@ -374,7 +375,8 @@ The server extracts `exp` from the verified JWT and enforces a hard close (code 
 Recommended for production deployments that require a bounded session lifetime even under IdP misconfiguration:
 
 ```ts
-createAuthenticatedWSS({
+const wss = await createAuthenticatedWSS({
+  port: 3000,
   auth0Domain: "...",
   auth0Audience: "...",
   createCores: (user) => new AppCore(user),

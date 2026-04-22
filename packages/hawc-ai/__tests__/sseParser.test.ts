@@ -56,6 +56,26 @@ describe("SseParser", () => {
     expect(events[0].data).toBe("hello");
   });
 
+  it("\\r単独の改行を処理できる", () => {
+    // SSE spec (whatwg/html) allows CR, LF, or CRLF as line terminators. Some
+    // proxies / legacy emitters ship bare CRs.
+    const parser = new SseParser();
+    const events = parser.feed('data: hello\r\r');
+    expect(events).toHaveLength(1);
+    expect(events[0].data).toBe("hello");
+  });
+
+  it("データなしの空行は event を次のイベントへ引き継がない", () => {
+    // `event: foo\n\n` (no data line) must not leak "foo" into whatever
+    // event follows; per spec the empty data buffer case still terminates
+    // the current event construction.
+    const parser = new SseParser();
+    const events = parser.feed('event: orphan\n\ndata: hello\n\n');
+    expect(events).toHaveLength(1);
+    expect(events[0].event).toBeUndefined();
+    expect(events[0].data).toBe("hello");
+  });
+
   it("data:の後にスペースがない形式も処理できる", () => {
     const parser = new SseParser();
     const events = parser.feed('data:hello\n\n');

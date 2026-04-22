@@ -67,6 +67,78 @@ describe("config", () => {
     setConfig({ autoTrigger: true });
   });
 
+  it("setConfig()で空文字triggerAttributeを拒否する", () => {
+    expect(() => setConfig({ triggerAttribute: "" })).toThrow(/triggerAttribute must be a non-empty string/);
+  });
+
+  it("setConfig()で空白のみtriggerAttributeを拒否する", () => {
+    expect(() => setConfig({ triggerAttribute: "   " })).toThrow(/triggerAttribute must be a non-empty string/);
+  });
+
+  it("setConfig()で非文字列triggerAttributeを拒否する", () => {
+    expect(() => setConfig({ triggerAttribute: 123 as any })).toThrow(/triggerAttribute must be a non-empty string/);
+  });
+
+  it("setConfig()で空文字tagNames.aiを拒否する", () => {
+    expect(() => setConfig({ tagNames: { ai: "" } })).toThrow(/tagNames\.ai must be a non-empty string/);
+  });
+
+  it("setConfig()で空文字tagNames.aiMessageを拒否する", () => {
+    expect(() => setConfig({ tagNames: { aiMessage: "" } })).toThrow(/tagNames\.aiMessage must be a non-empty string/);
+  });
+
+  it("setConfig()で空白のみtagNames.aiを拒否する", () => {
+    expect(() => setConfig({ tagNames: { ai: "   " } })).toThrow(/tagNames\.ai must be a non-empty string/);
+  });
+
+  it("setConfig()で非文字列tagNames.aiMessageを拒否する", () => {
+    expect(() => setConfig({ tagNames: { aiMessage: 42 as any } })).toThrow(/tagNames\.aiMessage must be a non-empty string/);
+  });
+
+  it("setConfig()でハイフン無しtagNames.aiを拒否する", () => {
+    expect(() => setConfig({ tagNames: { ai: "invalidtag" } })).toThrow(/tagNames\.ai must be a valid custom element name/);
+  });
+
+  it("setConfig()で大文字tagNames.aiMessageを拒否する", () => {
+    expect(() => setConfig({ tagNames: { aiMessage: "Hawc-Msg" } })).toThrow(/tagNames\.aiMessage must be a valid custom element name/);
+  });
+
+  it("setConfig()でremoteSettingTypeのenv/config以外を拒否する", () => {
+    expect(() => setConfig({ remote: { remoteSettingType: "bogus" as any } }))
+      .toThrow(/remote\.remoteSettingType must be "env" or "config"/);
+  });
+
+  it("setConfig()で明示的undefinedのtagNames.aiを拒否する", () => {
+    // `Object.assign` would otherwise overwrite the default "hawc-ai" with
+    // undefined, and registerComponents() would reach
+    // customElements.define(undefined, Ai).
+    expect(() => setConfig({ tagNames: { ai: undefined } as any }))
+      .toThrow(/tagNames\.ai must be a non-empty string/);
+    // 既定値が破壊されていないことを確認。
+    expect(config.tagNames.ai).toBe("hawc-ai");
+  });
+
+  it("setConfig()で明示的undefinedのtagNames.aiMessageを拒否する", () => {
+    expect(() => setConfig({ tagNames: { aiMessage: undefined } as any }))
+      .toThrow(/tagNames\.aiMessage must be a non-empty string/);
+    expect(config.tagNames.aiMessage).toBe("hawc-ai-message");
+  });
+
+  it("setConfig()で明示的undefinedのtriggerAttributeを拒否する", () => {
+    expect(() => setConfig({ triggerAttribute: undefined } as any))
+      .toThrow(/triggerAttribute must be a non-empty string/);
+    expect(config.triggerAttribute).toBe("data-aitarget");
+  });
+
+  it("setConfig()で明示的undefinedのremote.remoteSettingTypeを拒否する", () => {
+    // `Object.assign` would otherwise overwrite the default "config" with
+    // undefined, and resolveRemoteCoreUrl's `=== "env"` branch would never
+    // fire.
+    expect(() => setConfig({ remote: { remoteSettingType: undefined } as any }))
+      .toThrow(/remote\.remoteSettingType must be "env" or "config"/);
+    expect(config.remote.remoteSettingType).toBe("config");
+  });
+
   describe("remote", () => {
     afterEach(() => {
       setConfig({ remote: { enableRemote: false, remoteSettingType: "config", remoteCoreUrl: "" } });
@@ -127,6 +199,35 @@ describe("config", () => {
       expect(getRemoteCoreUrl()).toBe("ws://process.example.com");
       delete (globalThis as any).AI_REMOTE_CORE_URL;
     });
+  });
+});
+
+describe("registerComponents", () => {
+  // ai.test.ts の冒頭で registerComponents() を実行済み。Ai は既に "hawc-ai" に、
+  // AiMessage は既に "hawc-ai-message" に define されている前提で、defineOrVerify
+  // の失敗経路のみを個別タグで検証する。
+
+  afterEach(() => {
+    // 以降のテストが影響を受けないよう tagNames を元に戻す。
+    setConfig({ tagNames: { ai: "hawc-ai", aiMessage: "hawc-ai-message" } });
+  });
+
+  it("同じタグに別クラスが登録済みだとエラーになる", () => {
+    const dupTag = "hawc-ai-r2-duplicate";
+    class DummyForDup extends HTMLElement {}
+    customElements.define(dupTag, DummyForDup);
+
+    setConfig({ tagNames: { ai: dupTag } });
+
+    expect(() => registerComponents()).toThrow(/already registered with a different class/);
+  });
+
+  it("同じクラスが別タグで登録済みだとエラーになる", () => {
+    // Ai は既に "hawc-ai" に登録済み。"hawc-ai-r2-altname" へ再登録させようとすると
+    // getName(Ai) === "hawc-ai" と不一致になり /already registered under/ を投げる。
+    setConfig({ tagNames: { ai: "hawc-ai-r2-altname" } });
+
+    expect(() => registerComponents()).toThrow(/already registered under/);
   });
 });
 
@@ -704,6 +805,29 @@ describe("Ai (hawc-ai)", () => {
       expect(el.trigger).toBe(false);
       expect(fetchSpy).not.toHaveBeenCalled();
     });
+
+    it("trigger=true で send() の同期 rejection を hawc-ai:error に中継する", async () => {
+      // send() が core のエラー経路を経ずに同期 rejection する（provider 属性無効など）
+      // ケースで、trigger setter が rejection を握り潰して error イベントを落とさない
+      // ことを確認。
+      const el = document.createElement("hawc-ai") as Ai;
+      // model を省略 → send() の AiCore.send() 内バリデーションで即座に reject する。
+      el.setAttribute("provider", "openai");
+      document.body.appendChild(el);
+
+      const errors: unknown[] = [];
+      el.addEventListener("hawc-ai:error", (e: Event) => {
+        errors.push((e as CustomEvent).detail);
+      });
+
+      el.prompt = "Hello";
+      el.trigger = true;
+      await new Promise(resolve => setTimeout(resolve, 20));
+
+      expect(el.trigger).toBe(false);
+      expect(errors.length).toBeGreaterThan(0);
+      expect(el.error).not.toBeNull();
+    });
   });
 
   describe("messages", () => {
@@ -892,7 +1016,10 @@ describe("Ai (hawc-ai)", () => {
       await Promise.resolve();
       await Promise.resolve();
 
-      expect(el.error).toBe("bad-provider");
+      // el.error は AiHttpError | Error | null の契約に従って正規化される。
+      // non-Error / non-AiHttpError は Error("bad-provider") でラップされる。
+      expect(el.error).toBeInstanceOf(Error);
+      expect(el.error.message).toBe("bad-provider");
       expect(el._lastProviderError).toBeInstanceOf(Error);
       expect(el._lastProviderError.message).toBe("bad-provider");
     });
@@ -911,7 +1038,8 @@ describe("Ai (hawc-ai)", () => {
 
       el._applyProvider("openai");
 
-      expect(el.error).toBe("bad-provider");
+      expect(el.error).toBeInstanceOf(Error);
+      expect(el.error.message).toBe("bad-provider");
       expect(el._lastProviderError).toBeInstanceOf(Error);
       expect(el._lastProviderError.message).toBe("bad-provider");
     });

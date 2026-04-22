@@ -1,7 +1,8 @@
 import { raiseError } from "../raiseError.js";
+import { warnMalformedToolCall } from "../debug.js";
 import {
   IWcBindable, IAiProvider, AiMessage, AiUsage, AiRequestOptions, AiTool, AiToolCall,
-  AiContentPart, AiFinishReason,
+  AiContentPart, AiFinishReason, AiHttpError,
 } from "../types.js";
 import { assertKnownContentParts } from "../providers/contentHelpers.js";
 import { SseParser } from "../streaming/SseParser.js";
@@ -53,6 +54,36 @@ interface TurnResult {
   finishReason?: AiFinishReason;
 }
 
+/**
+ * Wraps an arbitrary `Error` so that remote serialization via
+ * `JSON.stringify` preserves `name` / `message` / `stack` without mutating
+ * the caller-owned error instance. `instanceof Error` is preserved; the
+ * specific subclass (`TypeError`, `DOMException`, …) is not, but the
+ * original `name` is copied into `this.name` so downstream consumers that
+ * branch on `error.name` (rather than `instanceof`) keep working.
+ */
+class AiSerializableError extends Error {
+  constructor(source: Error) {
+    super(source.message);
+    this.name = source.name;
+    // Copy the source stack verbatim — including an empty string, which some
+    // callers set deliberately to suppress stack output from JSON.stringify.
+    // Leaving our constructor's auto-generated stack in place would leak an
+    // internal AiCore frame and mask the caller's intent.
+    if (typeof source.stack === "string") this.stack = source.stack;
+  }
+  toJSON(): { name: string; message: string; stack?: string } {
+    const payload: { name: string; message: string; stack?: string } = {
+      name: this.name,
+      message: this.message,
+    };
+    if (this.stack) payload.stack = this.stack;
+    return payload;
+  }
+}
+
+type AiCoreError = AiHttpError | Error | null;
+
 // Accumulator for streamed tool call fragments keyed by provider-reported index.
 interface ToolCallAccumulator {
   id: string | undefined;
@@ -94,7 +125,7 @@ export class AiCore extends EventTarget {
   private _usage: AiUsage | null = null;
   private _loading: boolean = false;
   private _streaming: boolean = false;
-  private _error: any = null;
+  private _error: AiCoreError = null;
   private _provider: IAiProvider | null = null;
   private _abortController: AbortController | null = null;
   private _flushScheduled: boolean = false;
@@ -114,7 +145,7 @@ export class AiCore extends EventTarget {
   get usage(): AiUsage | null { return this._usage; }
   get loading(): boolean { return this._loading; }
   get streaming(): boolean { return this._streaming; }
-  get error(): any { return this._error; }
+  get error(): AiCoreError { return this._error; }
 
   get messages(): AiMessage[] {
     return this._messages.map(cloneMessage);
@@ -199,15 +230,26 @@ export class AiCore extends EventTarget {
     }));
   }
 
-  private _setError(error: any): void {
-    if (error instanceof Error && typeof (error as any).toJSON !== "function") {
-      (error as any).toJSON = () => ({
-        name: error.name,
-        message: error.message,
-        ...(error.stack ? { stack: error.stack } : {}),
-      });
+  private _setError(error: unknown): void {
+    // Wrap Error instances rather than mutating them so the caller's Error
+    // keeps its original shape when the same instance is referenced or
+    // JSON.stringified elsewhere. HTTP error shapes (plain objects produced
+    // internally by _fetchTurn) are stored as-is.
+    let stored: AiCoreError;
+    if (error === null || error === undefined) {
+      stored = null;
+    } else if (error instanceof AiSerializableError) {
+      stored = error;
+    } else if (error instanceof Error) {
+      stored = new AiSerializableError(error);
+    } else if (typeof error === "object" && error !== null && "status" in error) {
+      stored = error as AiHttpError;
+    } else {
+      // Non-Error, non-AiHttpError values are wrapped into an Error so the
+      // public `error: AiHttpError | Error | null` contract holds.
+      stored = new AiSerializableError(new Error(String(error)));
     }
-    this._error = error;
+    this._error = stored;
     this._target.dispatchEvent(new CustomEvent("hawc-ai:error", {
       detail: this._error,
       bubbles: true,
@@ -562,18 +604,6 @@ export class AiCore extends EventTarget {
     };
   }
 
-  /**
-   * Remove a message by reference. No-op if the message is not in the history.
-   * Kept as a utility so callers (and tests) can drop a known message without
-   * racing against concurrent mutations.
-   */
-  private _removeMessage(message: AiMessage): void {
-    const idx = this._messages.indexOf(message);
-    if (idx === -1) return;
-    this._messages.splice(idx, 1);
-    this._emitMessages();
-  }
-
   private async _processStream(body: ReadableStream<Uint8Array>, abortController: AbortController): Promise<TurnResult | null> {
     const reader = body.getReader();
     const decoder = new TextDecoder();
@@ -738,7 +768,10 @@ export class AiCore extends EventTarget {
       const entry = acc.get(i)!;
       if (!entry.id || !entry.name) {
         // An accumulator missing id or name is a provider bug or a truncated
-        // stream — skip rather than surface a malformed tool call.
+        // stream — skip rather than surface a malformed tool call, but warn
+        // in development so the drop does not silently turn a tool-use turn
+        // into a terminal assistant turn.
+        warnMalformedToolCall(i, entry);
         continue;
       }
       result.push({ id: entry.id, name: entry.name, arguments: entry.arguments });

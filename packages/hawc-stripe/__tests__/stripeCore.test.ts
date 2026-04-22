@@ -218,6 +218,69 @@ describe("StripeCore", () => {
       expect(r2.intentId).toBe("pi_new");
       expect(provider.cancelCalls).toContain("pi_orphan");
     });
+
+    describe("hint shape validation (regression)", () => {
+      // Hints reach the IntentBuilder from a RemoteCoreProxy verbatim, so
+      // the Core shape-validates them up-front. Invalid shapes must be
+      // rejected before the builder is invoked so builders need not
+      // defensively coerce every field.
+      beforeEach(() => {
+        core.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      });
+
+      it("rejects a non-object hint", async () => {
+        await expect(core.requestIntent({ mode: "payment", hint: "not-an-object" as any }))
+          .rejects.toThrow(/request\.hint/);
+      });
+
+      it("rejects hint.amountValue as a non-finite number", async () => {
+        await expect(core.requestIntent({
+          mode: "payment",
+          hint: { amountValue: Number.NaN } as any,
+        })).rejects.toThrow(/amountValue/);
+      });
+
+      it("rejects hint.amountValue as a negative number", async () => {
+        await expect(core.requestIntent({
+          mode: "payment",
+          hint: { amountValue: -1 } as any,
+        })).rejects.toThrow(/amountValue/);
+      });
+
+      it("rejects hint.amountValue as a non-number", async () => {
+        await expect(core.requestIntent({
+          mode: "payment",
+          hint: { amountValue: { $gt: 0 } } as any,
+        })).rejects.toThrow(/amountValue/);
+      });
+
+      it("rejects hint.amountCurrency as a non-string", async () => {
+        await expect(core.requestIntent({
+          mode: "payment",
+          hint: { amountCurrency: 123 } as any,
+        })).rejects.toThrow(/amountCurrency/);
+      });
+
+      it("rejects hint.customerId as a non-string", async () => {
+        await expect(core.requestIntent({
+          mode: "payment",
+          hint: { customerId: { $injected: true } } as any,
+        })).rejects.toThrow(/customerId/);
+      });
+
+      it("accepts a well-shaped hint unchanged", async () => {
+        let seen: unknown = null;
+        core.registerIntentBuilder((req) => {
+          seen = req.hint;
+          return { mode: "payment", amount: 500, currency: "usd" };
+        });
+        await core.requestIntent({
+          mode: "payment",
+          hint: { amountValue: 500, amountCurrency: "usd", customerId: "cus_1" },
+        });
+        expect(seen).toEqual({ amountValue: 500, amountCurrency: "usd", customerId: "cus_1" });
+      });
+    });
   });
 
   describe("reportConfirmation", () => {
@@ -560,6 +623,53 @@ describe("StripeCore", () => {
       // Error must NOT be folded into observable state — a forged payload
       // should not mutate UI state.
       expect(core.error).toBeNull();
+    });
+
+    it("accepts Buffer rawBody (express.raw middleware shape)", async () => {
+      // Express's `express.raw({ type: "application/json" })` hands
+      // `req.body` as a Buffer. Stripe-node's `constructEvent` accepts
+      // Buffer natively; the Core must forward verbatim without forcing
+      // callers to `.toString("utf8")` first.
+      const seen: unknown[] = [];
+      provider.verifyWebhook = (body: any, _h: string, _s: string) => {
+        seen.push(body);
+        return { id: "evt_buf", type: "x.y", data: { object: {} }, created: 1 };
+      };
+      const buf = Buffer.from('{"id":"evt_buf"}', "utf8");
+      await core.handleWebhook(buf, "sig");
+      expect(seen).toEqual([buf]);
+    });
+
+    it("accepts Uint8Array rawBody", async () => {
+      const seen: unknown[] = [];
+      provider.verifyWebhook = (body: any) => {
+        seen.push(body);
+        return { id: "evt_u8", type: "x.y", data: { object: {} }, created: 1 };
+      };
+      const u8 = new TextEncoder().encode('{"id":"evt_u8"}');
+      await core.handleWebhook(u8, "sig");
+      expect(seen).toEqual([u8]);
+    });
+
+    it("rejects rawBody that is neither string, Buffer, nor Uint8Array", async () => {
+      await expect(core.handleWebhook({ body: "{}" } as unknown as string, "sig"))
+        .rejects.toThrow(/rawBody/);
+      await expect(core.handleWebhook(null as unknown as string, "sig"))
+        .rejects.toThrow(/rawBody/);
+    });
+
+    it("rejects signatureHeader that is not a non-empty string (array / undefined)", async () => {
+      // Node's `req.headers` types string headers as
+      // `string | string[] | undefined`. An array shape typically means
+      // the header was delivered multiple times; treating the first
+      // element as canonical would be a forgery-friendly default, so
+      // the Core rejects loudly instead.
+      await expect(core.handleWebhook("{}", ["sig1", "sig2"] as unknown as string))
+        .rejects.toThrow(/signatureHeader/);
+      await expect(core.handleWebhook("{}", undefined as unknown as string))
+        .rejects.toThrow(/signatureHeader/);
+      await expect(core.handleWebhook("{}", ""))
+        .rejects.toThrow(/signatureHeader/);
     });
 
     it("folds payment_intent.succeeded into status when id matches", async () => {
@@ -1845,6 +1955,28 @@ describe("StripeCore", () => {
       c.registerIntentBuilder(() => { throw "plain string rejection"; });
       await expect(c.requestIntent({ mode: "payment", hint: {} })).rejects.toBeDefined();
       expect(c.error?.message).toBe("Payment failed.");
+    });
+
+    it("truncates pathologically large Stripe-shaped messages to a bounded length (regression)", async () => {
+      // A giant message on a Stripe-shaped error would otherwise flood
+      // logs / DOM / wire frames. The sanitizer caps `message` at a
+      // fixed upper bound and appends an ellipsis so operators notice
+      // truncation.
+      const c = new StripeCore(provider);
+      c.registerIntentBuilder(() => ({ mode: "payment", amount: 1000, currency: "usd" }));
+      const huge = "A".repeat(10_000);
+      provider.paymentError = Object.assign(new Error(huge), {
+        type: "StripeCardError",
+        code: "card_declined",
+      });
+      await expect(c.requestIntent({ mode: "payment", hint: {} })).rejects.toThrow();
+      // Bounded under 1 KiB and carries a truncation marker.
+      expect(c.error?.message).toBeDefined();
+      expect(c.error!.message.length).toBeLessThanOrEqual(512);
+      expect(c.error!.message.endsWith("…")).toBe(true);
+      // code / type must still pass through.
+      expect(c.error?.code).toBe("card_declined");
+      expect(c.error?.type).toBe("StripeCardError");
     });
   });
 

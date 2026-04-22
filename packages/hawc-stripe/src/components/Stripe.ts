@@ -94,12 +94,19 @@ const HTMLElementCtor: typeof HTMLElement =
  */
 export class Stripe extends HTMLElementCtor {
   /**
-   * Shared Stripe.js loader. Swapped in tests via `Stripe.setLoader(mock)`.
-   * Default path lazy-imports `@stripe/stripe-js` so the peer dep only
-   * resolves at first use — apps that never hit the browser Shell (server-
-   * only consumers) never need it installed.
+   * Upper bound on the sanitized `message` length that reaches the DOM.
+   * Mirrors `StripeCore._MAX_ERROR_MESSAGE_LENGTH` so a
+   * Stripe.js-originated error and a Core-sanitized error cannot diverge
+   * in permitted size on the Shell surface.
    */
-  private static _loader: StripeJsLoader = async (key: string) => {
+  private static readonly _MAX_ERROR_MESSAGE_LENGTH: number = 512;
+
+  /**
+   * Default Stripe.js loader. Captured as a frozen reference so
+   * `resetLoader()` can restore it after a `setLoader()` override without
+   * the caller having to cache the original themselves.
+   */
+  private static readonly _DEFAULT_LOADER: StripeJsLoader = async (key: string) => {
     // @ts-ignore — @stripe/stripe-js is an optional peer dep.
     const mod = await import("@stripe/stripe-js");
     const loadStripe = (mod as { loadStripe?: (k: string) => Promise<unknown> }).loadStripe;
@@ -114,12 +121,38 @@ export class Stripe extends HTMLElementCtor {
   };
 
   /**
+   * Shared Stripe.js loader. Swapped in tests via `Stripe.setLoader(mock)`.
+   * Default path lazy-imports `@stripe/stripe-js` so the peer dep only
+   * resolves at first use — apps that never hit the browser Shell (server-
+   * only consumers) never need it installed.
+   */
+  private static _loader: StripeJsLoader = Stripe._DEFAULT_LOADER;
+
+  /**
    * Override the Stripe.js loader. Primary use: tests inject a mock that
    * never actually hits Stripe. Also a fallback for apps bundling their own
    * `@stripe/stripe-js` under an alias.
+   *
+   * Global static state: the override applies to EVERY `<hawc-stripe>`
+   * element in the same module realm. Test suites that run side-by-side
+   * (vitest file-isolation boundaries, parallel describe blocks) MUST
+   * call `resetLoader()` in `afterEach` / teardown to prevent cross-test
+   * leakage — a mock installed by test A can otherwise be observed by
+   * test B's `<hawc-stripe>` if B forgot to override.
    */
   static setLoader(loader: StripeJsLoader): void {
     Stripe._loader = loader;
+  }
+
+  /**
+   * Restore the default Stripe.js loader. Intended for test teardown;
+   * apps in production rarely need to call this. Complements `setLoader`.
+   *
+   * Returning to the default is idempotent — calling `resetLoader()`
+   * twice is a no-op.
+   */
+  static resetLoader(): void {
+    Stripe._loader = Stripe._DEFAULT_LOADER;
   }
 
   static wcBindable: IWcBindable = {
@@ -542,17 +575,41 @@ export class Stripe extends HTMLElementCtor {
     }
     if (e && typeof e === "object") {
       const rec = e as Record<string, unknown>;
+      // Dual-name check is intentional: rejections reaching this path can
+      // come from two sources with different casing conventions.
+      //   1. Wire-originated (RemoteCoreProxy): the Core emits `StripeError`
+      //      with camelCase `declineCode` (already sanitized from
+      //      `decline_code`). Prefer that shape first.
+      //   2. Stripe.js-originated (rare — most Stripe.js errors flow through
+      //      `_sanitizeStripeJsError` at the confirm path, not here):
+      //      Stripe.js uses snake_case `decline_code`. Fall back to that
+      //      when the camelCase slot is empty.
+      // `_sanitizeStripeJsError` only checks `decline_code` because its
+      // input is known to be a Stripe.js shape; this function handles the
+      // union of both origins and therefore must check both names.
       const declineCode = typeof rec.declineCode === "string"
         ? rec.declineCode
         : (typeof rec.decline_code === "string" ? rec.decline_code : undefined);
+      const rawMessage = typeof rec.message === "string" ? rec.message : "Unknown error.";
       this._setErrorState({
         code: typeof rec.code === "string" ? rec.code : undefined,
         declineCode,
         type: typeof rec.type === "string" ? rec.type : undefined,
-        message: typeof rec.message === "string" ? rec.message : "Unknown error.",
+        // Length-cap the message here too so a proxy-serialized error that
+        // bypasses `_sanitizeStripeJsError` / Core's `_sanitizeError` still
+        // hits the DOM under the same bound. Mirrors the policy in both
+        // the Shell and Core sanitizers.
+        message: rawMessage.length > Stripe._MAX_ERROR_MESSAGE_LENGTH
+          ? rawMessage.slice(0, Stripe._MAX_ERROR_MESSAGE_LENGTH - 1) + "…"
+          : rawMessage,
       });
     } else {
-      this._setErrorState({ message: String(e) });
+      const raw = String(e);
+      this._setErrorState({
+        message: raw.length > Stripe._MAX_ERROR_MESSAGE_LENGTH
+          ? raw.slice(0, Stripe._MAX_ERROR_MESSAGE_LENGTH - 1) + "…"
+          : raw,
+      });
     }
   }
 
@@ -1369,15 +1426,25 @@ export class Stripe extends HTMLElementCtor {
    * confirm/retrieve flows in the browser. We therefore trust Stripe.js's own
    * client-side sanitization contract for `message` and keep it when present.
    *
+   * `message` is still length-capped — Stripe.js errors are empirically short,
+   * but a bundler's global error handler / extension proxy could theoretically
+   * splice large strings into the object before we reach it. The cap matches
+   * Core's `_sanitizeError` bound so DOM sinks see a consistent upper bound
+   * regardless of which side produced the error.
+   *
    * If this function is ever reused for non-Stripe.js inputs, DO NOT keep this
    * policy: align with Core's stricter allowlist-gated message forwarding.
    */
   private _sanitizeStripeJsError(err: Record<string, unknown>): StripeError {
+    const rawMessage = typeof err.message === "string" ? err.message : "Payment failed.";
+    const message = rawMessage.length > Stripe._MAX_ERROR_MESSAGE_LENGTH
+      ? rawMessage.slice(0, Stripe._MAX_ERROR_MESSAGE_LENGTH - 1) + "…"
+      : rawMessage;
     return {
       code: typeof err.code === "string" ? err.code : undefined,
       declineCode: typeof err.decline_code === "string" ? err.decline_code : undefined,
       type: typeof err.type === "string" ? err.type : undefined,
-      message: typeof err.message === "string" ? err.message : "Payment failed.",
+      message,
     };
   }
 

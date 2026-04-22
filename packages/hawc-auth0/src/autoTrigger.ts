@@ -26,15 +26,31 @@ function handleClick(event: Event): void {
   if (!authElement || authElement.tagName.toLowerCase() !== config.tagNames.auth) return;
 
   event.preventDefault();
+  // Duck-check before invocation. The tag-name match above only
+  // proves the element's tagName is registered — not that the
+  // upgrade has installed the prototype methods yet. On the very
+  // first click after navigation (custom element definition loaded
+  // via `defer` after parse), `login` can still be undefined, and
+  // calling it would throw `TypeError: authElement.login is not a
+  // function` into the click handler's call stack.
+  const loginFn = (authElement as unknown as { login?: unknown }).login;
+  if (typeof loginFn !== "function") return;
   // `login()` is async and can reject (e.g. click fires before the
   // element's `domain` / `client-id` attributes are set, or during
-  // an init failure). Swallow the rejection here so we don't leak
-  // an unhandled-rejection into the host page's global handler —
-  // the failure is still observable via `authEl.error` /
-  // `hawc-auth0:error`, matching the trigger setter's contract.
-  const result = (authElement as any).login();
-  if (result && typeof result.then === "function") {
-    result.catch(() => {
+  // an init failure). Treat the returned value as a potential
+  // Thenable rather than assuming a Promise: custom implementations
+  // could return a non-Promise Thenable, and the same `.catch`
+  // pattern handles both without a second await. Swallow the
+  // rejection here so we don't leak an unhandled-rejection into the
+  // host page's global handler — the failure is still observable
+  // via `authEl.error` / `hawc-auth0:error`, matching the trigger
+  // setter's contract. Normalising through `Promise.resolve(...)`
+  // would work too, but the explicit Thenable check keeps the
+  // rejection origin attached to whatever the method actually
+  // returned (easier to attribute in dev tools).
+  const result = (loginFn as (...a: unknown[]) => unknown).call(authElement);
+  if (result && typeof (result as { then?: unknown }).then === "function") {
+    (result as Promise<unknown>).catch(() => {
       /* error surfaces via authEl.error (AuthShell state) */
     });
   }

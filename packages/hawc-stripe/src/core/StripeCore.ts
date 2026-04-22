@@ -91,6 +91,15 @@ export class StripeCore extends EventTarget {
     "authentication_error",
     "api_connection_error",
   ]);
+  /**
+   * Upper bound on the sanitized `message` length that crosses the wire /
+   * reaches the DOM. A pathological server-side throw (`new Error(bigString)`)
+   * would otherwise flood logs, the WebSocket frame, and UI renderers.
+   * 512 is comfortably above Stripe's own user-facing error messages
+   * (observed < 200 chars) and a multi-sentence hand-written diagnostic
+   * from this package's own internal errors.
+   */
+  private static readonly _MAX_ERROR_MESSAGE_LENGTH: number = 512;
   // Re-exposed from `./wcBindable.ts` so existing `StripeCore.wcBindable`
   // references keep compiling; the Shell's module graph imports from the
   // dedicated wcBindable module directly to avoid dragging `node:crypto`
@@ -135,8 +144,28 @@ export class StripeCore extends EventTarget {
    */
   private static readonly _DEFAULT_WEBHOOK_DEDUP_CAPACITY: number = 1024;
   private static readonly _MAX_WEBHOOK_DEDUP_CAPACITY: number = 1_000_000;
-  private _seenWebhookIds: Set<string> = new Set();
-  private _seenWebhookOrder: string[] = [];
+  /**
+   * Backing store for the dedup window.
+   *
+   * `Map` is used instead of a `Set` + `Array` pair because:
+   * - insertion order is preserved (ES2015 spec), so the "oldest" id is
+   *   the first key returned by `keys().next()`,
+   * - eviction is O(1) (`keys().next().value` + `delete`),
+   * - membership tests stay O(1) via `has`,
+   * - removing a specific id on fatal-handler re-throw is O(1) via
+   *   `delete`, not O(n) as the old `indexOf` + `splice` pair was.
+   *
+   * The old Set+Array pair scaled as O(n) on both eviction (`shift`)
+   * and fatal-throw cleanup (`indexOf` + `splice`), which became a
+   * real cost at `_MAX_WEBHOOK_DEDUP_CAPACITY = 1_000_000`.
+   * The Map shape is drop-in replacement for both lookups and bounded
+   * retention while eliminating the linear scans.
+   *
+   * Value is `true` as a sentinel — we only care about keys. A `Set`
+   * alone would do for membership but would require a second structure
+   * for ordered eviction, reintroducing the O(n) path we are replacing.
+   */
+  private _seenWebhookIds: Map<string, true> = new Map();
 
   /**
    * Tracks the id, mode, and generation of the currently-active intent.
@@ -261,6 +290,14 @@ export class StripeCore extends EventTarget {
    * registration. Unlike registerWebhookHandler (which supports multiple
    * handlers per event type), there is only ever one active builder because
    * amount/currency must have a single source of truth.
+   *
+   * Disposer semantics: the returned function unregisters ONLY the
+   * builder it was paired with. If a later `registerIntentBuilder(next)`
+   * call replaced this one, the old disposer silently becomes a no-op —
+   * it cannot retroactively unregister `next`. This keeps a late-fired
+   * cleanup (React StrictMode double-invoke, effect ordering) from
+   * clobbering the currently-active builder. Symmetric with
+   * `registerResumeAuthorizer`.
    */
   registerIntentBuilder(builder: IntentBuilder): () => void {
     if (this._disposed) raiseError("StripeCore has been disposed.");
@@ -330,6 +367,12 @@ export class StripeCore extends EventTarget {
    * `metadata.userId` must equal the authenticated `ctx.sub`").
    *
    * Calling twice replaces the prior authorizer; returns a disposer.
+   *
+   * Disposer semantics: the returned function unregisters ONLY the
+   * authorizer it was paired with. If a later `registerResumeAuthorizer(
+   * next)` call replaced this one, the old disposer silently becomes a
+   * no-op — it cannot retroactively unregister `next`. Symmetric with
+   * `registerIntentBuilder`.
    */
   registerResumeAuthorizer(authorizer: ResumeAuthorizer): () => void {
     if (this._disposed) raiseError("StripeCore has been disposed.");
@@ -435,6 +478,17 @@ export class StripeCore extends EventTarget {
       if (typeof value !== "string") return undefined;
       return allowedPattern.test(value) ? value : undefined;
     };
+    // Cap message length to prevent pathological throws from flooding the
+    // wire / DOM / log sinks. Truncation preserves the shape (`StripeError`
+    // .message is always a string) while trading prefix visibility for
+    // bounded cost. Ellipsis makes the truncation visible at the UI level
+    // so operators notice an oversized message.
+    const truncateMessage = (msg: string): string => {
+      if (msg.length <= StripeCore._MAX_ERROR_MESSAGE_LENGTH) return msg;
+      // Reserve 1 char for the ellipsis so the final string length equals
+      // `_MAX_ERROR_MESSAGE_LENGTH`.
+      return msg.slice(0, StripeCore._MAX_ERROR_MESSAGE_LENGTH - 1) + "…";
+    };
 
     if (err && typeof err === "object") {
       const e = err as Record<string, unknown>;
@@ -465,7 +519,7 @@ export class StripeCore extends EventTarget {
         declineCode: sanitizeToken(e.decline_code, StripeCore._STRIPE_ERROR_CODE_RE)
           ?? sanitizeToken(e.declineCode, StripeCore._STRIPE_ERROR_CODE_RE),
         type,
-        message: safeMessage,
+        message: truncateMessage(safeMessage),
       };
     }
     return { message: "Payment failed." };
@@ -494,6 +548,46 @@ export class StripeCore extends EventTarget {
     const mode = request.mode ?? this._mode;
     if (mode !== "payment" && mode !== "setup") {
       raiseError(`mode must be "payment" or "setup", got ${JSON.stringify(mode)}.`);
+    }
+    // Shape-validate the hint BEFORE forwarding to the IntentBuilder.
+    // Hints arrive from RemoteCoreProxy verbatim (the browser Shell is
+    // tamperable), and while the IntentBuilder is the source of truth for
+    // amount / currency / customer, the builder's own code may downstream-
+    // cast fields (`hint.amountValue > threshold`, `cart.lookup(hint.
+    // customerId)`) without guarding shape. A malformed value like
+    // `amountValue: { $gt: 0 }` would coerce or explode in surprising
+    // ways; rejecting obviously-invalid shapes here keeps the builder
+    // contract clean. Unknown / wrong-type fields are dropped to
+    // undefined so the builder sees a normalized `IntentRequestHint`.
+    //
+    // Note: these shape checks run BEFORE any observable-state transition
+    // (no `_setStatus("processing")` / `_setLoading(true)` has fired yet),
+    // so we don't need to mirror the rollback pattern used by the
+    // `intent_builder_not_registered` branch below. `raiseError` simply
+    // throws and the caller observes state unchanged from its pre-call
+    // value. If a future refactor moves a state transition above this
+    // block, add `_setError` / `_setStatus("idle")` / `_setLoading(false)`
+    // before each `raiseError` here to preserve the
+    // "every error path lands on idle / loading=false" invariant.
+    if (request.hint !== undefined && (typeof request.hint !== "object" || request.hint === null)) {
+      raiseError(`request.hint must be an object or undefined, got ${JSON.stringify(request.hint)}.`);
+    }
+    const rawHint = request.hint as Record<string, unknown> | undefined;
+    if (rawHint !== undefined) {
+      if (rawHint.amountValue !== undefined) {
+        if (typeof rawHint.amountValue !== "number"
+          || !Number.isFinite(rawHint.amountValue)
+          || rawHint.amountValue < 0
+        ) {
+          raiseError(`request.hint.amountValue must be a non-negative finite number, got ${JSON.stringify(rawHint.amountValue)}.`);
+        }
+      }
+      if (rawHint.amountCurrency !== undefined && typeof rawHint.amountCurrency !== "string") {
+        raiseError(`request.hint.amountCurrency must be a string, got ${JSON.stringify(rawHint.amountCurrency)}.`);
+      }
+      if (rawHint.customerId !== undefined && typeof rawHint.customerId !== "string") {
+        raiseError(`request.hint.customerId must be a string, got ${JSON.stringify(rawHint.customerId)}.`);
+      }
     }
     if (!this._intentBuilder) {
       const err: StripeError = {
@@ -1092,7 +1186,6 @@ export class StripeCore extends EventTarget {
     this._resumeAuthorizer = null;
     this._webhookHandlers.clear();
     this._seenWebhookIds.clear();
-    this._seenWebhookOrder = [];
     // Drop secrets and the provider reference. The `_disposed` flag checked
     // at the top of every public command ensures none of these fields are
     // dereferenced after this point; the null assertion on `_provider` is
@@ -1113,18 +1206,53 @@ export class StripeCore extends EventTarget {
    * / `setup_intent.*` events back into observable state so subscribed Shells
    * see the terminal status without a round-trip through the client.
    *
-   * `rawBody` must be the exact bytes Stripe POSTed 窶・pass the string before
-   * any JSON parse / re-serialize, because signature verification includes
-   * a HMAC over the raw payload. SPEC ﾂｧ9.3 ("Webhook endpoint 縺ｮ raw body
-   * 菫晏・").
+   * `rawBody` must be the exact bytes Stripe POSTed — pass the string (or
+   * Buffer/Uint8Array) BEFORE any JSON parse / re-serialize, because signature
+   * verification includes a HMAC over the raw payload. Express's
+   * `express.raw({ type: "application/json" })` yields a `Buffer`; Fastify's
+   * raw body capture typically yields a `Buffer` or string; both shapes are
+   * accepted here and forwarded verbatim to the provider. SPEC §9.3 / §6.2
+   * ("Webhook endpoint の raw body 保全").
+   *
+   * `signatureHeader` is the value of the `stripe-signature` HTTP header.
+   * Node's raw `req.headers` types the field as `string | string[] |
+   * undefined`; for Stripe this is always a single value, but framework
+   * surfaces sometimes normalize to an array. Pass `req.headers["stripe-
+   * signature"]` directly — we reject the array shape loudly rather than
+   * guess which element is canonical.
+   *
+   * Concurrency: `handleWebhook` is NOT a per-intent mutex. Interleaved
+   * invocations on the same process (Fastify's parallel listeners,
+   * µWebSockets, parallel dispatch from a pre-queue, etc.) can cause fold
+   * state races — SPEC §6.2 recommends serializing webhooks per intent-id
+   * on the HTTP route side. Single-process Express / Node-default path is
+   * already sequential and does not need this.
    */
-  async handleWebhook(rawBody: string, signatureHeader: string): Promise<void> {
+  async handleWebhook(rawBody: string | Buffer | Uint8Array, signatureHeader: string): Promise<void> {
     if (this._disposed) raiseError("StripeCore has been disposed.");
     if (!this._webhookSecret) {
       raiseError("handleWebhook called but StripeCore was constructed without webhookSecret.");
     }
-    if (typeof rawBody !== "string") raiseError("rawBody must be a string.");
-    if (!signatureHeader) raiseError("signatureHeader is required.");
+    // Accept the shapes `express.raw()` and similar middleware produce.
+    // Reject everything else explicitly so a caller passing `req` or a
+    // parsed JSON object sees a clear error instead of a signature-
+    // verification failure that looks like Stripe rejected it.
+    const isBuffer = typeof Buffer !== "undefined" && Buffer.isBuffer(rawBody);
+    if (
+      typeof rawBody !== "string"
+      && !isBuffer
+      && !(rawBody instanceof Uint8Array)
+    ) {
+      raiseError("rawBody must be a string, Buffer, or Uint8Array.");
+    }
+    // `stripe-signature` is always a single value in practice, but Node's
+    // `req.headers` typing admits `string[]` for repeated headers. A forged
+    // / misrouted request could also deliver an array; treat that as
+    // invalid rather than silently pick index 0, which would be a forgery-
+    // friendly default.
+    if (typeof signatureHeader !== "string" || !signatureHeader) {
+      raiseError("signatureHeader must be a non-empty string.");
+    }
 
     let event: StripeEvent;
     try {
@@ -1152,11 +1280,14 @@ export class StripeCore extends EventTarget {
       return;
     }
     if (event.id) {
-      this._seenWebhookIds.add(event.id);
-      this._seenWebhookOrder.push(event.id);
-      if (this._seenWebhookOrder.length > this._webhookDedupCapacity) {
-        const oldest = this._seenWebhookOrder.shift();
-        if (oldest) this._seenWebhookIds.delete(oldest);
+      this._seenWebhookIds.set(event.id, true);
+      // Eviction: Map preserves insertion order, so `keys().next().value`
+      // is the oldest id. `delete` is O(1). The old Set+Array pair used
+      // `shift()` on the Array which is O(n); this branch stays O(1)
+      // even at `_MAX_WEBHOOK_DEDUP_CAPACITY = 1_000_000`.
+      if (this._seenWebhookIds.size > this._webhookDedupCapacity) {
+        const oldest = this._seenWebhookIds.keys().next().value;
+        if (oldest !== undefined) this._seenWebhookIds.delete(oldest);
       }
     }
 
@@ -1185,11 +1316,9 @@ export class StripeCore extends EventTarget {
         if (entry.fatal) {
           // Fatal errors opt back into Stripe retry semantics by removing
           // this event id from the in-memory dedup window before rethrow.
-          if (event.id) {
-            this._seenWebhookIds.delete(event.id);
-            const idx = this._seenWebhookOrder.indexOf(event.id);
-            if (idx >= 0) this._seenWebhookOrder.splice(idx, 1);
-          }
+          // `Map.delete` is O(1); the old `Array.indexOf` + `splice` pair
+          // was O(n) against the dedup capacity.
+          if (event.id) this._seenWebhookIds.delete(event.id);
           throw e;
         }
         this._target.dispatchEvent(new CustomEvent("hawc-stripe:webhook-warning", {
@@ -1205,7 +1334,10 @@ export class StripeCore extends EventTarget {
     if (!active) return;
     const obj = event.data?.object as Record<string, unknown> | undefined;
     if (!obj) return;
-    const objId = obj && typeof obj.id === "string" ? obj.id : undefined;
+    // `obj` is already non-null (guarded above) so only the string-check
+    // on `obj.id` is needed. The previous `obj && typeof obj.id === ...`
+    // shape re-checked `obj` unnecessarily.
+    const objId = typeof obj.id === "string" ? obj.id : undefined;
     if (!objId || objId !== active.id) return;
     // Cross-mode defense. Stripe uses type-prefixed ids (`pi_` / `seti_`)
     // so accidental id collision between a SetupIntent event and the
