@@ -13,6 +13,7 @@ export { Stripe as WcsStripe } from "./components/Stripe.js";
 export type { StripeJsLike, StripeElementsLike, StripePaymentElementLike, StripeJsLoader } from "./components/Stripe.js";
 
 export type {
+  IConfig, ITagNames, IRemoteConfig,
   IWritableConfig, IWritableTagNames, IWritableRemoteConfig,
   IStripeProvider, StripeMode, StripeStatus, StripeAmount, StripePaymentMethod, StripeError,
   StripeEvent, StripeIntentView, IntentRequestHint, IntentRequest, IntentBuilder,

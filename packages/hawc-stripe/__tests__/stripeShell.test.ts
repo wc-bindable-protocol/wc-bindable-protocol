@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { Stripe as WcsStripe } from "../src/components/Stripe";
 import { StripeCore } from "../src/core/StripeCore";
+import { setConfig, config as stripeConfig } from "../src/config";
 import type {
   StripeJsLike, StripeElementsLike, StripePaymentElementLike,
 } from "../src/components/Stripe";
@@ -1963,6 +1964,174 @@ describe("<hawc-stripe> Shell", () => {
       expect(warnings).toHaveLength(1);
       expect((warnings[0].detail as any).message).toContain("Failed to apply appearance");
       expect((warnings[0].detail as any).error).toBeInstanceOf(Error);
+    });
+  });
+
+  describe("setLoader / resetLoader", () => {
+    // resetLoader is the dispose-counterpart to setLoader — restores the
+    // default Stripe.js loader so a test-mounted mock does not leak into
+    // subsequent tests that forgot to overwrite it.
+    it("resetLoader swaps the active loader back to the default (mock spy stops firing)", async () => {
+      let mockLoaderCalls = 0;
+      WcsStripe.setLoader(async () => {
+        mockLoaderCalls++;
+        return fakes.stripeJs;
+      });
+
+      el = createEl({ mode: "payment", "publishable-key": "pk_test_reset" });
+      el.attachLocalCore(core);
+      await el.prepare();
+      expect(mockLoaderCalls).toBe(1);
+
+      WcsStripe.resetLoader();
+      // After reset, the mock spy is no longer reachable — the private
+      // `_loader` slot now holds the default reference. We verify this by
+      // checking the private slot directly (the default path would try
+      // to `import("@stripe/stripe-js")`, which is not installed in this
+      // test env, so exercising it end-to-end would produce an unrelated
+      // reject). Slot identity comparison is the narrow assertion the
+      // dispose API actually promises.
+      const defaultLoader = (WcsStripe as unknown as { _DEFAULT_LOADER: unknown })._DEFAULT_LOADER;
+      const activeLoader = (WcsStripe as unknown as { _loader: unknown })._loader;
+      expect(activeLoader).toBe(defaultLoader);
+
+      // Reinstate the fake loader for the rest of the describe block.
+      WcsStripe.setLoader(async () => fakes.stripeJs);
+    });
+
+    it("resetLoader is idempotent", () => {
+      expect(() => {
+        WcsStripe.resetLoader();
+        WcsStripe.resetLoader();
+      }).not.toThrow();
+      // Reinstate the fake loader for other tests.
+      WcsStripe.setLoader(async () => fakes.stripeJs);
+    });
+  });
+
+  describe("connectedCallback remote bootstrap failure paths", () => {
+    // These tests exercise the `_initRemote` error paths reached through
+    // connectedCallback's try/catch: empty remote URL under env mode, and
+    // `new WebSocket(url)` throwing on an unparseable URL. Both paths must
+    // end with a visible error state and no live `_proxy` / `_ws` — a
+    // silent no-op would leave the element looking "ready but idle" even
+    // though remote is fundamentally unavailable.
+
+    // Shared state for restoring module-global config between tests.
+    let configSnapshot: {
+      enableRemote: boolean;
+      remoteSettingType: "env" | "config";
+      remoteCoreUrl: string;
+    };
+    const g = globalThis as unknown as {
+      process?: { env?: Record<string, string | undefined> };
+      STRIPE_REMOTE_CORE_URL?: string;
+    };
+    let savedEnv: string | undefined;
+    let hadGlobalUrl = false;
+    let savedGlobalUrl: string | undefined;
+
+    beforeEach(() => {
+      configSnapshot = {
+        enableRemote: stripeConfig.remote.enableRemote,
+        remoteSettingType: stripeConfig.remote.remoteSettingType,
+        remoteCoreUrl: stripeConfig.remote.remoteCoreUrl,
+      };
+      savedEnv = g.process?.env?.STRIPE_REMOTE_CORE_URL;
+      hadGlobalUrl = "STRIPE_REMOTE_CORE_URL" in g;
+      savedGlobalUrl = g.STRIPE_REMOTE_CORE_URL;
+    });
+
+    afterEach(() => {
+      setConfig({
+        remote: {
+          enableRemote: configSnapshot.enableRemote,
+          remoteSettingType: configSnapshot.remoteSettingType,
+          remoteCoreUrl: configSnapshot.remoteCoreUrl,
+        },
+      });
+      if (g.process?.env) {
+        if (savedEnv === undefined) delete g.process.env.STRIPE_REMOTE_CORE_URL;
+        else g.process.env.STRIPE_REMOTE_CORE_URL = savedEnv;
+      }
+      if (hadGlobalUrl) g.STRIPE_REMOTE_CORE_URL = savedGlobalUrl;
+      else delete g.STRIPE_REMOTE_CORE_URL;
+    });
+
+    it("enableRemote=true with env mode + empty URL surfaces a local error and does NOT create a WebSocket", () => {
+      // Env mode: the URL is resolved at runtime from process.env /
+      // globalThis. Neither source set → `getRemoteCoreUrl()` returns "".
+      // `_initRemote` must raise before `new WebSocket("")`, and
+      // connectedCallback's try/catch must route the throw into local
+      // error state rather than letting it escape.
+      setConfig({
+        remote: {
+          enableRemote: true,
+          remoteSettingType: "env",
+          // remoteCoreUrl is ignored in env mode, but we need a value
+          // to pass setConfig's "enableRemote without URL" cross-check.
+          remoteCoreUrl: "wss://ignored-by-env-mode/",
+        },
+      });
+      if (g.process?.env) delete g.process.env.STRIPE_REMOTE_CORE_URL;
+      delete g.STRIPE_REMOTE_CORE_URL;
+
+      const originalWS = globalThis.WebSocket;
+      let wsCtorCalls = 0;
+      try {
+        globalThis.WebSocket = class extends originalWS {
+          constructor(url: string) {
+            wsCtorCalls++;
+            super(url);
+          }
+        } as unknown as typeof WebSocket;
+
+        el = createEl({ mode: "payment", "publishable-key": "pk_test_remote" });
+        // connectedCallback fired at appendChild; the throw from
+        // _initRemote must have been caught and stashed onto the
+        // element's local error state.
+        expect(el.error?.message).toMatch(/remoteCoreUrl/);
+        expect((el as unknown as { _isRemote: boolean })._isRemote).toBe(false);
+        expect((el as unknown as { _ws: unknown })._ws).toBeNull();
+        expect(wsCtorCalls).toBe(0);
+      } finally {
+        globalThis.WebSocket = originalWS;
+      }
+    });
+
+    it("WebSocket constructor throwing on URL parse surfaces a local error", () => {
+      // `new WebSocket("not://a valid url")` throws synchronously in
+      // browsers (SyntaxError: invalid URL). We simulate that here to
+      // avoid relying on happy-dom's exact URL-validation behavior.
+      setConfig({
+        remote: {
+          enableRemote: true,
+          remoteSettingType: "config",
+          remoteCoreUrl: "ws://broken-but-stored/",
+        },
+      });
+
+      const originalWS = globalThis.WebSocket;
+      try {
+        globalThis.WebSocket = class {
+          constructor() {
+            // Mirror the DOMException shape real browsers emit on a
+            // malformed WebSocket URL so the catch path sees a realistic
+            // message for its diagnostic.
+            throw new Error("SyntaxError: Invalid URL");
+          }
+        } as unknown as typeof WebSocket;
+
+        el = createEl({ mode: "payment", "publishable-key": "pk_test_remote" });
+        // The throw from `new WebSocket(...)` inside _initRemote must
+        // have been caught by connectedCallback and routed to local error.
+        // Element must NOT hold a half-initialized _ws/_proxy pair.
+        expect(el.error?.message).toMatch(/Invalid URL/);
+        expect((el as unknown as { _isRemote: boolean })._isRemote).toBe(false);
+        expect((el as unknown as { _ws: unknown })._ws).toBeNull();
+      } finally {
+        globalThis.WebSocket = originalWS;
+      }
     });
   });
 });

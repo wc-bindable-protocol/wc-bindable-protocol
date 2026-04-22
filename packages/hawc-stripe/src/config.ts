@@ -77,11 +77,11 @@ let frozenConfig: IConfig | null = null;
  * through `getConfig()` (which returns a deep-frozen clone); this export is
  * retained as a convenience for reads only.
  *
- * TODO(v2): consolidate on `getConfig()` and drop this export. The only
- * remaining consumer is the `__tests__/config.test.ts` readback assertions,
- * which keep the private module state reachable through a public-looking
- * binding. Migrating tests to `getConfig()` unblocks removal and shrinks
- * the publish surface to the three setter/getter functions.
+ * @deprecated Prefer `getConfig()` — this convenience binding will be
+ *   removed in v2. The only remaining consumer is the config test suite's
+ *   readback assertions. Migrating call sites to `getConfig()` unblocks
+ *   removal and shrinks the publish surface to the three setter/getter
+ *   functions.
  *
  * Implementation: `Object.defineProperties` with getter-only, non-configurable
  * descriptors on a real object, then `Object.freeze` at the top level. Writes
