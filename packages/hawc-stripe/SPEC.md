@@ -341,7 +341,7 @@ class StripeCore extends EventTarget {
    * signatureHeader は `stripe-signature` ヘッダの値。
   * 署名検証 → event ディスパッチ → status fold → 登録済み handler 実行。
    */
-  handleWebhook(rawBody: string, signatureHeader: string): Promise<void>;
+  handleWebhook(rawBody: string | Buffer | Uint8Array, signatureHeader: string): Promise<void>;
 }
 ```
 

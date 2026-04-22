@@ -559,6 +559,16 @@ export class StripeCore extends EventTarget {
     // ways; rejecting obviously-invalid shapes here keeps the builder
     // contract clean. Unknown / wrong-type fields are dropped to
     // undefined so the builder sees a normalized `IntentRequestHint`.
+    //
+    // Note: these shape checks run BEFORE any observable-state transition
+    // (no `_setStatus("processing")` / `_setLoading(true)` has fired yet),
+    // so we don't need to mirror the rollback pattern used by the
+    // `intent_builder_not_registered` branch below. `raiseError` simply
+    // throws and the caller observes state unchanged from its pre-call
+    // value. If a future refactor moves a state transition above this
+    // block, add `_setError` / `_setStatus("idle")` / `_setLoading(false)`
+    // before each `raiseError` here to preserve the
+    // "every error path lands on idle / loading=false" invariant.
     if (request.hint !== undefined && (typeof request.hint !== "object" || request.hint === null)) {
       raiseError(`request.hint must be an object or undefined, got ${JSON.stringify(request.hint)}.`);
     }
