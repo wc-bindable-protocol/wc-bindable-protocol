@@ -158,16 +158,24 @@ export class Stripe extends HTMLElementCtor {
   static wcBindable: IWcBindable = {
     protocol: "wc-bindable",
     version: 1,
+    // Deep-copy each descriptor object (not just the outer array) so a caller
+    // that mutates `Stripe.wcBindable.properties[0].event = "x"` via an `as
+    // any` cast cannot also mutate `STRIPE_CORE_WC_BINDABLE.properties[0]`
+    // and thereby rewrite the Core's event contract for every consumer. The
+    // array-level spread alone kept element identity shared, leaving that
+    // hole open; the element-level spread closes it. TypeScript `readonly`
+    // is only a compile-time guard.
     properties: [
-      ...STRIPE_CORE_WC_BINDABLE.properties,
+      ...STRIPE_CORE_WC_BINDABLE.properties.map(p => ({ ...p })),
       { name: "trigger", event: "hawc-stripe:trigger-changed" },
     ],
-    // Shallow-copy (not reference-share) so a caller that mutates
-    // `Stripe.wcBindable.inputs` via an `as any` cast cannot also mutate
-    // `STRIPE_CORE_WC_BINDABLE.inputs` and thereby alter Core's contract.
-    // TypeScript `readonly` is only a compile-time guard; the runtime
-    // copy closes the hole. Symmetric with the `...spread` above.
-    inputs: STRIPE_CORE_WC_BINDABLE.inputs ? [...STRIPE_CORE_WC_BINDABLE.inputs] : undefined,
+    // Same rationale as `properties` above — copy each input descriptor so
+    // field-level mutation on `Stripe.wcBindable.inputs[i]` does not leak
+    // through to the Core's descriptor. Array spread alone (the old shape)
+    // only guarded against push/splice on the container.
+    inputs: STRIPE_CORE_WC_BINDABLE.inputs
+      ? STRIPE_CORE_WC_BINDABLE.inputs.map(i => ({ ...i }))
+      : undefined,
     // Deliberately NOT forwarding the Core's full command surface. Only the
     // four orchestration methods the Shell itself implements publicly:
     // `prepare()` (create intent + mount Elements), `submit()` (confirm),
