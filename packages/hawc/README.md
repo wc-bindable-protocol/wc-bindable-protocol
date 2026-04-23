@@ -117,7 +117,7 @@ The thin-Shell case is important, but it is not the only canonical shape. In pra
 |------|-------|-----------------|---------------------|
 | A | Core in browser | `hawc-auth0` local | Thin framework-facing wrapper around a browser-anchored Core |
 | B | Core on server + thin Shell | `hawc-ai` remote, `hawc-flags` | Proxy, command delegation, or observation adapter over the wire |
-| C | Core on server + browser-anchored execution Shell | `hawc-s3`, `hawc-webauthn` | Executes the data plane the browser platform refuses to delegate |
+| C | Core on server + browser-anchored execution Shell | `hawc-s3`, `hawc-webauthn`, `hawc-stripe` | Executes the data plane the browser platform refuses to delegate |
 
 Case C is not a deviation from HAWC. It is a first-class case for domains where the browser owns an execution surface the server cannot stand in for: direct object upload, WebRTC, WebUSB, WebBluetooth, `File System Access API`, clipboard / drag-and-drop / paste flows, camera / microphone capture, and other user-gesture- or device-anchored capabilities.
 
@@ -128,6 +128,8 @@ The familiar thin-Shell rule holds whenever the Core can reach every external sy
 There is a different but equally canonical class of work where it cannot. When the **data plane** must run in the browser for reasons unrelated to business logic — direct upload to object storage, WebRTC, WebUSB, the `File System Access API`, anything gated on a user gesture or that would otherwise tunnel a payload through the WebSocket — the Shell stops being a thin marshaller and becomes the **data-plane executor**. The Core retains the **control plane** (signing, authorization, post-processing, persistence) and the wire still carries only small JSON-RPC messages, but the Shell now holds an XHR pump, a worker pool, retry / re-sign logic, and abort plumbing.
 
 `@wc-bindable/hawc-s3` is the canonical example: the bytes go browser → S3 directly because tunneling them through the control WebSocket would (a) double the egress cost, (b) waste the server's bandwidth, and (c) defeat S3's parallel multipart upload. The Shell ends up at ~800 lines. That is not a violation of HAWC's intent. It is the correct HAWC shape when the data plane is anchored to the browser by the platform.
+
+`@wc-bindable/hawc-stripe` is the same shape driven by a different constraint: PCI scope. Card data must never touch application code, so Stripe Elements renders the input inside a Stripe-owned iframe and POSTs the PAN directly from browser → Stripe. The Core (server) holds the secret key, builds PaymentIntents / SetupIntents, and verifies webhooks; the Shell loads Stripe.js, mounts the Payment Element, drives `confirmPayment` / `confirmSetup`, and handles the 3DS redirect return. The wire between them carries only intent identifiers, confirmation outcomes, and webhook-driven status — never card data. A Shell that tried to read the card number itself would not just be a HAWC violation; it would pull the entire application into PCI scope.
 
 The principle that survives across all three cases is:
 **the Core owns every decision; the Shell owns only execution it cannot delegate.** A "thick" Shell that signs its own URLs or runs its own authorization checks would be a HAWC violation, regardless of byte count. A thick Shell that PUTs bytes to a Core-signed URL is not.
@@ -148,7 +150,7 @@ That makes a small matrix more accurate than a single numbered ladder:
 | Browser | Thin wrapper around browser-anchored Core | `hawc-auth0` local |
 | Server | Command-mediating / proxy thin Shell | `hawc-ai` remote |
 | Server | Observation adapter thin Shell | `hawc-flags` |
-| Server | Browser-anchored execution Shell | `hawc-s3`, `hawc-webauthn` |
+| Server | Browser-anchored execution Shell | `hawc-s3`, `hawc-webauthn`, `hawc-stripe` |
 
 This framing keeps the true invariant in view. Runtime portability remains a major advantage, but it is a consequence available to some domains, not the sole definition of HAWC.
 
