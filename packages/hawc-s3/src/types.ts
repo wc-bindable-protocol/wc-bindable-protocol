@@ -189,6 +189,34 @@ export interface S3Error {
   status?: number;
 }
 
+/**
+ * Shape produced by the `toJSON` monkey-patched onto errors surfaced through
+ * the remote channel (see `S3Core._setError`). This is what arrives via the
+ * `_remoteValues.error` field after JSON serialisation across the WebSocket,
+ * so the element's `error` getter and any typed consumer must acknowledge
+ * the possibility in the error union.
+ */
+export interface SerializedError {
+  name: string;
+  message: string;
+  stack?: string;
+}
+
+/**
+ * Canonical union for any error surfaced via `S3Core.error` / `<hawc-s3>.error`
+ * / `WcsS3CoreValues.error`. A single alias keeps the union spelled out once:
+ *   - `S3Error` covers protocol-level errors (provider/HTTP fault with code).
+ *   - `Error` covers runtime exceptions (real Error instances from the local path).
+ *   - `SerializedError` covers errors that crossed the WebSocket boundary
+ *     (JSON-serialised `{ name, message, stack? }` — real Error instances no
+ *     longer survive `JSON.parse`), as well as plain-object throws from
+ *     providers that the `normaliseError` helper projects onto this shape.
+ *   - `null` is the cleared / never-had-error state.
+ * Consumers narrow with `instanceof Error` + shape checks; the alias itself
+ * does not imply a discriminated union.
+ */
+export type WcsS3AnyError = S3Error | Error | SerializedError | null;
+
 export interface WcsS3CoreValues {
   url: string;
   key: string;
@@ -198,7 +226,7 @@ export interface WcsS3CoreValues {
   uploading: boolean;
   completed: boolean;
   metadata: S3ObjectMetadata | null;
-  error: S3Error | Error | null;
+  error: WcsS3AnyError;
 }
 
 export interface WcsS3Values extends WcsS3CoreValues {

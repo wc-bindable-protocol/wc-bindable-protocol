@@ -102,7 +102,22 @@ function objectKey(bucket: string, key: string): string {
 function consumeFailure(state: ServerState, path: string, q: URLSearchParams): { status: number } | null {
   for (let i = 0; i < state.putFailures.length; i++) {
     const f = state.putFailures[i];
-    if (!f.match || f.match(path, q)) {
+    let matched = false;
+    if (!f.match) {
+      matched = true;
+    } else {
+      try {
+        matched = !!f.match(path, q);
+      } catch {
+        // A broken match predicate must not take down the whole PUT
+        // handler — previously an exception here bubbled up through the
+        // `async` IIFE to the outermost `.catch(() => send(res, 500, ...))`
+        // and fail-injected unrelated requests. Skip this entry and try
+        // the next one instead.
+        matched = false;
+      }
+    }
+    if (matched) {
       state.putFailures.splice(i, 1);
       return { status: f.status };
     }

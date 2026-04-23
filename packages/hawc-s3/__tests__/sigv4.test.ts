@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { presignS3Url } from "../src/signing/sigv4";
+import { presignS3Url, SkewError } from "../src/signing/sigv4";
 
 describe("presignS3Url (SigV4)", () => {
   // AWS-published reference vector for "Get a presigned URL using query parameters".
@@ -151,17 +151,61 @@ describe("presignS3Url (SigV4)", () => {
     expect(url.pathname).toBe("/b/k");
   });
 
-  it("clamps expiry to AWS limits", async () => {
-    const result = await presignS3Url(awsExample, {
+  it("rejects expiry above AWS 7-day limit loudly", async () => {
+    // Prior behaviour silently clamped via `Math.min(..., 604800)` after an
+    // `int32 | 0` coercion. 2^31 + 1 wraps negative and was then rescued by
+    // `Math.max(1, ...)` to a 1-second lifetime — a silent UX bug where the
+    // caller's stated intent ("valid for a week or so") produced a URL that
+    // expired in one second. Reject any value over the AWS hard cap so the
+    // caller sees the misuse instead of debugging an unexplained 403.
+    await expect(presignS3Url(awsExample, {
       method: "GET",
       region: "us-east-1",
       bucket: "b",
       key: "k",
       now: 0,
       expiresInSeconds: 999999999,
+    })).rejects.toThrow(/exceeds AWS limit/);
+  });
+
+  it("clamps expiry at the 604800 boundary", async () => {
+    const result = await presignS3Url(awsExample, {
+      method: "GET",
+      region: "us-east-1",
+      bucket: "b",
+      key: "k",
+      now: 0,
+      expiresInSeconds: 604800,
     });
     const url = new URL(result.url);
     expect(url.searchParams.get("X-Amz-Expires")).toBe("604800");
+  });
+
+  it("rejects non-finite expiry values", async () => {
+    await expect(presignS3Url(awsExample, {
+      method: "GET",
+      region: "us-east-1",
+      bucket: "b",
+      key: "k",
+      now: 0,
+      expiresInSeconds: Number.NaN,
+    })).rejects.toThrow(/finite/);
+  });
+
+  it("floors fractional expiry values", async () => {
+    // Prior behaviour used `| 0` which both truncates AND wraps at 2^31.
+    // `Math.trunc` keeps the truncation semantics for fractional values so
+    // existing callers passing e.g. `3600.5` still get a usable 3600-s URL.
+    const result = await presignS3Url(awsExample, {
+      method: "GET",
+      region: "us-east-1",
+      bucket: "b",
+      key: "k",
+      now: 0,
+      expiresInSeconds: 3600.9,
+    });
+    const url = new URL(result.url);
+    expect(url.searchParams.get("X-Amz-Expires")).toBe("3600");
   });
 
   it("rejects missing credentials", async () => {
@@ -277,6 +321,105 @@ describe("presignS3Url (SigV4)", () => {
       expect(url.searchParams.get("X-Amz-Signature")).toBe(
         "696eb4c0154dadb399b67b8fa61dc435a16b5907f324f515962fea161363729a"
       );
+    });
+  });
+
+  describe("clock-skew guard", () => {
+    const creds = {
+      accessKeyId: "AKIAIOSFODNN7EXAMPLE",
+      secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    };
+
+    it("throws SkewError when `now` drifts beyond `allowableClockSkewMs`", async () => {
+      await expect(presignS3Url(creds, {
+        method: "GET",
+        region: "us-east-1",
+        bucket: "b",
+        key: "k",
+        now: 1_000_000_000_000,
+        referenceNow: 1_000_000_300_000, // +5 min
+        allowableClockSkewMs: 60_000,    // tolerate 1 min
+        expiresInSeconds: 60,
+      })).rejects.toBeInstanceOf(SkewError);
+    });
+
+    it("signs normally when the drift is within tolerance", async () => {
+      const result = await presignS3Url(creds, {
+        method: "GET",
+        region: "us-east-1",
+        bucket: "b",
+        key: "k",
+        now: 1_000_000_000_000,
+        referenceNow: 1_000_000_010_000, // +10 s
+        allowableClockSkewMs: 60_000,
+        expiresInSeconds: 60,
+      });
+      expect(new URL(result.url).searchParams.get("X-Amz-Signature")).toMatch(/^[0-9a-f]{64}$/);
+    });
+
+    it("extraQuery cannot override reserved X-Amz-* signature parameters", async () => {
+      await expect(presignS3Url(creds, {
+        method: "GET",
+        region: "us-east-1",
+        bucket: "b",
+        key: "k",
+        expiresInSeconds: 60,
+        extraQuery: { "X-Amz-Credential": "forged" },
+      })).rejects.toThrow(/reserved SigV4 parameter/);
+    });
+
+    it("rejects each reserved SigV4 query key (case-insensitive)", async () => {
+      const reserved = [
+        "x-amz-algorithm",
+        "x-amz-credential",
+        "x-amz-date",
+        "x-amz-expires",
+        "x-amz-signedheaders",
+        "x-amz-security-token",
+        "x-amz-signature",
+      ];
+      for (const lower of reserved) {
+        await expect(presignS3Url(creds, {
+          method: "GET",
+          region: "us-east-1",
+          bucket: "b",
+          key: "k",
+          expiresInSeconds: 60,
+          extraQuery: { [lower]: "x" },
+        })).rejects.toThrow(/reserved SigV4 parameter/);
+        // Uppercase / mixed-case variant must also be rejected.
+        const upper = lower.replace(/(^|-)[a-z]/g, m => m.toUpperCase());
+        await expect(presignS3Url(creds, {
+          method: "GET",
+          region: "us-east-1",
+          bucket: "b",
+          key: "k",
+          expiresInSeconds: 60,
+          extraQuery: { [upper]: "x" },
+        })).rejects.toThrow(/reserved SigV4 parameter/);
+      }
+    });
+
+    it("allows legitimate x-amz-* request parameters (meta / SSE / ACL) in extraQuery", async () => {
+      const result = await presignS3Url(creds, {
+        method: "PUT",
+        region: "us-east-1",
+        bucket: "b",
+        key: "k",
+        expiresInSeconds: 60,
+        extraQuery: {
+          "x-amz-meta-userid": "u-123",
+          "x-amz-server-side-encryption": "AES256",
+          "x-amz-acl": "private",
+        },
+      });
+      const params = new URL(result.url).searchParams;
+      expect(params.get("x-amz-meta-userid")).toBe("u-123");
+      expect(params.get("x-amz-server-side-encryption")).toBe("AES256");
+      expect(params.get("x-amz-acl")).toBe("private");
+      // Signature must still be present and well-formed — the legitimate
+      // params are part of the canonical request and bound to the signature.
+      expect(params.get("X-Amz-Signature")).toMatch(/^[0-9a-f]{64}$/);
     });
   });
 });

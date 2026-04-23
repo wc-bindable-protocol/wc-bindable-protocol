@@ -143,4 +143,15 @@ describe("AwsS3Provider multipart", () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(mockResponse("denied", 403));
     await expect(newProvider().abortMultipart("k", "U", { bucket: "b" })).rejects.toThrow(/403/);
   });
+
+  it("abortMultipart accepts 200 and other 2xx responses", async () => {
+    // Real S3 returns 204, but S3-compatible stores (and proxies in front of
+    // real S3) sometimes return a plain 200 on abort. The `!res.ok` branch
+    // already covers "anything non-success", but this pins the behaviour
+    // that 200 specifically is not treated as an error — a prior revision
+    // whitelisted only 204 and 404 explicitly and would have thrown on 200
+    // even though the upload was correctly cancelled upstream.
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(mockResponse("", 200));
+    await expect(newProvider().abortMultipart("k", "U", { bucket: "b" })).resolves.toBeUndefined();
+  });
 });

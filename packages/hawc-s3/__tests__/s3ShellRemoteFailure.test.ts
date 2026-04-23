@@ -1,7 +1,21 @@
 import { describe, it, expect, beforeAll, beforeEach, afterEach } from "vitest";
 import { S3 } from "../src/components/S3";
+import { S3Core } from "../src/core/S3Core";
 import { setConfig } from "../src/config";
-import type { ClientMessage, ClientTransport, ServerMessage } from "@wc-bindable/remote";
+import {
+  RemoteShellProxy,
+  type ClientMessage,
+  type ClientTransport,
+  type ServerMessage,
+  type ServerTransport,
+} from "@wc-bindable/remote";
+import type {
+  IS3Provider,
+  PresignedDownload,
+  PresignedUpload,
+  MultipartPart,
+  S3RequestOptions,
+} from "../src/types";
 
 /**
  * A transport that never acks — used to prove that, BEFORE the failure
@@ -347,6 +361,200 @@ describe("S3 Shell — end-to-end onFail teardown via a WebSocket stub", () => {
       expect(String((el.error as Error).message)).toMatch(/WebSocket connection failed/);
     } finally {
       el.remove();
+    }
+  });
+});
+
+/**
+ * Paired in-memory transport — mirrors `s3RemotePartHeaders.test.ts`. Runs
+ * every message through JSON.stringify/parse so any non-JSON-safe field
+ * would surface exactly as it would on a real WebSocket. Used to drive the
+ * Shell ⇆ RemoteShellProxy ⇆ S3Core loop without a real socket.
+ */
+function pairedTransports(): { client: ClientTransport; server: ServerTransport } {
+  let clientHandler: ((m: ServerMessage) => void) | null = null;
+  let serverHandler: ((m: ClientMessage) => void) | null = null;
+  const toWire = (m: unknown): string => JSON.stringify(m);
+  const fromWire = <T>(s: string): T => JSON.parse(s) as T;
+  const client: ClientTransport = {
+    send: (m) => {
+      const frame = toWire(m);
+      queueMicrotask(() => serverHandler?.(fromWire<ClientMessage>(frame)));
+    },
+    onMessage: (h) => { clientHandler = h; },
+  };
+  const server: ServerTransport = {
+    send: (m) => {
+      const frame = toWire(m);
+      queueMicrotask(() => clientHandler?.(fromWire<ServerMessage>(frame)));
+    },
+    onMessage: (h) => { serverHandler = h; },
+  };
+  return { client, server };
+}
+
+/**
+ * Provider that rejects on `presignUpload`. Drives the `_requestUpload` RPC
+ * into its error path on the server, which is the scenario C10-#2 flagged:
+ * before the fix, the Core would publish `error` via `bind()` (event #1)
+ * AND the Shell's `_doSingle` catch would call `_setErrorState(e)` (event
+ * #2) for the same logical failure.
+ */
+class FailingPresignProvider implements IS3Provider {
+  async presignUpload(_k: string, _o: S3RequestOptions): Promise<PresignedUpload> {
+    throw new Error("provider: access denied");
+  }
+  async presignDownload(_k: string, _o: S3RequestOptions): Promise<PresignedDownload> {
+    return { url: "https://example/dl", method: "GET", expiresAt: Date.now() + 60_000 };
+  }
+  async deleteObject(_k: string, _o: S3RequestOptions): Promise<void> {}
+  async initiateMultipart(_k: string, _o: S3RequestOptions): Promise<{ uploadId: string }> {
+    return { uploadId: "never-called" };
+  }
+  async presignPart(
+    _k: string, _u: string, _p: number, _o: S3RequestOptions,
+  ): Promise<PresignedUpload> {
+    return { url: "https://example/part", method: "PUT", expiresAt: Date.now() + 60_000 };
+  }
+  async completeMultipart(
+    _k: string, _u: string, _p: MultipartPart[], _o: S3RequestOptions,
+  ): Promise<{ etag: string }> {
+    return { etag: "never-called" };
+  }
+  async abortMultipart(_k: string, _u: string, _o: S3RequestOptions): Promise<void> {}
+}
+
+const flushMany = async (): Promise<void> => {
+  for (let i = 0; i < 5; i++) await new Promise(r => setTimeout(r, 0));
+};
+
+describe("S3 Shell remote mode — error-event de-duplication (C10-#2)", () => {
+  beforeAll(() => {
+    if (!customElements.get("hawc-s3")) customElements.define("hawc-s3", S3);
+  });
+
+  it("a failing Core RPC produces exactly one hawc-s3:error event on the Shell", async () => {
+    // Before C10-#2's fix, a remote `_requestUpload` rejection triggered two
+    // separate `hawc-s3:error` dispatches for the same logical failure:
+    //   1. Core.requestUpload's catch called `_setError(e)`, which pushed an
+    //      `update` frame over the wire; the Shell's bind() callback turned
+    //      that into a local `hawc-s3:error` CustomEvent.
+    //   2. The proxy's rejection propagated back to `_doSingle`, whose
+    //      `catch` called `_setErrorState(e)` and dispatched its own
+    //      `hawc-s3:error` event.
+    // The fix routes RPC catches through `_setRpcErrorState` (which is a
+    // no-op in remote mode) so only (1) remains. If the regression returns,
+    // `errorEvents.length` will be 2.
+    const { client, server } = pairedTransports();
+    const core = new S3Core(new FailingPresignProvider());
+    core.bucket = "b";
+    core.prefix = "p/";
+    new RemoteShellProxy(core, server);
+
+    const el = document.createElement("hawc-s3") as S3;
+    const errorEvents: unknown[] = [];
+    el.addEventListener("hawc-s3:error", (ev: Event) => {
+      errorEvents.push((ev as CustomEvent).detail);
+    });
+    document.body.appendChild(el);
+    try {
+      (el as any)._connectRemote(client);
+      await flushMany();
+      el.file = new Blob(["x"]);
+
+      await expect(el.upload()).rejects.toThrow();
+      // Drain both proxy ack delivery and any bind() dispatch microtasks.
+      await flushMany();
+
+      // Filter out any null-detail events (the `_clearErrorState` transition
+      // that fires on `connectedCallback` when no prior error exists is gated,
+      // but belt-and-braces in case a future refactor changes that).
+      const withPayload = errorEvents.filter(e => e != null);
+      expect(withPayload).toHaveLength(1);
+      // Still visible through the public getter.
+      expect(el.error).not.toBeNull();
+    } finally {
+      el.remove();
+    }
+  });
+
+  it("a failing _complete RPC produces exactly one hawc-s3:error event on the Shell", async () => {
+    // Mirror of the above for the post-PUT completion RPC. The Shell's
+    // `_doSingle` also has a third catch (`_complete`) that used to
+    // `_setErrorState` unconditionally. Because this path exercises a real
+    // XHR PUT in between, we stub XMLHttpRequest so the PUT "succeeds"
+    // synchronously with a fake ETag; the Core's `complete()` then fails
+    // because the provider's `presignDownload` path is fine but our custom
+    // provider throws on `complete` via the `completeMultipart`/complete
+    // post-process flow. Simpler: fail `presignDownload` which is called
+    // from `complete()` after the upload succeeds.
+    class FailingCompleteProvider extends FailingPresignProvider {
+      async presignUpload(key: string, _o: S3RequestOptions): Promise<PresignedUpload> {
+        return {
+          url: `https://example/upload/${key}`,
+          method: "PUT",
+          expiresAt: Date.now() + 60_000,
+        };
+      }
+      async presignDownload(_k: string, _o: S3RequestOptions): Promise<PresignedDownload> {
+        throw new Error("provider: download denied");
+      }
+    }
+
+    // Stub XHR just long enough to make the PUT succeed with a fake ETag.
+    const RealXHR = globalThis.XMLHttpRequest;
+    class FakeXHR {
+      upload = { addEventListener: (_n: string, _fn: (e: ProgressEvent) => void) => {} };
+      private _listeners: Record<string, Array<(e: Event) => void>> = {};
+      open(_m: string, _u: string): void {}
+      setRequestHeader(_n: string, _v: string): void {}
+      addEventListener(name: string, fn: (e: Event) => void): void {
+        (this._listeners[name] ??= []).push(fn);
+      }
+      send(_body: unknown): void {
+        queueMicrotask(() => {
+          for (const fn of this._listeners["load"] ?? []) fn(new Event("load"));
+        });
+      }
+      abort(): void {}
+      getResponseHeader(name: string): string | null {
+        return name.toLowerCase() === "etag" ? '"deadbeef"' : null;
+      }
+      get status(): number { return 200; }
+      get responseText(): string { return ""; }
+      get statusText(): string { return "OK"; }
+    }
+    (globalThis as unknown as { XMLHttpRequest: unknown }).XMLHttpRequest = FakeXHR;
+
+    try {
+      const { client, server } = pairedTransports();
+      const core = new S3Core(new FailingCompleteProvider());
+      core.bucket = "b";
+      core.prefix = "p/";
+      new RemoteShellProxy(core, server);
+
+      const el = document.createElement("hawc-s3") as S3;
+      const errorEvents: unknown[] = [];
+      el.addEventListener("hawc-s3:error", (ev: Event) => {
+        errorEvents.push((ev as CustomEvent).detail);
+      });
+      document.body.appendChild(el);
+      try {
+        (el as any)._connectRemote(client);
+        await flushMany();
+        el.file = new Blob(["payload"]);
+
+        await expect(el.upload()).rejects.toThrow();
+        await flushMany();
+
+        const withPayload = errorEvents.filter(e => e != null);
+        expect(withPayload).toHaveLength(1);
+        expect(el.error).not.toBeNull();
+      } finally {
+        el.remove();
+      }
+    } finally {
+      (globalThis as unknown as { XMLHttpRequest: typeof XMLHttpRequest }).XMLHttpRequest = RealXHR;
     }
   });
 });

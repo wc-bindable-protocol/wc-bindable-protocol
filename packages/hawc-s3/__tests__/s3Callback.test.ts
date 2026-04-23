@@ -242,12 +242,12 @@ describe("S3Callback resource-leak on async _loadModule race", () => {
     document.body.removeChild(host);
   });
 
-  it("a load that runs while connected, then disconnects, has its Blob revoked", async () => {
-    // Verifies disconnectedCallback's existing _revokeBlob() still works
-    // alongside the new guards. We do not assert on `_fn` because happy-dom's
-    // dynamic-import of Blob URLs is not guaranteed to actually execute the
-    // module body — the invariant that matters here is "every alloc is
-    // paired with a revoke", which keeps unbounded leaks impossible.
+  it("a load that runs while connected, then disconnects, does not leak a Blob URL", async () => {
+    // Pairs every createObjectURL with a revokeObjectURL over the element's
+    // lifetime. We do not pin WHERE the revoke happens (success vs failure
+    // of the dynamic import, or on disconnect) — happy-dom's blob-URL import
+    // is unreliable. All we assert is the accounting invariant: counts match,
+    // and `_blobUrl` is null by the time the element is off-DOM.
     const host = document.createElement("hawc-s3");
     host.id = "normal-host";
     document.body.appendChild(host);
@@ -260,14 +260,66 @@ describe("S3Callback resource-leak on async _loadModule race", () => {
     await new Promise((r) => setTimeout(r, 0));
     await new Promise((r) => setTimeout(r, 10));
     expect(createSpy).toHaveBeenCalledTimes(1);
-    expect((cb as any)._blobUrl).not.toBeNull();
 
     document.body.removeChild(cb);
-    expect(revokeSpy).toHaveBeenCalledTimes(1);
+    // All allocations accounted for by a revoke: the module-load catch path
+    // revokes on failure (C7-#5), and disconnectedCallback revokes any still-
+    // attached blob. Either way, counts balance and the slot is clear.
+    expect(revokeSpy.mock.calls.length).toBe(createSpy.mock.calls.length);
     expect((cb as any)._blobUrl).toBeNull();
 
     createSpy.mockRestore();
     revokeSpy.mockRestore();
+    document.body.removeChild(host);
+  });
+
+  it("stale _loadModule does not revoke a newer generation's blob URL", async () => {
+    // Regression pin: an earlier revision had gen=1 reach its stale-cleanup
+    // path and call this._revokeBlob() — which reads this._blobUrl. If
+    // gen=2 had already allocated and assigned its newer blob to
+    // this._blobUrl, the stale cleanup would revoke the LIVE blob and the
+    // newer generation would dynamic-import a revoked URL.
+    //
+    // Post-fix: each _loadModule invocation captures its own blob URL
+    // locally and only revokes that specific URL from the stale path.
+    //
+    // Under C7-#5 the failure path of gen=1 may revoke its own blob as soon
+    // as the import rejects (happy-dom's dynamic-import of blob URLs is not
+    // reliable), so we no longer assert that `_blobUrl` holds gen=1's value
+    // at the time we swap `src`. The invariant we still enforce: whatever
+    // URL is LIVE on `_blobUrl` at the end must not appear in the revoke
+    // spy after it was assigned.
+    const host = document.createElement("hawc-s3");
+    host.id = "stale-race-host";
+    document.body.appendChild(host);
+    const revokeSpy = vi.spyOn(URL, "revokeObjectURL");
+
+    const cb = makeCallback("stale-race-host");
+    document.body.appendChild(cb);
+    // Let gen=1 reach the Blob allocation.
+    await new Promise((r) => setTimeout(r, 0));
+
+    // Trigger gen=2 by swapping the src attribute. Note: attributeChangedCallback
+    // re-runs _loadModule which calls _revokeBlob() at the top — that revokes
+    // any gen=1 blob still attached before allocating gen=2's own blob.
+    cb.setAttribute("src", "data:application/javascript,export default () => {}");
+    // Allow any pending microtasks/macrotasks to drain.
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 20));
+
+    // The element's current blob slot (if any) must never have been
+    // revoked AFTER it was assigned. We accept that blobs from earlier
+    // generations may be revoked any number of times (idempotent), but
+    // the currently-attached blob must either be null (src took over)
+    // or be absent from the revoke-spy call list.
+    const current = (cb as any)._blobUrl as string | null;
+    if (current !== null) {
+      const revokedUrls = revokeSpy.mock.calls.map(([u]) => u);
+      expect(revokedUrls).not.toContain(current);
+    }
+
+    revokeSpy.mockRestore();
+    document.body.removeChild(cb);
     document.body.removeChild(host);
   });
 });

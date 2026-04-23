@@ -1,4 +1,5 @@
 import { IConfig, IWritableConfig } from "./types.js";
+import { readProcessEnv } from "./processEnv.js";
 
 interface IInternalConfig extends IConfig {
   tagNames: {
@@ -15,12 +16,14 @@ interface IInternalConfig extends IConfig {
 function resolveRemoteCoreUrl(cfg: IInternalConfig): string {
   if (cfg.remote.remoteSettingType === "env") {
     // Mirror hawc-ai's resolution order: process.env first, then a global hook
-    // for browser bundles that inject the URL before scripts execute.
-    return (
-      (globalThis as any).process?.env?.S3_REMOTE_CORE_URL ??
-      (globalThis as any).S3_REMOTE_CORE_URL ??
-      ""
-    );
+    // for browser bundles that inject the URL before scripts execute. The
+    // global fallback (`globalThis.S3_REMOTE_CORE_URL`) is not a process env
+    // lookup and therefore does not share the helper — it is a separate
+    // inject-before-script convention we keep distinct from env resolution.
+    const fromEnv = readProcessEnv("S3_REMOTE_CORE_URL");
+    if (fromEnv !== undefined) return fromEnv;
+    const fromGlobal = (globalThis as { S3_REMOTE_CORE_URL?: string }).S3_REMOTE_CORE_URL;
+    return fromGlobal ?? "";
   }
   return cfg.remote.remoteCoreUrl;
 }
@@ -57,7 +60,16 @@ function deepClone<T>(obj: T): T {
 
 let frozenConfig: IConfig | null = null;
 
-export const config: IConfig = _config as IConfig;
+// Internal-only accessor. The module-level `_config` is mutable (setConfig
+// mutates it in place) and exposing it to callers conflated "give me the
+// current settings" with "hand me a handle I can mutate". External callers
+// go through `getConfig()` (deep-frozen clone) or the narrower typed
+// accessors below. Internal call sites (S3 / S3Callback / registerComponents)
+// use this getter to read the live mutable state without paying the freeze
+// cost on every access.
+export function _getInternalConfig(): IInternalConfig {
+  return _config;
+}
 
 export function getConfig(): IConfig {
   if (!frozenConfig) {

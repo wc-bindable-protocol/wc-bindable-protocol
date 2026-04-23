@@ -92,12 +92,51 @@ describe("S3 upload() re-entry bookkeeping", () => {
     s3.file = new Blob(["x"], { type: "text/plain" });
     s3.key = "k1";
     const first = s3.upload();
-    // Kick off a second upload before the first settles. The second's
-    // re-entry guard aborts + awaits the first, so both flows ultimately
-    // unwind through the same bookkeeping path.
+    // Kick off a second upload before the first settles. Under the current
+    // semantics the second call is a no-op and returns the existing
+    // in-flight promise — both `first` and `second` settle through the same
+    // promise identity, so there should be no extra bookkeeping chain that
+    // could leak an unhandled rejection.
     s3.key = "k2";
     const second = s3.upload();
     await Promise.allSettled([first, second]);
+    await drainUnhandled();
+    expect(unhandled).toEqual([]);
+
+    document.body.removeChild(s3);
+  });
+
+  it("upload() while in-flight does not start a replacement run (trigger=true also no-ops)", async () => {
+    // Pin the no-op-on-reentry semantics: a concurrent upload() call does not
+    // bump `_uploadGeneration` (which would happen on abort-and-replace) and
+    // `trigger=true` while an upload is in flight also does not start a
+    // second run. This matches the trigger setter's contract and prevents
+    // multipart uploadId leakage from racing workers.
+    const s3 = makeShell();
+    s3.file = new Blob(["x"], { type: "text/plain" });
+    s3.key = "k1";
+
+    const first = s3.upload();
+    // Reach into private state to observe the generation counter — the
+    // alternative (tracking outcome count) is flakier under async timing.
+    const genAtStart = (s3 as unknown as { _uploadGeneration: number })._uploadGeneration;
+
+    const second = s3.upload();
+    // trigger=true while in-flight must also be a no-op (pre-existing
+    // behavior from the trigger setter's `if (this._currentUpload) return;`
+    // guard, pinned here to guard against drift).
+    s3.trigger = true;
+    const third = s3.upload();
+
+    // No replacement run started: the generation counter is unchanged from
+    // the moment `first` took the slot.
+    const genAfterReentry = (s3 as unknown as { _uploadGeneration: number })._uploadGeneration;
+    expect(genAfterReentry).toBe(genAtStart);
+
+    // All concurrent calls ultimately settle through the same underlying
+    // pipeline — none leak an unhandled rejection even though the provider
+    // rejects presign.
+    await Promise.allSettled([first, second, third]);
     await drainUnhandled();
     expect(unhandled).toEqual([]);
 

@@ -1,9 +1,11 @@
 import { raiseError } from "../raiseError.js";
 import {
   IWcBindable, IS3Provider, S3RequestOptions, PresignedUpload, PresignedDownload,
-  S3ObjectMetadata, S3Progress, PostProcessHook, PostProcessContext, PostProcessOptions, S3Error,
+  S3ObjectMetadata, S3Progress, PostProcessHook, PostProcessContext, PostProcessOptions,
   MultipartInit, MultipartPartUrl, MultipartPart,
 } from "../types.js";
+import type { WcsS3AnyError } from "../types.js";
+import { normaliseError } from "../normaliseError.js";
 
 /** S3 minimum part size (5 MiB) — last part is exempt. */
 const S3_MIN_PART_SIZE = 5 * 1024 * 1024;
@@ -24,6 +26,62 @@ function computePartSize(totalSize: number, requested: number = DEFAULT_PART_SIZ
 }
 
 /**
+ * Names of the observable properties Core publishes. Paired with the event
+ * naming convention (`hawc-s3:<prop>-changed`) to build the wcBindable
+ * property table via `propertiesFromNames` rather than repeating the string
+ * twice per entry — the prior hand-written list made typos at either end
+ * silent (one event would just not be forwarded) and made adding a new
+ * property an exercise in careful string matching.
+ */
+const CORE_PROPERTY_NAMES = [
+  "url",
+  "key",
+  "etag",
+  "progress",
+  "loading",
+  "uploading",
+  "completed",
+  "metadata",
+] as const;
+
+/** Names of Core inputs (client-writable via wcBindable). */
+const CORE_INPUT_NAMES = ["bucket", "prefix", "contentType"] as const;
+
+/**
+ * Names of the async / sync commands Core exposes over wc-bindable.
+ * `async` is explicit per command (not derived from name) because
+ * `reportProgress` and `abort` are intentionally sync and a generic name
+ * convention would either mis-flag them or force inconsistent naming.
+ */
+const CORE_COMMANDS = [
+  { name: "requestUpload", async: true },
+  { name: "reportProgress" },
+  { name: "complete", async: true },
+  { name: "requestDownload", async: true },
+  { name: "deleteObject", async: true },
+  { name: "abort" },
+  { name: "requestMultipartUpload", async: true },
+  { name: "signMultipartPart", async: true },
+  { name: "completeMultipart", async: true },
+  { name: "abortMultipart", async: true },
+] as const satisfies ReadonlyArray<{ readonly name: string; readonly async?: boolean }>;
+
+function buildCoreWcBindable(): IWcBindable {
+  return {
+    protocol: "wc-bindable",
+    version: 1,
+    properties: [
+      ...CORE_PROPERTY_NAMES.map(name => ({ name, event: `hawc-s3:${name}-changed` })),
+      // `error` uses the unsuffixed event name so external listeners match the
+      // DOM convention for errors (not "error-changed").
+      { name: "error", event: "hawc-s3:error" },
+    ],
+    inputs: CORE_INPUT_NAMES.map(name => ({ name })),
+    commands: CORE_COMMANDS.map(c => ({ ...c })),
+  };
+}
+
+/**
  * Headless S3 blob-store core.
  *
  * Lives server-side. Holds AWS credentials (via the IS3Provider it owns),
@@ -35,38 +93,7 @@ function computePartSize(totalSize: number, requested: number = DEFAULT_PART_SIZ
  * bytes directly to S3 using the presigned URL.
  */
 export class S3Core extends EventTarget {
-  static wcBindable: IWcBindable = {
-    protocol: "wc-bindable",
-    version: 1,
-    properties: [
-      { name: "url", event: "hawc-s3:url-changed" },
-      { name: "key", event: "hawc-s3:key-changed" },
-      { name: "etag", event: "hawc-s3:etag-changed" },
-      { name: "progress", event: "hawc-s3:progress-changed" },
-      { name: "loading", event: "hawc-s3:loading-changed" },
-      { name: "uploading", event: "hawc-s3:uploading-changed" },
-      { name: "completed", event: "hawc-s3:completed-changed" },
-      { name: "metadata", event: "hawc-s3:metadata-changed" },
-      { name: "error", event: "hawc-s3:error" },
-    ],
-    inputs: [
-      { name: "bucket" },
-      { name: "prefix" },
-      { name: "contentType" },
-    ],
-    commands: [
-      { name: "requestUpload", async: true },
-      { name: "reportProgress" },
-      { name: "complete", async: true },
-      { name: "requestDownload", async: true },
-      { name: "deleteObject", async: true },
-      { name: "abort" },
-      { name: "requestMultipartUpload", async: true },
-      { name: "signMultipartPart", async: true },
-      { name: "completeMultipart", async: true },
-      { name: "abortMultipart", async: true },
-    ],
-  };
+  static wcBindable: IWcBindable = buildCoreWcBindable();
 
   private _target: EventTarget;
   private _provider: IS3Provider;
@@ -82,10 +109,23 @@ export class S3Core extends EventTarget {
   private _uploading: boolean = false;
   private _completed: boolean = false;
   private _metadata: S3ObjectMetadata | null = null;
-  private _error: S3Error | Error | null = null;
+  private _error: WcsS3AnyError = null;
 
   private _flushScheduled: boolean = false;
-  private _rafId: any = 0;
+  private _rafId: number | ReturnType<typeof setTimeout> | 0 = 0;
+  /**
+   * True when `_rafId` holds a `setTimeout` handle (the rAF-unavailable
+   * fallback path), false when it holds a real rAF id. We cannot reliably
+   * infer this from `typeof _rafId` alone: in non-browser environments
+   * `setTimeout` returns a Node `Timeout` object (type `"object"`), but in
+   * browser environments it returns a plain number — identical in shape to
+   * a real rAF id. Cancelling through the wrong API (e.g.
+   * `cancelAnimationFrame(timeoutId)`) is a silent no-op, leaving a stale
+   * timer that fires the progress flush for a generation the consumer has
+   * already told us to treat as stale. This flag makes the cancel path
+   * branch deterministic regardless of host.
+   */
+  private _rafIdIsTimeout: boolean = false;
   /** Monotonically incremented per requestUpload. Stale reports are dropped. */
   private _generation: number = 0;
   private _postProcessHooks: { hook: PostProcessHook; fatal: boolean }[] = [];
@@ -161,10 +201,20 @@ export class S3Core extends EventTarget {
   get loading(): boolean { return this._loading; }
   get uploading(): boolean { return this._uploading; }
   get completed(): boolean { return this._completed; }
+  /**
+   * Returns a shallow clone of the current metadata snapshot. A shallow
+   * clone is sufficient today because `S3ObjectMetadata` holds only
+   * primitives (`size`, `contentType`). If the type is ever extended with a
+   * non-primitive member (arrays of tags, a Headers map, a Date instance,
+   * etc.) this getter MUST be upgraded to a deep clone — the current spread
+   * would otherwise leak a mutable reference to internal state and let
+   * consumers mutate `_metadata` via the returned object, silently
+   * undermining the immutability contract of the public getter.
+   */
   get metadata(): S3ObjectMetadata | null {
     return this._metadata ? { ...this._metadata } : null;
   }
-  get error(): S3Error | Error | null { return this._error; }
+  get error(): WcsS3AnyError { return this._error; }
 
   // --- Post-process hook registration (server-side only API) ---
 
@@ -231,15 +281,50 @@ export class S3Core extends EventTarget {
     this._target.dispatchEvent(new CustomEvent("hawc-s3:metadata-changed", { detail: m ? { ...m } : null, bubbles: true }));
   }
 
-  private _setError(err: any): void {
-    if (err instanceof Error && typeof (err as any).toJSON !== "function") {
-      (err as any).toJSON = () => ({
-        name: err.name,
-        message: err.message,
-        ...(err.stack ? { stack: err.stack } : {}),
-      });
+  private _setError(err: unknown): void {
+    // Route every thrown value through the shared normaliser so `_error`
+    // never holds a bare string / nullish / arbitrary plain object — the
+    // declared type of the slot (`WcsS3AnyError`) is then an honest
+    // description of the runtime contents rather than a wishful cast.
+    // Providers that reject with bare strings, AWS-SDK-shaped payloads, or
+    // pre-serialised errors from another realm are projected onto the same
+    // `SerializedError` shape the Shell's `_setErrorState` consumes, so
+    // remote and local consumers see identical structure.
+    const normalised = normaliseError(err);
+
+    // Attach a non-enumerable `toJSON` so that `JSON.stringify(core.error)`
+    // produces a serialisable payload (Error instances would otherwise become
+    // `{}`). Using `defineProperty` with `enumerable: false` avoids altering
+    // the shape consumers observe via `for…in` / `Object.keys`, and the
+    // non-enumerable flag keeps tools that iterate own properties unchanged.
+    // Guard with an own-property check so we do not re-define on errors that
+    // already carry a `toJSON` (or ones the monkey-patch has previously
+    // stamped — this method is re-entrant for the same error across multiple
+    // dispatch paths). Plain `SerializedError` payloads are already
+    // JSON-safe, so the monkey-patch only applies to real Error instances.
+    if (
+      normalised instanceof Error
+      && !Object.prototype.hasOwnProperty.call(normalised, "toJSON")
+      && typeof (normalised as { toJSON?: unknown }).toJSON !== "function"
+    ) {
+      try {
+        Object.defineProperty(normalised, "toJSON", {
+          value: () => ({
+            name: normalised.name,
+            message: normalised.message,
+            ...(normalised.stack ? { stack: normalised.stack } : {}),
+          }),
+          enumerable: false,
+          configurable: true,
+          writable: true,
+        });
+      } catch {
+        // Frozen / sealed errors (exotic error classes, cross-realm errors)
+        // cannot have properties defined on them; swallow and ship the raw
+        // error through — consumers will just see the default serialisation.
+      }
     }
-    this._error = err;
+    this._error = normalised;
     this._target.dispatchEvent(new CustomEvent("hawc-s3:error", { detail: this._error, bubbles: true }));
   }
 
@@ -248,21 +333,58 @@ export class S3Core extends EventTarget {
   private _scheduleProgressFlush(): void {
     if (this._flushScheduled) return;
     this._flushScheduled = true;
-    const raf = globalThis.requestAnimationFrame ?? ((cb: FrameRequestCallback) => setTimeout(cb, 16));
-    this._rafId = raf(() => {
+    // Snapshot the generation so a flush scheduled before an abort() does not
+    // fire a stale progress event after `abort()` reset the state to idle.
+    // Without the snapshot, the rAF callback re-dispatches `this._progress`
+    // as-is (a racy read that may itself have been mutated) and re-sets
+    // `_flushScheduled = false` without having actually been cancelled — a
+    // subsequent reportProgress would see `_flushScheduled === false` and
+    // re-schedule another flush of values the consumer has already been told
+    // to treat as stale.
+    const gen = this._generation;
+    const callback = () => {
       this._flushScheduled = false;
       this._rafId = 0;
+      this._rafIdIsTimeout = false;
+      if (gen !== this._generation || !this._uploading) return;
       this._setProgress(this._progress);
-    });
+    };
+    if (typeof globalThis.requestAnimationFrame === "function") {
+      this._rafIdIsTimeout = false;
+      this._rafId = globalThis.requestAnimationFrame(callback);
+    } else {
+      // No rAF available (non-browser environment, headless test runner with
+      // rAF deliberately disabled, etc.). Fall back to a 16ms setTimeout —
+      // same cadence as 60fps rAF. The rAF signature expects a `number`
+      // timestamp argument but the callback above ignores its arguments, so
+      // the shape mismatch (setTimeout invokes with no args) is benign.
+      this._rafIdIsTimeout = true;
+      this._rafId = setTimeout(callback, 16);
+    }
   }
 
   private _cancelFlush(): void {
     if (this._rafId) {
-      const cancel = globalThis.cancelAnimationFrame ?? clearTimeout;
-      cancel(this._rafId);
+      // Dispatch to the matching canceller based on the `_rafIdIsTimeout`
+      // flag set when we scheduled. Using `typeof _rafId === "number"` to
+      // decide is unreliable: in browser environments `setTimeout` also
+      // returns a number, so the old heuristic would route a timeout id to
+      // `cancelAnimationFrame` — which silently no-ops on an unrecognised id
+      // and leaves the timer alive to fire a stale flush.
+      if (this._rafIdIsTimeout) {
+        clearTimeout(this._rafId as ReturnType<typeof setTimeout>);
+      } else if (typeof globalThis.cancelAnimationFrame === "function") {
+        globalThis.cancelAnimationFrame(this._rafId as number);
+      }
       this._rafId = 0;
-      this._flushScheduled = false;
+      this._rafIdIsTimeout = false;
     }
+    // Always reset `_flushScheduled`, even when `_rafId` is already 0 —
+    // otherwise an abort() that races the rAF callback's own reset can leave
+    // the flag stuck at `true` and subsequent `_scheduleProgressFlush()`
+    // calls would no-op forever (their early `if (this._flushScheduled)` would
+    // keep short-circuiting).
+    this._flushScheduled = false;
   }
 
   private _resolveBucket(): string {
@@ -296,7 +418,22 @@ export class S3Core extends EventTarget {
     if (!mp) return;
     this._multipart = null;
     this._provider.abortMultipart(mp.key, mp.uploadId, mp.options)
-      .catch(() => { /* best-effort */ });
+      .catch((error: unknown) => {
+        // Best-effort: surface via the same warning channel as the explicit
+        // `abort()` path so ops are not blind to orphan cleanup failures.
+        this._target.dispatchEvent(new CustomEvent("hawc-s3:abort-cleanup-warning", {
+          detail: {
+            error,
+            ctx: {
+              bucket: mp.options.bucket,
+              key: mp.key,
+              uploadId: mp.uploadId,
+              reason: "prior-multipart",
+            },
+          },
+          bubbles: true,
+        }));
+      });
   }
 
   // --- Commands ---
@@ -319,6 +456,14 @@ export class S3Core extends EventTarget {
     // session that has been superseded.
     this._singleUpload = null;
     this._generation++;
+    // Capture our generation after the bump, matching requestMultipartUpload.
+    // A newer requestUpload / requestMultipartUpload / abort can fire while we
+    // are awaiting presignUpload below, and we must not mutate uploading /
+    // snapshot state on behalf of a superseded request — otherwise the newer
+    // request's "uploading=false" transition would be overwritten by our
+    // stale "uploading=true", and a complete() against the newer session
+    // would consume our snapshot instead of its own.
+    const gen = this._generation;
     this._setError(null);
     this._setLoading(true);
     this._setUploading(false);
@@ -333,6 +478,14 @@ export class S3Core extends EventTarget {
     });
     try {
       const presigned = await this._provider.presignUpload(key, opts);
+      // Superseded by a newer request while we awaited the presign. Bail
+      // without touching `_singleUpload`, `_uploading`, or progress — the
+      // newer request owns those slots now. Still return the presigned URL
+      // so the original awaiting caller can decide what to do (typically the
+      // Shell will see its own generation check fire and discard).
+      if (gen !== this._generation) {
+        return presigned;
+      }
       // Capture the snapshot only after presign succeeds, so a failed presign
       // does not leave a stale slot that complete() would later consume.
       // Stash the key so completion can validate against the upload's
@@ -356,12 +509,39 @@ export class S3Core extends EventTarget {
       this._setUploading(true);
       this._setProgress({ loaded: 0, total: size ?? 0, phase: "uploading" });
       return presigned;
-    } catch (e: any) {
-      this._setError(e);
-      this._setLoading(false);
-      this._setUploading(false);
+    } catch (e: unknown) {
+      // Only mutate state if we are still the current generation — otherwise
+      // we would clobber the newer request's in-flight state with our own
+      // error / loading-false transitions.
+      if (gen === this._generation) {
+        this._setError(e);
+        this._setLoading(false);
+        this._setUploading(false);
+      }
       throw e;
     }
+  }
+
+  /**
+   * Run the registered post-process chain with `complete()` /
+   * `completeMultipart()` fatal/non-fatal semantics. Throws on the first
+   * fatal hook failure, returning `true` for "continue finalization" and
+   * `false` when the caller should short-circuit (a stale generation has
+   * been detected). Extracted so both finalizers share one implementation.
+   */
+  private async _runPostProcessHooks(ctx: PostProcessContext, gen: number): Promise<boolean> {
+    for (const entry of this._postProcessHooks) {
+      try {
+        await entry.hook(ctx);
+      } catch (e: unknown) {
+        if (entry.fatal) throw e;
+        this._target.dispatchEvent(new CustomEvent("hawc-s3:postprocess-warning", {
+          detail: { error: e, ctx },
+          bubbles: true,
+        }));
+      }
+    }
+    return gen === this._generation;
   }
 
   /**
@@ -372,6 +552,15 @@ export class S3Core extends EventTarget {
     if (!this._uploading) return;
     if (!Number.isFinite(loaded) || !Number.isFinite(total)) return;
     if (loaded < 0 || total < 0) return;
+    // Clamp `loaded > total` inconsistencies. Browser XHR guards this via
+    // `ev.lengthComputable`, but reports arriving over the remote proxy
+    // (or any custom Shell transport) are untrusted input — a buggy /
+    // hostile client that sends `{loaded: 1e12, total: 1}` would otherwise
+    // flow straight into `_progress` and the UI would see a >100% bar
+    // with a wildly inflated byte count. Silently snap `loaded` down to
+    // `total` so the progress curve stays monotonic and bounded, matching
+    // the invariant every consumer assumes.
+    if (total > 0 && loaded > total) loaded = total;
     this._progress = { loaded, total, phase: "uploading" };
     this._scheduleProgressFlush();
   }
@@ -411,11 +600,13 @@ export class S3Core extends EventTarget {
     // at, even if `this.bucket`/`this.prefix` were mutated mid-flight.
     const opts = snapshot?.options ?? this._baseRequestOptions();
     this._cancelFlush();
-    this._setProgress({
-      loaded: this._metadata?.size ?? this._progress.loaded,
-      total: this._metadata?.size ?? this._progress.total,
-      phase: "completing",
-    });
+    // PUT has returned successfully, so the uploading phase is "100% done".
+    // Snap loaded and total to the same value so the progress bar lands at
+    // 100% immediately, even if the browser never delivered a final progress
+    // event that matched the full total. Prefer the snapshotted metadata size
+    // (the authoritative count) and fall back to the last observed total.
+    const finalTotal = this._metadata?.size ?? this._progress.total;
+    this._setProgress({ loaded: finalTotal, total: finalTotal, phase: "completing" });
     if (etag) this._setEtag(etag);
 
     const ctx: PostProcessContext = {
@@ -437,35 +628,34 @@ export class S3Core extends EventTarget {
       // `hawc-s3:postprocess-warning` and the chain continues. Use this for
       // audit / notification / telemetry hooks that must not invalidate the
       // upload because their sink is degraded.
-      for (const entry of this._postProcessHooks) {
-        try {
-          await entry.hook(ctx);
-        } catch (e: any) {
-          if (entry.fatal) throw e;
-          this._target.dispatchEvent(new CustomEvent("hawc-s3:postprocess-warning", {
-            detail: { error: e, ctx },
-            bubbles: true,
-          }));
-        }
-      }
+      const stillCurrent = await this._runPostProcessHooks(ctx, gen);
       // Stale completion (e.g. user kicked off a new upload mid-hook).
-      if (gen !== this._generation) return "";
+      if (!stillCurrent) return "";
       const download = await this._provider.presignDownload(key, opts);
       this._setUrl(download.url);
       this._setProgress({ loaded: ctx.size ?? 0, total: ctx.size ?? 0, phase: "done" });
       this._setUploading(false);
       this._setCompleted(true);
       this._setLoading(false);
-      this._singleUpload = null;
       return download.url;
-    } catch (e: any) {
+    } catch (e: unknown) {
       if (gen === this._generation) {
         this._setError(e);
         this._setUploading(false);
         this._setLoading(false);
       }
-      this._singleUpload = null;
       throw e;
+    } finally {
+      // Clear the snapshot unconditionally — success and failure paths both
+      // need to drop the slot so a subsequent `requestUpload` does not see a
+      // stale entry. `finally` also survives refactors that add early returns
+      // or throw sites to the try body, which the previous duplicated
+      // assignments in try + catch would miss.
+      //
+      // Clearing only when the generation is still this completion's own
+      // avoids the race where a newer `requestUpload` has already populated
+      // `_singleUpload` before a slow hook on this completion returns.
+      if (gen === this._generation) this._singleUpload = null;
     }
   }
 
@@ -477,7 +667,7 @@ export class S3Core extends EventTarget {
       this._setKey(key);
       this._setUrl(result.url);
       return result;
-    } catch (e: any) {
+    } catch (e: unknown) {
       this._setError(e);
       throw e;
     }
@@ -485,10 +675,44 @@ export class S3Core extends EventTarget {
 
   async deleteObject(key: string): Promise<void> {
     if (!key) raiseError("key is required.");
+    // Detect delete-during-active-upload on the SAME key before the network
+    // call. Core does not attempt to automatically cancel the upload — both
+    // flows are legitimate protocols the caller may have reasons to run —
+    // but silently letting them race produces a broken end state:
+    // complete() finalises against an object that no longer exists, the
+    // Shell emits a `url-changed` pointing at a 404, and the
+    // post-process hook is invoked for an orphaned upload. Surface the
+    // collision via `hawc-s3:delete-during-upload-warning` so the caller
+    // can decide whether to `abort()` first, and README documents the
+    // expected ordering. The event is dispatched before the network call
+    // so the warning fires even if the delete request itself then fails.
+    const activeUploadSnapshot = this._multipart?.key === key
+      ? this._multipart
+      : (this._singleUpload?.key === key ? this._singleUpload : null);
+    if (activeUploadSnapshot && this._uploading) {
+      this._target.dispatchEvent(new CustomEvent("hawc-s3:delete-during-upload-warning", {
+        detail: {
+          key,
+          uploadId: this._multipart?.uploadId,
+          mode: this._multipart ? "multipart" : "single",
+        },
+        bubbles: true,
+      }));
+    }
+    // When the delete targets the key of an active upload, route the DELETE
+    // through the upload's snapshotted options (bucket/prefix). Otherwise
+    // the warning says "same key" but the network call hits whatever
+    // bucket/prefix `this` currently has — which, after a mid-upload
+    // `core.bucket = ...`, is a different object entirely. All other ops
+    // that interact with a tracked upload (complete, completeMultipart,
+    // abort, abortMultipart, signMultipartPart) already consult the
+    // snapshot; deleteObject must do the same for consistency and so the
+    // warning is honest about what got deleted.
+    const opts = activeUploadSnapshot?.options ?? this._baseRequestOptions();
     this._setError(null);
     this._setLoading(true);
     try {
-      await this._provider.deleteObject(key, this._baseRequestOptions());
+      await this._provider.deleteObject(key, opts);
       // Clear url/etag if the deleted key matches the current state.
       if (this._key === key) {
         this._setUrl("");
@@ -496,7 +720,7 @@ export class S3Core extends EventTarget {
         this._setCompleted(false);
         this._setMetadata(null);
       }
-    } catch (e: any) {
+    } catch (e: unknown) {
       this._setError(e);
       throw e;
     } finally {
@@ -510,7 +734,11 @@ export class S3Core extends EventTarget {
    * Does not actually cancel the browser's XHR — that is the Shell's job.
    *
    * If a multipart upload is in flight, fire-and-forget the abortMultipart
-   * call so S3 does not retain orphaned parts (and bill for them).
+   * call so S3 does not retain orphaned parts (and bill for them). This
+   * method is deliberately sync-returning: the wc-bindable `abort` command
+   * is declared non-async and remote callers invoke it without awaiting.
+   * Use `abortMultipart(key, uploadId)` for the awaitable form when you
+   * need to block until S3 has acknowledged the cleanup.
    */
   abort(): void {
     const mp = this._multipart;
@@ -520,12 +748,57 @@ export class S3Core extends EventTarget {
     this._cancelFlush();
     if (this._uploading) this._setUploading(false);
     if (this._loading) this._setLoading(false);
+    // A prior successful upload may have left `_completed=true` standing.
+    // abort semantics expects the element to return to idle; leaving
+    // `completed=true` misrepresents the post-abort state to any
+    // state-mirroring binding (including the remote proxy mirror), which
+    // would otherwise continue to report the just-aborted upload as
+    // "completed" until the next `_setCompleted(false)` at the start of a
+    // new run. Dispatching the `false` transition here keeps observers
+    // (reactive frameworks, remote mirrors, test assertions) in sync with
+    // the actual idle state immediately after `abort()` resolves.
+    if (this._completed) this._setCompleted(false);
+    // Symmetric cleanup of the observable outputs that a prior successful
+    // upload may have left standing: `_url` (the GET URL), `_etag`, and
+    // `_metadata`. Leaving these populated while `completed=false` is
+    // internally inconsistent — consumers reading `el.url` / `el.etag`
+    // after `abort()` would see the previous run's values and could emit
+    // a stale link into their UI or mirror. This matches the clear that
+    // `deleteObject(sameKey)` already performs for the same reason, and
+    // makes the post-abort state indistinguishable from a freshly
+    // constructed Core for every observable property.
+    if (this._url) this._setUrl("");
+    if (this._etag) this._setEtag("");
+    if (this._metadata) this._setMetadata(null);
     this._setProgress({ loaded: 0, total: 0, phase: "idle" });
     if (mp) {
       // Use the captured key + options, not the current ones — the caller may
       // have already mutated `this.bucket`/`this.prefix` since init.
+      //
+      // Surface cleanup failures via `hawc-s3:abort-cleanup-warning` instead
+      // of the old `.catch(() => {})` silent swallow. `abort()` is itself
+      // sync-returning (the wc-bindable command is non-async) so we cannot
+      // reject the caller's promise, but ops still need a signal that the
+      // orphan parts were not reclaimed — otherwise S3 keeps billing for
+      // them and the only evidence is a storage-report anomaly days later.
+      // The event mirrors the `hawc-s3:postprocess-warning` pattern used
+      // elsewhere in Core: non-fatal, structured `{ error, ctx }` detail,
+      // bubbles so host pages can install a single top-level listener.
       this._provider.abortMultipart(mp.key, mp.uploadId, mp.options)
-        .catch(() => { /* best-effort cleanup */ });
+        .catch((error: unknown) => {
+          this._target.dispatchEvent(new CustomEvent("hawc-s3:abort-cleanup-warning", {
+            detail: {
+              error,
+              ctx: {
+                bucket: mp.options.bucket,
+                key: mp.key,
+                uploadId: mp.uploadId,
+                reason: "abort",
+              },
+            },
+            bubbles: true,
+          }));
+        });
     }
   }
 
@@ -579,7 +852,7 @@ export class S3Core extends EventTarget {
     let uploadId: string;
     try {
       ({ uploadId } = await this._provider.initiateMultipart(key, opts));
-    } catch (e: any) {
+    } catch (e: unknown) {
       if (gen === this._generation) {
         this._setError(e);
         this._setLoading(false);
@@ -601,6 +874,18 @@ export class S3Core extends EventTarget {
         const start = i * effectivePartSize;
         const end = Math.min(start + effectivePartSize, size);
         const presigned = await this._provider.presignPart(key, uploadId, partNumber, opts);
+        // Per-part generation check: a large multipart can take many awaits
+        // to sign, and a racing newer request (requestUpload,
+        // requestMultipartUpload, abort) can easily fire mid-loop. Without
+        // this check we would keep signing parts for an abandoned upload
+        // only to discard them via the post-loop check — wasting credit on
+        // the signing endpoint and, more importantly, leaving more room for
+        // the error branch below to throw a stale error into this._error on
+        // a superseded generation. Throwing here routes us into the catch
+        // arm which already rolls back via abortMultipart.
+        if (gen !== this._generation) {
+          throw new Error("[@wc-bindable/hawc-s3] requestMultipartUpload superseded.");
+        }
         parts.push({
           partNumber,
           url: presigned.url,
@@ -621,7 +906,7 @@ export class S3Core extends EventTarget {
             : {}),
         });
       }
-    } catch (e: any) {
+    } catch (e: unknown) {
       // Roll back the just-initiated multipart so we do not leak.
       this._provider.abortMultipart(key, uploadId, opts).catch(() => {});
       if (gen === this._generation) {
@@ -722,56 +1007,41 @@ export class S3Core extends EventTarget {
     const mpSize = this._multipart.size;
     const mpContentType = this._multipart.contentType;
     this._cancelFlush();
-    this._setProgress({
-      loaded: this._metadata?.size ?? this._progress.loaded,
-      total: this._metadata?.size ?? this._progress.total,
-      phase: "completing",
-    });
+    // Snap progress to 100% at the start of the completing phase — see the
+    // matching comment in `complete()` for why loaded/total land on the same
+    // value. For multipart we prefer the Core's own metadata snapshot (the
+    // size the upload was initiated with), falling back to the last observed
+    // total if metadata has been cleared mid-flight.
+    const mpFinalTotal = this._metadata?.size ?? this._progress.total;
+    this._setProgress({ loaded: mpFinalTotal, total: mpFinalTotal, phase: "completing" });
 
     let etag = "";
     try {
-      ({ etag } = await this._provider.completeMultipart(key, uploadId, parts, mpOptions));
-    } catch (e: any) {
-      if (gen === this._generation) {
-        this._setError(e);
-        this._setUploading(false);
-        this._setLoading(false);
+      try {
+        ({ etag } = await this._provider.completeMultipart(key, uploadId, parts, mpOptions));
+      } catch (e: unknown) {
+        // Best-effort: if S3 rejected the merge, abort to free the parts.
+        this._provider.abortMultipart(key, uploadId, mpOptions).catch(() => {});
+        throw e;
       }
-      // Best-effort: if S3 rejected the merge, abort to free the parts.
-      this._provider.abortMultipart(key, uploadId, mpOptions).catch(() => {});
-      this._multipart = null;
-      throw e;
-    }
-    if (etag) this._setEtag(etag);
-    this._multipart = null;
+      if (etag) this._setEtag(etag);
 
-    const ctx: PostProcessContext = {
-      // bucket reflects the upload's true destination, not the current input.
-      bucket: mpOptions.bucket,
-      key,
-      etag,
-      // Read from the snapshot for the same reason `bucket` does: a mid-
-      // upload `deleteObject(key)` clears `this._metadata`, and we want the
-      // post-process ctx to always reflect the upload that actually happened.
-      size: mpSize,
-      contentType: mpContentType,
-    };
+      const ctx: PostProcessContext = {
+        // bucket reflects the upload's true destination, not the current input.
+        bucket: mpOptions.bucket,
+        key,
+        etag,
+        // Read from the snapshot for the same reason `bucket` does: a mid-
+        // upload `deleteObject(key)` clears `this._metadata`, and we want the
+        // post-process ctx to always reflect the upload that actually happened.
+        size: mpSize,
+        contentType: mpContentType,
+      };
 
-    try {
-      // Fatal/non-fatal semantics match `complete()` — see the long comment
-      // there. Keep the two paths in lockstep.
-      for (const entry of this._postProcessHooks) {
-        try {
-          await entry.hook(ctx);
-        } catch (e: any) {
-          if (entry.fatal) throw e;
-          this._target.dispatchEvent(new CustomEvent("hawc-s3:postprocess-warning", {
-            detail: { error: e, ctx },
-            bubbles: true,
-          }));
-        }
-      }
-      if (gen !== this._generation) return "";
+      // Fatal/non-fatal semantics match `complete()` — see the comment on
+      // `_runPostProcessHooks`. Keep the two finalizers in lockstep.
+      const stillCurrent = await this._runPostProcessHooks(ctx, gen);
+      if (!stillCurrent) return "";
       // The download must point at the path the bytes actually live at.
       const download = await this._provider.presignDownload(key, mpOptions);
       this._setUrl(download.url);
@@ -780,13 +1050,25 @@ export class S3Core extends EventTarget {
       this._setCompleted(true);
       this._setLoading(false);
       return download.url;
-    } catch (e: any) {
+    } catch (e: unknown) {
       if (gen === this._generation) {
         this._setError(e);
         this._setUploading(false);
         this._setLoading(false);
       }
       throw e;
+    } finally {
+      // Clear `_multipart` in a single place so both success + every failure
+      // branch drop the slot deterministically. Previously the clear was
+      // duplicated across the provider-fail catch and the post-hook success
+      // path, which meant a refactor that introduced another early throw
+      // would silently leak the slot — and a subsequent `requestUpload`
+      // would then call `abortMultipart` against the merged uploadId.
+      //
+      // Guard on generation so a racing newer `requestMultipartUpload` that
+      // has already installed its own `_multipart` does not get its slot
+      // cleared by this older completion unwinding.
+      if (gen === this._generation) this._multipart = null;
     }
   }
 
