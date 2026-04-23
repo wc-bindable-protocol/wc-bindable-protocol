@@ -28,7 +28,8 @@
     "test:coverage": "npm run test:unit:coverage",
     "test:unit": "vitest run __tests__",
     "test:unit:watch": "vitest __tests__",
-    "test:unit:coverage": "vitest run __tests__ --coverage --coverage.provider=v8 --coverage.reporter=text --coverage.include=src/**/*.ts --coverage.exclude=src/types.ts --coverage.exclude=src/index.ts --coverage.exclude=src/server/index.ts"
+    "test:unit:coverage": "vitest run __tests__ --coverage --coverage.provider=v8 --coverage.reporter=text --coverage.include=src/**/*.ts --coverage.exclude=src/types.ts --coverage.exclude=src/index.ts --coverage.exclude=src/server/index.ts",
+    "test:integration": "npm run build -w @wc-bindable/core -w @wc-bindable/remote -w @wc-bindable/hawc-flags && playwright test"
   },
   "keywords": [
     "web-components",
