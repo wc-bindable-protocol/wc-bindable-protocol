@@ -5,6 +5,43 @@ import {
 } from "../types.js";
 
 /**
+ * Minimal structural shape of `@simplewebauthn/server`'s verified-response
+ * return values that this adapter depends on. The package is an optional
+ * peer dep — `import type` from it would fail in consumers that don't
+ * install it (module resolution runs for type-only imports under
+ * `moduleResolution: "bundler"` / `"node16"`). So we keep a *local*
+ * minimal shape here: it is intentionally a subset of the real types
+ * from `@simplewebauthn/server` v11 and is used only to narrow the
+ * return value of the dynamic imports, not to impose a new public
+ * contract on callers. The prior shape used `as any` everywhere which
+ * erased all structural safety at the boundary; this gives the compiler
+ * enough shape to flag obvious drift when the library ships breaking
+ * layout changes without turning the optional peer into a hard dep.
+ */
+interface VerifiedRegistrationShape {
+  verified: boolean;
+  registrationInfo?: {
+    // v11 nests under `credential`; v10 exposed these directly. We
+    // accept both so the classifier in `_loadServer` is not the only
+    // version-drift defense.
+    credential?: {
+      id?: string | Uint8Array;
+      publicKey?: Uint8Array;
+      counter?: number;
+    };
+    credentialID?: string | Uint8Array;
+    credentialPublicKey?: Uint8Array;
+    counter?: number;
+  };
+}
+interface VerifiedAuthenticationShape {
+  verified: boolean;
+  authenticationInfo?: {
+    newCounter?: number;
+  };
+}
+
+/**
  * Reference verifier adapter backed by `@simplewebauthn/server`.
  *
  * `@simplewebauthn/server` is an **optional peer dependency** — identical
@@ -26,8 +63,16 @@ export class SimpleWebAuthnVerifier implements IWebAuthnVerifier {
     requireUserVerification: boolean;
   }): Promise<VerifiedRegistration> {
     const mod = await _loadServer();
-    const result = await mod.verifyRegistrationResponse({
-      response: params.response as any,
+    // `response` is still handed through as `any` — the library's
+    // own `RegistrationResponseJSON` type uses branded byte-arrays
+    // for base64url fields that our `RegistrationResponseJSON`
+    // (string-based, matches the wire JSON shape) is intentionally
+    // incompatible with. Narrowing that would require pulling the
+    // library's types transitively into our public surface, which the
+    // optional-peer contract forbids. The runtime contract (plain
+    // object with string fields) is the same either way.
+    const result: VerifiedRegistrationShape = await mod.verifyRegistrationResponse({
+      response: params.response,
       expectedChallenge: params.expectedChallenge,
       expectedOrigin: params.expectedOrigin,
       expectedRPID: params.expectedRPID,
@@ -39,11 +84,32 @@ export class SimpleWebAuthnVerifier implements IWebAuthnVerifier {
     // @simplewebauthn/server v11 nests the credential fields under
     // `registrationInfo.credential`. Earlier versions exposed them directly;
     // fall back to the legacy shape so minor-version drift does not crash.
-    const info = result.registrationInfo as any;
+    const info = result.registrationInfo;
     const cred = info.credential ?? info;
-    const rawId: Uint8Array = cred.id ?? cred.credentialID;
-    const publicKey: Uint8Array = cred.publicKey ?? cred.credentialPublicKey;
-    const counter: number = cred.counter ?? 0;
+    const rawId: Uint8Array | string | undefined =
+      (cred as { id?: string | Uint8Array }).id ??
+      (info as { credentialID?: string | Uint8Array }).credentialID;
+    const publicKey: Uint8Array | undefined =
+      (cred as { publicKey?: Uint8Array }).publicKey ??
+      (info as { credentialPublicKey?: Uint8Array }).credentialPublicKey;
+    // Defense against a library future that renames the fields again —
+    // the prior code silently coerced `undefined` through `encode()` and
+    // produced the empty-string credentialId, which the Core would then
+    // persist. A future verifyAuthentication call could lookup credential
+    // "" and match nothing, returning a confusing "not registered" error
+    // instead of the true "the library returned unexpected data" signal.
+    // Throw with a clear diagnostic so library drift surfaces immediately.
+    if (rawId === undefined || publicKey === undefined) {
+      throw new Error(
+        "[@wc-bindable/hawc-webauthn] @simplewebauthn/server returned an unexpected " +
+        "registrationInfo shape: missing credential id or publicKey. " +
+        "The package's response layout may have changed; update the adapter."
+      );
+    }
+    const counter: number =
+      (cred as { counter?: number }).counter ??
+      (info as { counter?: number }).counter ??
+      0;
     return {
       credentialId: typeof rawId === "string" ? rawId : encode(rawId),
       publicKey: encode(publicKey),
@@ -61,30 +127,26 @@ export class SimpleWebAuthnVerifier implements IWebAuthnVerifier {
     requireUserVerification: boolean;
   }): Promise<VerifiedAuthentication> {
     const mod = await _loadServer();
-    const result = await mod.verifyAuthenticationResponse({
-      response: params.response as any,
+    // v11-only shape: `credential: { id, publicKey, counter, transports }`.
+    // The package.json `peerDependencies` pins `@simplewebauthn/server` to
+    // `^11.0.0`, so the v10 `authenticator: { credentialID, ... }` key we
+    // used to also send is dead code under the supported version range
+    // and would risk tripping a future strict-schema validation in the
+    // library. If the peer-range is ever widened, restore the dual-key
+    // shape alongside a version probe; until then, speak v11 cleanly.
+    const result: VerifiedAuthenticationShape = await mod.verifyAuthenticationResponse({
+      response: params.response,
       expectedChallenge: params.expectedChallenge,
       expectedOrigin: params.expectedOrigin,
       expectedRPID: params.expectedRPID,
       requireUserVerification: params.requireUserVerification,
-      // v11 signature: `credential: { id, publicKey, counter, transports }`.
-      // v10 and below: `authenticator: { credentialID, credentialPublicKey, counter, transports }`.
-      // Supplying both keys is harmless — the library reads the one it knows —
-      // and keeps this adapter working across the minor-version boundary
-      // without a hard `peerDependencies` pin.
       credential: {
         id: params.credential.credentialId,
         publicKey: decode(params.credential.publicKey),
         counter: params.credential.counter,
-        transports: params.credential.transports as any,
+        transports: params.credential.transports,
       },
-      authenticator: {
-        credentialID: decode(params.credential.credentialId),
-        credentialPublicKey: decode(params.credential.publicKey),
-        counter: params.credential.counter,
-        transports: params.credential.transports as any,
-      },
-    } as any);
+    });
     if (!result.verified) {
       throw new Error("[@wc-bindable/hawc-webauthn] authentication verification failed.");
     }

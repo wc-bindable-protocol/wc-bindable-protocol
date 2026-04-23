@@ -508,9 +508,16 @@ describe("integration: real Core + handlers + Shell", () => {
       let caught: any;
       try { await shell.start(); } catch (e) { caught = e; }
       // Shell surfaces the verify error — message includes the 500 status.
+      // The response body is MASKED as "user lookup failed" under the
+      // information-disclosure policy: raw internal exceptions never reach
+      // the wire unless the app opts in by throwing HttpError. The 500
+      // status itself still fires 5xx alerts, which is the contract this
+      // test pins.
       expect(caught).toBeDefined();
       expect(String(caught.message)).toMatch(/500/);
-      expect(String(caught.message)).toMatch(/DB outage/);
+      expect(String(caught.message)).toMatch(/user lookup failed/);
+      // And conversely, the raw DB message must NOT leak on the wire.
+      expect(String(caught.message)).not.toMatch(/DB outage/);
     });
   });
 

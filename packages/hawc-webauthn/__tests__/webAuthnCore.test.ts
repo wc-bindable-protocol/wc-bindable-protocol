@@ -102,6 +102,21 @@ describe("WebAuthnCore", () => {
       expect(() => new WebAuthnCore({ ...base, verifier: null } as any)).toThrow(/verifier/);
     });
 
+    it("rejects origin shapes that pass a truthy check but break verification (regression)", () => {
+      // Regression (Cycle 2 #2): a bare truthy check on options.origin
+      // accepted `[]`, `[""]`, `["https://x", ""]`, and arrays of non-string
+      // values. Each of these shapes passes schema but makes every
+      // verify() fail at the verifier's origin-match step with a
+      // cryptic "no origin matched" error — well after a real user has
+      // already kicked off a ceremony. Reject at construction so the
+      // misconfiguration surfaces immediately to the operator.
+      const base = { rpId: "x", rpName: "x", origin: "x", challengeStore, credentialStore, verifier };
+      expect(() => new WebAuthnCore({ ...base, origin: [] } as any)).toThrow(/non-empty/);
+      expect(() => new WebAuthnCore({ ...base, origin: [""] } as any)).toThrow(/non-empty/);
+      expect(() => new WebAuthnCore({ ...base, origin: ["https://x", ""] } as any)).toThrow(/non-empty/);
+      expect(() => new WebAuthnCore({ ...base, origin: [123 as any] } as any)).toThrow(/non-empty/);
+    });
+
     it("starts in idle with empty observable state", () => {
       expect(core.status).toBe("idle");
       expect(core.credentialId).toBe("");
@@ -284,6 +299,22 @@ describe("WebAuthnCore", () => {
       verifier.regError = err;
       await expect(core.verifyRegistration("s1", mkRegistrationResponse())).rejects.toThrow("bad attestation");
       expect(core.error?.toJSON?.()).toEqual({ name: "Error", message: "bad attestation" });
+    });
+
+    it("preserves the clientVisible marker on the wrapped core.error (regression)", async () => {
+      // `_failVerify` paths attach `clientVisible: true` so the handler's
+      // catch can decide to relay the message verbatim. The thrown err
+      // is the original (unwrapped) Error today — but `core.error` holds
+      // the _SerializableError envelope, and any consumer that inspects
+      // that envelope (e.g. RemoteCoreProxy relaying over the wire) must
+      // see the same signal. Fire a guaranteed `_failVerify` path and
+      // assert the marker survived the wrap.
+      await expect(
+        core.verifyRegistration("s1", mkRegistrationResponse()),
+      ).rejects.toThrow(/no active challenge/);
+      expect(core.status).toBe("error");
+      expect(core.error).toBeTruthy();
+      expect((core.error as any).clientVisible).toBe(true);
     });
 
     it("passes expected challenge/origin/rpId to the verifier", async () => {
@@ -497,7 +528,10 @@ describe("WebAuthnCore", () => {
 
     it("rejects unknown credentials", async () => {
       await seedCredentialAndChallenge();
-      await expect(core.verifyAuthentication("s1", mkAuthResponse("unknown"))).rejects.toThrow(/not registered/);
+      // Uses the same "not recognized for this session" wording as the
+      // userId-mismatch branch — see WebAuthnCore.verifyAuthentication
+      // for the enumeration-defense rationale.
+      await expect(core.verifyAuthentication("s1", mkAuthResponse("unknown"))).rejects.toThrow(/not recognized/);
     });
 
     it("throws when verifyAuthentication is missing required arguments", async () => {
@@ -515,7 +549,11 @@ describe("WebAuthnCore", () => {
         counter: 0, createdAt: Date.now(),
       });
       await core.createAuthenticationChallenge("s1", "user-42");
-      await expect(core.verifyAuthentication("s1", mkAuthResponse("cred-1"))).rejects.toThrow(/does not belong/);
+      // Generic "not recognized" message — distinct strings for
+      // "unknown credential" vs "wrong user" would let a caller
+      // enumerate which credentials belong to a user. See WebAuthnCore
+      // verifyAuthentication comment.
+      await expect(core.verifyAuthentication("s1", mkAuthResponse("cred-1"))).rejects.toThrow(/not recognized/);
     });
 
     it("rejects a stale sign counter (cloned authenticator heuristic)", async () => {
@@ -604,6 +642,50 @@ describe("WebAuthnCore", () => {
       expect(core.user).toBeNull();
       expect(core.error).toBeNull();
     });
+
+    it("does not redispatch credential-id-changed / user-changed on no-op writes (regression)", async () => {
+      // Regression (Cycle 2 #6): `_setCredentialId` / `_setUser` now
+      // dedupe identical writes. Without the guard, calling `reset()` on
+      // a Core that is already idle fired `credential-id-changed` with
+      // detail "" and `user-changed` with detail null, causing bound
+      // components to churn on spurious transitions. Pin both the
+      // idle-only path and the double-reset path here.
+      const credIdEvents: any[] = [];
+      const userEvents: any[] = [];
+      core.addEventListener("hawc-webauthn:credential-id-changed", (e: any) => credIdEvents.push(e.detail));
+      core.addEventListener("hawc-webauthn:user-changed", (e: any) => userEvents.push(e.detail));
+
+      // Fresh Core starts at "" / null. Reset from this state should emit
+      // zero dedup-guarded events.
+      core.reset();
+      core.reset();
+
+      expect(credIdEvents).toHaveLength(0);
+      expect(userEvents).toHaveLength(0);
+    });
+
+    it("reset after a completed register dispatches exactly once, and a second reset is a no-op (regression)", async () => {
+      // Complementary to the idle-only case above: a reset after real
+      // state exists should fire exactly one credential-id-changed ("")
+      // and one user-changed (null). A second reset — still "" / null —
+      // should fire zero.
+      await core.createRegistrationChallenge("s1", { id: "u", name: "n", displayName: "d" });
+      await core.verifyRegistration("s1", mkRegistrationResponse());
+
+      const credIdEvents: any[] = [];
+      const userEvents: any[] = [];
+      core.addEventListener("hawc-webauthn:credential-id-changed", (e: any) => credIdEvents.push(e.detail));
+      core.addEventListener("hawc-webauthn:user-changed", (e: any) => userEvents.push(e.detail));
+
+      core.reset();
+      expect(credIdEvents).toEqual([""]);
+      expect(userEvents).toEqual([null]);
+
+      core.reset();
+      // Second reset is fully dedup'd — no additional dispatches.
+      expect(credIdEvents).toEqual([""]);
+      expect(userEvents).toEqual([null]);
+    });
   });
 
   describe("target injection", () => {
@@ -633,6 +715,77 @@ describe("WebAuthnCore", () => {
       await strictCore.createRegistrationChallenge("s1", { id: "u", name: "n", displayName: "d" });
       await strictCore.verifyRegistration("s1", mkRegistrationResponse());
       expect(verifier.regCalls[0].requireUserVerification).toBe(true);
+    });
+  });
+
+  describe("Cycle 9: input guards & reactive reset", () => {
+    // Round 2 #7 — WebAuthn §5.4.3 caps user.id at 64 bytes after
+    // UTF-8 encoding. The previous implementation silently accepted
+    // oversized ids and deferred the failure to the browser's
+    // navigator.credentials.create() which surfaced it as a cryptic
+    // TypeError — and worse, only after the challenge slot was
+    // already consumed.
+    it("rejects registration when user.id exceeds 64 UTF-8 bytes", async () => {
+      // 65 ASCII bytes (each 1 byte in UTF-8).
+      const oversized = "a".repeat(65);
+      await expect(
+        core.createRegistrationChallenge("s1", { id: oversized, name: "n", displayName: "d" })
+      ).rejects.toThrow(/user\.id must be at most 64 bytes/);
+    });
+
+    it("rejects user.id that exceeds 64 bytes after multi-byte UTF-8 encoding", async () => {
+      // 22 * "あ" (3 bytes each) = 66 bytes — fails even though the
+      // JS-string length is only 22.
+      const multiByte = "あ".repeat(22);
+      await expect(
+        core.createRegistrationChallenge("s1", { id: multiByte, name: "n", displayName: "d" })
+      ).rejects.toThrow(/64 bytes/);
+    });
+
+    it("accepts user.id at the 64-byte boundary", async () => {
+      const exactly64 = "a".repeat(64);
+      const opts = await core.createRegistrationChallenge("s1", {
+        id: exactly64, name: "n", displayName: "d",
+      });
+      expect(opts.user.id).toBeDefined();
+    });
+
+    // Round 2 #11 — existingCredentialIds entries must be base64url.
+    // A non-base64url string would either decode to unrelated bytes on
+    // the browser side or trip the authenticator's exclude-list check.
+    it("rejects non-base64url entries in existingCredentialIds", async () => {
+      await expect(
+        core.createRegistrationChallenge(
+          "s1",
+          { id: "u", name: "n", displayName: "d" },
+          ["valid-id", "has/slash"],  // "/" is not in the base64url alphabet
+        )
+      ).rejects.toThrow(/base64url/);
+    });
+
+    // Round 2 #6 — new challenge must clear residual credentialId from
+    // a prior completed ceremony. The reactive surface otherwise lies
+    // ("still on cred-old while registering cred-new").
+    it("clears credentialId when a fresh registration challenge is issued", async () => {
+      // First complete a full registration to populate credentialId.
+      await core.createRegistrationChallenge("s1", { id: "u", name: "n", displayName: "d" });
+      await core.verifyRegistration("s1", mkRegistrationResponse());
+      expect(core.credentialId).toBe("cred-1");
+      // A fresh challenge must reset credentialId to "" — AND fire the
+      // change event so binders see the transition.
+      const events: string[] = [];
+      core.addEventListener("hawc-webauthn:credential-id-changed", (e: any) => events.push(e.detail));
+      await core.createRegistrationChallenge("s2", { id: "u2", name: "n2", displayName: "d2" });
+      expect(core.credentialId).toBe("");
+      expect(events).toContain("");
+    });
+
+    it("clears credentialId when a fresh authentication challenge is issued", async () => {
+      await core.createRegistrationChallenge("s1", { id: "u", name: "n", displayName: "d" });
+      await core.verifyRegistration("s1", mkRegistrationResponse());
+      expect(core.credentialId).toBe("cred-1");
+      await core.createAuthenticationChallenge("s2");
+      expect(core.credentialId).toBe("");
     });
   });
 });

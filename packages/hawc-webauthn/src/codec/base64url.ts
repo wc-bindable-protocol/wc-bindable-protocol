@@ -26,7 +26,36 @@ export function encode(bytes: ArrayBuffer | Uint8Array): string {
   return b64.replaceAll("+", STANDARD_TO_URL["+"]).replaceAll("/", STANDARD_TO_URL["/"]).replace(/=+$/, "");
 }
 
+// base64url alphabet: A-Z a-z 0-9 - _ ; no padding at the boundary (we add it
+// below). Any character outside this set is a protocol violation — the decoder
+// used to silently ignore such inputs because both `atob` and the manual
+// fallback would either throw cryptic errors or treat the unknown character
+// as zero, producing bogus bytes the caller would then feed into WebAuthn
+// primitives. Reject loudly so a tainted wire payload fails verification
+// rather than round-tripping into mangled buffers.
+const _BASE64URL_PATTERN = /^[A-Za-z0-9_-]*$/;
+
+/**
+ * Decode a base64url string into a `Uint8Array` backed by a fresh
+ * `ArrayBuffer`.
+ *
+ * Return-type note: the generic form `Uint8Array<ArrayBuffer>` requires
+ * TypeScript 5.7 or newer. Under older compilers `lib.dom.d.ts` accepts
+ * `Uint8Array<ArrayBufferLike>` as a BufferSource but not
+ * `Uint8Array<ArrayBuffer>`, and dropping the generic would silently
+ * coerce the return into `Uint8Array<ArrayBufferLike>` — which can alias
+ * a SharedArrayBuffer and therefore fails WebAuthn's BufferSource
+ * narrowing. The whole package is built against TS 5.9 (see the root
+ * `typescript` devDependency), so we pin the tighter type here to keep
+ * the wire boundary type-safe.
+ */
 export function decode(input: string): Uint8Array<ArrayBuffer> {
+  if (typeof input !== "string") {
+    throw new TypeError("[@wc-bindable/hawc-webauthn] base64url decode expects a string input.");
+  }
+  if (!_BASE64URL_PATTERN.test(input)) {
+    throw new Error("[@wc-bindable/hawc-webauthn] invalid base64url input: contains characters outside A-Za-z0-9_-.");
+  }
   const padded = input + "=".repeat((4 - (input.length % 4)) % 4);
   const standard = padded.replaceAll("-", URL_TO_STANDARD["-"]).replaceAll("_", URL_TO_STANDARD._);
   const binary = typeof atob === "function"
@@ -71,12 +100,26 @@ function _nodeBase64Decode(base64: string): string {
   const lookup = new Map<string, number>();
   for (let i = 0; i < alphabet.length; i++) lookup.set(alphabet[i], i);
   const clean = base64.replace(/=+$/, "");
+  // Defensive lookup: the public `decode()` already rejects non-alphabet
+  // input before it reaches us, but this helper is also reachable in
+  // stripped runtimes and via direct imports in tests. Returning 0 for
+  // an unknown byte (the prior `!` non-null assertion's effective
+  // behavior) would silently corrupt the output; throw instead so the
+  // caller cannot act on bogus bytes.
+  const get = (ch: string | undefined): number => {
+    if (ch === undefined) return 0;
+    const v = lookup.get(ch);
+    if (v === undefined) {
+      throw new Error("[@wc-bindable/hawc-webauthn] invalid base64 character during decode.");
+    }
+    return v;
+  };
   let out = "";
   for (let i = 0; i < clean.length; i += 4) {
-    const n0 = lookup.get(clean[i])!;
-    const n1 = lookup.get(clean[i + 1])!;
-    const n2 = i + 2 < clean.length ? lookup.get(clean[i + 2])! : 0;
-    const n3 = i + 3 < clean.length ? lookup.get(clean[i + 3])! : 0;
+    const n0 = get(clean[i]);
+    const n1 = get(clean[i + 1]);
+    const n2 = i + 2 < clean.length ? get(clean[i + 2]) : 0;
+    const n3 = i + 3 < clean.length ? get(clean[i + 3]) : 0;
     const chunk = (n0 << 18) | (n1 << 12) | (n2 << 6) | n3;
     out += String.fromCharCode((chunk >> 16) & 0xff);
     if (i + 2 < clean.length) out += String.fromCharCode((chunk >> 8) & 0xff);
@@ -85,8 +128,19 @@ function _nodeBase64Decode(base64: string): string {
   return out;
 }
 
-/** Generate a cryptographically random challenge of `len` bytes, base64url. */
+/** Generate a cryptographically random challenge of `len` bytes, base64url.
+ *
+ * Input validation: `len` must be a positive integer. Without this guard
+ * `new Uint8Array(len)` accepts several pathological values that all fail
+ * in different surprising ways downstream — `0` yields an empty challenge
+ * (silently defeats replay protection), non-integers like `3.7` silently
+ * truncate to `3`, and negatives throw a cryptic RangeError from the
+ * Uint8Array constructor. Reject loudly at the boundary so callers cannot
+ * accidentally produce unsafe challenges. */
 export function randomChallenge(len: number): string {
+  if (!Number.isInteger(len) || len <= 0) {
+    throw new Error("[@wc-bindable/hawc-webauthn] randomChallenge length must be a positive integer.");
+  }
   const bytes = new Uint8Array(len);
   const cryptoObj: Crypto | undefined =
     (globalThis as any).crypto ?? (globalThis as any).webcrypto;

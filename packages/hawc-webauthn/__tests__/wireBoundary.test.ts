@@ -87,9 +87,17 @@ describe("wire boundary: Core ↔ handlers ↔ Shell", () => {
       create: vi.fn().mockImplementation((args: CredentialCreationOptions) => {
         const buf = (args.publicKey!.user.id as Uint8Array);
         createdUserId = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer;
+        // Per WebAuthn spec, cred.id === base64url(cred.rawId) — the
+        // two are two encodings of the same bytes. The prior fixture
+        // had them independent (`id: "cred-1"` + `rawId: [1,2,3]`),
+        // which the handler now correctly rejects as malformed. Build
+        // rawId from "cred-1" so `id` (base64url of those ASCII bytes)
+        // and `rawId` (the same bytes as a buffer) agree.
+        const rawIdBytes = new TextEncoder().encode("cred-1");
         return Promise.resolve({
-          id: "cred-1",
-          rawId: new Uint8Array([1, 2, 3]).buffer,
+          // encode("cred-1" bytes) → base64url "Y3JlZC0x"
+          id: "Y3JlZC0x",
+          rawId: rawIdBytes.buffer.slice(rawIdBytes.byteOffset, rawIdBytes.byteOffset + rawIdBytes.byteLength),
           type: "public-key",
           authenticatorAttachment: "platform",
           getClientExtensionResults: () => ({}),

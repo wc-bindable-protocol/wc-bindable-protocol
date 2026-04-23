@@ -126,4 +126,61 @@ describe("base64url codec", () => {
     restoreGlobal("webcrypto", undefined);
     expect(() => randomChallenge(4)).toThrow(/getRandomValues/);
   });
+
+  // Regression (Cycle 2 #1): `new Uint8Array(len)` used to accept pathological
+  // values that each failed in a distinct and surprising way —
+  // `0` silently produced an empty challenge (defeats replay protection),
+  // `3.7` silently truncated to 3 bytes, negatives/`NaN`/`undefined` threw
+  // cryptic RangeErrors from deeper in the stack. Reject at the boundary
+  // with a single coherent message so the caller cannot accidentally
+  // issue an unsafe challenge.
+  it.each([0, -1, 3.7, Number.NaN, undefined])(
+    "randomChallenge rejects non-positive-integer length (%p)",
+    (len) => {
+      expect(() => randomChallenge(len as any)).toThrow(/positive integer/);
+    },
+  );
+
+  describe("decode input validation (regression)", () => {
+    // Regression: the prior decoder ignored non-alphabet characters,
+    // silently producing bogus bytes instead of throwing. Ids like
+    // "alice@example.com" (used to slip past directly because '@' and
+    // '.' are outside the base64url alphabet) now fail fast so the
+    // caller cannot act on corrupted bytes.
+
+    it("rejects input containing characters outside the base64url alphabet", () => {
+      expect(() => decode("alice@example.com")).toThrow(/invalid base64url/);
+    });
+
+    it("rejects input with standard (non-URL) base64 alphabet characters", () => {
+      expect(() => decode("abc+/=")).toThrow(/invalid base64url/);
+    });
+
+    it("rejects a non-string input", () => {
+      expect(() => decode(undefined as any)).toThrow(/expects a string/);
+      expect(() => decode(null as any)).toThrow(/expects a string/);
+      expect(() => decode(42 as any)).toThrow(/expects a string/);
+    });
+
+    it("accepts the empty string (round-trips to an empty buffer)", () => {
+      const out = decode("");
+      expect(out.byteLength).toBe(0);
+    });
+
+    it("manual decoder rejects unknown characters when it is reached directly", () => {
+      // Force the fallback path by stripping both atob and Buffer.
+      // The public decode() validates at the entry point, so the inner
+      // helper only sees alphabet-clean input in normal operation. But
+      // the helper must not silently coerce unknown chars to 0 either —
+      // a future caller that wires it up differently must see a throw.
+      restoreGlobal("atob", undefined);
+      restoreGlobal("Buffer", undefined);
+      // Pure alphabet path still works:
+      expect(Array.from(decode("YWJj"))).toEqual([97, 98, 99]);
+      // And the outer validator still throws for outside-alphabet input,
+      // so the helper's defense is a belt-and-suspenders layer that
+      // only fires if decode() is called through an unusual import path.
+      expect(() => decode("!!!")).toThrow(/invalid base64url/);
+    });
+  });
 });

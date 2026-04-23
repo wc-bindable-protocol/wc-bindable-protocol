@@ -27,11 +27,20 @@ export class HttpError extends Error {
  * Returns `undefined` when no caller-supplied status is present, in
  * which case the handler falls back to its endpoint-specific default
  * (500 for challenge, 400 for verify).
+ *
+ * Status range: only 4xx / 5xx are honored. The previous window
+ * `[100, 600)` let a hook attach `status: 200` / `status: 302` to a
+ * thrown Error and have the handler relay it as a SUCCESS response
+ * — both a misleading response code AND a way for a compromised hook
+ * to mask authentication failures as "ok, redirect here". Informational
+ * 1xx codes are never the right answer for a thrown error either.
+ * Clamp to the only statuses that are semantically valid for a failure
+ * path; anything outside falls back to the endpoint-specific default.
  */
 export function _statusFromError(e: unknown): number | undefined {
   if (e && typeof e === "object" && "status" in e) {
     const s = (e as { status: unknown }).status;
-    if (typeof s === "number" && Number.isInteger(s) && s >= 100 && s < 600) {
+    if (typeof s === "number" && Number.isInteger(s) && s >= 400 && s < 600) {
       return s;
     }
   }

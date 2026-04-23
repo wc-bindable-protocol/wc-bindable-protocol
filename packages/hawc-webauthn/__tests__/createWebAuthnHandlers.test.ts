@@ -193,9 +193,12 @@ describe("createWebAuthnHandlers", () => {
     it("turns verify failures into 400s, not 500s", async () => {
       const handlers = createWebAuthnHandlers(core, { resolveSessionId: () => "s1" });
       // No challenge seeded — verify will reject with "no active challenge".
+      // Use non-empty base64url-safe placeholders so the handler's
+      // credential-shape validator passes the payload through to the
+      // Core (the shape check would otherwise reject clientDataJSON="").
       const res = await handlers.verify(postJson("https://x/v", {
         mode: "register",
-        credential: { id: "c", rawId: "c", type: "public-key", response: { clientDataJSON: "", attestationObject: "" } },
+        credential: { id: "c", rawId: "c", type: "public-key", response: { clientDataJSON: "Yw", attestationObject: "YQ" } },
       }));
       expect(res.status).toBe(400);
       const body = await res.json();
@@ -225,6 +228,135 @@ describe("createWebAuthnHandlers", () => {
         credential: { id: "c" },
       }));
       expect(res.status).toBe(400);
+    });
+
+    describe("credential shape validation (regression)", () => {
+      // Regression: the prior handler passed body.credential straight
+      // into the Core. A malformed client payload would burn the
+      // challenge slot (take() consumes regardless) before the verifier
+      // threw. The shape check up front means the challenge survives
+      // and the client can retry with a correct payload.
+
+      async function seedChallenge(): Promise<ReturnType<typeof createWebAuthnHandlers>> {
+        const handlers = createWebAuthnHandlers(core, { resolveSessionId: () => "s1" });
+        await handlers.challenge(postJson("https://x/c", {
+          mode: "register",
+          user: { id: "u-1", name: "a@x", displayName: "Alice" },
+        }));
+        return handlers;
+      }
+
+      it("rejects missing credential.id", async () => {
+        const handlers = await seedChallenge();
+        const res = await handlers.verify(postJson("https://x/v", {
+          mode: "register",
+          credential: {
+            rawId: "cred-1", type: "public-key",
+            response: { clientDataJSON: "Yw", attestationObject: "YQ" },
+          },
+        }));
+        expect(res.status).toBe(400);
+        expect((await res.json()).error).toMatch(/credential\.id/);
+      });
+
+      it("rejects non-base64url credential.id", async () => {
+        const handlers = await seedChallenge();
+        const res = await handlers.verify(postJson("https://x/v", {
+          mode: "register",
+          credential: {
+            id: "has@invalid.char", rawId: "cred-1", type: "public-key",
+            response: { clientDataJSON: "Yw", attestationObject: "YQ" },
+          },
+        }));
+        expect(res.status).toBe(400);
+        expect((await res.json()).error).toMatch(/base64url/);
+      });
+
+      it("rejects credential.type other than 'public-key'", async () => {
+        const handlers = await seedChallenge();
+        const res = await handlers.verify(postJson("https://x/v", {
+          mode: "register",
+          credential: {
+            id: "cred-1", rawId: "cred-1", type: "something-else",
+            response: { clientDataJSON: "Yw", attestationObject: "YQ" },
+          },
+        }));
+        expect(res.status).toBe(400);
+        expect((await res.json()).error).toMatch(/public-key/);
+      });
+
+      it("rejects missing credential.response for register", async () => {
+        const handlers = await seedChallenge();
+        const res = await handlers.verify(postJson("https://x/v", {
+          mode: "register",
+          credential: { id: "cred-1", rawId: "cred-1", type: "public-key" },
+        }));
+        expect(res.status).toBe(400);
+      });
+
+      it("rejects missing attestationObject for register", async () => {
+        const handlers = await seedChallenge();
+        const res = await handlers.verify(postJson("https://x/v", {
+          mode: "register",
+          credential: {
+            id: "cred-1", rawId: "cred-1", type: "public-key",
+            response: { clientDataJSON: "Yw" },
+          },
+        }));
+        expect(res.status).toBe(400);
+        expect((await res.json()).error).toMatch(/attestationObject/);
+      });
+
+      it("rejects missing authenticatorData for authenticate", async () => {
+        const handlers = createWebAuthnHandlers(core, { resolveSessionId: () => "s1" });
+        const res = await handlers.verify(postJson("https://x/v", {
+          mode: "authenticate",
+          credential: {
+            id: "cred-1", rawId: "cred-1", type: "public-key",
+            response: { clientDataJSON: "Yw", signature: "YQ" },
+          },
+        }));
+        expect(res.status).toBe(400);
+        expect((await res.json()).error).toMatch(/authenticatorData/);
+      });
+
+      it("rejects missing signature for authenticate", async () => {
+        const handlers = createWebAuthnHandlers(core, { resolveSessionId: () => "s1" });
+        const res = await handlers.verify(postJson("https://x/v", {
+          mode: "authenticate",
+          credential: {
+            id: "cred-1", rawId: "cred-1", type: "public-key",
+            response: { clientDataJSON: "Yw", authenticatorData: "YQ" },
+          },
+        }));
+        expect(res.status).toBe(400);
+        expect((await res.json()).error).toMatch(/signature/);
+      });
+
+      it("does not consume the challenge slot when the shape is invalid", async () => {
+        // This is the real regression: a badly-shaped request must NOT
+        // force the user to restart the ceremony. After the shape-check
+        // rejection the original challenge is still fresh and a
+        // well-formed request can succeed.
+        const handlers = await seedChallenge();
+        // First request: bad shape → 400.
+        const bad = await handlers.verify(postJson("https://x/v", {
+          mode: "register",
+          credential: { id: "nope", rawId: "nope", type: "public-key", response: {} },
+        }));
+        expect(bad.status).toBe(400);
+        // Second request with the correct shape against the SAME
+        // session — must succeed because the shape-check did not
+        // consume the slot.
+        const good = await handlers.verify(postJson("https://x/v", {
+          mode: "register",
+          credential: {
+            id: "cred-1", rawId: "cred-1", type: "public-key",
+            response: { clientDataJSON: "Yw", attestationObject: "YQ" },
+          },
+        }));
+        expect(good.status).toBe(200);
+      });
     });
   });
 
@@ -377,6 +509,13 @@ describe("createWebAuthnHandlers", () => {
       // hid the 5xx event from infra alerts. This test pins the split:
       // verify-side errors stay 400, resolveUser-side errors become 500
       // unless the caller supplied a `.status` override.
+      //
+      // Response body message: under the tightened disclosure policy,
+      // plain Errors (no `.status`, not HttpError) collapse to the
+      // generic "user lookup failed" string so that internal driver
+      // messages (file paths, connection strings) do not leak to
+      // unauthenticated callers. Applications wanting to surface
+      // "DB connection lost" explicitly must throw an HttpError.
       const handlers = createWebAuthnHandlers(core, {
         resolveSessionId: () => "s1",
         resolveUser: () => { throw new Error("DB connection lost"); },
@@ -395,7 +534,8 @@ describe("createWebAuthnHandlers", () => {
       }));
       expect(res.status).toBe(500);
       const body = await res.json();
-      expect(body.error).toMatch(/DB connection lost/);
+      // Masked — no internal DB error fragments on the wire.
+      expect(body.error).toBe("user lookup failed");
     });
 
     it("verify failure on a happy resolveUser still returns 400 (regression — split is symmetric)", async () => {
@@ -739,6 +879,74 @@ describe("createWebAuthnHandlers", () => {
       }));
       const body = await res.json();
       expect(body.excludeCredentials).toEqual([]);
+    });
+  });
+
+  describe("Cycle 9: status range & shape guards", () => {
+    // Round 2 #1 — `_statusFromError` previously accepted [100, 600),
+    // letting a thrown Error with status: 200/302 surface as a success
+    // response. The narrowed window [400, 600) means those values are
+    // ignored and the endpoint's own default (401/500) applies.
+    it("ignores .status values below 400 on thrown hook errors", async () => {
+      const { challenge } = createWebAuthnHandlers(core, {
+        resolveSessionId: () => {
+          const err: any = new Error("sneaky");
+          err.status = 200;  // would previously surface as 200 OK
+          throw err;
+        },
+      });
+      const res = await challenge(postJson("https://x/c", { mode: "register" }));
+      expect(res.status).toBe(401);   // default for resolveSessionId throws
+      // Message-surface: a .status outside the valid window means the
+      // error is no longer "application-explicit", so the generic
+      // fallback must apply — no internal message leakage either.
+      expect((await res.json()).error).toBe("unauthorized");
+    });
+
+    it("ignores .status: 302 on thrown hook errors (no redirect on failure paths)", async () => {
+      const { challenge } = createWebAuthnHandlers(core, {
+        resolveSessionId: () => "s1",
+        normalizeRegistrationUser: () => {
+          const err: any = new Error("moved");
+          err.status = 302;
+          throw err;
+        },
+      });
+      const res = await challenge(postJson("https://x/c", {
+        mode: "register",
+        user: { id: "u", name: "n", displayName: "d" },
+      }));
+      expect(res.status).toBe(500);
+    });
+
+    it("continues to honor .status values in [400, 600)", async () => {
+      const { challenge } = createWebAuthnHandlers(core, {
+        resolveSessionId: () => {
+          const err: any = new Error("csrf");
+          err.status = 403;
+          throw err;
+        },
+      });
+      const res = await challenge(postJson("https://x/c", { mode: "register" }));
+      expect(res.status).toBe(403);
+      expect((await res.json()).error).toBe("csrf");
+    });
+
+    // Round 2 #9 — credential.id must equal credential.rawId (both are
+    // encodings of the same credential id bytes per WebAuthn spec).
+    it("rejects verify when credential.id and credential.rawId disagree", async () => {
+      const { verify } = createWebAuthnHandlers(core, { resolveSessionId: () => "s1" });
+      // No challenge in-flight for this session but the shape check
+      // runs FIRST, so the response exercises the shape path.
+      const res = await verify(postJson("https://x/v", {
+        mode: "register",
+        credential: {
+          id: "abc", rawId: "xyz", type: "public-key",
+          response: { clientDataJSON: "cd", attestationObject: "att" },
+        },
+      }));
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/id and credential\.rawId must be equal/);
     });
   });
 });

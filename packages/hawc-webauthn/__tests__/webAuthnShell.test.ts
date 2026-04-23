@@ -91,22 +91,15 @@ describe("<hawc-webauthn> shell", () => {
   });
 
   describe("attribute mapping", () => {
-    it("defaults mode to register and userVerification to preferred", () => {
+    it("defaults mode to register and timeout to 60000", () => {
       const el = mkElement({});
       expect(el.mode).toBe("register");
-      expect(el.userVerification).toBe("preferred");
-      expect(el.attestation).toBe("none");
       expect(el.timeout).toBe(60_000);
     });
 
     it("reads valid mode values", () => {
       const el = mkElement({ mode: "authenticate" });
       expect(el.mode).toBe("authenticate");
-    });
-
-    it("treats invalid user-verification as preferred", () => {
-      const el = mkElement({ "user-verification": "garbage" });
-      expect(el.userVerification).toBe("preferred");
     });
 
     it("parses positive finite timeout", () => {
@@ -120,19 +113,31 @@ describe("<hawc-webauthn> shell", () => {
       expect(mkElement({ timeout: "abc" }).timeout).toBe(60_000);
     });
 
-    it("returns defaults for missing or invalid rpId and attestation", () => {
-      expect(mkElement({}).rpId).toBe("");
-      expect(mkElement({ "user-verification": "required" }).userVerification).toBe("required");
-      expect(mkElement({ attestation: "weird" as any }).attestation).toBe("none");
-      expect(mkElement({ attestation: "direct" }).attestation).toBe("direct");
+    it("does NOT expose rp-id / user-verification / attestation as Shell attributes (regression — server-authoritative)", () => {
+      // Case C: the challenge option blob is the authoritative source
+      // for rpId, userVerification, and attestation. Exposing them as
+      // Shell inputs would let a compromised page override server-issued
+      // values — e.g. downgrade userVerification from "required" to
+      // "discouraged" or force attestation to "none". Explicitly pin
+      // that the Shell class does NOT define these getters/setters and
+      // wcBindable does not declare the inputs.
+      const el = mkElement({
+        "rp-id": "anything",
+        "user-verification": "required",
+        attestation: "direct",
+      });
+      expect((el as any).rpId).toBeUndefined();
+      expect((el as any).userVerification).toBeUndefined();
+      expect((el as any).attestation).toBeUndefined();
+      const inputNames = (WebAuthn.wcBindable.inputs ?? []).map((i) => i.name);
+      expect(inputNames).not.toContain("rpId");
+      expect(inputNames).not.toContain("userVerification");
+      expect(inputNames).not.toContain("attestation");
     });
 
     it("property setters reflect to attributes", () => {
       const el = mkElement({});
       el.mode = "authenticate";
-      el.rpId = "example.com";
-      el.userVerification = "required";
-      el.attestation = "direct";
       el.challengeUrl = "/challenge";
       el.verifyUrl = "/verify";
       el.userId = "u-1";
@@ -140,9 +145,6 @@ describe("<hawc-webauthn> shell", () => {
       el.userDisplayName = "Alice";
       el.timeout = 1234;
       expect(el.getAttribute("mode")).toBe("authenticate");
-      expect(el.getAttribute("rp-id")).toBe("example.com");
-      expect(el.getAttribute("user-verification")).toBe("required");
-      expect(el.getAttribute("attestation")).toBe("direct");
       expect(el.getAttribute("challenge-url")).toBe("/challenge");
       expect(el.getAttribute("verify-url")).toBe("/verify");
       expect(el.getAttribute("user-id")).toBe("u-1");
@@ -545,6 +547,65 @@ describe("<hawc-webauthn> shell", () => {
       expect(el.trigger).toBe(false);
       expect(el.status).toBe("error");
     });
+
+    it("true→false cancels an in-flight ceremony (regression — previously a no-op)", async () => {
+      // Regression: the prior setter treated true→false as a no-op,
+      // leaving a framework bound to `trigger` with no declarative way
+      // to abort. The only cancel paths were imperative `abort()` or
+      // disconnect. Setting trigger=false now explicitly aborts.
+      const el = mkElement({
+        mode: "authenticate",
+        "challenge-url": "/c", "verify-url": "/v",
+      });
+      let signal: AbortSignal | undefined;
+      globalThis.fetch = vi.fn().mockImplementation((_url, init: any) => {
+        signal = init.signal;
+        return new Promise((_, reject) => {
+          init.signal.addEventListener("abort", () => {
+            reject(new DOMException("aborted", "AbortError"));
+          });
+        });
+      }) as any;
+      stubCredentials({ get: vi.fn() });
+
+      el.trigger = true;
+      await Promise.resolve();
+      expect(el.trigger).toBe(true);
+      // Flip to false — ceremony must unwind via AbortSignal.
+      el.trigger = false;
+      await new Promise((r) => setTimeout(r, 10));
+      expect(signal?.aborted).toBe(true);
+      expect(el.trigger).toBe(false);
+    });
+
+    it("true→true and false→false are both no-ops (no double-fire, no phantom events)", async () => {
+      const el = mkElement({
+        mode: "authenticate",
+        "challenge-url": "/c", "verify-url": "/v",
+      });
+      // Never resolves — keeps ceremony live for the true→true probe.
+      globalThis.fetch = vi.fn().mockImplementation(() => new Promise(() => {})) as any;
+      stubCredentials({ get: vi.fn() });
+
+      const triggerEvents: boolean[] = [];
+      el.addEventListener("hawc-webauthn:trigger-changed", (e: any) => triggerEvents.push(e.detail));
+
+      // false→false: no event.
+      el.trigger = false;
+      expect(triggerEvents).toHaveLength(0);
+
+      // false→true: one event.
+      el.trigger = true;
+      await Promise.resolve();
+      expect(triggerEvents.filter((v) => v === true)).toHaveLength(1);
+
+      // true→true: still one event.
+      el.trigger = true;
+      expect(triggerEvents.filter((v) => v === true)).toHaveLength(1);
+
+      // Clean up the in-flight ceremony so the next test is not polluted.
+      el.abort();
+    });
   });
 
   describe("abort()", () => {
@@ -593,6 +654,51 @@ describe("<hawc-webauthn> shell", () => {
     });
   });
 
+  describe("identical-write dedupe on Shell setters (regression — mirrors Core policy)", () => {
+    // Regression: the Shell's `_setCredentialId` / `_setUser` / `_setError`
+    // previously dispatched unconditionally. Consecutive `start()` calls
+    // therefore emitted "" → "" credential-id-changed events, null → null
+    // user-changed events, and null → null error events at the reset
+    // step — binders saw spurious transitions that the Core had already
+    // deduped on its side. Pin that the Shell mirrors the Core's
+    // "identical writes do not re-dispatch" policy.
+
+    it("consecutive start() calls on a fresh element do not re-emit identical '' / null state", async () => {
+      const el = mkElement({ mode: "authenticate" });  // no challenge-url -> fail fast
+
+      const credIdEvents: any[] = [];
+      const userEvents: any[] = [];
+      const errorEvents: any[] = [];
+      el.addEventListener("hawc-webauthn:credential-id-changed", (e: any) => credIdEvents.push(e.detail));
+      el.addEventListener("hawc-webauthn:user-changed", (e: any) => userEvents.push(e.detail));
+      el.addEventListener("hawc-webauthn:error", (e: any) => errorEvents.push(e.detail));
+
+      // First start() — fails fast on missing challenge-url. The reset
+      // step hits _setError(null) [already null → dedup],
+      // _setCredentialId("") [already "" → dedup],
+      // _setUser(null) [already null → dedup]. Then _runCeremony throws
+      // and _setError(err) fires ONE error event.
+      await expect(el.start()).rejects.toThrow(/challenge-url/);
+      // Second start() — reset step again. _setError(null) now differs
+      // from the prior err → fires once. _setCredentialId("") is still
+      // "" → dedup. _setUser(null) still null → dedup. Then fails again
+      // and _setError(err2) fires.
+      await expect(el.start()).rejects.toThrow(/challenge-url/);
+
+      // credential-id and user must NEVER have dispatched — values
+      // never moved away from their initial "" / null, so the dedupe
+      // suppresses every write.
+      expect(credIdEvents).toEqual([]);
+      expect(userEvents).toEqual([]);
+      // error fires: err1 from first failure, null reset before second,
+      // err2 from second failure. Three total — not six.
+      expect(errorEvents).toHaveLength(3);
+      expect(errorEvents[0]).toBeInstanceOf(Error);
+      expect(errorEvents[1]).toBeNull();
+      expect(errorEvents[2]).toBeInstanceOf(Error);
+    });
+  });
+
   describe("re-entry serialization", () => {
     it("aborts the prior start() when a new one begins", async () => {
       const el = mkElement({
@@ -630,6 +736,65 @@ describe("<hawc-webauthn> shell", () => {
       expect(firstSignal.signal?.aborted).toBe(true);
       await expect(second).resolves.toBeUndefined();
       expect(el.status).toBe("completed");
+    });
+
+    it("three overlapping start() calls serialize strictly — only the last one completes (regression)", async () => {
+      // Regression: the prior "abort + await _currentStart" shape
+      // handled two overlapping starts but raced when a THIRD arrived
+      // mid-await. After the first settled, the second and third both
+      // resumed in microtask order and clobbered each other's
+      // `_currentStart` / AbortController assignments, leaving one
+      // ceremony orphaned (live fetch, no abort reachable). The
+      // generation + chain fix below gives FIFO serialization.
+      const el = mkElement({
+        mode: "authenticate",
+        "challenge-url": "/c", "verify-url": "/v",
+      });
+
+      const signals: AbortSignal[] = [];
+      let callCount = 0;
+      globalThis.fetch = vi.fn().mockImplementation((_url, init: any) => {
+        callCount++;
+        signals.push(init.signal);
+        // First call blocks and only resolves on abort. Second call
+        // is the SUCCESSFUL ceremony's challenge fetch (runs for the
+        // surviving third start() — the second start()'s ceremony
+        // never kicks off because it was superseded by a newer
+        // generation before its chain segment executed).
+        if (callCount === 1) {
+          return new Promise((_, reject) => {
+            init.signal.addEventListener("abort", () => {
+              reject(new DOMException("aborted", "AbortError"));
+            });
+          });
+        }
+        if (callCount === 2) {
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({ challenge: encode(new Uint8Array([1])), rpId: "x", allowCredentials: [] }),
+          });
+        }
+        return Promise.resolve({ ok: true, json: async () => ({ credentialId: "cred-1" }) });
+      }) as any;
+      stubCredentials({ get: vi.fn().mockResolvedValue(fakeAssertionCredential()) });
+
+      const first = el.start();
+      await Promise.resolve();
+      const second = el.start();
+      // No `await` between — third arrives while second is still
+      // queueing. This is the scenario the generation counter fixes.
+      const third = el.start();
+
+      // First must reject (aborted). Second also rejects (aborted by
+      // the third before it even got to run the ceremony, or by
+      // generation-skip). Third runs the ceremony and completes.
+      await expect(first).rejects.toThrow();
+      await expect(second).resolves.toBeUndefined();  // generation-skip: no-op resolve
+      await expect(third).resolves.toBeUndefined();
+      expect(el.status).toBe("completed");
+      // First signal was aborted. The test's key invariant is that
+      // the chain did not leave an orphan ceremony live.
+      expect(signals[0]?.aborted).toBe(true);
     });
   });
 
@@ -796,6 +961,106 @@ describe("<hawc-webauthn> shell", () => {
       // Without the fix this stayed at the previous user; now it must be null.
       expect(el.user).toBeNull();
       expect(el.credentialId).toBe("cred-1");
+    });
+  });
+
+  describe("Cycle 9: AbortController lifecycle & _asError robustness", () => {
+    // Round 2 #5 — the AC slot must be cleared on success AND failure
+    // alike. Prior to the fix, `_abortController` lingered after a
+    // completed ceremony, so a late abort() call would "cancel" an
+    // already-settled signal with no effect but no signal either.
+    it("clears _abortController after a successful ceremony", async () => {
+      const el = mkElement({
+        "mode": "register",
+        "challenge-url": "/c",
+        "verify-url": "/v",
+        "user-id": "u-1",
+        "user-name": "n",
+        "user-display-name": "U",
+      });
+
+      stubCredentials({
+        create: vi.fn().mockResolvedValue(fakeAttestationCredential()),
+        get: vi.fn(),
+      });
+      globalThis.fetch = vi.fn().mockImplementation((url: string) => {
+        const target = String(url);
+        if (target.endsWith("/c")) {
+          return Promise.resolve(new Response(JSON.stringify({
+            rp: { id: "example.com", name: "Example" },
+            user: { id: encode(new TextEncoder().encode("u-1")), name: "n", displayName: "U" },
+            challenge: "Y2hhbGxlbmdl",
+            pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+            timeout: 60000,
+            excludeCredentials: [],
+            authenticatorSelection: { userVerification: "preferred" },
+            attestation: "none",
+          }), { headers: { "content-type": "application/json" } }));
+        }
+        if (target.endsWith("/v")) {
+          return Promise.resolve(new Response(JSON.stringify({ credentialId: "cred-1" }), {
+            headers: { "content-type": "application/json" },
+          }));
+        }
+        throw new Error("unexpected " + target);
+      }) as any;
+
+      await el.start();
+      expect(el.status).toBe("completed");
+      // Access private via bracket notation (vitest/TS allows this
+      // because private is erased at runtime).
+      expect((el as any)._abortController).toBeNull();
+    });
+
+    it("clears _abortController after a failed ceremony", async () => {
+      const el = mkElement({
+        "mode": "register",
+        "challenge-url": "/c",
+        "verify-url": "/v",
+        "user-id": "u-1",
+        "user-name": "n",
+        "user-display-name": "U",
+      });
+
+      globalThis.fetch = vi.fn().mockRejectedValue(new Error("network")) as any;
+      await expect(el.start()).rejects.toThrow(/network/);
+      expect(el.status).toBe("error");
+      expect((el as any)._abortController).toBeNull();
+    });
+
+    // Round 2 #8 — `_asError(null)` / `_asError(undefined)` must not
+    // produce Error("null") / Error("undefined"). Those are misleading
+    // — the reactive `error` surface looks like a genuine failure named
+    // "null" / "undefined" instead of signaling "nothing was thrown".
+    it("produces a legible Error when something throws null", async () => {
+      const el = mkElement({
+        "mode": "register",
+        "challenge-url": "/c",
+        "verify-url": "/v",
+        "user-id": "u-1",
+        "user-name": "n",
+        "user-display-name": "U",
+      });
+      // Force _fetchChallenge's fetch to throw null. fetch() normally
+      // rejects with Error, but user code that wraps fetch can turn a
+      // reject-with-nullish into exactly this shape.
+      globalThis.fetch = vi.fn().mockImplementation(() => Promise.reject(null)) as any;
+      await expect(el.start()).rejects.toBeInstanceOf(Error);
+      expect(el.error).not.toBeNull();
+      expect(el.error!.message).toBe("unknown error (nothing thrown)");
+      // Must NOT stringify to "null".
+      expect(el.error!.message).not.toBe("null");
+    });
+
+    it("produces a legible Error when something throws undefined", async () => {
+      const el = mkElement({
+        "mode": "authenticate",
+        "challenge-url": "/c",
+        "verify-url": "/v",
+      });
+      globalThis.fetch = vi.fn().mockImplementation(() => Promise.reject(undefined)) as any;
+      await expect(el.start()).rejects.toBeInstanceOf(Error);
+      expect(el.error!.message).toBe("unknown error (nothing thrown)");
     });
   });
 });

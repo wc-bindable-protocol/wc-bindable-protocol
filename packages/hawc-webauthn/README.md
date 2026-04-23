@@ -3,11 +3,13 @@
 Declarative **WebAuthn / Passkeys** component for Web Components. Framework-agnostic passwordless authentication via `wc-bindable-protocol`.
 
 ```html
+<!-- rpId / userVerification / attestation are server-authoritative and
+     configured on WebAuthnCore — see "Server setup" and the
+     "Server-authoritative fields" note below. They are intentionally
+     NOT attributes on <hawc-webauthn>. -->
 <hawc-webauthn
   id="passkey"
-  rp-id="example.com"
   mode="register"
-  user-verification="required"
   user-id="user-42"
   user-name="alice@example.com"
   user-display-name="Alice"
@@ -69,9 +71,13 @@ type WebAuthnStatus =
   | "error";
 ```
 
+**Core vs. Shell status progression.** The Shell `<hawc-webauthn>` passes through the full sequence because it drives `navigator.credentials.*` itself. The server-side `WebAuthnCore` only sees the control plane: it emits `idle → challenging → verifying → completed | error` and **never** emits `creating` or `asserting` (those states describe work happening in the browser, which the Core cannot observe). Code bound directly to a Core instance (e.g. a remote-proxy debugging surface) should not assume `creating`/`asserting` will arrive.
+
 ---
 
 ## Server setup
+
+> **SECURITY REQUIRED — CSRF defense is mandatory.** The shipped handlers do **not** perform CSRF token checks or `Origin` header validation. The Shell sends `credentials: "include"` (cookies flow automatically), which makes both endpoints cross-site-forgeable unless YOU enforce CSRF defense in front of — or inside — your `resolveSessionId` hook. Without it, any third-party page can force-authenticate a logged-in user against your endpoints. See [CSRF and Origin header verification](#csrf-and-origin-header-verification) below for the minimum required defenses before you ship this to production. The WebAuthn signature check inside the verifier is NOT a substitute — a forged request still burns a challenge slot and produces a DoS vector.
 
 > **Always import from `@wc-bindable/hawc-webauthn/server` on Node.** The root entry (`@wc-bindable/hawc-webauthn`) re-exports the `<hawc-webauthn>` custom-element class, which extends `HTMLElement` and is evaluated at module-load time. In any Node-only runtime (server, Workers, build scripts, tests under `node:` environments) `HTMLElement` is undefined and the import fails immediately with `ReferenceError: HTMLElement is not defined`. The `/server` subpath exports the `WebAuthnCore`, stores, verifier adapter, `HttpError`, and `createWebAuthnHandlers` — none of those touch DOM globals, so they load cleanly under Node, Bun, Deno, and Cloudflare Workers. Browser code uses the root entry; Node code uses `/server`.
 
@@ -128,7 +134,7 @@ app.post("/api/webauthn/verify",    (c) => handlers.verify(c.req.raw));
 
 ### Hook errors → HTTP status
 
-Any handler hook can short-circuit to a specific status code by throwing `HttpError(status, message)` or any Error with a numeric `.status` in `[100, 600)`. Defaults are picked per failure phase so that infra alerts tuned on 5xx behave correctly:
+Any handler hook can short-circuit to a specific status code by throwing `HttpError(status, message)` or any Error with a numeric `.status` in `[400, 600)` (only 4xx / 5xx are honored — a thrown error cannot produce a 2xx/3xx response, preventing a compromised hook from masking auth failures as "ok"). Defaults are picked per failure phase so that infra alerts tuned on 5xx behave correctly:
 
 | Endpoint | Failure source | Default status |
 |----------|----------------|---------------:|
@@ -140,7 +146,7 @@ Any handler hook can short-circuit to a specific status code by throwing `HttpEr
 
 The split inside `verify` matters: a Core verify failure is almost always client-caused (expired challenge, replay, wrong origin) and shouldn't page anyone, while a `resolveUser` failure is application territory (DB outage, IdP timeout) and must surface as 5xx. Authentication / authorization failures inside any hook should throw `HttpError(401)` or `HttpError(403)` so they neither pollute 5xx alerts nor get mis-classified as 400 client errors.
 
-Caller-supplied `.status` overrides every default. `.status` values that are not integers in `[100, 600)` are ignored (the default for that phase applies) — this prevents an attacker-controlled error from downgrading a 500 to a 200.
+Caller-supplied `.status` overrides every default. `.status` values that are not integers in `[400, 600)` are ignored (the default for that phase applies) — this prevents an attacker-controlled error from downgrading a 500 to a 200 or emitting a redirect on a failure path.
 
 ### Authenticate enumeration defense
 
@@ -158,9 +164,28 @@ resolveAuthenticationUserId: (req, requested) => {
 
 Return `null` to keep the request usernameless even when the client sent an id; throw `HttpError(...)` to refuse with a specific status.
 
+### Timing side-channel note
+
+`verifyAuthentication` has multiple early-return rejection paths (malformed credential id, missing challenge slot, expired challenge, unknown credential, userId mismatch) that complete in microseconds, while the success path runs a full ECDSA/RSA verify that takes tens of milliseconds. This timing delta is observable over the network and can support credential-id / user enumeration against a well-instrumented attacker. The implementation does NOT equalize these paths with a dummy verify — doing so would add a per-request ECDSA verify (DoS amplifier) and a poorly-chosen dummy credential leaks its own distinguishing timing. Deployments that treat credential-id secrecy as a security boundary should sit the Core behind a rate-limiter that rejects the Nth failed verify per client IP. The wire error strings are deliberately collapsed to a single "credential not recognized for this session" message across rejection reasons — that closes the message-content channel even though the timing channel remains.
+
 ### Duplicate-credential defense
 
 Even with `listExistingCredentials` populating the browser's exclude list, the Core re-checks at verify time: a credential whose `credentialId` is already persisted is rejected (separate messages for "already registered to this user" vs "to a different user"). This prevents both duplicate-enrollment audit-log noise and silent ownership transfer if the store overwrites by `credentialId`.
+
+### CSRF and Origin header verification
+
+The Fetch-API handlers shipped here **do not themselves perform CSRF token checks or `Origin` / `Sec-Fetch-Site` header validation** — those are intentionally the responsibility of your `resolveSessionId` hook (and whatever middleware runs in front of the handlers). Two reasons:
+
+1. Session-cookie decoding is already happening inside `resolveSessionId`, and CSRF defense is a property of that cookie surface (double-submit cookie, `SameSite=Strict|Lax`, sync token compare). Layering another CSRF scheme at the handler would duplicate — and potentially contradict — whatever the rest of your app does.
+2. The Shell sets `credentials: "include"` on its fetch so cookie auth flows automatically. That same property makes the endpoints cross-site-forgeable if your session cookie does not opt into `SameSite` or your framework does not validate an anti-CSRF token.
+
+Minimum recommended defenses (enforce inside `resolveSessionId` or a preceding middleware):
+
+- `SameSite=Strict` (or at least `Lax`) on the session cookie, plus `Secure` and `HttpOnly`.
+- Reject requests whose `Origin` header is neither the configured `origin` (passed to `WebAuthnCore`) nor same-site to the endpoint — matching the WebAuthn verifier's own origin check, but at the HTTP boundary.
+- For frameworks that issue CSRF tokens (Rails / Django / Next.js Server Actions), require and validate the token in `resolveSessionId` before returning the sessionId. Throw `HttpError(403, "csrf")` on mismatch.
+
+The `challenge` endpoint's default status for `resolveSessionId` throws is 401, but you can throw `HttpError(403, ...)` from the hook to surface a specific CSRF-failure status. Every WebAuthn ceremony also has an intrinsic origin check inside the verifier: `expectedOrigin` passed to `WebAuthnCore` is matched against the assertion's `clientDataJSON.origin`, so even if a CSRF bypass smuggled a request through, the authenticator signature would fail to verify — but relying on that as the only defense means the challenge slot still gets burned on every forged request, which is a DoS vector you want to close earlier.
 
 ### Swap the defaults for production
 
@@ -199,13 +224,12 @@ bootstrapWebAuthn();  // defines <hawc-webauthn>
 | `mode` | yes | `"register"` or `"authenticate"` |
 | `challenge-url` | yes | POST endpoint backed by `handlers.challenge` |
 | `verify-url` | yes | POST endpoint backed by `handlers.verify` |
-| `rp-id` | no | Informational; server-returned `rpId` is authoritative |
-| `user-verification` | no | `"required" | "preferred" | "discouraged"` (default `"preferred"`) |
-| `attestation` | no | `"none" | "indirect" | "direct" | "enterprise"` (default `"none"`) |
 | `user-id` | `register`: yes | Stable identifier for the credential owner |
 | `user-name` | `register`: yes | Typically email |
 | `user-display-name` | `register`: yes | Human-readable display name |
 | `timeout` | no | Milliseconds (default `60000`) |
+
+**Server-authoritative fields (intentionally not Shell attributes).** `rpId`, `userVerification`, and `attestation` are configured on the server-side `WebAuthnCore` (see [Server setup](#server-setup)) and returned to the browser inside the challenge option blob. There is deliberately no `rp-id` / `user-verification` / `attestation` attribute on `<hawc-webauthn>`: letting a page override server-issued values would let a compromised Shell downgrade `userVerification` from `"required"` to `"discouraged"`, or force `attestation` to `"none"` to hide a swapped authenticator. The Shell consumes the server's values verbatim.
 
 ### Commands
 
