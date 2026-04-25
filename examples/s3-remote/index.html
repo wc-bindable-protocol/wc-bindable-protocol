@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>hawc-s3 Remote Demo</title>
+  <title>s3-uploader Remote Demo</title>
   <style>
     body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
     h1 { font-size: 1.4rem; }
@@ -17,13 +17,13 @@
     "imports": {
       "@wc-bindable/core": "/packages/core/dist/index.js",
       "@wc-bindable/remote": "/packages/remote/dist/index.js",
-      "@wc-bindable/hawc-s3": "/packages/hawc-s3/dist/index.js"
+      "@wc-bindable/s3": "/packages/s3/dist/index.js"
     }
   }
   </script>
 </head>
 <body>
-  <h1>hawc-s3 Remote Demo</h1>
+  <h1>s3-uploader Remote Demo</h1>
   <p>
     Pick a file and click Upload. The browser asks the server (over WebSocket) for a
     presigned PUT URL, uploads the bytes <strong>directly</strong> to S3, then notifies
@@ -55,13 +55,13 @@
 
   <!--
     The custom elements get their tag names + remote settings from bootstrapS3().
-    `enableRemote: true` + S3_REMOTE_CORE_URL means <hawc-s3> talks to S3Core
+    `enableRemote: true` + S3_REMOTE_CORE_URL means <s3-uploader> talks to S3Core
     on the Node server instead of looking for a local S3Core.
   -->
-  <hawc-s3 id="s3"></hawc-s3>
+  <s3-uploader id="s3"></s3-uploader>
 
   <!-- Browser-side declarative callbacks (C案 client side). -->
-  <hawc-s3-callback for="#s3" on="progress">
+  <s3-callback for="#s3" on="progress">
     <script type="module">
       export default ({ loaded, total }) => {
         const bar = document.getElementById("bar");
@@ -72,9 +72,9 @@
         }
       };
     </script>
-  </hawc-s3-callback>
+  </s3-callback>
 
-  <hawc-s3-callback for="#s3" on="completed">
+  <s3-callback for="#s3" on="completed">
     <script type="module">
       export default async (completed, { host }) => {
         if (!completed) return;
@@ -90,32 +90,32 @@
           log.length ? log.map(e => JSON.stringify(e)).join("\n") : "(no uploads yet)";
       };
     </script>
-  </hawc-s3-callback>
+  </s3-callback>
 
-  <hawc-s3-callback for="#s3" on="uploading">
+  <s3-callback for="#s3" on="uploading">
     <script type="module">
       export default (uploading) => {
         document.getElementById("status").textContent = uploading ? "uploading" : "idle";
         document.getElementById("cancel").disabled = !uploading;
       };
     </script>
-  </hawc-s3-callback>
+  </s3-callback>
 
-  <hawc-s3-callback for="#s3" on="error">
+  <s3-callback for="#s3" on="error">
     <script type="module">
       export default (err) => {
         const msg = err?.message || (typeof err === "string" ? err : JSON.stringify(err));
         document.getElementById("error").textContent = msg ? "error: " + msg : "";
       };
     </script>
-  </hawc-s3-callback>
+  </s3-callback>
 
   <script type="module">
-    // Wire the env-style remote URL the way the @wc-bindable/hawc-s3 config expects.
+    // Wire the env-style remote URL the way the @wc-bindable/s3 config expects.
     // bootstrapS3() with `remoteSettingType: "env"` reads globalThis.S3_REMOTE_CORE_URL.
     globalThis.S3_REMOTE_CORE_URL = `ws://${location.host}`;
 
-    const { bootstrapS3 } = await import("@wc-bindable/hawc-s3");
+    const { bootstrapS3 } = await import("@wc-bindable/s3");
     bootstrapS3({
       remote: { enableRemote: true, remoteSettingType: "env" },
     });

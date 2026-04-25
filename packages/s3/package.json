@@ -1,0 +1,62 @@
+{
+  "name": "@wc-bindable/s3",
+  "version": "0.4.0",
+  "description": "Declarative S3 (and S3-compatible) blob store component for Web Components. Server-side signing, browser-direct upload, no AWS SDK, via wc-bindable-protocol.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./server": {
+      "types": "./dist/server.d.ts",
+      "default": "./dist/server.js"
+    },
+    "./auto": {
+      "types": "./src/auto/auto.d.ts",
+      "default": "./src/auto/auto.min.js"
+    },
+    "./auto/remoteEnv": {
+      "types": "./src/auto/remoteEnv.d.ts",
+      "default": "./src/auto/remoteEnv.min.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src/auto",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "prepack": "npm run build",
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest run __tests__",
+    "test:watch": "vitest __tests__",
+    "test:integration": "npm run build -w @wc-bindable/core -w @wc-bindable/remote -w @wc-bindable/s3 && playwright test"
+  },
+  "keywords": [
+    "web-components",
+    "s3",
+    "aws",
+    "blob",
+    "upload",
+    "presigned-url",
+    "custom-elements",
+    "wc-bindable",
+    "declarative"
+  ],
+  "dependencies": {
+    "@wc-bindable/core": "^0.4.0",
+    "@wc-bindable/remote": "^0.4.0"
+  },
+  "author": "mogera551",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wc-bindable-protocol/wc-bindable-protocol.git",
+    "directory": "packages/s3"
+  },
+  "license": "MIT"
+}

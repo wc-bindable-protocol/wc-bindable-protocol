@@ -1,10 +1,10 @@
 /**
- * Demo server for @wc-bindable/hawc-s3 in remote mode.
+ * Demo server for @wc-bindable/s3 in remote mode.
  *
  * Starts:
  *   - HTTP server (serves index.html and strictly the `dist/` subtree of
  *     workspace packages — source, package.json, tests, etc. are NOT served)
- *   - WebSocket server bridging the browser <hawc-s3> Shell to a server-side S3Core
+ *   - WebSocket server bridging the browser <s3-uploader> Shell to a server-side S3Core
  *
  * Required env:
  *   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION
@@ -27,7 +27,7 @@ import { fileURLToPath } from "node:url";
 import { WebSocketServer } from "ws";
 // Use the /server subpath — the default barrel re-exports the browser custom
 // elements, which extend HTMLElement and crash at evaluation time in Node.
-import { S3Core, AwsS3Provider } from "@wc-bindable/hawc-s3/server";
+import { S3Core, AwsS3Provider } from "@wc-bindable/s3/server";
 import { RemoteShellProxy } from "@wc-bindable/remote";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));

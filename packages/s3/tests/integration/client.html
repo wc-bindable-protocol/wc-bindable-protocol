@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>s3-uploader Remote E2E</title>
+  <script type="importmap">
+  {
+    "imports": {
+      "@wc-bindable/core": "/packages/core/dist/index.js",
+      "@wc-bindable/remote": "/packages/remote/dist/index.js",
+      "@wc-bindable/s3": "/packages/s3/dist/index.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="status">starting</div>
+  <pre id="results"></pre>
+  <pre id="callbackEvents"></pre>
+
+  <!--
+    multipart-threshold=128 forces files > 128 B through the multipart path.
+    multipart-concurrency=2 keeps the test deterministic on slow CI runners.
+  -->
+  <s3-uploader id="s3" multipart-threshold="128" multipart-concurrency="2"></s3-uploader>
+
+  <s3-callback for="#s3" on="completed">
+    <script type="module">
+      export default (completed, { host }) => {
+        if (!completed) return;
+        const ev = window.__events ?? (window.__events = []);
+        ev.push({ kind: "completed", url: !!host.url, etag: host.etag });
+      };
+    </script>
+  </s3-callback>
+
+  <s3-callback for="#s3" on="error">
+    <script type="module">
+      export default (err) => {
+        // The Core resets `error` to null at the start of each upload — that
+        // is not a real failure, so swallow it here.
+        if (err == null) return;
+        const ev = window.__events ?? (window.__events = []);
+        ev.push({ kind: "error", message: err?.message ?? String(err) });
+      };
+    </script>
+  </s3-callback>
+
+  <s3-callback for="#s3" on="progress">
+    <script type="module">
+      export default ({ loaded, total, phase }) => {
+        const ev = window.__events ?? (window.__events = []);
+        ev.push({ kind: "progress", loaded, total, phase });
+      };
+    </script>
+  </s3-callback>
+
+  <script type="module">
+    globalThis.S3_REMOTE_CORE_URL = `ws://${location.host}`;
+    const { bootstrapS3 } = await import("@wc-bindable/s3");
+    bootstrapS3({ remote: { enableRemote: true, remoteSettingType: "env" } });
+
+    const s3 = document.getElementById("s3");
+    const results = {};
+    const log = (k, v) => {
+      results[k] = v;
+      document.getElementById("results").textContent = JSON.stringify(results, null, 2);
+    };
+
+    const dumpEvents = () => {
+      document.getElementById("callbackEvents").textContent = JSON.stringify(window.__events ?? [], null, 2);
+    };
+
+    function uploadAndWait(blob, key) {
+      return new Promise((resolve, reject) => {
+        const onCompleted = (e) => {
+          if (!e.detail) return; // ignore the initial "false" snapshot
+          s3.removeEventListener("s3-uploader:completed-changed", onCompleted);
+          s3.removeEventListener("s3-uploader:error", onError);
+          resolve({ url: s3.url, etag: s3.etag });
+        };
+        const onError = (e) => {
+          // Core resets error→null at the start of each upload; only treat a
+          // non-null detail as a real failure.
+          if (e.detail == null) return;
+          s3.removeEventListener("s3-uploader:completed-changed", onCompleted);
+          s3.removeEventListener("s3-uploader:error", onError);
+          reject(e.detail);
+        };
+        s3.addEventListener("s3-uploader:completed-changed", onCompleted);
+        s3.addEventListener("s3-uploader:error", onError);
+        s3.file = blob;
+        s3.key = key;
+        s3.trigger = true;
+      });
+    }
+
+    // Wait for the initial sync from the server-side S3Core.
+    await new Promise((r) => setTimeout(r, 300));
+
+    try {
+      // --- Test 1: single PUT (small file) ---
+      const small = new Blob([new Uint8Array(64).fill(0x41)], { type: "text/plain" });
+      const r1 = await uploadAndWait(small, "small.txt");
+      log("singlePut", { url: !!r1.url, etag: r1.etag });
+
+      // Verify the URL actually serves the bytes back.
+      const r1get = await fetch(r1.url).then(r => r.arrayBuffer());
+      log("singleGetSize", r1get.byteLength);
+
+      // --- Test 2: multipart (large enough to exceed threshold) ---
+      // 384 B > 128 threshold, but client.html sets a non-real partSize via the
+      // server-controlled S3Core. The S3Core's computePartSize enforces 5 MiB
+      // minimum, so the actual multipart will produce 1 part. Use a 6 MiB blob
+      // to force multiple parts.
+      const partBytes = 6 * 1024 * 1024 + 100; // > 5 MiB minimum, ensures 2 parts
+      const large = new Blob([new Uint8Array(partBytes).fill(0x42)], { type: "application/octet-stream" });
+      const r2 = await uploadAndWait(large, "large.bin");
+      log("multipart", { url: !!r2.url, etag: r2.etag });
+      const r2get = await fetch(r2.url).then(r => r.arrayBuffer());
+      log("multipartGetSize", r2get.byteLength);
+
+      // --- Test 3: progress events fired ---
+      const progressEvents = (window.__events ?? []).filter(e => e.kind === "progress");
+      log("progressEventCount", progressEvents.length);
+      log("progressPhases", [...new Set(progressEvents.map(e => e.phase))]);
+      // (Byte-level progress is observed at the server-side Core boundary
+      //  by the integration spec — the client-side stream is rAF-coalesced
+      //  and mid-upload bytes are dropped on fast local loopback.)
+
+      // --- Test 4: completed callback fired twice ---
+      const completedEvents = (window.__events ?? []).filter(e => e.kind === "completed");
+      log("completedEventCount", completedEvents.length);
+
+      dumpEvents();
+      document.getElementById("status").textContent = "done";
+    } catch (err) {
+      log("fatal", err?.message ?? String(err));
+      dumpEvents();
+      document.getElementById("status").textContent = "error";
+    }
+  </script>
+</body>
+</html>

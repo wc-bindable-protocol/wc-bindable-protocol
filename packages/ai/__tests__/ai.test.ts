@@ -1,0 +1,1246 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { Ai } from "../src/components/Ai";
+import { AiMessage } from "../src/components/AiMessage";
+import { registerComponents } from "../src/registerComponents";
+import { bootstrapAi } from "../src/bootstrapAi";
+import { config, setConfig, getConfig, getRemoteCoreUrl } from "../src/config";
+import { raiseError } from "../src/raiseError";
+import { registerAutoTrigger, unregisterAutoTrigger } from "../src/autoTrigger";
+
+registerComponents();
+
+function createMockResponse(body: any, options: { status?: number; ok?: boolean } = {}): Response {
+  const { status = 200, ok = true } = options;
+  return {
+    ok,
+    status,
+    statusText: ok ? "OK" : "Error",
+    headers: new Headers({ "Content-Type": "application/json" }),
+    body: null,
+    json: () => Promise.resolve(body),
+    text: () => Promise.resolve(typeof body === "string" ? body : JSON.stringify(body)),
+  } as unknown as Response;
+}
+
+describe("raiseError", () => {
+  it("[@wc-bindable/ai]プレフィックス付きのエラーをスローする", () => {
+    expect(() => raiseError("test error")).toThrow("[@wc-bindable/ai] test error");
+  });
+});
+
+describe("config", () => {
+  it("デフォルト設定を取得できる", () => {
+    expect(config.tagNames.ai).toBe("ai-agent");
+    expect(config.tagNames.aiMessage).toBe("ai-message");
+    expect(config.autoTrigger).toBe(true);
+    expect(config.triggerAttribute).toBe("data-aitarget");
+  });
+
+  it("getConfig()でフリーズされたコピーを取得できる", () => {
+    const frozen = getConfig();
+    expect(Object.isFrozen(frozen)).toBe(true);
+    expect(frozen).toBe(getConfig());
+  });
+
+  it("setConfig()で設定を変更できる", () => {
+    setConfig({ autoTrigger: false });
+    expect(config.autoTrigger).toBe(false);
+    setConfig({ autoTrigger: true });
+  });
+
+  it("setConfig()でtagNamesを変更できる", () => {
+    setConfig({ tagNames: { ai: "my-ai" } });
+    expect(config.tagNames.ai).toBe("my-ai");
+    setConfig({ tagNames: { ai: "ai-agent" } });
+  });
+
+  it("setConfig()でtriggerAttributeを変更できる", () => {
+    setConfig({ triggerAttribute: "data-trigger" });
+    expect(config.triggerAttribute).toBe("data-trigger");
+    setConfig({ triggerAttribute: "data-aitarget" });
+  });
+
+  it("setConfig()後にgetConfig()キャッシュがリセットされる", () => {
+    const f1 = getConfig();
+    setConfig({ autoTrigger: false });
+    expect(getConfig()).not.toBe(f1);
+    setConfig({ autoTrigger: true });
+  });
+
+  it("setConfig()で空文字triggerAttributeを拒否する", () => {
+    expect(() => setConfig({ triggerAttribute: "" })).toThrow(/triggerAttribute must be a non-empty string/);
+  });
+
+  it("setConfig()で空白のみtriggerAttributeを拒否する", () => {
+    expect(() => setConfig({ triggerAttribute: "   " })).toThrow(/triggerAttribute must be a non-empty string/);
+  });
+
+  it("setConfig()で非文字列triggerAttributeを拒否する", () => {
+    expect(() => setConfig({ triggerAttribute: 123 as any })).toThrow(/triggerAttribute must be a non-empty string/);
+  });
+
+  it("setConfig()で空文字tagNames.aiを拒否する", () => {
+    expect(() => setConfig({ tagNames: { ai: "" } })).toThrow(/tagNames\.ai must be a non-empty string/);
+  });
+
+  it("setConfig()で空文字tagNames.aiMessageを拒否する", () => {
+    expect(() => setConfig({ tagNames: { aiMessage: "" } })).toThrow(/tagNames\.aiMessage must be a non-empty string/);
+  });
+
+  it("setConfig()で空白のみtagNames.aiを拒否する", () => {
+    expect(() => setConfig({ tagNames: { ai: "   " } })).toThrow(/tagNames\.ai must be a non-empty string/);
+  });
+
+  it("setConfig()で非文字列tagNames.aiMessageを拒否する", () => {
+    expect(() => setConfig({ tagNames: { aiMessage: 42 as any } })).toThrow(/tagNames\.aiMessage must be a non-empty string/);
+  });
+
+  it("setConfig()でハイフン無しtagNames.aiを拒否する", () => {
+    expect(() => setConfig({ tagNames: { ai: "invalidtag" } })).toThrow(/tagNames\.ai must be a valid custom element name/);
+  });
+
+  it("setConfig()で大文字tagNames.aiMessageを拒否する", () => {
+    expect(() => setConfig({ tagNames: { aiMessage: "Hawc-Msg" } })).toThrow(/tagNames\.aiMessage must be a valid custom element name/);
+  });
+
+  it("setConfig()でremoteSettingTypeのenv/config以外を拒否する", () => {
+    expect(() => setConfig({ remote: { remoteSettingType: "bogus" as any } }))
+      .toThrow(/remote\.remoteSettingType must be "env" or "config"/);
+  });
+
+  it("setConfig()で明示的undefinedのtagNames.aiを拒否する", () => {
+    // `Object.assign` would otherwise overwrite the default "ai-agent" with
+    // undefined, and registerComponents() would reach
+    // customElements.define(undefined, Ai).
+    expect(() => setConfig({ tagNames: { ai: undefined } as any }))
+      .toThrow(/tagNames\.ai must be a non-empty string/);
+    // 既定値が破壊されていないことを確認。
+    expect(config.tagNames.ai).toBe("ai-agent");
+  });
+
+  it("setConfig()で明示的undefinedのtagNames.aiMessageを拒否する", () => {
+    expect(() => setConfig({ tagNames: { aiMessage: undefined } as any }))
+      .toThrow(/tagNames\.aiMessage must be a non-empty string/);
+    expect(config.tagNames.aiMessage).toBe("ai-message");
+  });
+
+  it("setConfig()で明示的undefinedのtriggerAttributeを拒否する", () => {
+    expect(() => setConfig({ triggerAttribute: undefined } as any))
+      .toThrow(/triggerAttribute must be a non-empty string/);
+    expect(config.triggerAttribute).toBe("data-aitarget");
+  });
+
+  it("setConfig()で明示的undefinedのremote.remoteSettingTypeを拒否する", () => {
+    // `Object.assign` would otherwise overwrite the default "config" with
+    // undefined, and resolveRemoteCoreUrl's `=== "env"` branch would never
+    // fire.
+    expect(() => setConfig({ remote: { remoteSettingType: undefined } as any }))
+      .toThrow(/remote\.remoteSettingType must be "env" or "config"/);
+    expect(config.remote.remoteSettingType).toBe("config");
+  });
+
+  describe("remote", () => {
+    afterEach(() => {
+      setConfig({ remote: { enableRemote: false, remoteSettingType: "config", remoteCoreUrl: "" } });
+      delete (globalThis as any).process?.env?.AI_REMOTE_CORE_URL;
+    });
+
+    it("デフォルトはリモート無効", () => {
+      expect(config.remote.enableRemote).toBe(false);
+      expect(config.remote.remoteSettingType).toBe("config");
+      expect(config.remote.remoteCoreUrl).toBe("");
+    });
+
+    it("setConfig()でremote設定を変更できる", () => {
+      setConfig({ remote: { enableRemote: true, remoteCoreUrl: "ws://localhost:3000" } });
+      expect(config.remote.enableRemote).toBe(true);
+      expect(config.remote.remoteCoreUrl).toBe("ws://localhost:3000");
+    });
+
+    it("remoteSettingType=configのときremoteCoreUrlを返す", () => {
+      setConfig({ remote: { remoteSettingType: "config", remoteCoreUrl: "ws://example.com" } });
+      expect(getRemoteCoreUrl()).toBe("ws://example.com");
+    });
+
+    it("remoteSettingType=envのとき環境変数AI_REMOTE_CORE_URLを返す", () => {
+      (globalThis as any).process = { env: { AI_REMOTE_CORE_URL: "ws://env.example.com" } };
+      setConfig({ remote: { remoteSettingType: "env" } });
+      expect(getRemoteCoreUrl()).toBe("ws://env.example.com");
+    });
+
+    it("remoteSettingType=envで環境変数未設定のとき空文字を返す", () => {
+      (globalThis as any).process = { env: {} };
+      setConfig({ remote: { remoteSettingType: "env" } });
+      expect(getRemoteCoreUrl()).toBe("");
+    });
+
+    it("remoteSettingType=envでprocess未定義のとき空文字を返す", () => {
+      const orig = (globalThis as any).process;
+      delete (globalThis as any).process;
+      setConfig({ remote: { remoteSettingType: "env" } });
+      expect(getRemoteCoreUrl()).toBe("");
+      (globalThis as any).process = orig;
+    });
+
+    it("remoteSettingType=envでprocess未定義でもglobalThis.AI_REMOTE_CORE_URLから読める", () => {
+      const origProcess = (globalThis as any).process;
+      delete (globalThis as any).process;
+      (globalThis as any).AI_REMOTE_CORE_URL = "ws://global.example.com";
+      setConfig({ remote: { remoteSettingType: "env" } });
+      expect(getRemoteCoreUrl()).toBe("ws://global.example.com");
+      delete (globalThis as any).AI_REMOTE_CORE_URL;
+      (globalThis as any).process = origProcess;
+    });
+
+    it("remoteSettingType=envでprocess.envとglobalThis両方あるときprocess.envが優先される", () => {
+      (globalThis as any).process = { env: { AI_REMOTE_CORE_URL: "ws://process.example.com" } };
+      (globalThis as any).AI_REMOTE_CORE_URL = "ws://global.example.com";
+      setConfig({ remote: { remoteSettingType: "env" } });
+      expect(getRemoteCoreUrl()).toBe("ws://process.example.com");
+      delete (globalThis as any).AI_REMOTE_CORE_URL;
+    });
+  });
+});
+
+describe("registerComponents", () => {
+  // ai.test.ts の冒頭で registerComponents() を実行済み。Ai は既に "ai-agent" に、
+  // AiMessage は既に "ai-message" に define されている前提で、defineOrVerify
+  // の失敗経路のみを個別タグで検証する。
+
+  afterEach(() => {
+    // 以降のテストが影響を受けないよう tagNames を元に戻す。
+    setConfig({ tagNames: { ai: "ai-agent", aiMessage: "ai-message" } });
+  });
+
+  it("同じタグに別クラスが登録済みだとエラーになる", () => {
+    const dupTag = "ai-agent-r2-duplicate";
+    class DummyForDup extends HTMLElement {}
+    customElements.define(dupTag, DummyForDup);
+
+    setConfig({ tagNames: { ai: dupTag } });
+
+    expect(() => registerComponents()).toThrow(/already registered with a different class/);
+  });
+
+  it("同じクラスが別タグで登録済みだとエラーになる", () => {
+    // Ai は既に "ai-agent" に登録済み。"ai-agent-r2-altname" へ再登録させようとすると
+    // getName(Ai) === "ai-agent" と不一致になり /already registered under/ を投げる。
+    setConfig({ tagNames: { ai: "ai-agent-r2-altname" } });
+
+    expect(() => registerComponents()).toThrow(/already registered under/);
+  });
+});
+
+describe("bootstrapAi", () => {
+  it("設定なしで呼び出せる", () => {
+    expect(() => bootstrapAi()).not.toThrow();
+  });
+
+  it("設定付きで呼び出せる", () => {
+    expect(() => bootstrapAi({ autoTrigger: false })).not.toThrow();
+    setConfig({ autoTrigger: true });
+  });
+});
+
+describe("auto entrypoints (contract verification)", () => {
+  // These tests verify the exact API surface used by src/auto/auto.js and
+  // src/auto/remoteEnv.js so that API renames or path changes are caught by CI.
+
+  afterEach(() => {
+    setConfig({ remote: { enableRemote: false, remoteSettingType: "config", remoteCoreUrl: "" } });
+  });
+
+  it("auto.js の呼び出しパターン: bootstrapAi() が動作する", () => {
+    // src/auto/auto.js: import { bootstrapAi } from "../../dist/index.js"; bootstrapAi();
+    expect(() => bootstrapAi()).not.toThrow();
+  });
+
+  it("remoteEnv.js の呼び出しパターン: bootstrapAi({ remote: ... }) が動作する", () => {
+    // src/auto/remoteEnv.js: bootstrapAi({ remote: { enableRemote: true, remoteSettingType: "env" } });
+    expect(() => bootstrapAi({ remote: { enableRemote: true, remoteSettingType: "env" } })).not.toThrow();
+    expect(config.remote.enableRemote).toBe(true);
+    expect(config.remote.remoteSettingType).toBe("env");
+  });
+});
+
+describe("Ai (ai-agent)", () => {
+  let fetchSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    fetchSpy = vi.spyOn(globalThis, "fetch");
+  });
+
+  afterEach(() => {
+    fetchSpy.mockRestore();
+    document.body.innerHTML = "";
+  });
+
+  it("カスタム要素として登録されている", () => {
+    expect(customElements.get("ai-agent")).toBeDefined();
+    expect(customElements.get("ai-message")).toBeDefined();
+  });
+
+  it("wcBindableプロパティにtriggerが含まれる", () => {
+    expect(Ai.wcBindable.properties).toHaveLength(7);
+    expect(Ai.wcBindable.properties[6].name).toBe("trigger");
+  });
+
+  it("hasConnectedCallbackPromiseがfalseである", () => {
+    expect(Ai.hasConnectedCallbackPromise).toBe(false);
+  });
+
+  it("observedAttributesにproviderが含まれる", () => {
+    expect(Ai.observedAttributes).toContain("provider");
+  });
+
+  describe("属性", () => {
+    it("provider属性を取得・設定できる", () => {
+      const el = document.createElement("ai-agent") as Ai;
+      expect(el.provider).toBe("");
+      el.provider = "openai";
+      expect(el.provider).toBe("openai");
+    });
+
+    it("model属性の未設定時は空文字を返す", () => {
+      const el = document.createElement("ai-agent") as Ai;
+      expect(el.model).toBe("");
+    });
+
+    it("model属性を取得・設定できる", () => {
+      const el = document.createElement("ai-agent") as Ai;
+      el.model = "gpt-4o";
+      expect(el.model).toBe("gpt-4o");
+    });
+
+    it("baseUrl属性を取得・設定できる", () => {
+      const el = document.createElement("ai-agent") as Ai;
+      el.baseUrl = "/api/ai";
+      expect(el.baseUrl).toBe("/api/ai");
+    });
+
+    it("stream属性のデフォルトはtrue (no-streamなし)", () => {
+      const el = document.createElement("ai-agent") as Ai;
+      expect(el.stream).toBe(true);
+      el.stream = false;
+      expect(el.stream).toBe(false);
+      expect(el.hasAttribute("no-stream")).toBe(true);
+      el.stream = true;
+      expect(el.hasAttribute("no-stream")).toBe(false);
+    });
+
+    it("prompt/temperature/maxTokensプロパティ", () => {
+      const el = document.createElement("ai-agent") as Ai;
+      el.prompt = "Hello";
+      expect(el.prompt).toBe("Hello");
+
+      el.temperature = 0.7;
+      expect(el.temperature).toBe(0.7);
+      el.temperature = undefined;
+      expect(el.temperature).toBeUndefined();
+
+      el.maxTokens = 1000;
+      expect(el.maxTokens).toBe(1000);
+      el.maxTokens = undefined;
+      expect(el.maxTokens).toBeUndefined();
+    });
+
+    it("apiKey属性を取得・設定できる", () => {
+      const el = document.createElement("ai-agent") as Ai;
+      el.apiKey = "sk-test";
+      expect(el.apiKey).toBe("sk-test");
+    });
+
+    it("system属性を取得・設定できる", () => {
+      const el = document.createElement("ai-agent") as Ai;
+      el.system = "Be helpful";
+      expect(el.system).toBe("Be helpful");
+    });
+
+    it("apiVersion属性を取得・設定できる", () => {
+      const el = document.createElement("ai-agent") as Ai;
+      el.apiVersion = "2024-06-01";
+      expect(el.apiVersion).toBe("2024-06-01");
+    });
+  });
+
+  describe("connectedCallback", () => {
+    it("DOM追加時に非表示になる", () => {
+      const el = document.createElement("ai-agent") as Ai;
+      el.setAttribute("provider", "openai");
+      document.body.appendChild(el);
+      expect(el.style.display).toBe("none");
+    });
+
+    it("provider未設定でもDOM追加できる", () => {
+      const el = document.createElement("ai-agent") as Ai;
+      document.body.appendChild(el);
+      expect(el.style.display).toBe("none");
+    });
+
+    it("provider属性からCoreのproviderを設定する", () => {
+      const el = document.createElement("ai-agent") as Ai;
+      el.setAttribute("provider", "openai");
+      document.body.appendChild(el);
+      expect((el as any)._core.provider).not.toBeNull();
+    });
+
+    it("attributeChangedCallbackでproviderを更新する", () => {
+      const el = document.createElement("ai-agent") as Ai;
+      el.setAttribute("provider", "openai");
+      document.body.appendChild(el);
+      el.setAttribute("provider", "anthropic");
+      expect((el as any)._core.provider).not.toBeNull();
+    });
+
+    it("provider属性をremoveAttributeするとCoreのproviderがクリアされる", () => {
+      const el = document.createElement("ai-agent") as Ai;
+      el.setAttribute("provider", "openai");
+      document.body.appendChild(el);
+      expect((el as any)._core.provider).not.toBeNull();
+
+      el.removeAttribute("provider");
+      expect((el as any)._core.provider).toBeNull();
+    });
+
+    it("provider属性クリア後にsendするとエラーになる", async () => {
+      const el = document.createElement("ai-agent") as Ai;
+      el.setAttribute("provider", "openai");
+      el.setAttribute("model", "gpt-4o");
+      document.body.appendChild(el);
+
+      el.removeAttribute("provider");
+      el.prompt = "Hello";
+      await expect(el.send()).rejects.toThrow("provider is required");
+    });
+
+    it("不正なproviderに変更したらsendは旧providerで送信せずrejectする", async () => {
+      const el = document.createElement("ai-agent") as Ai;
+      el.setAttribute("provider", "openai");
+      el.setAttribute("model", "gpt-4o");
+      el.stream = false;
+      document.body.appendChild(el);
+
+      const errors: any[] = [];
+      el.addEventListener("ai-agent:error", (e: Event) => {
+        errors.push((e as CustomEvent).detail);
+      });
+
+      // 不正なproviderへ変更：setAttributeが例外を投げずに属性は更新され、
+      // errorイベントが発火し、send()は旧openaiで送信せずrejectすること
+      el.setAttribute("provider", "invalid-provider");
+      expect(el.getAttribute("provider")).toBe("invalid-provider");
+      expect(errors.length).toBeGreaterThan(0);
+
+      el.prompt = "Hi";
+      await expect(el.send()).rejects.toThrow("Unknown provider");
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it("不正provider設定後に正しいproviderへ戻すとerrorがクリアされsendできる", async () => {
+      fetchSpy.mockResolvedValueOnce(createMockResponse({
+        choices: [{ message: { content: "recovered" } }],
+      }));
+
+      const el = document.createElement("ai-agent") as Ai;
+      el.setAttribute("provider", "openai");
+      el.setAttribute("model", "gpt-4o");
+      el.stream = false;
+      document.body.appendChild(el);
+
+      // 不正providerでerrorを発生させる
+      el.setAttribute("provider", "invalid-provider");
+      expect(el.error).toBeInstanceOf(Error);
+
+      // 正しいproviderへ戻す
+      el.setAttribute("provider", "openai");
+      expect(el.error).toBeNull();
+
+      el.prompt = "Hi";
+      await expect(el.send()).resolves.toBe("recovered");
+    });
+
+    it("autoTrigger無効時にautoTrigger登録しない", () => {
+      setConfig({ autoTrigger: false });
+      const el = document.createElement("ai-agent") as Ai;
+      document.body.appendChild(el);
+      expect(el.style.display).toBe("none");
+      setConfig({ autoTrigger: true });
+    });
+  });
+
+  describe("send", () => {
+    it("remote有効だが未接続の要素では初期化エラーになる", async () => {
+      setConfig({ remote: { enableRemote: true, remoteSettingType: "config", remoteCoreUrl: "ws://localhost:3000" } });
+
+      try {
+        const el = document.createElement("ai-agent") as Ai;
+        el.setAttribute("provider", "openai");
+        el.setAttribute("model", "gpt-4o");
+        el.prompt = "Hi";
+
+        await expect(el.send()).rejects.toThrow("Ai is not initialized yet");
+      } finally {
+        setConfig({ remote: { enableRemote: false, remoteSettingType: "config", remoteCoreUrl: "" } });
+      }
+    });
+
+    it("非ストリーミングでsendできる", async () => {
+      fetchSpy.mockResolvedValueOnce(createMockResponse({
+        choices: [{ message: { content: "Hello!" } }],
+      }));
+
+      const el = document.createElement("ai-agent") as Ai;
+      el.setAttribute("provider", "openai");
+      el.setAttribute("model", "gpt-4o");
+      el.stream = false;
+      document.body.appendChild(el);
+
+      el.prompt = "Hi";
+      const result = await el.send();
+
+      expect(result).toBe("Hello!");
+      expect(el.content).toBe("Hello!");
+      expect(el.loading).toBe(false);
+      expect(el.streaming).toBe(false);
+      expect(el.error).toBeNull();
+      expect(el.usage).toBeNull();
+    });
+
+    it("system属性がAPIリクエストに含まれる", async () => {
+      fetchSpy.mockResolvedValueOnce(createMockResponse({
+        choices: [{ message: { content: "OK" } }],
+      }));
+
+      const el = document.createElement("ai-agent") as Ai;
+      el.setAttribute("provider", "openai");
+      el.setAttribute("model", "gpt-4o");
+      el.setAttribute("system", "Be concise");
+      el.stream = false;
+      document.body.appendChild(el);
+
+      el.prompt = "Hi";
+      await el.send();
+
+      const body = JSON.parse((fetchSpy.mock.calls[0][1] as RequestInit).body as string);
+      expect(body.messages[0]).toEqual({ role: "system", content: "Be concise" });
+    });
+
+    it("<ai-message>からsystemメッセージを収集する", async () => {
+      fetchSpy.mockResolvedValueOnce(createMockResponse({
+        choices: [{ message: { content: "OK" } }],
+      }));
+
+      const el = document.createElement("ai-agent") as Ai;
+      el.setAttribute("provider", "openai");
+      el.setAttribute("model", "gpt-4o");
+      el.stream = false;
+      const msgEl = document.createElement("ai-message") as AiMessage;
+      msgEl.setAttribute("role", "system");
+      msgEl.textContent = "You are a helpful assistant.";
+      el.appendChild(msgEl);
+      document.body.appendChild(el);
+
+      el.prompt = "Hi";
+      await el.send();
+
+      const body = JSON.parse((fetchSpy.mock.calls[0][1] as RequestInit).body as string);
+      expect(body.messages[0].content).toBe("You are a helpful assistant.");
+    });
+
+    it("system属性が<ai-message>より優先される", async () => {
+      fetchSpy.mockResolvedValueOnce(createMockResponse({
+        choices: [{ message: { content: "OK" } }],
+      }));
+
+      const el = document.createElement("ai-agent") as Ai;
+      el.setAttribute("provider", "openai");
+      el.setAttribute("model", "gpt-4o");
+      el.setAttribute("system", "Priority system");
+      el.stream = false;
+      const msgEl = document.createElement("ai-message") as AiMessage;
+      msgEl.setAttribute("role", "system");
+      msgEl.textContent = "Fallback system";
+      el.appendChild(msgEl);
+      document.body.appendChild(el);
+
+      el.prompt = "Hi";
+      await el.send();
+
+      const body = JSON.parse((fetchSpy.mock.calls[0][1] as RequestInit).body as string);
+      expect(body.messages[0].content).toBe("Priority system");
+    });
+
+    it("non-systemメッセージが先にあってもsystemメッセージを収集する", async () => {
+      fetchSpy.mockResolvedValueOnce(createMockResponse({
+        choices: [{ message: { content: "OK" } }],
+      }));
+
+      const el = document.createElement("ai-agent") as Ai;
+      el.setAttribute("provider", "openai");
+      el.setAttribute("model", "gpt-4o");
+      el.stream = false;
+
+      const userMsg = document.createElement("ai-message") as AiMessage;
+      userMsg.setAttribute("role", "user");
+      userMsg.textContent = "Initial user message";
+      el.appendChild(userMsg);
+
+      const sysMsg = document.createElement("ai-message") as AiMessage;
+      sysMsg.setAttribute("role", "system");
+      sysMsg.textContent = "System prompt";
+      el.appendChild(sysMsg);
+
+      document.body.appendChild(el);
+
+      el.prompt = "Hi";
+      await el.send();
+
+      const body = JSON.parse((fetchSpy.mock.calls[0][1] as RequestInit).body as string);
+      expect(body.messages[0].content).toBe("System prompt");
+    });
+
+    it("role='user'/'assistant'の子要素をmessagesにseedする（few-shot）", async () => {
+      fetchSpy.mockResolvedValueOnce(createMockResponse({
+        choices: [{ message: { content: "OK" } }],
+      }));
+
+      const el = document.createElement("ai-agent") as Ai;
+      el.setAttribute("provider", "openai");
+      el.setAttribute("model", "gpt-4o");
+      el.stream = false;
+
+      const u1 = document.createElement("ai-message") as AiMessage;
+      u1.setAttribute("role", "user");
+      u1.textContent = "What is 2+2?";
+      el.appendChild(u1);
+
+      const a1 = document.createElement("ai-message") as AiMessage;
+      a1.setAttribute("role", "assistant");
+      a1.textContent = "4.";
+      el.appendChild(a1);
+
+      document.body.appendChild(el);
+      // connectedCallback内のqueueMicrotaskでseedが走るのを待つ
+      await new Promise(r => queueMicrotask(() => r(null)));
+
+      expect(el.messages).toEqual([
+        { role: "user", content: "What is 2+2?" },
+        { role: "assistant", content: "4." },
+      ]);
+
+      // few-shotのあとの実際のsendでも履歴が保持される
+      el.prompt = "Then 3+3?";
+      await el.send();
+
+      const body = JSON.parse((fetchSpy.mock.calls[0][1] as RequestInit).body as string);
+      expect(body.messages).toEqual([
+        { role: "user", content: "What is 2+2?" },
+        { role: "assistant", content: "4." },
+        { role: "user", content: "Then 3+3?" },
+      ]);
+    });
+
+    it("few-shotのseedはsystem子要素を履歴に含めない（_collectSystem経由のまま）", async () => {
+      fetchSpy.mockResolvedValueOnce(createMockResponse({
+        choices: [{ message: { content: "OK" } }],
+      }));
+
+      const el = document.createElement("ai-agent") as Ai;
+      el.setAttribute("provider", "openai");
+      el.setAttribute("model", "gpt-4o");
+      el.stream = false;
+
+      const sys = document.createElement("ai-message") as AiMessage;
+      sys.setAttribute("role", "system");
+      sys.textContent = "Be terse.";
+      el.appendChild(sys);
+
+      const u = document.createElement("ai-message") as AiMessage;
+      u.setAttribute("role", "user");
+      u.textContent = "Hi";
+      el.appendChild(u);
+
+      document.body.appendChild(el);
+      await new Promise(r => queueMicrotask(() => r(null)));
+
+      // history has user only; system flows via options.system per send()
+      expect(el.messages).toEqual([{ role: "user", content: "Hi" }]);
+
+      el.prompt = "Bye";
+      await el.send();
+
+      const body = JSON.parse((fetchSpy.mock.calls[0][1] as RequestInit).body as string);
+      expect(body.messages[0]).toEqual({ role: "system", content: "Be terse." });
+      expect(body.messages[1]).toEqual({ role: "user", content: "Hi" });
+      expect(body.messages[2]).toEqual({ role: "user", content: "Bye" });
+    });
+
+    it("el.messagesをappend前にセットしていたらseedは上書きしない", async () => {
+      const el = document.createElement("ai-agent") as Ai;
+      el.setAttribute("provider", "openai");
+      el.setAttribute("model", "gpt-4o");
+
+      // 先に明示設定
+      el.messages = [{ role: "user", content: "programmatic" }];
+
+      // 後からDOMにfew-shot子要素を追加
+      const u = document.createElement("ai-message") as AiMessage;
+      u.setAttribute("role", "user");
+      u.textContent = "from-dom";
+      el.appendChild(u);
+
+      document.body.appendChild(el);
+      await new Promise(r => queueMicrotask(() => r(null)));
+
+      // 明示設定を保持、DOM seed はスキップ
+      expect(el.messages).toEqual([{ role: "user", content: "programmatic" }]);
+    });
+
+    it("空コンテンツの子要素はseedされない", async () => {
+      const el = document.createElement("ai-agent") as Ai;
+      el.setAttribute("provider", "openai");
+      el.setAttribute("model", "gpt-4o");
+
+      const empty = document.createElement("ai-message") as AiMessage;
+      empty.setAttribute("role", "user");
+      empty.textContent = "   "; // whitespace only
+      el.appendChild(empty);
+
+      const real = document.createElement("ai-message") as AiMessage;
+      real.setAttribute("role", "user");
+      real.textContent = "real content";
+      el.appendChild(real);
+
+      document.body.appendChild(el);
+      await new Promise(r => queueMicrotask(() => r(null)));
+
+      expect(el.messages).toEqual([{ role: "user", content: "real content" }]);
+    });
+
+    it("role属性未指定の<ai-message>はsystemとして扱われる", async () => {
+      fetchSpy.mockResolvedValueOnce(createMockResponse({
+        choices: [{ message: { content: "OK" } }],
+      }));
+
+      const el = document.createElement("ai-agent") as Ai;
+      el.setAttribute("provider", "openai");
+      el.setAttribute("model", "gpt-4o");
+      el.stream = false;
+
+      const msgEl = document.createElement("ai-message") as AiMessage;
+      // role属性を設定しない（デフォルトsystem）
+      msgEl.textContent = "Default system";
+      el.appendChild(msgEl);
+
+      document.body.appendChild(el);
+
+      el.prompt = "Hi";
+      await el.send();
+
+      const body = JSON.parse((fetchSpy.mock.calls[0][1] as RequestInit).body as string);
+      expect(body.messages[0].content).toBe("Default system");
+    });
+  });
+
+  describe("trigger", () => {
+    it("trigger=trueでsendが実行される", async () => {
+      fetchSpy.mockResolvedValueOnce(createMockResponse({
+        choices: [{ message: { content: "Hi" } }],
+      }));
+
+      const el = document.createElement("ai-agent") as Ai;
+      el.setAttribute("provider", "openai");
+      el.setAttribute("model", "gpt-4o");
+      el.stream = false;
+      document.body.appendChild(el);
+
+      el.prompt = "Hello";
+      el.trigger = true;
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      expect(el.content).toBe("Hi");
+      expect(el.trigger).toBe(false);
+    });
+
+    it("trigger=trueでtrigger-changedイベントがtrue→falseの順で発火する", async () => {
+      fetchSpy.mockResolvedValueOnce(createMockResponse({
+        choices: [{ message: { content: "Hi" } }],
+      }));
+
+      const el = document.createElement("ai-agent") as Ai;
+      el.setAttribute("provider", "openai");
+      el.setAttribute("model", "gpt-4o");
+      el.stream = false;
+      document.body.appendChild(el);
+
+      const triggerEvents: boolean[] = [];
+      el.addEventListener("ai-agent:trigger-changed", (e: Event) => {
+        triggerEvents.push((e as CustomEvent).detail);
+      });
+
+      el.prompt = "Hello";
+      el.trigger = true;
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      expect(triggerEvents).toEqual([true, false]);
+    });
+
+    it("trigger=falseでは何も起きない", () => {
+      const el = document.createElement("ai-agent") as Ai;
+      el.setAttribute("provider", "openai");
+      document.body.appendChild(el);
+      el.trigger = false;
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it("trigger=trueでsendが失敗してもfinallyでtrigger=falseへ戻る", async () => {
+      const el = document.createElement("ai-agent") as Ai;
+      el.setAttribute("provider", "openai");
+      document.body.appendChild(el);
+
+      el.prompt = "Hello";
+      el.trigger = true;
+      await new Promise(resolve => setTimeout(resolve, 20));
+
+      expect(el.trigger).toBe(false);
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it("trigger=true で send() の同期 rejection を ai-agent:error に中継する", async () => {
+      // send() が core のエラー経路を経ずに同期 rejection する（provider 属性無効など）
+      // ケースで、trigger setter が rejection を握り潰して error イベントを落とさない
+      // ことを確認。
+      const el = document.createElement("ai-agent") as Ai;
+      // model を省略 → send() の AiCore.send() 内バリデーションで即座に reject する。
+      el.setAttribute("provider", "openai");
+      document.body.appendChild(el);
+
+      const errors: unknown[] = [];
+      el.addEventListener("ai-agent:error", (e: Event) => {
+        errors.push((e as CustomEvent).detail);
+      });
+
+      el.prompt = "Hello";
+      el.trigger = true;
+      await new Promise(resolve => setTimeout(resolve, 20));
+
+      expect(el.trigger).toBe(false);
+      expect(errors.length).toBeGreaterThan(0);
+      expect(el.error).not.toBeNull();
+    });
+  });
+
+  describe("messages", () => {
+    it("messagesプロパティでCoreの履歴にアクセスできる", async () => {
+      fetchSpy.mockResolvedValueOnce(createMockResponse({
+        choices: [{ message: { content: "Hi!" } }],
+      }));
+
+      const el = document.createElement("ai-agent") as Ai;
+      el.setAttribute("provider", "openai");
+      el.setAttribute("model", "gpt-4o");
+      el.stream = false;
+      document.body.appendChild(el);
+
+      el.prompt = "Hello";
+      await el.send();
+
+      expect(el.messages).toHaveLength(2);
+      el.messages = [];
+      expect(el.messages).toHaveLength(0);
+    });
+
+    it("remote modeで未同期messagesは空配列へフォールバックする", () => {
+      const el = document.createElement("ai-agent") as any;
+      el._proxy = {};
+      el._remoteValues = {};
+
+      expect(el.messages).toEqual([]);
+    });
+
+    it("local modeでcore不在時のmessages getter/setterは空配列/no-opになる", () => {
+      const el = document.createElement("ai-agent") as any;
+      el._core = null;
+
+      expect(el.messages).toEqual([]);
+      expect(() => {
+        el.messages = [{ role: "user", content: "ignored" }];
+      }).not.toThrow();
+    });
+  });
+
+  describe("output fallback state", () => {
+    it("remote modeで未同期値は既定値へフォールバックする", () => {
+      const el = document.createElement("ai-agent") as any;
+      el._proxy = {};
+      el._remoteValues = {};
+
+      expect(el.content).toBe("");
+      expect(el.loading).toBe(false);
+      expect(el.streaming).toBe(false);
+      expect(el.usage).toBeNull();
+    });
+
+    it("local modeでcore不在時は既定値や_errorStateへフォールバックする", () => {
+      const el = document.createElement("ai-agent") as any;
+      el._core = null;
+      el._errorState = "local-error";
+
+      expect(el.content).toBe("");
+      expect(el.loading).toBe(false);
+      expect(el.streaming).toBe(false);
+      expect(el.usage).toBeNull();
+      expect(el.error).toBe("local-error");
+    });
+
+    it("remote modeのerrorはlocal error優先とserver error fallbackの両方を返す", () => {
+      const el = document.createElement("ai-agent") as any;
+      el._proxy = {};
+      el._remoteValues = {};
+      el._errorState = "local-error";
+      el._hasLocalError = true;
+
+      expect(el.error).toBe("local-error");
+
+      el._hasLocalError = false;
+      expect(el.error).toBe("local-error");
+
+      el._remoteValues.error = "remote-error";
+      expect(el.error).toBe("remote-error");
+    });
+  });
+
+  describe("abort", () => {
+    it("abort()でリクエストをキャンセルできる", () => {
+      const el = document.createElement("ai-agent") as Ai;
+      el.setAttribute("provider", "openai");
+      document.body.appendChild(el);
+      // abortが例外なく呼べることを確認
+      expect(() => el.abort()).not.toThrow();
+    });
+
+    it("coreもproxyも無い場合のabortはno-op", () => {
+      const el = document.createElement("ai-agent") as any;
+      el._core = null;
+      expect(() => el.abort()).not.toThrow();
+    });
+
+    it("remote abortのrejectも内部で握りつぶす", async () => {
+      const el = document.createElement("ai-agent") as any;
+      el._proxy = { invoke: vi.fn().mockRejectedValue(new Error("abort failed")) };
+
+      expect(() => el.abort()).not.toThrow();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+  });
+
+  describe("disconnectedCallback", () => {
+    it("DOM削除時にabortが呼ばれる", () => {
+      const el = document.createElement("ai-agent") as Ai;
+      el.setAttribute("provider", "openai");
+      document.body.appendChild(el);
+      // abortSpyは内部なので、間接的に確認
+      expect(() => el.remove()).not.toThrow();
+    });
+  });
+
+  describe("internal helpers", () => {
+    it("serialized error objectをErrorインスタンスへ復元する", () => {
+      const revived = (Ai as any)._reviveError({
+        name: "RemoteError",
+        message: "boom",
+        stack: "stack-trace",
+      });
+
+      expect(revived).toBeInstanceOf(Error);
+      expect(revived.name).toBe("RemoteError");
+      expect(revived.message).toBe("boom");
+      expect(revived.stack).toBe("stack-trace");
+    });
+
+    it("status付きerror objectはそのまま返す", () => {
+      const httpError = { status: 401, statusText: "Unauthorized", body: "denied" };
+      expect((Ai as any)._reviveError(httpError)).toBe(httpError);
+    });
+
+    it("stack無しserialized errorも復元できる", () => {
+      const revived = (Ai as any)._reviveError({
+        name: "RemoteError",
+        message: "boom",
+      });
+
+      expect(revived).toBeInstanceOf(Error);
+      expect(revived.name).toBe("RemoteError");
+      expect(revived.message).toBe("boom");
+    });
+
+    it("transportエラー判定がclosed/disposed/timeoutのみtrueになる", () => {
+      const timeoutError = new Error("timed out");
+      timeoutError.name = "TimeoutError";
+
+      expect((Ai as any)._isTransportError(new Error("Transport closed"))).toBe(true);
+      expect((Ai as any)._isTransportError(new Error("RemoteCoreProxy disposed"))).toBe(true);
+      expect((Ai as any)._isTransportError(timeoutError)).toBe(true);
+      expect((Ai as any)._isTransportError(new Error("provider is required"))).toBe(false);
+      expect((Ai as any)._isTransportError("closed")).toBe(false);
+    });
+
+    it("provider以外のattributeChangedCallbackは無視する", () => {
+      const el = document.createElement("ai-agent") as any;
+      const spy = vi.spyOn(el, "_applyProvider");
+
+      el.attributeChangedCallback("model", null, "gpt-4o");
+
+      expect(spy).not.toHaveBeenCalled();
+    });
+
+    it("messages setter成功時はlocal errorをクリアする", async () => {
+      const el = document.createElement("ai-agent") as any;
+      el._proxy = { setWithAck: vi.fn().mockResolvedValue(undefined) };
+      el._hasLocalError = true;
+      el._errorState = new Error("local");
+
+      el.messages = [{ role: "user", content: "hello" }];
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(el.error).toBeNull();
+    });
+
+    it("remote provider更新失敗のnon-ErrorもErrorへ正規化される", async () => {
+      const el = document.createElement("ai-agent") as any;
+      el._proxy = { setWithAck: vi.fn().mockRejectedValue("bad-provider") };
+
+      el._applyProvider("openai");
+      await Promise.resolve();
+      await Promise.resolve();
+
+      // el.error は AiHttpError | Error | null の契約に従って正規化される。
+      // non-Error / non-AiHttpError は Error("bad-provider") でラップされる。
+      expect(el.error).toBeInstanceOf(Error);
+      expect(el.error.message).toBe("bad-provider");
+      expect(el._lastProviderError).toBeInstanceOf(Error);
+      expect(el._lastProviderError.message).toBe("bad-provider");
+    });
+
+    it("local provider setterのnon-Error失敗をErrorへ正規化する", () => {
+      const el = document.createElement("ai-agent") as any;
+      Object.defineProperty(el, "_core", {
+        value: {},
+        writable: true,
+      });
+      Object.defineProperty(el._core, "provider", {
+        set() {
+          throw "bad-provider";
+        },
+      });
+
+      el._applyProvider("openai");
+
+      expect(el.error).toBeInstanceOf(Error);
+      expect(el.error.message).toBe("bad-provider");
+      expect(el._lastProviderError).toBeInstanceOf(Error);
+      expect(el._lastProviderError.message).toBe("bad-provider");
+    });
+
+    it("古いprovider更新成功ackは無視される", async () => {
+      const el = document.createElement("ai-agent") as any;
+      let resolveFirst!: () => void;
+      const first = new Promise<void>((resolve) => {
+        resolveFirst = resolve;
+      });
+      el._proxy = {
+        setWithAck: vi.fn()
+          .mockReturnValueOnce(first)
+          .mockResolvedValueOnce(undefined),
+      };
+
+      el._applyProvider("openai");
+      el._applyProvider("anthropic");
+      resolveFirst();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(el._lastProviderError).toBeNull();
+    });
+
+    it("古いprovider更新失敗ackは無視される", async () => {
+      const el = document.createElement("ai-agent") as any;
+      let rejectFirst!: (reason?: unknown) => void;
+      const first = new Promise<void>((_resolve, reject) => {
+        rejectFirst = reject;
+      });
+      el._proxy = {
+        setWithAck: vi.fn()
+          .mockReturnValueOnce(first)
+          .mockResolvedValueOnce(undefined),
+      };
+
+      el._applyProvider("openai");
+      el._applyProvider("anthropic");
+      rejectFirst(new Error("stale"));
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(el._lastProviderError).toBeNull();
+      expect(el.error).toBeNull();
+    });
+  });
+});
+
+describe("AiMessage (ai-message)", () => {
+  it("role属性のデフォルトはsystem", () => {
+    const el = document.createElement("ai-message") as AiMessage;
+    expect(el.role).toBe("system");
+  });
+
+  it("messageContentでテキストを取得できる", () => {
+    const el = document.createElement("ai-message") as AiMessage;
+    el.textContent = "  You are helpful.  ";
+    expect(el.messageContent).toBe("You are helpful.");
+  });
+
+  it("textContentが空の場合は空文字を返す", () => {
+    const el = document.createElement("ai-message") as AiMessage;
+    expect(el.messageContent).toBe("");
+  });
+
+  it("Shadow DOMでlight DOMの描画を抑制する", () => {
+    const el = document.createElement("ai-message") as AiMessage;
+    expect(el.shadowRoot).not.toBeNull();
+  });
+});
+
+describe("autoTrigger", () => {
+  let fetchSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    fetchSpy = vi.spyOn(globalThis, "fetch");
+    unregisterAutoTrigger();
+  });
+
+  afterEach(() => {
+    fetchSpy.mockRestore();
+    unregisterAutoTrigger();
+    document.body.innerHTML = "";
+  });
+
+  it("data-aitarget属性でsendをトリガーできる", async () => {
+    fetchSpy.mockResolvedValue(createMockResponse({
+      choices: [{ message: { content: "OK" } }],
+    }));
+
+    registerAutoTrigger();
+
+    const aiEl = document.createElement("ai-agent") as Ai;
+    aiEl.id = "ai1";
+    aiEl.setAttribute("provider", "openai");
+    aiEl.setAttribute("model", "gpt-4o");
+    aiEl.stream = false;
+    document.body.appendChild(aiEl);
+    (aiEl as any)._prompt = "Hello";
+
+    const button = document.createElement("button");
+    button.setAttribute("data-aitarget", "ai1");
+    document.body.appendChild(button);
+
+    button.click();
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    expect(fetchSpy).toHaveBeenCalled();
+  });
+
+  it("対象がAi要素でない場合は無視する", () => {
+    registerAutoTrigger();
+    const div = document.createElement("div");
+    div.id = "not-ai";
+    document.body.appendChild(div);
+    const button = document.createElement("button");
+    button.setAttribute("data-aitarget", "not-ai");
+    document.body.appendChild(button);
+    expect(() => button.click()).not.toThrow();
+  });
+
+  it("属性値が空の場合は無視する", () => {
+    registerAutoTrigger();
+    const button = document.createElement("button");
+    button.setAttribute("data-aitarget", "");
+    document.body.appendChild(button);
+    expect(() => button.click()).not.toThrow();
+  });
+
+  it("event.targetがElementでない場合は無視する", () => {
+    registerAutoTrigger();
+    const textNode = document.createTextNode("text");
+    document.body.appendChild(textNode);
+    const event = new Event("click", { bubbles: true });
+    Object.defineProperty(event, "target", { value: textNode });
+    document.dispatchEvent(event);
+  });
+
+  it("unregisterAutoTrigger()で解除できる", () => {
+    registerAutoTrigger();
+    unregisterAutoTrigger();
+    // 二重解除もOK
+    unregisterAutoTrigger();
+  });
+
+  it("registerAutoTrigger()は重複登録しない", () => {
+    registerAutoTrigger();
+    registerAutoTrigger();
+    unregisterAutoTrigger();
+  });
+
+  it("data-aitarget属性のないクリックは無視する", () => {
+    registerAutoTrigger();
+    const button = document.createElement("button");
+    document.body.appendChild(button);
+    expect(() => button.click()).not.toThrow();
+  });
+
+  it("send失敗時もautoTriggerのcatchで握りつぶされる", async () => {
+    registerAutoTrigger();
+
+    const aiEl = document.createElement("ai-agent") as Ai;
+    aiEl.id = "ai-fail";
+    aiEl.setAttribute("provider", "openai");
+    document.body.appendChild(aiEl);
+    (aiEl as any)._prompt = "Hello";
+
+    const button = document.createElement("button");
+    button.setAttribute("data-aitarget", "ai-fail");
+    document.body.appendChild(button);
+
+    expect(() => button.click()).not.toThrow();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("nested targetからのクリックでもclosest経由で発火できる", async () => {
+    fetchSpy.mockResolvedValue(createMockResponse({
+      choices: [{ message: { content: "OK" } }],
+    }));
+
+    registerAutoTrigger();
+
+    const aiEl = document.createElement("ai-agent") as Ai;
+    aiEl.id = "ai-nested";
+    aiEl.setAttribute("provider", "openai");
+    aiEl.setAttribute("model", "gpt-4o");
+    aiEl.stream = false;
+    document.body.appendChild(aiEl);
+    (aiEl as any)._prompt = "Hello";
+
+    const button = document.createElement("button");
+    button.setAttribute("data-aitarget", "ai-nested");
+    const span = document.createElement("span");
+    button.appendChild(span);
+    document.body.appendChild(button);
+
+    span.click();
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    expect(fetchSpy).toHaveBeenCalled();
+  });
+});

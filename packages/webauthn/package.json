@@ -1,0 +1,64 @@
+{
+  "name": "@wc-bindable/webauthn",
+  "version": "0.4.0",
+  "description": "Declarative WebAuthn / Passkeys component for Web Components. Server-side challenge + verification, browser-native credentials.create()/.get(), via wc-bindable-protocol.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./server": {
+      "types": "./dist/server/index.d.ts",
+      "default": "./dist/server/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "prepack": "npm run build",
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "npm run test:unit",
+    "test:watch": "npm run test:unit:watch",
+    "test:coverage": "npm run test:unit:coverage",
+    "test:unit": "vitest run __tests__",
+    "test:unit:watch": "vitest __tests__",
+    "test:unit:coverage": "vitest run __tests__ --coverage --coverage.provider=v8 --coverage.reporter=text --coverage.reporter=html --coverage.include=src/**/*.ts --coverage.exclude=src/types.ts --coverage.exclude=src/index.ts --coverage.exclude=src/server/index.ts",
+    "test:integration": "npm run build && playwright test"
+  },
+  "keywords": [
+    "web-components",
+    "webauthn",
+    "passkey",
+    "passwordless",
+    "fido2",
+    "custom-elements",
+    "wc-bindable",
+    "declarative",
+    "framework-agnostic"
+  ],
+  "dependencies": {
+    "@wc-bindable/core": "^0.4.0"
+  },
+  "peerDependencies": {
+    "@simplewebauthn/server": "^11.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@simplewebauthn/server": {
+      "optional": true
+    }
+  },
+  "author": "mogera551",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wc-bindable-protocol/wc-bindable-protocol.git",
+    "directory": "packages/webauthn"
+  },
+  "license": "MIT"
+}

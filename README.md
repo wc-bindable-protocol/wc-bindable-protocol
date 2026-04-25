@@ -56,10 +56,10 @@ This protocol intentionally does **not** cover:
 | [@wc-bindable/angular](packages/angular/) | Angular directive — `wcBindable` |
 | [@wc-bindable/solid](packages/solid/) | Solid primitive — `createWcBindable()` / `use:wcBindable` |
 | [@wc-bindable/remote](packages/remote/) | Remote proxy — connect Core and Shell over a network via WebSocket or custom transport |
-| [@wc-bindable/hawc](packages/hawc/) | HAWC architecture document — the design basis for the `hawc-*` family |
-| [@wc-bindable/hawc-ai](packages/hawc-ai/) | Headless AI inference component — OpenAI, Anthropic, Azure OpenAI, and Google (Gemini) with SSE streaming, no provider SDK |
-| [@wc-bindable/hawc-auth0](packages/hawc-auth0/) | Headless Auth0 authentication component — local (token in DOM for `fetch`) and remote (gatekeeper over authenticated WebSocket) modes |
-| [@wc-bindable/hawc-s3](packages/hawc-s3/) | Headless S3 / S3-compatible blob store component — server-side signing + browser-direct upload, no AWS SDK |
+| [@wc-bindable/hawc](packages/hawc/) | HAWC architecture document — the design basis for the headless component family |
+| [@wc-bindable/ai](packages/ai/) | Headless AI inference component — OpenAI, Anthropic, Azure OpenAI, and Google (Gemini) with SSE streaming, no provider SDK |
+| [@wc-bindable/auth0](packages/auth0/) | Headless Auth0 authentication component — local (token in DOM for `fetch`) and remote (gatekeeper over authenticated WebSocket) modes |
+| [@wc-bindable/s3](packages/s3/) | Headless S3 / S3-compatible blob store component — server-side signing + browser-direct upload, no AWS SDK |
 
 ## Quick start
 

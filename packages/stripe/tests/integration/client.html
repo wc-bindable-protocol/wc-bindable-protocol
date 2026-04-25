@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>stripe-checkout Remote E2E</title>
+  <script type="importmap">
+  {
+    "imports": {
+      "@wc-bindable/core": "/packages/core/dist/index.js",
+      "@wc-bindable/remote": "/packages/remote/dist/index.js",
+      "@wc-bindable/stripe": "/packages/stripe/dist/index.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="status">starting</div>
+  <pre id="results"></pre>
+
+  <script type="module">
+    globalThis.STRIPE_REMOTE_CORE_URL = `ws://${location.host}`;
+
+    const params = new URLSearchParams(location.search);
+    const scenario = params.get("scenario") ?? "submit";
+    const { bootstrapStripe, WcsStripe } = await import("@wc-bindable/stripe");
+
+    const loaderCalls = [];
+    const confirmCalls = [];
+    const mountTargets = [];
+
+    function parseIntentId(clientSecret) {
+      return String(clientSecret ?? "").replace(/_secret_.+$/, "");
+    }
+
+    function createFakeStripeJs() {
+      let mounted = false;
+      let readyHandler = null;
+      let changeHandler = null;
+      const paymentElement = {
+        mount(target) {
+          mounted = true;
+          mountTargets.push(typeof target === "string" ? target : target?.dataset?.stripeCheckoutMount ? "[data-stripe-checkout-mount]" : String(target?.tagName ?? "unknown"));
+          if (readyHandler) queueMicrotask(() => readyHandler({}));
+          if (changeHandler) queueMicrotask(() => changeHandler({ complete: true }));
+        },
+        unmount() {},
+        destroy() {},
+        on(event, cb) {
+          if (event === "ready") {
+            readyHandler = cb;
+            if (mounted) queueMicrotask(() => readyHandler({}));
+          }
+          if (event === "change") {
+            changeHandler = cb;
+            if (mounted) queueMicrotask(() => changeHandler({ complete: true }));
+          }
+        },
+      };
+      return {
+        elements() {
+          return {
+            create() { return paymentElement; },
+            getElement() { return paymentElement; },
+            update() {},
+          };
+        },
+        async confirmPayment(opts) {
+          confirmCalls.push({ kind: "payment", clientSecret: opts.clientSecret ?? null });
+          return {
+            paymentIntent: {
+              id: parseIntentId(opts.clientSecret),
+              status: "succeeded",
+              payment_method: {
+                id: "pm_card_visa",
+                card: { brand: "visa", last4: "4242" },
+              },
+            },
+          };
+        },
+        async confirmSetup(opts) {
+          confirmCalls.push({ kind: "setup", clientSecret: opts.clientSecret ?? null });
+          return {
+            setupIntent: {
+              id: parseIntentId(opts.clientSecret),
+              status: "succeeded",
+              payment_method: {
+                id: "pm_card_setup",
+                card: { brand: "visa", last4: "4242" },
+              },
+            },
+          };
+        },
+        async retrievePaymentIntent(clientSecret) {
+          return { paymentIntent: { id: parseIntentId(clientSecret), status: "succeeded" } };
+        },
+        async retrieveSetupIntent(clientSecret) {
+          return { setupIntent: { id: parseIntentId(clientSecret), status: "succeeded" } };
+        },
+      };
+    }
+
+    WcsStripe.setLoader(async (publishableKey) => {
+      loaderCalls.push(publishableKey);
+      return createFakeStripeJs();
+    });
+    bootstrapStripe({ remote: { enableRemote: true, remoteSettingType: "env" } });
+
+    const results = {};
+    const log = (key, value) => {
+      results[key] = value;
+      document.getElementById("results").textContent = JSON.stringify(results, null, 2);
+    };
+
+    function snapshot(el, statusEvents, elementReadyCount) {
+      log("status", el.status);
+      log("intentId", el.intentId);
+      log("amount", el.amount);
+      log("paymentMethod", el.paymentMethod);
+      log("error", el.error);
+      log("statusEvents", statusEvents);
+      log("elementReadyCount", elementReadyCount);
+      log("loaderCalls", loaderCalls);
+      log("confirmCalls", confirmCalls);
+      log("mountTargets", mountTargets);
+      log("searchAfter", globalThis.location.search);
+    }
+
+    async function waitFor(predicate, timeoutMs = 5000) {
+      const start = Date.now();
+      while (Date.now() - start < timeoutMs) {
+        if (predicate()) return;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      throw new Error("timeout waiting for condition");
+    }
+
+    const el = document.createElement("stripe-checkout");
+    el.setAttribute("mode", params.get("mode") ?? "payment");
+    el.setAttribute("publishable-key", "pk_test_e2e");
+    el.setAttribute("amount-value", "1980");
+    el.setAttribute("amount-currency", "jpy");
+    el.setAttribute("customer-id", "cus_e2e");
+    el.setAttribute("return-url", `${location.origin}${location.pathname}`);
+
+    const statusEvents = [];
+    let elementReadyCount = 0;
+    el.addEventListener("stripe-checkout:status-changed", (e) => statusEvents.push(e.detail));
+    el.addEventListener("stripe-checkout:element-ready", () => { elementReadyCount++; });
+    document.body.appendChild(el);
+
+    try {
+      if (scenario === "submit") {
+        await waitFor(() => el.status === "collecting" || el.error != null);
+        if (el.error) throw new Error(el.error.message ?? "prepare failed");
+        await el.submit();
+        await waitFor(() => el.status === "succeeded" || el.status === "failed" || el.error != null);
+        snapshot(el, statusEvents, elementReadyCount);
+      } else if (scenario === "resume") {
+        await waitFor(() => el.intentId != null || el.error != null || el.status === "succeeded" || el.status === "failed");
+        snapshot(el, statusEvents, elementReadyCount);
+      } else {
+        throw new Error(`unknown scenario: ${scenario}`);
+      }
+
+      document.getElementById("status").textContent = "done";
+    } catch (err) {
+      log("fatal", err instanceof Error ? err.message : String(err));
+      snapshot(el, statusEvents, elementReadyCount);
+      document.getElementById("status").textContent = "error";
+    }
+  </script>
+</body>
+</html>

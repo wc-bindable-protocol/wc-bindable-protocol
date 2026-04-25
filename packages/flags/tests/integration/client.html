@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>feature-flags Remote E2E Test</title>
+  <script type="importmap">
+    {
+      "imports": {
+        "@wc-bindable/core": "/packages/core/dist/index.js",
+        "@wc-bindable/remote": "/packages/remote/dist/index.js",
+        "./RemoteCoreProxy.js": "/packages/remote/dist/RemoteCoreProxy.js",
+        "./RemoteShellProxy.js": "/packages/remote/dist/RemoteShellProxy.js",
+        "./types.js": "/packages/remote/dist/types.js",
+        "./transport/index.js": "/packages/remote/dist/transport/index.js",
+        "./transport/WebSocketClientTransport.js": "/packages/remote/dist/transport/WebSocketClientTransport.js",
+        "./transport/WebSocketServerTransport.js": "/packages/remote/dist/transport/WebSocketServerTransport.js",
+        "./transport/messageValidation.js": "/packages/remote/dist/transport/messageValidation.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="status">connecting</div>
+  <div id="results"></div>
+
+  <script type="module">
+    import { bind } from "@wc-bindable/core";
+    import { createRemoteCoreProxy, WebSocketClientTransport } from "@wc-bindable/remote";
+
+    // FlagsCore's wcBindable declaration (must match server-side FlagsCore)
+    const declaration = {
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [
+        { name: "flags",      event: "feature-flags:flags-changed" },
+        { name: "identified", event: "feature-flags:identified-changed" },
+        { name: "loading",    event: "feature-flags:loading-changed" },
+        { name: "error",      event: "feature-flags:error" },
+      ],
+      commands: [
+        { name: "identify", async: true },
+        { name: "reload",   async: true },
+      ],
+    };
+
+    const results = {};
+    const log = (key, value) => {
+      results[key] = value;
+      document.getElementById("results").textContent = JSON.stringify(results);
+    };
+    const clone = (v) => JSON.parse(JSON.stringify(v ?? null));
+
+    try {
+      const sessionId = crypto.randomUUID();
+
+      async function setFlag(key, defaultValue) {
+        const res = await fetch("/admin/set-flag", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Session-Id": sessionId,
+          },
+          body: JSON.stringify({ key, defaultValue }),
+        });
+        if (!res.ok) throw new Error(`admin set-flag failed: ${res.status}`);
+      }
+
+      const ws = new WebSocket(`ws://${location.host}?session=${sessionId}`);
+      const transport = new WebSocketClientTransport(ws);
+      const proxy = createRemoteCoreProxy(declaration, transport);
+
+      // Collect all bind() updates
+      const updates = [];
+      bind(proxy, (name, value) => {
+        updates.push({ name, value: clone(value) });
+        log("updates", updates);
+      });
+
+      // Wait for initial sync from the server
+      await new Promise((r) => setTimeout(r, 300));
+      log("syncReceived", updates.length > 0);
+      log("initialFlags", clone(proxy.flags));
+      log("initialIdentified", proxy.identified);
+      log("initialLoading", proxy.loading);
+
+      // --- Test 1: identify("alice") ---
+      await proxy.invoke("identify", "alice");
+      log("aliceFlags", clone(proxy.flags));
+      log("aliceIdentified", proxy.identified);
+      log("aliceLoading", proxy.loading);
+
+      // --- Test 2: identify("bob") replaces the identity ---
+      await proxy.invoke("identify", "bob");
+      log("bobFlags", clone(proxy.flags));
+
+      // --- Test 3: subscription push via server-side setFlag ---
+      // Server mutates `feature-z`'s defaultValue; InMemoryFlagProvider
+      // fans the change out to subscribers, FlagsCore publishes the new
+      // flag map, RemoteShellProxy forwards it across the socket.
+      await setFlag("feature-z", 100);
+      await new Promise((r) => setTimeout(r, 200));
+      log("pushedFeatureZ", proxy.flags?.["feature-z"]);
+      log("pushedFlags", clone(proxy.flags));
+
+      // --- Test 4: reload() fetches the latest snapshot ---
+      await setFlag("feature-z", 999);
+      // Clear push-pipeline effects before reload — we want reload to be
+      // the mechanism that exposes the new value, not the race-won push.
+      await new Promise((r) => setTimeout(r, 50));
+      await proxy.invoke("reload");
+      log("reloadedFeatureZ", proxy.flags?.["feature-z"]);
+      log("finalLoading", proxy.loading);
+      log("finalIdentified", proxy.identified);
+
+      document.getElementById("status").textContent = "done";
+    } catch (err) {
+      log("error", err.message);
+      document.getElementById("status").textContent = "error";
+    }
+  </script>
+</body>
+</html>
