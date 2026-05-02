@@ -62,6 +62,7 @@ test("WebSocket connection failure rejects invoke", async ({ page }) => {
       protocol: "wc-bindable" as const,
       version: 1 as const,
       properties: [{ name: "value", event: "t:v" }],
+      commands: [{ name: "test" }],
     };
 
     const ws = new WebSocket("ws://localhost:1"); // will fail
