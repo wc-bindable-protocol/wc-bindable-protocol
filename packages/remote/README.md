@@ -2,7 +2,7 @@
 
 Remote proxy for the **wc-bindable** protocol — connect Core and Shell over a network.
 
-Splits the HAWC Core/Shell boundary across a network using WebSocket. The server runs the real Core; the client gets a proxy EventTarget that works transparently with `bind()` and framework adapters.
+Splits the wc-bindable Core/Shell boundary across a network using WebSocket. The server runs the real Core; the client gets a proxy EventTarget that works transparently with `bind()` and framework adapters.
 
 ## Install
 
