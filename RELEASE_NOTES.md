@@ -1,3 +1,39 @@
+# v0.5.0
+
+## `@wc-bindable/remote` — API additions
+
+- **Acknowledged delivery**: new `setWithAck()` / `setWithAckOptions()` on `RemoteCoreProxy` for input writes that need server-side validation feedback. The fire-and-forget `set()` is unchanged. Servers advertise support via `capabilities.setAck` in the initial sync response; legacy servers without that capability cause `setWithAck` calls to reject cleanly instead of hanging.
+- **Cancellation and timeouts**: `invokeWithOptions()` accepts `AbortSignal` and `timeoutMs`. `invoke()` and `setWithAck()` apply a default 30s client-side timeout (`timeoutMs: 0` disables it). The legacy `invokeWithOptions(name, options, ...args)` overload is **deprecated** in favor of the explicit `invokeWithOptions(name, args, options)` form, and scheduled for removal in v1.0.
+- **Opt-in back-pressure**:
+  - `createRemoteCoreProxy(decl, transport, { maxPendingInvocations })` — bound the in-flight `setWithAck`/`invoke` map.
+  - `new WebSocketClientTransport(ws, { maxPreOpenQueue })` — bound the pre-open send buffer.
+  - `new RemoteShellProxy(core, transport, { maxSyncUpdateBuffer })` — warn when sync-time getter side-effects flood the update buffer.
+  - All defaults remain `Infinity` for backward compatibility.
+- **Pluggable logger**: every remote class accepts `{ logger }`, and `Logger` / `consoleLogger` are exported so structured loggers (pino, winston, bunyan, …) can replace the default `console.warn` / `console.error` routing.
+- **Sync robustness**: getter failures during the initial sync are reported via `getterFailures[]` so the client preserves its cached value instead of reverting to `undefined`. Properties whose getter returns `undefined` are explicitly enumerated in `undefinedProperties[]` so reset events fire correctly even on the very first sync. Older servers that omit either field continue to interoperate.
+
+## Documentation
+
+- Removed legacy HAWC references from README, the examples landing page, and `@wc-bindable/remote`'s README. RELEASE_NOTES retains historical mentions intact.
+- Added `CLAUDE.md` describing the monorepo structure, the protocol contract, remote-package invariants, and test environment quirks for AI coding assistants.
+- Added `.claude/skills/release.md` codifying the lockstep release procedure.
+
+## Packages
+
+| Package | Version |
+|---------|---------|
+| `@wc-bindable/core` | 0.5.0 |
+| `@wc-bindable/react` | 0.5.0 |
+| `@wc-bindable/vue` | 0.5.0 |
+| `@wc-bindable/svelte` | 0.5.0 |
+| `@wc-bindable/angular` | 0.5.0 |
+| `@wc-bindable/solid` | 0.5.0 |
+| `@wc-bindable/preact` | 0.5.0 |
+| `@wc-bindable/alpine` | 0.5.0 |
+| `@wc-bindable/remote` | 0.5.0 |
+
+---
+
 # v0.4.0
 
 ## New Package
