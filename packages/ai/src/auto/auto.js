@@ -1,3 +1,0 @@
-import { bootstrapAi } from "../../dist/index.js";
-
-bootstrapAi();
