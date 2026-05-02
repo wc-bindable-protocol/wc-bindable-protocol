@@ -39,7 +39,9 @@ npm install
 
 Inspect the resulting `package-lock.json` diff for surprises:
 - Expected: workspace versions update; inter-workspace `dependencies` resolve to the new versions.
-- Unexpected: `extraneous` workspace entries, dropped/added third-party packages. Investigate before continuing — do **not** delete `node_modules/` or `package-lock.json` reflexively.
+- Unexpected: dropped/added third-party packages. Investigate before continuing — do **not** delete `node_modules/` or `package-lock.json` reflexively.
+
+**`extraneous: true` workspace entries** are a known recurring artifact in this repo. Past merge histories include packages (e.g. `ai`, `auth0`, `flags`, `s3`, `stripe`, `webauthn`, historic `hawc`) that were merged in then later removed from disk; their workspace entries can linger in `package-lock.json` flagged with `"extraneous": true`. `npm install` does not always clean these up. Treat them as stale leftovers — remove the entire offending block (the `"packages/<name>": { ... },` JSON object, including the trailing comma; for the last entry, also drop the leading comma on the previous block) and re-run `npm install` to verify integrity. Cross-check with `ls packages/` to confirm the entry truly has no on-disk counterpart before deleting.
 
 ## 3. Update RELEASE_NOTES.md
 
@@ -67,6 +69,13 @@ Both must pass. If a remote-package change is in this release, also run the inte
 npm run test:integration --workspace @wc-bindable/remote
 ```
 
+**If integration tests fail, do not assume regression.** Behavioral tightenings in `@wc-bindable/remote` (stricter input/command name validation, new error envelopes, capability gating, etc.) are common in this package, and integration specs sometimes encode the *previous* behavior implicitly — for instance, a test that calls `proxy.invoke("undeclared-name")` to surface a downstream WebSocket close error will now reject earlier on the new client-side validation, never reaching the close path. Triage each failure into:
+
+- **Stale-test failure** — production behavior is intentionally stricter / more correct than the test assumed. Update the test (e.g. add a missing `commands: [{ name: ... }]` to its declaration) so it exercises the path it's actually named for, and **commit the test fix as a separate commit** *before* the release commit so git history shows test-realignment apart from the version bump.
+- **Real regression** — production behavior changed unintentionally. Stop the release, fix the code, rerun from Step 4.
+
+When in doubt, re-read the failing test's name/intent and compare to the current code path. If the test name describes a failure mode (e.g. "WebSocket close rejects pending invoke"), but the failure now happens before that mode is reachable, the test is stale.
+
 ## 5. Commit + tag
 
 Single commit and matching annotated tag:
@@ -87,18 +96,24 @@ npm publish --workspaces --access public --dry-run
 
 Skim the file list per package. Anything in `dist/` and `README.md`, nothing else (the `files` field in each `package.json` enforces this). If you see `node_modules/`, `tests/`, source `.ts`, or random tooling files, stop — fix the `files` field.
 
-## 7. Publish (CONFIRM with the user first — irreversible)
+## 7. Publish — **operator runs this manually**
+
+`npm publish` is **always run by the human operator on their machine, not by this skill / not by Claude**. The npm account on this repo (`mogera551`) is 2FA-protected, so the publish requires an OTP code that only the operator can supply. Claude must not attempt `npm publish` on the user's behalf.
+
+After Step 6's dry-run looks clean, surface the exact command for the operator to run themselves and wait for confirmation that it succeeded:
 
 ```
-npm publish --workspaces --access public
+npm publish --workspaces --access public --otp=<6-digit-code>
 ```
 
-`--access public` is required for the `@wc-bindable` scope. The root `package.json` is `private`, so it is skipped automatically.
+`--access public` is required for the `@wc-bindable` scope. The root `package.json` is `private`, so it is skipped automatically. The operator should have `npm whoami` show the expected account first.
 
-If npm rejects some packages mid-run:
+If the operator reports that some packages were rejected mid-run (OTP timeout, network error, partial publish):
 - Do **not** unpublish or retry blindly. Published versions cannot be re-uploaded with different content.
-- Check what landed: `npm view @wc-bindable/<name> versions` per package.
+- Help them check what landed: `npm view @wc-bindable/<name> versions` per package.
 - Cut a follow-up patch (`<NEW>+1`) that ships only the missing packages. Don't try to "complete" a partial release at the same version.
+
+Only proceed to Step 8 once the operator confirms the publish completed.
 
 ## 8. Push commit + tag (CONFIRM with the user first)
 
