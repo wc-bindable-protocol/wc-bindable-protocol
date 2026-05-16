@@ -116,6 +116,8 @@ This protocol intentionally does **not** cover:
 
 ## Packages
 
+All 19 packages below are published on npm at the same lockstep version, each has its own test suite that runs as part of the workspace `npm test`, and all are at the same maturity baseline (pre-1.0, API stable within a `0.x.y` line per the [release notes](RELEASE_NOTES.md)). One sub-feature is explicitly tagged as experimental in its row: Qwik 2.x via `/v2` — the Qwik 1.x main export is stable.
+
 | Package | Description |
 |---|---|
 | [@wc-bindable/core](packages/core/) | Protocol type definitions, `bind()` utility, `getWcBindableDeclaration()` and `isWcBindable()` discovery primitives |
@@ -240,6 +242,8 @@ const [ref, values] = useWcBindable<HTMLElement, MyFetchValues>();
 wc-bindable assumes the target you bind to is **trusted code you intentionally loaded**. A custom-element `getter` is an arbitrary function executed in the consumer's JavaScript context on every event — do not bind to components whose `getter` implementations you did not vet.
 
 **Treat a `static wcBindable` declaration like executable component code, not like inert metadata.** Because the `getter` field is a function, a wc-bindable declaration is fundamentally different from a JSON or schema artifact — loading a component from an untrusted source loads a function-valued field that will run with consumer-context privileges on every dispatched event. Threat models that allow "just serialized metadata" but disallow "third-party code" need to treat declarations as the latter.
+
+**Discovery itself touches the target.** Even reading `target.constructor.wcBindable` to discover a declaration goes through JavaScript property access, which means a hostile target may expose `constructor`, `wcBindable`, or any descriptor field through `Proxy` traps or accessor properties that have side effects on read. The core's `getWcBindableDeclaration()` helper wraps every such access in `try / catch` to guarantee it does not throw, but it cannot prevent side effects from running. Consumers should bind only to targets they intentionally loaded; the helper's no-throw posture is a safety net for already-trusted code, not a sandbox.
 
 For remote targets (`@wc-bindable/remote`), the proxy layer is a **protocol layer, not a security boundary**: authentication, authorization, rate limiting, and per-message payload validation are the responsibility of the layer that owns the transport. Do not expose a Core directly to an untrusted peer without those guardrails. `getter` functions are NEVER transported as code — they run on the trusted side and only extracted values cross the wire.
 

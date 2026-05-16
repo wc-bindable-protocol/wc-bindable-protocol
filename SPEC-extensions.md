@@ -72,6 +72,17 @@ Implementations MUST honor:
 - Pre-aborted signals (`signal.aborted === true` at call time) MUST cause the returned promise to reject immediately without sending any wire message.
 - After timeout or abort settles the caller's promise, the proxy MUST NOT re-settle it if a late `return` / `throw` envelope arrives for the same `id`. The late envelope MUST be dropped, and the proxy SHOULD log the drop at warn level so the unexpected delivery is visible to diagnostics. (See § Transport lifecycle vocabulary for the terminal-vs-transient terminology that interacts with this.)
 
+#### Lifecycle methods
+
+In addition to the call surface above, the consumer-side proxy exposes a small set of lifecycle methods. Their normative status differs from the call methods because their presence depends on whether the implementation supports reconnect, not on the protocol contract itself:
+
+| Method | Signature | Required? | Semantics |
+|---|---|---|---|
+| `dispose` | `dispose(): void` | **MUST** be implemented on the consumer-side proxy. | Idempotently releases proxy and transport resources. After `dispose()`: `set` MUST throw, `setWithAck` / `setWithAckOptions` / `invoke` / `invokeWithOptions` MUST reject (returning an already-rejected Promise per § Methods). `dispose()` itself MUST be safely re-callable as a no-op. Implementations MUST NOT accept a new transport after `dispose()`. |
+| `reconnect` | `reconnect(transport: ClientTransport): void` | **OPTIONAL** (MAY be implemented). | If implemented: attaches a fresh transport after the previous one closed, MUST send a fresh `sync`, MUST throw synchronously if the proxy is already disposed OR if the existing transport is still active (re-attaching to a healthy connection is a programmer error). Implementations that do not support reconnect MUST omit `reconnect` from their public surface entirely (rather than expose a stub that throws on every call); consumers can `dispose()` and construct a new proxy as the equivalent operation. |
+
+The reference `@wc-bindable/remote` implementation provides both methods. Third-party implementations that omit `reconnect` should document the omission so consumers know to use the dispose-and-reconstruct path instead.
+
 #### Call-order preservation
 
 Implementations **MUST** preserve the caller's invocation order when serializing `set` / `setWithAck` / `setWithAckOptions` / `invoke` / `invokeWithOptions` (and any other future `*WithOptions` variant) onto a single logical channel. That is, the proxy itself MUST NOT reorder calls — message N is handed to the transport strictly before message N+1, regardless of which entry point the caller used.
@@ -98,6 +109,19 @@ The core protocol does NOT inspect this field.
 ### Error envelope
 
 When `setWithAck` or `invoke` fails on the remote side, the consumer-side proxy SHOULD raise an `Error` whose `name`, `message`, and (when available) `stack` reflect the original throw. Implementations MAY attach the raw serialized payload as `cause`. Implementations MUST NOT silently swallow remote throws.
+
+#### Canonical mapping for non-Error throws
+
+JavaScript allows throwing any value (`throw "oops"`, `throw null`, `throw { code: 42 }`, …), not only `Error` instances. The producer-side proxy MUST canonicalize whatever was thrown into the `{ name, message, stack? }` envelope shape according to the following rules:
+
+| Thrown value | `name` | `message` | `stack` |
+|---|---|---|---|
+| An `Error` instance (or subclass) | `error.name \|\| "Error"` | `String(error.message)` (empty string is permitted) | `error.stack` if present and the producer's trust-boundary policy permits transmission (see security note above) |
+| Any other value (string / number / boolean / null / plain object / etc.) | `"NonErrorThrow"` | `String(thrownValue)` — invokes the value's default coercion (`String(null)` → `"null"`, `String({a:1})` → `"[object Object]"`, etc.) | Omitted (no stack exists for a non-Error throw) |
+
+The literal string `"NonErrorThrow"` is normative: consumers MAY pattern-match on it to distinguish thrown-non-Error from thrown-Error at the surface. Producers MAY additionally attach the original thrown value as `cause` on the wire if it survives `JsonValue` validation (see § Design invariants invariant 3); non-JsonValue thrown values MUST be omitted from `cause` (the `name` + `message` pair is the canonical fallback).
+
+Consumers MUST surface the wire envelope as a JavaScript `Error` instance regardless of the thrown shape on the producer side — the `Error` boundary at the proxy preserves `try { await invoke() } catch (e) { ... }` ergonomics without leaking the producer-side throw oddity into the consumer's catch.
 
 > **Security note on `stack`.** A producer-side stack trace typically includes internal file paths, function names, and runtime version markers — sensitive metadata that should NOT cross an untrusted trust boundary. The `stack` field is therefore conditional:
 >
@@ -259,7 +283,12 @@ This section is the **normative** wire-format specification for any implementati
 - `return` / `throw` MUST reference an `id` issued by a prior client message. The producer MAY emit only ONE of `return` or `throw` for any given `id`. Implementations SHOULD reject unknown `id`s with a logger warning rather than throwing — late replies after an abort are normal.
 - `capabilities.setAck === true` advertises that the producer honors `setWithAck`. **For an Extension 2 producer to claim current conformance, `setAck` MUST be advertised as `true`** (`setWithAck` is part of the consumer-side proxy's mandatory surface in § Methods; a producer that does not implement it leaves a documented safety mechanism unusable across the wire). A producer that omits `capabilities.setAck` or advertises `false` is a **legacy / non-current** producer — it can be interoperated with for fire-and-forget `set` and for property observation, but it does not satisfy the current version of this extension. Consumers MUST still cope with legacy producers (their `setWithAck` calls reject as described below) for backward compatibility, but new producer implementations MUST advertise `setAck: true`.
 
-  > **Wire schema vs conformance.** The capabilities object and its fields are typed OPTIONAL in the wire schema above so legacy producers that predate any given capability can still send a well-formed `sync` response. The current-conformance MUSTs in this list (`setAck: true`, `undefinedProperties: true`, `getterFailures: true`) tighten that schema-level optionality at the conformance level: a new producer implementation is well-formed without these fields but is not *current-conformant* without them. This split — "schema-optional, conformance-required" — is what lets the consumer side detect a legacy peer via field absence while keeping the consumer's parser happy with both shapes.
+  > **Wire schema vs conformance.** The capabilities object and its fields are typed OPTIONAL in the wire schema above so legacy producers that predate any given capability can still send a well-formed `sync` response. Conformance levels for each capability differ by safety impact:
+  >
+  > - `setAck: true` — **MUST** for current Extension 2 producer conformance. `setWithAck` is a safety mechanism (it prevents silent drops on transient outages from corrupting downstream `invoke` calls), so a producer that does not implement it leaves a documented hazard unguarded; that is the threshold for refusing the conformance label.
+  > - `undefinedProperties: true` and `getterFailures: true` — **SHOULD** be advertised by new producer implementations. These are diagnostic / classification fields; their absence degrades the consumer-side disambiguation between "modern producer with no undefined values" and "legacy producer" (see the per-capability rules below), but no safety mechanism breaks. Producers that omit them are still current-conformant, just less informative.
+  >
+  > The split between MUST and SHOULD here is what lets the consumer side detect a legacy peer via field absence while keeping the consumer's parser happy with both shapes.
 - Consumers that issued `setWithAck` calls **before** the `sync` response MUST reject all of them with a clear error if `setAck` is absent or `false`. Calls issued **after** a `sync` response whose `setAck` is absent or `false` MUST be rejected by the consumer-side proxy with the same clear error — concretely, `setWithAck` / `setWithAckOptions` MUST **synchronously return an already-rejected `Promise`** (not throw synchronously, consistent with the Promise-rejection rule for protocol-level failures in § Methods). The proxy MUST NOT send a `setWithAck` message it knows the producer will not handle.
 - **Fire-and-forget `set` (the `id`-less variant) is unaffected by this capability bit** — it is part of the baseline wire contract and every producer (legacy and current alike) MUST handle it regardless of `setAck` support.
 

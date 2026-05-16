@@ -256,13 +256,26 @@ Concretely: a Level 2 claim is `{1, 2}` (MUST). A Level 3 claim is `{1, 3}` for 
 
 | Level | Name | What it covers | What it does NOT cover |
 |---|---|---|---|
-| **1** | **Protocol conformance** | The `static wcBindable` declaration shape (§ Schema); the consumer-side EventTarget capability rule (§ Overview); the event-naming convention; the default-and-custom `getter` rule; the `in`-operator initial sync rule with its `syncOn` modes; the teardown / exception-safety / partial-delivery rules. Language-agnostic — a Deno, Bun, Python, or Go implementation is conformant at Level 1 as long as the declaration semantics and behavior match. | The names exported from the implementation; the wire format. |
+| **1** | **Protocol conformance** | Has two independently claimable facets — see § Level 1 facets below. | The names exported from the implementation; the wire format. |
 | **2** | **Core JS API compatibility** | Everything in Level 1, PLUS the three normatively-named exports: **`bind`**, **`getWcBindableDeclaration`**, **`isWcBindable`** (with the TypeScript surface and parameter shapes defined in [§ Normative TypeScript surface](#normative-typescript-surface), plus the runtime rule in [§ onUpdate validity](#onupdate-validity)). This is what makes a JavaScript reimplementation an import-line drop-in for `@wc-bindable/core` — every framework adapter does `import { bind } from "@wc-bindable/core"`, and a fork that exported `attach` instead would break every adapter even if it satisfied Level 1. | The remote wire format (Extension 2). |
 | **3** | **Remote wire conformance** | Everything in Level 1, PLUS the wire-format invariants in [SPEC-extensions.md § Extension 2](SPEC-extensions.md) — message shapes, FIFO / JSON-shape / single-shell invariants, undefined enumeration, declaration fingerprint, transport adapter contract. An implementation that consumes or produces wc-bindable across a network MUST satisfy this. If the implementation also exposes JS bindings to local consumers, those bindings SHOULD additionally satisfy Level 2 for drop-in compatibility with the JS adapter ecosystem. | Application-specific transport choice; back-pressure policy beyond the spec minimums. |
 
 **Type names** (`OnUpdate`, `UnbindFn`, `BindOptions`, `WcBindableDeclaration`, ...) are NOT normatively named at any level — TypeScript users can re-import them under any local alias without breaking interop because the runtime call shape stays the same. **Constants** (`MIN_COMPATIBLE_VERSION`) are likewise not normatively named (per § Versioning); only their values are pinned. Level 2's identifier-name rule is intentionally narrow: only the three runtime entry points whose names cross the import boundary in the wild are pinned.
 
 A non-JavaScript Level-1 implementation (for example, a Python sidecar that owns wc-bindable component instances inside a CPython runtime and exposes change events via a local socket) is a fully valid producer; it does not need to invent or expose anything called `bind`. If that same implementation also speaks the Extension 2 wire format to a JS consumer, it claims Level 1 + Level 3, not Level 2.
+
+#### Level 1 facets
+
+Level 1 has two facets. An implementation claiming Level 1 MUST specify which:
+
+| Facet | Scope | What it covers |
+|---|---|---|
+| **1P — Producer conformance** | A target that emits change events for declared properties. | The `static wcBindable` declaration shape (§ Schema); the event-naming convention; the default-and-custom `getter` rule on the producer side (a getter that runs at dispatch time and returns the value the consumer observes); the EventTarget-or-equivalent `dispatchEvent` requirement (§ Overview); the no-side-effect-event-dispatch-from-property-getter rule (§ Event detail vs Property Read). |
+| **1O — Observer conformance** | A consumer-side implementation of `bind()`-equivalent semantics. | The consumer-side EventTarget capability rule (`addEventListener` / `removeEventListener`); the `in`-operator initial-sync rule with its `syncOn` modes (§ Initial Value Synchronization, § Deferring); the teardown / exception-safety / partial-delivery rules (§ Teardown Contract); the unknown-`syncOn` fallback (§ Deferring); the `onUpdate` validity rule (§ onUpdate validity). |
+
+An implementation MAY claim 1P alone (typical: a non-JS server-side component implementation), 1O alone (typical: a JS-only inspector / devtools harness that binds to existing components but never authors them), or both (typical: `@wc-bindable/core`, which exposes both `bind()` for consumers and the declaration-discovery surface every producer needs).
+
+A higher-level claim (`Level 2`, `Level 3`) usually implies both 1P + 1O — the JS reference implementation and the remote wire shape both touch both facets. A non-JS Level 3 implementation may be 1P-only on the producer side and not implement 1O at all (its sidecar role is to emit, not to observe), which is the common case.
 
 ---
 
