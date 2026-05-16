@@ -106,6 +106,8 @@ When declaring inputs for a Shell (HTMLElement), the optional `attribute` field 
 
 Adapters **MUST** ignore unknown top-level fields. Future versions of this specification may add new optional root keys; older adapters that do not recognize them must still bind successfully to `properties`.
 
+When `inputs` or `commands` is absent (`undefined`), consumers **MUST** treat it as an empty array (`[]`) — semantically equivalent to declaring "no inputs" / "no commands". An absent field and an explicit `[]` MUST behave identically for every consumer concern (e.g. Extension 1's "name MUST be declared in inputs/commands before a `set` / `invoke` reaches the producer" check rejects every name under both encodings).
+
 ### Property Descriptor
 
 | Field    | Type       | Required | Description                                              |
@@ -156,8 +158,10 @@ Implementations **MUST** expose two discovery primitives whose contracts are obs
 
 | Function | Returns | Contract |
 |---|---|---|
-| `getWcBindableDeclaration(target)` | `WcBindableDeclaration \| undefined` | Resolves the declaration via the rule above. Returns `undefined` if `target.constructor.wcBindable` is missing, has a `protocol` other than `"wc-bindable"`, has a non-integer `version`, has `version < 1`, or has a `properties` field that is not an array. MUST NOT throw. MUST NOT consult any source other than `target.constructor.wcBindable`. |
+| `getWcBindableDeclaration(target)` | `WcBindableDeclaration \| undefined` | Resolves the declaration via the rule above and **fully validates** it. Returns `undefined` if any of the following hold: `target.constructor.wcBindable` is missing; `protocol !== "wc-bindable"`; `version` is not an integer `>= 1`; `properties` is not an array; any property descriptor is missing a non-empty string `name` or `event`, or has a non-function `getter`; any input or command descriptor is missing a non-empty string `name`; any `name` is duplicated within `properties`, within `inputs`, or within `commands`. MUST NOT throw. MUST NOT consult any source other than `target.constructor.wcBindable`. |
 | `isWcBindable(target)` | `boolean` | A type guard that is exactly equivalent to `getWcBindableDeclaration(target) !== undefined`. Implementations MAY (and SHOULD) implement it as that one-line forward. |
+
+**Discovery is bindability.** Because `getWcBindableDeclaration()` performs the complete schema validation (including the duplicate-name rule that invalidates a declaration per § Property Descriptor / § Input Descriptor / § Command Descriptor), no declaration that survives this filter can silently no-op inside `bind()`. The earlier draft where `isWcBindable()` could return `true` for an invalid declaration while `bind()` returned a no-op cleanup is fixed: the two helpers now agree by construction. Consumers can therefore use `isWcBindable()` as the single decision point for "will `bind()` install listeners?".
 
 The two functions are kept paired so that callers who need the declaration object (tooling, codegen, devtools, test inspection) read it once instead of probing for existence and then re-reading. Adapters that perform their own discovery MUST surface the same `boolean`-vs-declaration pair to be considered conforming. Naming is normative — third-party implementations of these helpers MUST use the same identifiers so consumers can swap implementations.
 

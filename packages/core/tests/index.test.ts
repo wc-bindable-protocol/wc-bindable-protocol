@@ -112,6 +112,65 @@ describe("getWcBindableDeclaration", () => {
     });
     expect(getWcBindableDeclaration(el)).toBeUndefined();
   });
+
+  it("returns undefined when a property descriptor is missing name", () => {
+    const el = createBindableElement({
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [{ event: "test:e" } as unknown as { name: string; event: string }],
+    });
+    expect(getWcBindableDeclaration(el)).toBeUndefined();
+  });
+
+  it("returns undefined when a property descriptor's getter is not a function", () => {
+    const el = createBindableElement({
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [{ name: "value", event: "test:e", getter: 42 as unknown as () => unknown }],
+    });
+    expect(getWcBindableDeclaration(el)).toBeUndefined();
+  });
+
+  it("returns undefined when properties contain duplicate names", () => {
+    const el = createBindableElement({
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [
+        { name: "value", event: "test:a" },
+        { name: "value", event: "test:b" },
+      ],
+    });
+    expect(getWcBindableDeclaration(el)).toBeUndefined();
+  });
+
+  it("returns undefined when inputs contain duplicate names", () => {
+    const el = createBindableElement({
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [{ name: "value", event: "test:e" }],
+      inputs: [{ name: "url" }, { name: "url" }],
+    });
+    expect(getWcBindableDeclaration(el)).toBeUndefined();
+  });
+
+  it("returns undefined when commands contain duplicate names", () => {
+    const el = createBindableElement({
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [{ name: "value", event: "test:e" }],
+      commands: [{ name: "fetch" }, { name: "fetch" }],
+    });
+    expect(getWcBindableDeclaration(el)).toBeUndefined();
+  });
+
+  it("accepts declarations whose inputs/commands are absent (treated as empty)", () => {
+    const el = createBindableElement({
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [{ name: "value", event: "test:e" }],
+    });
+    expect(getWcBindableDeclaration(el)).not.toBeUndefined();
+  });
 });
 
 describe("bind", () => {
@@ -199,7 +258,7 @@ describe("bind", () => {
     expect(onUpdate).not.toHaveBeenCalled();
   });
 
-  it("treats a declaration with duplicate property names as invalid (no-op bind)", () => {
+  it("treats a declaration with duplicate property names as invalid — both isWcBindable and bind agree", () => {
     const el = createBindableElement({
       protocol: "wc-bindable",
       version: 1,
@@ -210,6 +269,10 @@ describe("bind", () => {
     });
     (el as unknown as Record<string, unknown>).value = "x";
     const onUpdate = vi.fn();
+
+    // SPEC.md § Discovery API requires isWcBindable() to return false here,
+    // not the older "true + bind no-ops" split.
+    expect(isWcBindable(el)).toBe(false);
 
     const unbind = bind(el, onUpdate);
     el.dispatchEvent(new CustomEvent("test:value-changed", { detail: "y" }));

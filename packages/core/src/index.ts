@@ -69,8 +69,20 @@ const DEFAULT_GETTER = (e: Event): unknown => (e as CustomEvent).detail;
 /**
  * Read the wc-bindable declaration off `target` via the protocol's sole
  * discovery path (`target.constructor.wcBindable`). Returns the declaration
- * if it is shaped like a valid wc-bindable contract, or `undefined`
- * otherwise.
+ * if it is a fully valid wc-bindable contract, or `undefined` otherwise.
+ *
+ * Validation performed:
+ *   - `protocol === "wc-bindable"`
+ *   - `version` is an integer `>= MIN_COMPATIBLE_VERSION`
+ *   - `properties` is an array; every entry has a string `name` and string
+ *     `event`; `getter` (if present) is a function
+ *   - `inputs` / `commands` (if present) are arrays of objects with string `name`s
+ *   - `name`s are unique within `properties`, within `inputs`, and within `commands`
+ *
+ * Because the validation is *complete*, the helper doubles as the single
+ * source of truth for "is this target safe to bind to" — `isWcBindable()`
+ * is exactly `getWcBindableDeclaration(target) !== undefined`, and no
+ * declaration that survives this filter will silently no-op inside `bind()`.
  *
  * Prefer this helper over reading `target.constructor.wcBindable`
  * directly. The helper centralizes the discovery rule so future protocol
@@ -86,7 +98,47 @@ export function getWcBindableDeclaration(
   if (typeof decl.version !== "number" || !Number.isInteger(decl.version)) return undefined;
   if (decl.version < MIN_COMPATIBLE_VERSION) return undefined;
   if (!Array.isArray(decl.properties)) return undefined;
+
+  if (!isValidNamedList(decl.properties, isValidPropertyDescriptor)) return undefined;
+  if (decl.inputs !== undefined && !isValidNamedList(decl.inputs, isValidInputDescriptor)) return undefined;
+  if (decl.commands !== undefined && !isValidNamedList(decl.commands, isValidCommandDescriptor)) return undefined;
+
   return decl;
+}
+
+function isValidPropertyDescriptor(p: unknown): p is WcBindableProperty {
+  if (!p || typeof p !== "object") return false;
+  const pp = p as Partial<WcBindableProperty>;
+  if (typeof pp.name !== "string" || pp.name.length === 0) return false;
+  if (typeof pp.event !== "string" || pp.event.length === 0) return false;
+  if (pp.getter !== undefined && typeof pp.getter !== "function") return false;
+  return true;
+}
+
+function isValidInputDescriptor(p: unknown): p is WcBindableInput {
+  if (!p || typeof p !== "object") return false;
+  const pp = p as Partial<WcBindableInput>;
+  return typeof pp.name === "string" && pp.name.length > 0;
+}
+
+function isValidCommandDescriptor(p: unknown): p is WcBindableCommand {
+  if (!p || typeof p !== "object") return false;
+  const pp = p as Partial<WcBindableCommand>;
+  return typeof pp.name === "string" && pp.name.length > 0;
+}
+
+function isValidNamedList<T extends { name: string }>(
+  list: unknown,
+  isValidEntry: (entry: unknown) => entry is T,
+): list is T[] {
+  if (!Array.isArray(list)) return false;
+  const seen = new Set<string>();
+  for (const entry of list) {
+    if (!isValidEntry(entry)) return false;
+    if (seen.has(entry.name)) return false; // duplicate name within the list
+    seen.add(entry.name);
+  }
+  return true;
 }
 
 export function isWcBindable(target: EventTarget): target is WcBindableElement {
@@ -142,17 +194,13 @@ export function bind(
   onUpdate: (name: string, value: unknown) => void,
   options?: BindOptions,
 ): UnbindFn {
+  // Discovery performs the full schema validation (descriptor shapes,
+  // name-uniqueness within properties/inputs/commands). A declaration that
+  // survives this check is safe to bind without further validation here —
+  // there is no path where isWcBindable() returns true but bind() silently
+  // no-ops on the same target.
   const decl = getWcBindableDeclaration(target);
   if (decl === undefined) return () => {};
-  // Reject declarations with duplicate property names rather than producing
-  // double dispatch. SPEC.md classifies this as an invalid declaration; the
-  // adapter MAY treat the target as non-bindable. See SPEC.md § Property
-  // Descriptor.
-  const seen = new Set<string>();
-  for (const prop of decl.properties) {
-    if (seen.has(prop.name)) return () => {};
-    seen.add(prop.name);
-  }
 
   const { properties } = decl;
   const cleanups: (() => void)[] = [];

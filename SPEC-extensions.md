@@ -31,7 +31,7 @@ Wire-level ordering between two messages then depends on the transport's own del
 - Transports that preserve message order (e.g. WebSocket over TCP, in-process function calls) inherit this guarantee: a `set("url", X)` immediately followed by `invoke("fetch")` on the same proxy is observed by the remote side as `url ← X` then `fetch()`.
 - Transports that do NOT preserve message order (hypothetical UDP-style or multi-channel transports) MUST document the gap, and consumers that need ordering across calls MUST sequence with `await setWithAck(...)` before issuing the dependent call.
 
-The canonical `@wc-bindable/remote` WebSocket transport inherits TCP-level ordering, so the documented `set("url", "..."); await invoke("fetch")` pattern is safe on it. The same pattern on an unordered transport requires `await setWithAck("url", "...")` first.
+The canonical `@wc-bindable/remote` WebSocket transport inherits TCP-level ordering, so the documented `set("url", "..."); await invoke("fetch")` pattern is safe **on a healthy ordered channel**: while the connection is up the producer observes the messages in caller order. It is **not** sufficient under a transient outage — `set` is at-most-once, so on a connection blip the `set` can be dropped while a subsequent `invoke` lands, leaving the producer to run the command against a stale input with no error returned to the caller. Whenever `invoke` semantically depends on a prior `set` having been applied, sequence with `await setWithAck("url", "...")` (or its `setWithAckOptions` variant) first. The README remote example documents the same caveat alongside the snippet.
 
 ### The `async` hint
 
@@ -77,8 +77,33 @@ This section is the **normative** wire-format specification for any implementati
 ### Design invariants
 
 1. **Property-centric, not event-centric.** Each `properties[i]` becomes its own per-property message stream identified by `name`. Multiple property descriptors MAY share the same `event` name on the producer side; the wire MUST discriminate by `name`.
-2. **`getter` runs on the producer side only.** Functions are NEVER transported as code; only the extracted value crosses the wire. The consumer-side proxy MUST rewrite each `properties[i].event` to a unique synthetic per-property event name on the local declaration so `bind()` on the consumer can discriminate properties that originally shared an event name on the producer.
-3. **JSON-shape payloads only.** Every value the wire carries MUST round-trip through `JSON.stringify` / `JSON.parse`: plain objects, arrays, strings, finite numbers, booleans, `null`. `undefined`, `Date`, `Map`, `Set`, `BigInt`, typed arrays, class instances, functions, and cyclic objects are out of contract. Transports whose native channel could preserve richer values (e.g. `MessagePort` structured clone) MUST serialize at the boundary so every transport presents the same lossy view. **Handling of non-serializable values is normative:** the producer-side proxy MUST detect a serialization failure (either by attempting `JSON.stringify` and observing a thrown `TypeError`, or by a transport-level equivalent) and respond as follows: for an `update`/`sync` payload, the proxy MUST emit a logger warning naming the affected property and MUST drop the value (no `update` message for that change; the consumer continues observing the last successfully-transmitted value); for a `setWithAck`/`invoke` reply (`return` envelope), the proxy MUST instead emit a `throw` envelope referencing the same `id` so the pending consumer promise rejects with a typed error rather than hanging or resolving with corrupted data. The producer MUST NOT substitute a sentinel like `null` for a failed serialization — silent value mutation breaks the consumer's value-cache and `bind()` `onUpdate` contract.
+2. **`getter` runs on the producer side only.** Functions are NEVER transported as code; only the extracted value crosses the wire. The consumer-side proxy MUST rewrite each `properties[i].event` to a unique synthetic per-property event name on the local declaration so `bind()` on the consumer can discriminate properties that originally shared an event name on the producer. Concretely, the consumer-side proxy:
+   - constructs its `constructor.wcBindable.properties` with each entry's `event` replaced by a synthetic name (the reference implementation uses `"@wc-bindable/remote:" + name`),
+   - **OMITS** `getter` on every consumer-side property descriptor — when a wire `update` arrives, the proxy dispatches a `CustomEvent` whose `detail` is the already-extracted value, so the default `e => e.detail` getter (from SPEC.md § Default Getter) reads the right value with no remote-side function reference involved,
+   - keeps `inputs` and `commands` as-is (these are purely declarative, with no per-descriptor function reference to translate).
+
+   A consumer-side declaration that erroneously copied the original `getter` from the producer would re-apply extraction to an already-extracted value and silently corrupt the consumer's observed state.
+3. **JSON-shape payloads only.** The wire's value type is formally defined as:
+
+   ```typescript
+   type JsonValue =
+     | null
+     | boolean
+     | string
+     | number              // finite only — NaN and ±Infinity are NOT JsonValue
+     | JsonValue[]
+     | { [key: string]: JsonValue };  // own enumerable string keys only
+   ```
+
+   `undefined`, `Date`, `Map`, `Set`, `BigInt`, typed arrays, class instances, functions, symbols, cyclic references, and non-finite numbers are out of contract. Transports whose native channel could preserve richer values (e.g. `MessagePort` structured clone) MUST serialize at the boundary so every transport presents the same lossy view.
+
+   **`JSON.stringify` alone is NOT sufficient validation.** `JSON.stringify` silently coerces `NaN`/`Infinity` to `null`, silently drops object own-properties whose value is `undefined`, a function, or a symbol, and silently drops symbol-keyed properties. A value can therefore pass `JSON.stringify` without throwing while being silently mutated into a different shape on the wire. Producers MUST validate values as `JsonValue` via an explicit deep traversal **before** handing them to the transport — a typed predicate `isJsonValue(v)` is the conformant primitive. (Implementations MAY use `JSON.stringify` followed by a structural compare of the parsed result to the original; raw `try { JSON.stringify(v) }` is non-conformant.)
+
+   **Handling of non-`JsonValue` values is normative:**
+
+   - For an `update` / `sync` payload, the producer MUST emit a logger warning naming the affected property and MUST drop the value — no `update` message for that change; the consumer continues observing the last successfully-transmitted value.
+   - For a `setWithAck` / `invoke` reply (`return` envelope), the producer MUST instead emit a `throw` envelope referencing the same `id`, so the pending consumer promise rejects with a typed error rather than hanging or resolving with corrupted data.
+   - The producer MUST NOT substitute a sentinel like `null` for a failed serialization. Silent value mutation breaks the consumer's value-cache and the `bind()` `onUpdate` contract.
 4. **FIFO ordering on a single (consumer, producer) channel.** The transport MUST preserve the order in which the proxy called `send()`. WebSocket-per-connection and `MessagePort`-per-port satisfy this; `BroadcastChannel` and fan-in / fan-out transports do not in general.
 5. **Per-channel single-shell semantics.** A given producer-side shell MUST serve exactly one consumer proxy at a time. Multiplexing N consumers onto one shell is out of scope; spawn N shells (one per channel) instead.
 
@@ -93,6 +118,7 @@ This section is the **normative** wire-format specification for any implementati
 
 - `set` without an `id` is fire-and-forget (Extension 1 `set`); with an `id` it requires an acknowledgement (Extension 1 `setWithAck`).
 - `cmd.id` is a client-allocated identifier (e.g. UUID v4) unique within the lifetime of the proxy. The producer MUST echo it back in the `return` / `throw` envelope.
+- `{ type: "sync" }` carries no `id`. **At most one `sync` request MAY be outstanding per channel at a time.** The consumer-side proxy MUST NOT issue a new `sync` until the previous one has either received its `sync` response or the channel has been torn down. The producer MAY conflate back-to-back `sync` requests it has not yet answered into a single response. If a future revision needs concurrent `sync` requests (e.g. cross-shell snapshots on a multiplexed transport), introduce a new message type with an explicit `id` rather than overloading this one.
 
 ### Message types — server → client
 
@@ -113,13 +139,28 @@ This section is the **normative** wire-format specification for any implementati
 { "type": "update", "name": string, "value": JsonValue }
 
 // Reply to a setWithAck or invoke with matching id.
-{ "type": "return", "id": string, "value": JsonValue }
+// `value` is OPTIONAL. Its absence and its concrete shape have different
+// meanings depending on which client message the `id` came from — see the
+// "Return envelope value field" subsection below.
+{ "type": "return", "id": string, "value"?: JsonValue }
 { "type": "throw",  "id": string, "error": { "name": string, "message": string, "stack"?: string } }
 ```
 
 - `update` is dispatched for every change event the producer-side shell observes, after applying the producer-side `getter`. The `name` MUST be one declared in `properties`.
 - `return` / `throw` MUST reference an `id` issued by a prior client message. The producer MAY emit only ONE of `return` or `throw` for any given `id`. Implementations SHOULD reject unknown `id`s with a logger warning rather than throwing — late replies after an abort are normal.
 - `capabilities.setAck === true` advertises that the producer honors `setWithAck`. Consumers that issued `setWithAck` calls before the `sync` response MUST reject all of them with a clear error if `setAck` is absent or `false`.
+
+#### Return envelope value field
+
+`value` is OPTIONAL on a `return` envelope. Because the wire is JSON-only (no `undefined` representation, see § Design invariants), the producer cannot transmit a literal `undefined` as the value; the producer MUST encode the absence-of-value case by omitting the `value` key entirely. The interpretation differs by which client message the `id` came from:
+
+- **`setWithAck` ack.** The `Promise` resolves with `void`, so there is no return value to transmit. The producer MUST omit the `value` field. Consumers MUST ignore any `value` that does appear on a setWithAck `return` (treat as a producer bug worth logging) and MUST resolve the pending promise with `undefined`.
+- **`invoke` return.** The producer represents the method's return value as follows:
+  - Synchronous or eventual return of `undefined` → omit `value`. Consumers MUST resolve the pending promise with `undefined`.
+  - Synchronous or eventual return of `null` → set `value: null`. Consumers MUST resolve the pending promise with `null`. **`null` and `undefined` are wire-distinguishable** via key presence (omitted vs. present-with-`null`).
+  - Any other JsonValue → set `value: <that JsonValue>`. Consumers MUST resolve the pending promise with the deserialized value.
+
+The earlier "value: undefined" pseudocode in the end-to-end diagrams was a JS-level shorthand; on the wire it always serialized as a missing key (because `JSON.stringify` drops own properties whose value is `undefined`), and that omission is now the normative encoding.
 
 ### Undefined enumeration
 
@@ -133,6 +174,22 @@ Producers MAY omit the `undefinedProperties` field entirely when no declared pro
 
 Legacy compatibility: a producer that predates the `undefinedProperties` field will simply omit it. Consumers SHOULD treat a re-sync that omits a previously-cached property as a revert-to-`undefined` event, even without the explicit list, so that long-running connections do not drift.
 
+#### `getterFailures` semantics
+
+`getterFailures?: string[]` on the sync response enumerates declared property names for which the producer attempted the sync-time read (`getter` invocation, raw property access, or whatever the producer uses to materialize the value) and that attempt **threw**. These properties:
+
+- MUST be omitted from `values` (the producer has no value to send for them).
+- MUST be omitted from `undefinedProperties` (the producer cannot assert that the current value is `undefined`; it failed to read).
+- Are NOT a protocol-level error. The wire stays well-formed; only the affected properties are skipped.
+
+Consumer-side rules:
+
+- The consumer MUST log a warning naming each property in `getterFailures` (the producer-side `Logger` will already have a matching entry, but the consumer should surface it too so app-level diagnostics see both sides).
+- The consumer MUST NOT dispatch any initial-sync event for properties in `getterFailures`. Specifically: if such a property was previously cached at a non-`undefined` value, the consumer MUST NOT revert the cache to `undefined` on the basis of this sync (that revert is reserved for properties in `undefinedProperties` and for the legacy-fallback case). A getter failure is property-level and transient, not a state assertion.
+- Subsequent `update` messages for the same `name` (after the getter recovers) MUST be applied normally — the failure does NOT taint the property permanently.
+
+Producers MAY omit `getterFailures` when no read failed. Consumers MUST treat a missing field as an empty list.
+
 ### `setWithAck` end-to-end
 
 ```
@@ -142,9 +199,9 @@ client                                producer
   │                                   │  isReservedRemoteName(name)? throw
   │                                   │  try: core[name] = value
   │                                   │     (Extension 1: MUST execute before ack)
-  │   ◄── { type: "return",       ── │  ack with value: undefined
-  │         id: "abc",                │
-  │         value: undefined }        │
+  │   ◄── { type: "return",       ── │  ack with no value key (Promise<void>)
+  │         id: "abc" }               │     ↑ "value" field is omitted per
+  │                                   │       § Return envelope value field
 ```
 
 If the assignment throws synchronously, the producer MUST send a `throw` with the same `id`. If `name` is not declared as an input, the producer MUST send a `throw` with `id` (NOT a silent drop), so the client's pending `Promise` rejects with a useful error.
