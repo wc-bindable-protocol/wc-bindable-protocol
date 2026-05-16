@@ -52,9 +52,11 @@ This protocol intentionally does **not** cover:
 | [@wc-bindable/core](packages/core/) | Protocol type definitions, `bind()` utility, and `isWcBindable()` type guard |
 | [@wc-bindable/react](packages/react/) | React hook — `useWcBindable()` |
 | [@wc-bindable/vue](packages/vue/) | Vue composable — `useWcBindable()` |
+| [@wc-bindable/preact](packages/preact/) | Preact hook — `useWcBindable()` |
 | [@wc-bindable/svelte](packages/svelte/) | Svelte action — `use:wcBindable` |
 | [@wc-bindable/angular](packages/angular/) | Angular directive — `wcBindable` |
 | [@wc-bindable/solid](packages/solid/) | Solid primitive — `createWcBindable()` / `use:wcBindable` |
+| [@wc-bindable/alpine](packages/alpine/) | Alpine.js plugin — `x-wc-bindable` directive |
 | [@wc-bindable/lit](packages/lit/) | Lit ReactiveController — `WcBindableController` |
 | [@wc-bindable/qwik](packages/qwik/) | Qwik composable — `useWcBindable()` (Qwik 1.x; Qwik 2.x via `/v2`, experimental) |
 | [@wc-bindable/stencil](packages/stencil/) | Stencil controller — `WcBindableController` |
@@ -77,7 +79,23 @@ npm install @wc-bindable/core @wc-bindable/react
 import { useWcBindable } from "@wc-bindable/react";
 
 function App() {
-  const [ref, values] = useWcBindable<HTMLElement>({ value: "" });
+  const [ref, values] = useWcBindable<HTMLElement, { value: string }>({ value: "" });
+  return (
+    <>
+      <my-input ref={ref} />
+      <p>{values.value}</p>
+    </>
+  );
+}
+```
+
+### Preact
+
+```tsx
+import { useWcBindable } from "@wc-bindable/preact";
+
+function App() {
+  const [ref, values] = useWcBindable<HTMLElement, { value: string }>({ value: "" });
   return <my-input ref={ref} />;
 }
 ```
@@ -85,13 +103,13 @@ function App() {
 ### Vue
 
 ```vue
-<script setup>
+<script setup lang="ts">
 import { useWcBindable } from "@wc-bindable/vue";
-const { ref, values } = useWcBindable({ value: "" });
+const { ref: inputRef, values } = useWcBindable<HTMLElement, { value: string }>({ value: "" });
 </script>
 
 <template>
-  <my-input :ref="ref" />
+  <my-input ref="inputRef" />
   <p>{{ values.value }}</p>
 </template>
 ```
@@ -128,6 +146,23 @@ function App() {
   const [values, directive] = createWcBindable();
   return <my-input ref={directive} />;
 }
+```
+
+### Alpine.js
+
+```html
+<script type="module">
+  import Alpine from "alpinejs";
+  import wcBindable from "@wc-bindable/alpine";
+
+  Alpine.plugin(wcBindable);
+  Alpine.start();
+</script>
+
+<div x-data="{ value: '' }">
+  <my-input x-wc-bindable></my-input>
+  <p x-text="value"></p>
+</div>
 ```
 
 ### Qwik
