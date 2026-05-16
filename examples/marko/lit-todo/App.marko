@@ -1,0 +1,59 @@
+import { wcBindable } from "@wc-bindable/marko";
+import "../../vanilla/lit-todo/lit-todo.ts";
+import appSource from "./App.marko?raw";
+
+class {
+  onCreate() {
+    this.state = { values: {} };
+  }
+  onMount() {
+    this.unbind = wcBindable(this.getEl("todo"), (name, value) => {
+      this.state.values = { ...this.state.values, [name]: value };
+    });
+  }
+  onDestroy() {
+    if (this.unbind) this.unbind();
+  }
+}
+
+$ const TODO_TAG = "lit-todo";
+$ const items = state.values.items;
+$ const count = state.values.count;
+
+<div style="font-family: system-ui, sans-serif; max-width: 600px; margin: 40px auto; padding: 0 20px">
+  <p><a href="/index.html">&larr; Examples</a></p>
+  <h1>wc-bindable: Marko - Lit Todo</h1>
+
+  <div style="margin: 24px 0; padding: 16px; border: 1px solid #ddd; border-radius: 8px">
+    <div style="font-weight: 600; margin-bottom: 8px">
+      Lit Todo Component
+      <if(count != null)>
+        <span style="display: inline-block; background: #2563eb; color: white; border-radius: 12px; padding: 2px 10px; font-size: 13px; margin-left: 8px">
+          ${count}
+        </span>
+      </if>
+    </div>
+    <${TODO_TAG} key="todo"/>
+  </div>
+
+  <div style="margin: 24px 0; padding: 16px; border: 1px solid #ddd; border-radius: 8px">
+    <div style="font-weight: 600; margin-bottom: 8px">Bound Values (via wcBindable)</div>
+    <pre style="font-size: 14px; color: #2563eb">${JSON.stringify(state.values, null, 2)}</pre>
+  </div>
+
+  <if(items && items.length > 0)>
+    <div style="margin: 24px 0; padding: 16px; border: 1px solid #ddd; border-radius: 8px">
+      <div style="font-weight: 600; margin-bottom: 8px">Marko-rendered item list (from bound state)</div>
+      <ul>
+        <for|item| of=items>
+          <li>${item}</li>
+        </for>
+      </ul>
+    </div>
+  </if>
+
+  <details style="margin: 24px 0; padding: 16px; border: 1px solid #ddd; border-radius: 8px">
+    <summary style="font-weight: 600; margin-bottom: 8px; cursor: pointer">Source Code</summary>
+    <pre style="font-size: 13px; overflow: auto; margin: 8px 0 0; padding: 12px; background: #f8fafc; border-radius: 4px"><code>${appSource}</code></pre>
+  </details>
+</div>
