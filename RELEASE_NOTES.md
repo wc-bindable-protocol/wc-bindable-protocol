@@ -100,7 +100,7 @@ All 8 frameworks now have complete examples across 3 demo components (Counter, F
 
 ## Node.js Support
 
-- Added `examples/node-fetch/` — `MyFetchCore` (EventTarget) + `bind()` running in Node.js with zero DOM dependencies
+- Added `examples/node/fetch/` — `MyFetchCore` (EventTarget) + `bind()` running in Node.js with zero DOM dependencies
 - Validates HAWC Core/Shell separation: Core components are runtime-agnostic
 
 ## Packages

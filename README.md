@@ -226,10 +226,10 @@ The `examples/` directory contains working demos that verify the protocol across
 |---|---|
 | [Vanilla — Counter](examples/vanilla/counter/) | Basic counter using `bind()` directly |
 | [Vanilla — Fetch](examples/vanilla/fetch/) | Headless `<my-fetch>` component with async state |
-| [React — Counter](examples/react-counter/) | Counter bound via `useWcBindable` hook |
-| [React — Fetch](examples/react-fetch/) | Fetch bound via `useWcBindable` hook |
-| [Vue — Counter](examples/vue-counter/) | Counter bound via `useWcBindable` composable |
-| [Vue — Fetch](examples/vue-fetch/) | Fetch bound via `useWcBindable` composable |
+| [React — Counter](examples/react/counter/) | Counter bound via `useWcBindable` hook |
+| [React — Fetch](examples/react/fetch/) | Fetch bound via `useWcBindable` hook |
+| [Vue — Counter](examples/vue/counter/) | Counter bound via `useWcBindable` composable |
+| [Vue — Fetch](examples/vue/fetch/) | Fetch bound via `useWcBindable` composable |
 
 ### Running the examples
 
