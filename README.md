@@ -57,7 +57,7 @@ If the snippet above feels small and the remote / wire-format material later fee
 
 The "no runtime dependencies" claim refers to Layer 1, which is what `@wc-bindable/core` ships. Layers 2 and 3 are opt-in; loading them does not retroactively complicate a Layer-1-only consumer.
 
-A small clarification on the Layer 1 "just `static` class fields and `CustomEvent`" framing: when the consumer opts into `bind(target, onUpdate, { syncOn: "connect" })`, the deferred-sync path touches three more environment globals — `HTMLElement`, `document`, `MutationObserver`. They are referenced through `typeof` guards, so importing `@wc-bindable/core` itself never fails in Node / Deno / Workers where those globals are absent; the deferred path simply degrades to the synchronous `"call"` behavior in that case. Layer 1 thus retains the no-dependency posture in the package-manifest sense (no `npm` deps), while still being able to take advantage of DOM globals when they happen to exist.
+**You do not need `@wc-bindable/remote` to use wc-bindable with a framework.** Layer 3 is for the specific case of running the Core in a different process / runtime / machine than the consumer. The framework adapters in the [Packages](#packages) table below all operate at Layer 1 and require nothing from Layer 3.
 
 ## Why?
 
@@ -95,15 +95,9 @@ For DOM elements that have not yet been connected when `bind()` is called, pass 
 
 > **Prefer `syncOn: "call"` whenever the adapter can observe a mounted lifecycle.** `syncOn: "connect"` is a fallback for imperative light-DOM insertion only — it does NOT replace a proper lifecycle hook. The deferred path installs a document-wide `MutationObserver` which does NOT traverse shadow roots (so a target appended into a shadow tree never fires the deferred sync), and N simultaneous deferred binds installs N document observers. If your adapter owns the element lifecycle, bind from inside that hook with the default `syncOn: "call"` and skip the deferred path entirely. See [SPEC.md § Deferring the Initial Sync Until Connection](SPEC.md#deferring-the-initial-sync-until-connection) for the full caveat list.
 
-## Security model
+### Runtime note
 
-wc-bindable assumes the target you bind to is **trusted code you intentionally loaded**. A custom-element `getter` is an arbitrary function executed in the consumer's JavaScript context on every event — do not bind to components whose `getter` implementations you did not vet.
-
-**Treat a `static wcBindable` declaration like executable component code, not like inert metadata.** Because the `getter` field is a function, a wc-bindable declaration is fundamentally different from a JSON or schema artifact — loading a component from an untrusted source loads a function-valued field that will run with consumer-context privileges on every dispatched event. Threat models that allow "just serialized metadata" but disallow "third-party code" need to treat declarations as the latter.
-
-For remote targets (`@wc-bindable/remote`), the proxy layer is a **protocol layer, not a security boundary**: authentication, authorization, rate limiting, and per-message payload validation are the responsibility of the layer that owns the transport. Do not expose a Core directly to an untrusted peer without those guardrails. `getter` functions are NEVER transported as code — they run on the trusted side and only extracted values cross the wire.
-
-See [SPEC.md § Trust Boundaries](SPEC.md#trust-boundaries) and [packages/remote/README.md § Security model](packages/remote/README.md#security-model--trust-boundary) for the full contract.
+`@wc-bindable/core` ships **zero `npm` runtime dependencies**. The default `bind(target, onUpdate)` path uses only `static` class fields and standard `addEventListener` / `removeEventListener` calls, so it works unchanged in browsers, Node, Deno, and Cloudflare Workers. The optional `{ syncOn: "connect" }` path additionally touches three DOM globals — `HTMLElement`, `document`, `MutationObserver` — through `typeof` guards; in non-browser runtimes where these are undefined, that path silently degrades to the synchronous `"call"` behavior. The package-manifest no-dependency posture is unaffected either way.
 
 ## Non-goals
 
@@ -234,6 +228,16 @@ import type { MyFetchValues } from "./my-fetch/types.js";
 const [ref, values] = useWcBindable<HTMLElement, MyFetchValues>();
 // values.loading, values.value, values.error — all reactive
 ```
+
+## Security model
+
+wc-bindable assumes the target you bind to is **trusted code you intentionally loaded**. A custom-element `getter` is an arbitrary function executed in the consumer's JavaScript context on every event — do not bind to components whose `getter` implementations you did not vet.
+
+**Treat a `static wcBindable` declaration like executable component code, not like inert metadata.** Because the `getter` field is a function, a wc-bindable declaration is fundamentally different from a JSON or schema artifact — loading a component from an untrusted source loads a function-valued field that will run with consumer-context privileges on every dispatched event. Threat models that allow "just serialized metadata" but disallow "third-party code" need to treat declarations as the latter.
+
+For remote targets (`@wc-bindable/remote`), the proxy layer is a **protocol layer, not a security boundary**: authentication, authorization, rate limiting, and per-message payload validation are the responsibility of the layer that owns the transport. Do not expose a Core directly to an untrusted peer without those guardrails. `getter` functions are NEVER transported as code — they run on the trusted side and only extracted values cross the wire.
+
+See [SPEC.md § Trust Boundaries](SPEC.md#trust-boundaries) and [packages/remote/README.md § Security model](packages/remote/README.md#security-model--trust-boundary) for the full contract.
 
 ## Advanced: extracting Core to a server
 

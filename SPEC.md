@@ -37,13 +37,14 @@ The protocol requires no dependencies and relies solely on standard APIs: `stati
 - Optionally allow declaration of input properties and commands for a complete interface description
 - Allow any reactivity system to consume those declarations without prior knowledge of the component
 - Remain zero-dependency and runtime-only
-- Be simple enough to implement in tens of lines of code
+- Be simple enough that a **minimal local observer** — discovery + `bind()` returning a cleanup — fits in tens of lines of code
+- Define the stricter edge-case rules (full descriptor validation, exception-safe teardown, partial-delivery semantics, deferred-sync ordering, shadow-DOM limitations) that a **production-grade adapter** needs separately, so the small-impl pitch and the production contract do not have to be the same artifact
 
 ---
 
 ## Protocol Declaration
 
-Any class extending `EventTarget` declares its bindable properties by defining a `static wcBindable` field on the class.
+A producer target — **typically a class that extends `EventTarget`** (e.g. an `HTMLElement` subclass) — declares its bindable properties by defining a `static wcBindable` field on the class. A structural EventTarget-compatible object MAY also participate as long as it exposes the required `addEventListener` / `removeEventListener` / `dispatchEvent` methods and the same `constructor.wcBindable` discovery path; subclassing `EventTarget` is the recommended pattern but is not strictly required (see [§ Overview](#overview) for the consumer-vs-producer capability split).
 
 ### Headless (EventTarget only)
 
@@ -453,6 +454,13 @@ function isValidCommandDescriptor(p) {
 }
 
 function bind(target, onUpdate, options) {
+  // Programmer error: a non-function onUpdate cannot be reached for an
+  // empty-properties target (no event would ever fire it), so defer-and-
+  // let-it-throw silently accepts the bug. Reject up front. See
+  // § onUpdate validity.
+  if (typeof onUpdate !== "function") {
+    throw new TypeError("bind: onUpdate must be a function");
+  }
   // Discovery == bindability: a declaration that survives this check is
   // safe to bind. The version check above is permissive (every integer
   // >= 1) per § Versioning; no adapter-specific upper bound exists.
