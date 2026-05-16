@@ -70,6 +70,8 @@ Any framework adapter can then automatically bind to those properties — no man
 
 When the adapter binds to an element, it reads the current value of each declared property (using `name in target` so an explicitly-`undefined` value is still delivered) and then listens for subsequent change events. `bind()` returns an unbind function that removes every listener it registered; adapters re-expose this so consumers can tear down cleanly. For DOM elements that have not yet been connected when `bind()` is called, pass `{ syncOn: "connect" }` to defer the initial read until `connectedCallback` has run. Framework adapters that bind from a mounted-element lifecycle hook (React `useEffect`, Vue `onMounted`, Angular `AfterViewInit`, etc.) use the default `syncOn: "call"` because the host already guarantees the element is attached; the imperative binders this repository ships for VanJS / MobX / RxJS / Signals currently pass `syncOn: "connect"` internally so callers do not have to sequence `appendChild()` and `binder.bind(el)` manually. This is a guideline ([SPEC-extensions.md § Extension 3](SPEC-extensions.md) is informational, not normative); third-party adapters are free to make a different choice as long as it matches their binder shape.
 
+> **Note — Shadow DOM caveat for `syncOn: "connect"`.** The deferred path is observed via a `MutationObserver` attached to the top-level `document`, which does NOT traverse shadow roots. A target appended into another element's shadow tree becomes `isConnected === true` without firing the observer, and the deferred initial sync never runs. `syncOn: "connect"` is intended for light-DOM imperative insertion. If your adapter owns the element lifecycle (any of the framework hooks listed above), bind from the mounted hook with the default `syncOn: "call"` instead. See [SPEC.md § Deferring the Initial Sync Until Connection](SPEC.md#deferring-the-initial-sync-until-connection) for the full caveat list.
+
 ## Security model
 
 wc-bindable assumes the target you bind to is **trusted code you intentionally loaded**. A custom-element `getter` is an arbitrary function executed in the consumer's JavaScript context on every event — do not bind to components whose `getter` implementations you did not vet.
@@ -87,7 +89,7 @@ This protocol intentionally does **not** cover:
 - **Automatic two-way synchronization** — The protocol can describe both outputs (`properties`) and inputs (`inputs`, `commands`), but it does not implement automatic synchronization between component and framework state. Setting input properties and invoking commands are always explicit actions by the consumer.
 - **Form integration** — Integration with form libraries or `FormData` is outside the scope.
 - **SSR / hydration** — The protocol operates at the DOM level and does not address server-side rendering or hydration strategies.
-- **Validation or schema enforcement** — Property values are passed as-is. Type checking or validation is the consumer's responsibility.
+- **Application-level schema enforcement** — The core protocol passes property values to consumers as-is; it does not type-check or business-validate them. Type checking is the consumer's responsibility. (Transport-level extensions DO validate transport-shape: `@wc-bindable/remote` enforces JSON-serializability of every payload before it crosses the wire, see [SPEC-extensions.md § Extension 2](SPEC-extensions.md). That is wire-shape validation, not application validation — the value's *application* meaning still passes through unexamined.)
 
 ## Packages
 

@@ -8,6 +8,7 @@ import type {
 } from "./types.js";
 import { isReservedRemoteName } from "./transport/messageValidation.js";
 import { type Logger, resolveLogger } from "./logger.js";
+import { buildDeclarationFingerprint } from "./declarationFingerprint.js";
 
 const REMOTE_CAPABILITIES: RemoteCapabilities = {
   setAck: true,
@@ -309,6 +310,12 @@ export class RemoteShellProxy {
         type: "sync",
         values,
         capabilities: REMOTE_CAPABILITIES,
+        // Always include the fingerprint — it lets the client detect a stale
+        // or mismatched declaration cached on its side (different package
+        // version, partial deploy, etc.) before the mismatch surfaces as a
+        // per-message rejection. See SPEC-extensions.md § Declaration
+        // fingerprint.
+        declarationFingerprint: buildDeclarationFingerprint(this._declaration),
         ...(getterFailures.length > 0 ? { getterFailures } : {}),
         ...(undefinedProperties.length > 0 ? { undefinedProperties } : {}),
       }, "sync response");

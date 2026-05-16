@@ -99,11 +99,11 @@ describe("RemoteShellProxy", () => {
     new RemoteShellProxy(core, server);
     handler!({ type: "sync" });
 
-    expect(send).toHaveBeenCalledWith({
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({
       type: "sync",
       values: { value: null, loading: false },
       capabilities: { setAck: true },
-    });
+    }));
   });
 
   it("logs and swallows sync send failures", () => {
@@ -153,12 +153,12 @@ describe("RemoteShellProxy", () => {
     new RemoteShellProxy(core, server);
     handler!({ type: "sync" });
 
-    expect(send).toHaveBeenCalledWith({
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({
       type: "sync",
       values: {},
       capabilities: { setAck: true },
       undefinedProperties: ["missing"],
-    });
+    }));
   });
 
   it("falls back when JSON.stringify does not return a string for a thrown cause", () => {
@@ -307,12 +307,12 @@ describe("RemoteShellProxy", () => {
     new RemoteShellProxy(core, server);
 
     expect(() => handler!({ type: "sync" })).not.toThrow();
-    expect(send).toHaveBeenCalledWith({
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({
       type: "sync",
       values: { ok: "value" },
       capabilities: { setAck: true },
       getterFailures: ["bad"],
-    });
+    }));
     expect(errorSpy).toHaveBeenCalledWith(
       'RemoteShellProxy: getter for "bad" threw during sync:',
       expect.any(Error),
@@ -353,11 +353,11 @@ describe("RemoteShellProxy", () => {
     new RemoteShellProxy(core, server);
     handler!({ type: "sync" });
 
-    expect(send).toHaveBeenNthCalledWith(1, {
+    expect(send).toHaveBeenNthCalledWith(1, expect.objectContaining({
       type: "sync",
       values: { value: "snapshot", status: "current" },
       capabilities: { setAck: true },
-    });
+    }));
     expect(send).toHaveBeenNthCalledWith(2, {
       type: "update",
       name: "status",
@@ -410,7 +410,7 @@ describe("RemoteShellProxy", () => {
     handler!({ type: "sync" });
 
     expect(sent).toEqual([
-      { type: "sync", values: { value: "snapshot", status: "current" }, capabilities: { setAck: true } },
+      expect.objectContaining({ type: "sync", values: { value: "snapshot", status: "current" }, capabilities: { setAck: true } }),
       { type: "update", name: "status", value: "queued" },
       { type: "update", name: "status", value: "after-flush" },
     ]);
@@ -878,7 +878,7 @@ describe("RemoteShellProxy", () => {
 
     // Handler still alive — subsequent sync request is processed.
     handler!({ type: "sync" });
-    expect(send).toHaveBeenCalledWith({ type: "sync", values: {}, capabilities: { setAck: true } });
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ type: "sync", values: {}, capabilities: { setAck: true } }));
 
     errorSpy.mockRestore();
   });
@@ -1577,12 +1577,12 @@ describe("RemoteShellProxy", () => {
       new RemoteShellProxy(core, { send, onMessage: (h) => { handler = h; } });
       handler!({ type: "sync" });
 
-      expect(send).toHaveBeenCalledWith({
+      expect(send).toHaveBeenCalledWith(expect.objectContaining({
         type: "sync",
         values: { ready: true },
         capabilities: { setAck: true },
         undefinedProperties: ["value", "status"],
-      });
+      }));
     });
 
     it("omits the field when every declared property has a concrete value", () => {
@@ -1602,11 +1602,11 @@ describe("RemoteShellProxy", () => {
       handler!({ type: "sync" });
 
       const payload = send.mock.calls[0]?.[0];
-      expect(payload).toEqual({
+      expect(payload).toEqual(expect.objectContaining({
         type: "sync",
         values: { value: 42 },
         capabilities: { setAck: true },
-      });
+      }));
       expect(payload).not.toHaveProperty("undefinedProperties");
     });
 
@@ -1637,13 +1637,13 @@ describe("RemoteShellProxy", () => {
         errorSpy.mockRestore();
       }
 
-      expect(send).toHaveBeenCalledWith({
+      expect(send).toHaveBeenCalledWith(expect.objectContaining({
         type: "sync",
         values: { ok: "hello" },
         capabilities: { setAck: true },
         getterFailures: ["bad"],
         undefinedProperties: ["undef"],
-      });
+      }));
     });
   });
 

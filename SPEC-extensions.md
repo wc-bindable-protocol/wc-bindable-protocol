@@ -136,6 +136,14 @@ This section is the **normative** wire-format specification for any implementati
 
    **`JSON.stringify` alone is NOT sufficient validation.** `JSON.stringify` silently coerces `NaN`/`Infinity` to `null`, silently drops object own-properties whose value is `undefined`, a function, or a symbol, and silently drops symbol-keyed properties. A value can therefore pass `JSON.stringify` without throwing while being silently mutated into a different shape on the wire. Producers MUST validate values as `JsonValue` via an explicit deep traversal **before** handing them to the transport — a typed predicate `isJsonValue(v)` is the conformant primitive. (Implementations MAY use `JSON.stringify` followed by a structural compare of the parsed result to the original; raw `try { JSON.stringify(v) }` is non-conformant.)
 
+   **Object-shape requirements (deep validation algorithm).** When traversing an object, the validator MUST enforce all of the following per visited level; failing any of them makes the value non-conformant:
+
+   - `Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null`. Plain objects only. Class instances, `Date`, `Map`, `Set`, `RegExp`, etc. carry custom prototypes and are out of contract — without this check they pass through as `{}` (no own enumerable keys) and the wire silently strips their semantics.
+   - For every own enumerable string key, `Object.getOwnPropertyDescriptor(value, key)` MUST be a data descriptor (`"value" in desc`, neither `"get"` nor `"set"` in `desc`). Accessor properties are rejected outright. Beyond shape correctness, this also avoids invoking the getter during validation — a getter on an untrusted-source value could have side effects (information leak, state mutation) at exactly the trust boundary where the wire is meant to be defensive.
+   - Symbol-keyed properties on an object are silently invisible to JSON and to `JSON.stringify`; the validator MAY ignore them (they are simply not transmitted) but MUST NOT signal them as valid `JsonValue` content if a consumer attempts to use them.
+   - Arrays: every element MUST itself satisfy `isJsonValue`; sparse holes (where `i in arr === false`) MUST be either rejected or treated as the explicit value `null`, with the choice documented by the implementation.
+   - Cyclic references: traversal MUST detect a cycle (typically via a `WeakSet` of seen objects) and reject the value; otherwise the validator stack-overflows on adversarial input.
+
    **Handling of non-`JsonValue` values is normative — on both sides of the wire:**
 
    *Producer-side (server → client traffic):*
@@ -179,12 +187,22 @@ This section is the **normative** wire-format specification for any implementati
 // `undefinedProperties` enumerates names whose current value is `undefined` —
 // these are omitted from `values` because JSON cannot represent undefined.
 // See "Undefined enumeration" below.
+//
+// `declarationFingerprint` lets the consumer detect a stale or mismatched
+// local declaration before the mismatch surfaces as a per-message rejection.
+// See "Declaration fingerprint" below.
 {
   "type": "sync",
   "values": { [name: string]: JsonValue },
   "undefinedProperties"?: string[],
   "capabilities"?: { "setAck"?: boolean },
-  "getterFailures"?: string[]
+  "getterFailures"?: string[],
+  "declarationFingerprint"?: {
+    "version": number,
+    "properties": string[],   // sorted, deduplicated property names
+    "inputs":     string[],   // sorted, deduplicated input names
+    "commands":   string[]    // sorted, deduplicated command names
+  }
 }
 
 // Subsequent per-property change forwarded by the shell.
@@ -243,6 +261,26 @@ Consumer-side rules:
 - Subsequent `update` messages for the same `name` (after the getter recovers) MUST be applied normally — the failure does NOT taint the property permanently.
 
 Producers MAY omit `getterFailures` when no read failed. Consumers MUST treat a missing field as an empty list.
+
+#### Declaration fingerprint
+
+The optional `declarationFingerprint` field on a sync response carries a canonical structural summary of the producer's `wcBindable`:
+
+- `version` — the integer version of the producer's declaration.
+- `properties`, `inputs`, `commands` — the **sorted, deduplicated** lists of declared `name`s on each surface. Event names are NOT included: the consumer-side proxy rewrites them to synthetic per-property identifiers (see § Design invariants invariant 2), so cross-the-wire event-name comparison would always report differences and defeat the purpose.
+
+Producers SHOULD include the field on every sync response. The cost is `O(N)` in declaration size and a few hundred bytes of wire payload; the benefit is structural-mismatch detection before the first `set` / `invoke` reaches the producer.
+
+Consumers SHOULD compute the same fingerprint from their **local** declaration (the one passed to `createRemoteCoreProxy` or its equivalent) at construction time, and on every received `sync` response SHOULD compare the local fingerprint to the remote one:
+
+- If they are equal (or the producer omits the field — see legacy fallback below), do nothing.
+- If they differ, the consumer MUST log a warning identifying the mismatch and SHOULD continue accepting the sync. Subsequent per-message rejections (an undeclared input name, an undeclared command name) will still fire normally; the fingerprint warning surfaces the root cause at handshake time so operators do not have to chase those rejections back to a version drift.
+
+Consumers MAY suppress the warning after the first mismatch on a given transport to avoid log spam on re-sync; the warning state SHOULD reset on reconnect so a real fingerprint change after reconnect is reported again.
+
+**Legacy fallback.** Producers from a release that predates the field omit it; consumers MUST treat absence as "no fingerprint comparison available" and proceed silently. This keeps the field purely additive on the wire.
+
+**What the fingerprint does NOT cover.** Two declarations whose names match but whose event-name space, getter semantics, or runtime types differ will hash-equal. The fingerprint is a structural-surface check, not a semantic-equivalence check. Use it to catch the common operational case (consumer and producer on different `@my-app/core` package versions); pair it with version-pinning in your dependency lockfile for stronger guarantees.
 
 #### Update-time getter failure
 

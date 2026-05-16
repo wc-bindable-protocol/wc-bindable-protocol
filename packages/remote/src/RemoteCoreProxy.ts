@@ -2,12 +2,17 @@ import type { WcBindableDeclaration } from "@wc-bindable/core";
 import type {
   ClientMessage,
   ClientTransport,
+  DeclarationFingerprint,
   ServerMessage,
   RemoteRequestOptions,
   RemoteSerializedError,
 } from "./types.js";
 import { isReservedRemoteName } from "./transport/messageValidation.js";
 import { type Logger, resolveLogger } from "./logger.js";
+import {
+  buildDeclarationFingerprint,
+  declarationFingerprintsEqual,
+} from "./declarationFingerprint.js";
 
 const DEFAULT_PENDING_TIMEOUT_MS = 30_000;
 
@@ -158,6 +163,13 @@ export class RemoteCoreProxy extends EventTarget {
   private _setAckSupported: boolean | null = null;
   private _maxPendingInvocations: number;
   private _logger: Logger;
+  /** Local fingerprint, computed once at construction and compared against
+   *  the server's fingerprint on every `sync` response. See
+   *  SPEC-extensions.md § Declaration fingerprint. */
+  private _localFingerprint: DeclarationFingerprint;
+  /** True once we have warned about a fingerprint mismatch on this
+   *  transport; prevents per-resync log spam. Reset on reconnect. */
+  private _fingerprintMismatchWarned = false;
 
   constructor(
     declaration: WcBindableDeclaration,
@@ -170,6 +182,7 @@ export class RemoteCoreProxy extends EventTarget {
     this._commands = new Set((declaration.commands ?? []).map((command) => command.name));
     this._maxPendingInvocations = normalizePendingLimit(options.maxPendingInvocations);
     this._logger = resolveLogger(options.logger);
+    this._localFingerprint = buildDeclarationFingerprint(declaration);
 
     this._attachTransport(transport);
   }
@@ -492,6 +505,28 @@ export class RemoteCoreProxy extends EventTarget {
     transport.dispose();
   }
 
+  /**
+   * Compare the producer's declaration fingerprint to the local one and
+   * emit a warning on the first observed mismatch. The wire field is
+   * optional (legacy producers omit it); absence means "no comparison
+   * available" and is silently accepted. See SPEC-extensions.md §
+   * Declaration fingerprint.
+   */
+  private _compareDeclarationFingerprint(
+    remote: DeclarationFingerprint | undefined,
+  ): void {
+    if (remote === undefined) return;
+    if (this._fingerprintMismatchWarned) return;
+    if (declarationFingerprintsEqual(remote, this._localFingerprint)) return;
+    this._fingerprintMismatchWarned = true;
+    this._logger.warn(
+      "RemoteCoreProxy: declaration fingerprint mismatch between client and server. " +
+        "The local declaration passed to createRemoteCoreProxy() does not match the " +
+        "server-side wcBindable. Check that both sides are on the same package version. " +
+        `Local=${JSON.stringify(this._localFingerprint)} Remote=${JSON.stringify(remote)}`,
+    );
+  }
+
   private _rejectUnsupportedSetAckPending(): void {
     const error = new Error(
       "RemoteCoreProxy: remote server does not support setWithAck(); use set() or upgrade the server",
@@ -510,6 +545,7 @@ export class RemoteCoreProxy extends EventTarget {
     this._transport = transport;
     this._connectionError = null;
     this._setAckSupported = null;
+    this._fingerprintMismatchWarned = false;
 
     transport.onMessage((msg) => {
       /* v8 ignore next -- stale transport callbacks after reconnect are ignored defensively */
@@ -538,6 +574,7 @@ export class RemoteCoreProxy extends EventTarget {
         if (!this._setAckSupported) {
           this._rejectUnsupportedSetAckPending();
         }
+        this._compareDeclarationFingerprint(msg.declarationFingerprint);
         const getterFailures = new Set(msg.getterFailures ?? []);
         const undefinedProperties = new Set(msg.undefinedProperties ?? []);
         // Populate cache and dispatch events for each initial value.

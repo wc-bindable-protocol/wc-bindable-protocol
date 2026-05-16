@@ -11,6 +11,21 @@ export interface RemoteCapabilities {
 }
 
 /**
+ * Canonical structural fingerprint of a wcBindable declaration. Carries the
+ * version integer and the sorted-and-deduplicated name lists from
+ * `properties`, `inputs`, and `commands` — everything that determines whether
+ * two declarations describe the same surface to a remote consumer. Event
+ * names are intentionally NOT included: the consumer-side proxy rewrites them
+ * to synthetic per-property names, so equality there would be spurious.
+ */
+export interface DeclarationFingerprint {
+  version: number;
+  properties: string[];
+  inputs: string[];
+  commands: string[];
+}
+
+/**
  * Messages sent from server (Core side) to client (Shell side).
  */
 export type ServerMessage =
@@ -37,6 +52,19 @@ export type ServerMessage =
        * `undefined` on re-sync.
        */
       undefinedProperties?: string[];
+      /**
+       * Canonical fingerprint of the server-side `wcBindable` declaration —
+       * the set of names the producer actually exposes in `properties`,
+       * `inputs`, and `commands`, plus the `version`. Servers SHOULD include
+       * this so clients can detect a stale or mismatched declaration cached
+       * on their side (different package version, partial deploy, etc.)
+       * before the mismatch surfaces as a per-message rejection. Clients
+       * SHOULD compute the same fingerprint from their local declaration
+       * and SHOULD log a warning if the two differ. The wire is purely
+       * additive: legacy servers omit the field and clients treat absence
+       * as "no fingerprint comparison available".
+       */
+      declarationFingerprint?: DeclarationFingerprint;
     }
   | { type: "update"; name: string; value: unknown }
   | { type: "return"; id: string; value: unknown }

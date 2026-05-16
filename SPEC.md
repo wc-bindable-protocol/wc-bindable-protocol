@@ -9,7 +9,14 @@
 
 `wc-bindable-protocol` is a minimal, framework-agnostic protocol that enables any class extending `EventTarget` to declare its reactive properties so that any reactivity system (React, Vue, Svelte, etc.) can bind to them without framework-specific coupling. Optionally, components can also declare their input properties and commands, providing a complete interface description that enables tooling, documentation generation, and remote proxying.
 
-The minimum requirement is `EventTarget` — any object that supports `addEventListener` and `dispatchEvent` can participate in the protocol. `HTMLElement` (a subclass of `EventTarget`) is the most common implementation target, as it enables DOM integration and framework binding via refs, but it is not required. This means the protocol works equally well in non-browser runtimes (Node.js, Deno, Cloudflare Workers, etc.) where `EventTarget` is available.
+The minimum requirement is `EventTarget` — any object that participates in the standard EventTarget contract can take part in the protocol. The capability requirement splits by role:
+
+- **A producer** (a target that *emits* change events for its declared properties) MUST be able to `dispatchEvent` so consumers can observe its updates. In practice this means extending `EventTarget` or a subclass such as `HTMLElement`.
+- **A consumer-side bind target** (anything passed to `bind()` — including the producer above, a `RemoteCoreProxy`, a test double, or a thin wrapper that only relays events) MUST expose `addEventListener` and `removeEventListener` as functions. `dispatchEvent` is NOT required at the bind site itself; a wrapper that re-emits events through its own internal channel can omit it as long as listeners receive the right events.
+
+`getWcBindableDeclaration()` enforces the consumer-side bindability check (presence of `addEventListener` / `removeEventListener`) — see [§ Discovery API](#discovery-api). The producer-side `dispatchEvent` requirement is a contract on the component author, not something the discovery helper can verify from the consumer side.
+
+`HTMLElement` (a subclass of `EventTarget`) is the most common implementation target, as it enables DOM integration and framework binding via refs, but it is not required. This means the protocol works equally well in non-browser runtimes (Node.js, Deno, Cloudflare Workers, etc.) where `EventTarget` is available.
 
 The protocol requires no dependencies and relies solely on standard APIs: `static` class fields and `CustomEvent`.
 
@@ -168,7 +175,7 @@ Implementations **MUST** expose two discovery primitives whose contracts are obs
 
 | Function | Returns | Contract |
 |---|---|---|
-| `getWcBindableDeclaration(target)` | `WcBindableDeclaration \| undefined` | Resolves the declaration via the rule above and **fully validates** it. Returns `undefined` if any of the following hold: `target` does not satisfy the minimum EventTarget capability (`typeof target.addEventListener !== "function"` or `typeof target.removeEventListener !== "function"`); `target.constructor.wcBindable` is missing; `protocol !== "wc-bindable"`; `version` is not an integer `>= 1`; `properties` is not an array; any property descriptor is missing a non-empty string `name` or `event`, or has a non-function `getter`; any input or command descriptor is missing a non-empty string `name`; any `name` is duplicated within `properties`, within `inputs`, or within `commands`. MUST NOT throw. MUST NOT consult any source other than `target.constructor.wcBindable` (and the EventTarget-capability test on `target` itself). |
+| `getWcBindableDeclaration(target)` | `WcBindableDeclaration \| undefined` | Resolves the declaration via the rule above and **fully validates** it. Returns `undefined` if any of the following hold: `target` does not satisfy the minimum EventTarget capability (`typeof target.addEventListener !== "function"` or `typeof target.removeEventListener !== "function"`); `target.constructor.wcBindable` is missing; `protocol !== "wc-bindable"`; `version` is not an integer `>= 1`; `properties` is not an array; any property descriptor is missing a non-empty string `name` or `event`, or has a non-function `getter`; any input or command descriptor is missing a non-empty string `name`, has a non-string `attribute`, or has a non-boolean `async`; any `name` is duplicated within `properties`, within `inputs`, or within `commands`. MUST NOT throw. MUST NOT consult any source other than `target.constructor.wcBindable` (and the EventTarget-capability test on `target` itself). The validation covers every Schema-typed field, including the optional hint fields (`attribute`, `async`) that core does not interpret — type-checking them here keeps the "discovery succeeded ⇒ Schema is well-formed" guarantee honest for extension consumers that DO interpret them. |
 | `isWcBindable(target)` | `boolean` | A type guard that is exactly equivalent to `getWcBindableDeclaration(target) !== undefined`. Implementations MAY (and SHOULD) implement it as that one-line forward. |
 
 **Discovery is bindability — for `bind()` from `@wc-bindable/core`.** Because `getWcBindableDeclaration()` performs the complete schema validation (including the duplicate-name rule that invalidates a declaration per § Property Descriptor / § Input Descriptor / § Command Descriptor), no declaration that survives this filter can silently no-op inside `bind()`. Consumers can therefore use `isWcBindable()` as the single decision point for "will `bind()` install listeners?". (For why the discovery and bindability checks are unified rather than split, see [§ Appendix: Design rationale notes](#appendix-design-rationale-notes).)
@@ -298,11 +305,14 @@ interface BindOptions {
 function getWcBindableDeclaration(target: unknown): WcBindableDeclaration | undefined;
 function isWcBindable(target: unknown): target is WcBindableTarget;
 
-/** Binding. The narrowed `WcBindableTarget` is what survives discovery; the
- *  `EventTarget` parameter accepts any input and `bind()` internally calls
- *  `getWcBindableDeclaration()` to discriminate. */
+/** Binding. `target` is typed `unknown` for the same reason the discovery
+ *  helpers are: bind() MUST NOT throw on any input shape, and callers
+ *  routinely pass values that include null/undefined (e.g.
+ *  `document.querySelector()` returns `Element | null`). bind() routes the
+ *  input through `getWcBindableDeclaration()` and returns a no-op cleanup
+ *  for every non-bindable value. */
 function bind(
-  target: EventTarget,
+  target: unknown,
   onUpdate: OnUpdate,
   options?: BindOptions,
 ): UnbindFn;
@@ -377,8 +387,21 @@ function isValidPropertyDescriptor(p) {
     && typeof p.event === "string" && p.event.length > 0
     && (p.getter === undefined || typeof p.getter === "function");
 }
-function isValidInputDescriptor(p)   { return p && typeof p === "object" && typeof p.name === "string" && p.name.length > 0; }
-function isValidCommandDescriptor(p) { return p && typeof p === "object" && typeof p.name === "string" && p.name.length > 0; }
+function isValidInputDescriptor(p) {
+  if (!p || typeof p !== "object") return false;
+  if (typeof p.name !== "string" || p.name.length === 0) return false;
+  // `attribute` is a Schema-typed optional string. Validate the type even
+  // though core does not interpret it — see SPEC-extensions.md.
+  if (p.attribute !== undefined && typeof p.attribute !== "string") return false;
+  return true;
+}
+function isValidCommandDescriptor(p) {
+  if (!p || typeof p !== "object") return false;
+  if (typeof p.name !== "string" || p.name.length === 0) return false;
+  // `async` is a Schema-typed optional boolean. Same rationale as `attribute`.
+  if (p.async !== undefined && typeof p.async !== "boolean") return false;
+  return true;
+}
 
 function bind(target, onUpdate, options) {
   // Discovery == bindability: a declaration that survives this check is
@@ -386,20 +409,24 @@ function bind(target, onUpdate, options) {
   // >= 1) per § Versioning; no adapter-specific upper bound exists.
   const decl = getWcBindableDeclaration(target);
   if (decl === undefined) return () => {};
+  // After the discovery guard, `target` is known to expose
+  // addEventListener / removeEventListener (the helper's EventTarget
+  // capability check), so the cast below is safe.
+  const et = /** @type {EventTarget} */ (target);
 
   const cleanups = [];
   for (const prop of decl.properties) {
     const getter = prop.getter ?? DEFAULT_GETTER;
     const handler = (event) => onUpdate(prop.name, getter(event));
-    target.addEventListener(prop.event, handler);
-    cleanups.push(() => target.removeEventListener(prop.event, handler));
+    et.addEventListener(prop.event, handler);
+    cleanups.push(() => et.removeEventListener(prop.event, handler));
   }
 
   // Initial value synchronization — use `in` so that an explicitly-undefined
   // property is still reported on first sync.
   const initialSync = () => {
     for (const prop of decl.properties) {
-      if (prop.name in target) onUpdate(prop.name, target[prop.name]);
+      if (prop.name in et) onUpdate(prop.name, et[prop.name]);
     }
   };
 
@@ -417,14 +444,14 @@ function bind(target, onUpdate, options) {
   const canDefer =
     syncOn === "connect" &&
     HTMLElementCtor !== undefined &&
-    target instanceof HTMLElementCtor &&
-    !target.isConnected &&
+    et instanceof HTMLElementCtor &&
+    !et.isConnected &&
     documentRef !== undefined &&
     MutationObserverCtor !== undefined;
 
   if (canDefer) {
     const observer = new MutationObserverCtor(() => {
-      if (target.isConnected) { observer.disconnect(); runOrCleanup(initialSync); }
+      if (et.isConnected) { observer.disconnect(); runOrCleanup(initialSync); }
     });
     observer.observe(documentRef, { childList: true, subtree: true });
     cleanups.push(() => observer.disconnect());
@@ -618,8 +645,8 @@ When the protocol is proxied across a trust boundary (for example, `@wc-bindable
 
 ## FAQ
 
-**Why `static` field?**  
-Static fields are accessible without instantiation, allowing adapters to inspect the protocol before mounting the element.
+**Why `static` field?**
+Putting the declaration on the class (rather than on every instance) keeps it in one place that both *tooling* and *bind() at runtime* read the same way. Tooling that operates on the class object — codegen, docs generators, schema extractors — can inspect `Class.wcBindable` directly without instantiating anything. The `bind()` path receives an instance and reads `instance.constructor.wcBindable`, reaching the same declaration via the JS-native `constructor` reference. One source of truth, two consumers, no per-instance copy.
 
 **Why not JSON / custom attribute?**  
 Functions (getters) cannot be expressed in JSON. A `static` field keeps everything in one place with full JavaScript expressiveness.

@@ -163,6 +163,26 @@ describe("getWcBindableDeclaration", () => {
     expect(getWcBindableDeclaration(el)).toBeUndefined();
   });
 
+  it("returns undefined when an input descriptor's attribute is not a string", () => {
+    const el = createBindableElement({
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [{ name: "value", event: "test:e" }],
+      inputs: [{ name: "value", attribute: 123 as unknown as string }],
+    });
+    expect(getWcBindableDeclaration(el)).toBeUndefined();
+  });
+
+  it("returns undefined when a command descriptor's async is not a boolean", () => {
+    const el = createBindableElement({
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [{ name: "value", event: "test:e" }],
+      commands: [{ name: "fetch", async: "yes" as unknown as boolean }],
+    });
+    expect(getWcBindableDeclaration(el)).toBeUndefined();
+  });
+
   it("accepts declarations whose inputs/commands are absent (treated as empty)", () => {
     const el = createBindableElement({
       protocol: "wc-bindable",
@@ -316,6 +336,22 @@ describe("bind", () => {
     expect(typeof unbind).toBe("function");
     unbind(); // should not throw
     expect(onUpdate).not.toHaveBeenCalled();
+  });
+
+  it("accepts arbitrary unknown inputs (null, primitives, plain objects) and returns a no-op cleanup", () => {
+    // bind() signature is `target: unknown` precisely to absorb the common
+    // `document.querySelector(...)` returning null case without a separate
+    // null check at the call site.
+    for (const probe of [null, undefined, 0, "string", true, Symbol("x"), {}, [], new Map()]) {
+      const onUpdate = vi.fn();
+      let unbind: (() => void) | undefined;
+      expect(() => {
+        unbind = bind(probe, onUpdate);
+      }).not.toThrow();
+      expect(typeof unbind).toBe("function");
+      unbind!();
+      expect(onUpdate).not.toHaveBeenCalled();
+    }
   });
 
   it("cleans up listeners when initial-sync throws (no leak)", () => {

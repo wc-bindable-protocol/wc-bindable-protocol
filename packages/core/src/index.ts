@@ -142,13 +142,25 @@ function isValidPropertyDescriptor(p: unknown): p is WcBindableProperty {
 function isValidInputDescriptor(p: unknown): p is WcBindableInput {
   if (!p || typeof p !== "object") return false;
   const pp = p as Partial<WcBindableInput>;
-  return typeof pp.name === "string" && pp.name.length > 0;
+  if (typeof pp.name !== "string" || pp.name.length === 0) return false;
+  // `attribute` is a Schema-defined optional field of type `string`. Core
+  // never interprets it (see SPEC-extensions.md), but its declared type
+  // is still part of the wcBindable schema — a non-string value here is
+  // an invalid declaration even though core would otherwise ignore the
+  // field. Validating it keeps "isWcBindable === true ⇒ schema is well-
+  // formed" honest.
+  if (pp.attribute !== undefined && typeof pp.attribute !== "string") return false;
+  return true;
 }
 
 function isValidCommandDescriptor(p: unknown): p is WcBindableCommand {
   if (!p || typeof p !== "object") return false;
   const pp = p as Partial<WcBindableCommand>;
-  return typeof pp.name === "string" && pp.name.length > 0;
+  if (typeof pp.name !== "string" || pp.name.length === 0) return false;
+  // Same rationale as `attribute` above: `async` is a Schema-typed
+  // optional boolean. Type-validate it even though core never reads it.
+  if (pp.async !== undefined && typeof pp.async !== "boolean") return false;
+  return true;
 }
 
 function isValidNamedList<T extends { name: string }>(
@@ -214,7 +226,7 @@ const MutationObserverCtor: typeof MutationObserver | undefined =
   typeof MutationObserver !== "undefined" ? MutationObserver : undefined;
 
 export function bind(
-  target: EventTarget,
+  target: unknown,
   onUpdate: (name: string, value: unknown) => void,
   options?: BindOptions,
 ): UnbindFn {
@@ -225,6 +237,11 @@ export function bind(
   // no-ops on the same target.
   const decl = getWcBindableDeclaration(target);
   if (decl === undefined) return () => {};
+  // After the discovery guard, `target` is known to expose
+  // addEventListener / removeEventListener (the helper's EventTarget
+  // capability check), so the assertion below is safe — narrowing
+  // `unknown` to EventTarget without re-checking.
+  const et = target as EventTarget;
 
   const { properties } = decl;
   const cleanups: (() => void)[] = [];
@@ -233,8 +250,8 @@ export function bind(
   for (const prop of properties) {
     const getter = prop.getter ?? DEFAULT_GETTER;
     const handler = (event: Event) => onUpdate(prop.name, getter(event));
-    target.addEventListener(prop.event, handler);
-    cleanups.push(() => target.removeEventListener(prop.event, handler));
+    et.addEventListener(prop.event, handler);
+    cleanups.push(() => et.removeEventListener(prop.event, handler));
   }
 
   // initialSync may throw if:
@@ -250,8 +267,8 @@ export function bind(
       // Use `in` so that a property whose current value is `undefined` is
       // still observable on first sync — distinguishing "value is undefined"
       // from "property is not exposed on the target".
-      if (prop.name in (target as object)) {
-        const current = (target as unknown as Record<string, unknown>)[prop.name];
+      if (prop.name in et) {
+        const current = (et as unknown as Record<string, unknown>)[prop.name];
         onUpdate(prop.name, current);
       }
     }
@@ -273,8 +290,8 @@ export function bind(
   const canDefer =
     syncOn === "connect" &&
     HTMLElementCtor !== undefined &&
-    target instanceof HTMLElementCtor &&
-    !target.isConnected &&
+    et instanceof HTMLElementCtor &&
+    !et.isConnected &&
     documentRef !== undefined &&
     MutationObserverCtor !== undefined;
 
@@ -286,8 +303,9 @@ export function bind(
     // Deferred initialSync errors are routed through runOrCleanup so the
     // listener set installed by bind() is torn down before the error
     // surfaces — same contract as the synchronous path.
+    const htmlTarget = et as HTMLElement;
     const observer = new MutationObserverCtor(() => {
-      if ((target as HTMLElement).isConnected) {
+      if (htmlTarget.isConnected) {
         observer.disconnect();
         runOrCleanup(initialSync);
       }
