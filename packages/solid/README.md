@@ -5,7 +5,7 @@ Solid adapter for the **wc-bindable** protocol.
 ## Install
 
 ```bash
-npm install @wc-bindable/solid @wc-bindable/core
+npm install @wc-bindable/solid solid-js
 ```
 
 ## Usage
