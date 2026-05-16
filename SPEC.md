@@ -48,6 +48,8 @@ A producer target — **typically a class that extends `EventTarget`** (e.g. an 
 
 ### Headless (EventTarget only)
 
+> **Terminology note.** "Headless" in this spec means **no DOM at all** — a plain `EventTarget` subclass that runs in Node, Deno, Workers, or any other non-browser runtime. Distinct from the related but different concept in the README's "Web Components as invisible service layers" section, which describes DOM-mounted Web Components with no visual surface (e.g. an `<my-fetch>` element that exists in the DOM but renders nothing). Both patterns benefit from the protocol; they differ on whether the target is in the document tree at all.
+
 ```javascript
 class MyFetchCore extends EventTarget {
   static wcBindable = {
