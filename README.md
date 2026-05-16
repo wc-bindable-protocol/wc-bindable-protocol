@@ -2,7 +2,7 @@
 
 **wc-bindable lets a component publish "these properties can be observed, and these events mean they changed" in one standard place** — and any reactivity system reads that same place to wire up bindings without per-component glue.
 
-The minimal, framework-agnostic protocol works for any `EventTarget`-based object — including Web Components, headless cores running in Node / Deno / Workers, and remote proxies — so the same declaration drives React, Vue, Svelte, Lit, plain `bind()` calls, and across-the-wire transport equally.
+The minimal, framework-agnostic protocol works for any **EventTarget-compatible bind target** — Web Components, headless `EventTarget` cores running in Node / Deno / Workers, and relay / remote proxies that expose `addEventListener` / `removeEventListener` (without necessarily extending `EventTarget` themselves) — so the same declaration drives React, Vue, Svelte, Lit, plain `bind()` calls, and across-the-wire transport equally.
 
 The **core protocol has no runtime dependencies** — just `static` class fields and `CustomEvent`. Framework adapters depend only on their target framework (`@wc-bindable/react` on React, etc.); they do not pull in other frameworks.
 
@@ -98,6 +98,10 @@ For DOM elements that have not yet been connected when `bind()` is called, pass 
 ### Runtime note
 
 `@wc-bindable/core` ships **zero `npm` runtime dependencies**. The default `bind(target, onUpdate)` path uses only `static` class fields and standard `addEventListener` / `removeEventListener` calls, so it works unchanged in browsers, Node, Deno, and Cloudflare Workers. The optional `{ syncOn: "connect" }` path additionally touches three DOM globals — `HTMLElement`, `document`, `MutationObserver` — through `typeof` guards; in non-browser runtimes where these are undefined, that path silently degrades to the synchronous `"call"` behavior. The package-manifest no-dependency posture is unaffected either way.
+
+### Security at-a-glance
+
+> **`getter` is executable JavaScript.** A `wcBindable` declaration's optional `getter` field is an arbitrary function that runs in the consumer's JS context on every dispatched event. Bind only to components you intentionally loaded and trust. Remote transports do NOT send `getter` over the wire — it runs on the trusted side and only the extracted value crosses the network. Full treatment in [§ Security model](#security-model) below.
 
 ## Non-goals
 

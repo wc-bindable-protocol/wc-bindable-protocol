@@ -272,7 +272,7 @@ A reactivity system that supports this protocol should:
 
 > **This 4-step list is a simplification.** The full, normative validation that `bind()` MUST perform — descriptor-shape checks (non-empty string `name` / `event`, function-or-undefined `getter`), name-uniqueness within `properties` / `inputs` / `commands`, the EventTarget-capability check on `target` itself, and the MUST-NOT-throw guard for pathological constructors — is specified in [§ Discovery API](#discovery-api). The reference implementation that follows this guide routes the validation through `getWcBindableDeclaration()`, which performs all of the above; if you re-implement `bind()` from scratch following only the 4 steps above, you will reproduce the "isWcBindable returns true but bind silently no-ops" footgun that the discovery-is-bindability rule exists to prevent. Always consult § Discovery API for the complete check set.
 
-The `target` parameter accepts any `EventTarget` — this includes `HTMLElement` instances as well as headless `EventTarget` subclasses.
+The `target` parameter accepts any **consumer-side bind target** — anything that exposes `addEventListener` / `removeEventListener` plus a valid `constructor.wcBindable` declaration. `HTMLElement` instances and headless `EventTarget` subclasses are the common cases; relay proxies that satisfy the consumer-side capability set without literally extending `EventTarget` are also valid. See [§ Overview](#overview) for the producer-vs-consumer capability split.
 
 ### `onUpdate` validity
 
