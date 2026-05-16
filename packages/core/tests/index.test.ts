@@ -280,6 +280,36 @@ describe("getWcBindableDeclaration", () => {
     expect(() => bind(new EmptyCore(), "nope" as unknown as () => void)).toThrow(TypeError);
   });
 
+  it("unbind() is unconditionally idempotent — second call does not re-invoke cleanups", () => {
+    // Regression for the idempotency MUST in § Teardown Contract: the
+    // returned closure SHOULD guard re-entry with a `disposed` flag so a
+    // hostile (non-idempotent) removeEventListener / disconnect is not
+    // called twice. This test wraps removeEventListener with a spy to
+    // detect a second call.
+    class TwoEventCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [
+          { name: "a", event: "test:a" },
+          { name: "b", event: "test:b" },
+        ],
+      };
+    }
+    const core = new TwoEventCore();
+    const realRemove = core.removeEventListener.bind(core);
+    const removeSpy = vi.fn(realRemove);
+    core.removeEventListener = removeSpy;
+
+    const unbind = bind(core, () => {});
+
+    unbind();
+    expect(removeSpy).toHaveBeenCalledTimes(2); // one per property
+
+    unbind(); // second call MUST be a no-op
+    expect(removeSpy).toHaveBeenCalledTimes(2); // still 2, not 4
+  });
+
   it("cleans up all listeners even when an earlier cleanup throws (exception-safe unbind)", () => {
     // Regression: unbind previously aborted on the first throwing cleanup,
     // leaving later listeners attached. Now wraps each cleanup in try/catch.

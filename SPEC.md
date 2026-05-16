@@ -531,10 +531,20 @@ function bind(target, onUpdate, options) {
     runOrCleanup(initialSync);
   }
 
+  let disposed = false;
   return () => {
+    // Re-entry guard: second and later invocations are an unconditional
+    // no-op (§ Teardown Contract). This holds regardless of whether the
+    // constituent cleanups are themselves idempotent, mirroring the
+    // defensive posture used at registration time (runOrCleanup wraps
+    // the addEventListener loop because a hostile Proxy can throw
+    // mid-loop; by the same logic a hostile non-idempotent
+    // removeEventListener must not be called twice).
+    if (disposed) return;
+    disposed = true;
     // Exception-safe teardown: every cleanup runs even if an earlier one
     // throws. Required by the "MUST remove every listener" rule (see
-    // § Teardown Contract).
+    // § Teardown Contract). Secondary errors are swallowed.
     for (const fn of cleanups) {
       try { fn(); } catch { /* swallow per teardown-contract semantics */ }
     }
@@ -546,13 +556,13 @@ function bind(target, onUpdate, options) {
 
 `bind()` **MUST** return a function that, when called, removes every event listener (and any other resource — e.g. `MutationObserver`) the adapter installed during the call. This applies whether or not the target was actually bindable: a no-op cleanup function (`() => {}`) is the correct return value for non-`wc-bindable` targets.
 
-The returned cleanup function MUST be **idempotent** — calling it more than once MUST be a safe no-op on subsequent calls. The cleanups the adapter records internally (typically `removeEventListener` and `MutationObserver.disconnect()` invocations) already satisfy this in the browser standard library, and adapter-supplied cleanups SHOULD be authored to the same shape. Idempotency is what makes the deferred-throw safety net (described below) work cleanly: the caller's later `unbind()` call re-invokes the same cleanups that the throw path already ran, and the second invocation has no effect.
+The returned cleanup function MUST be **idempotent** — calling it more than once MUST be a safe no-op on subsequent calls. The conforming way to satisfy this is a **re-entry guard inside the returned closure** (a `disposed` flag that the closure sets on first call and checks on every entry), so the idempotency MUST holds unconditionally rather than depending on each constituent cleanup being idempotent in isolation. The cleanups the adapter records internally (typically `removeEventListener` and `MutationObserver.disconnect()` invocations) happen to be idempotent in the browser standard library, but a hostile target — for instance a `Proxy`-wrapped relay whose `removeEventListener` raises or counts each call — is exactly the kind of bind target this spec accepts elsewhere; the closure-level guard makes the idempotency rule symmetric with the registration-side defensive wrapping in the reference implementation. Idempotency is also what makes the deferred-throw safety net (described below) work cleanly: the caller's later `unbind()` call simply returns early because the throw path already set `disposed = true`.
 
 **If anything inside `bind()` throws while installing resources** — including the listener-registration loop (e.g. a `Proxy`-wrapped relay target's `addEventListener` throws via a `get` trap on the Nth iteration), the synchronous initial-sync step (a property's `in` trap throws, a property getter throws on read, the consumer's `onUpdate` callback throws), or the deferred-sync observer's setup — the adapter **MUST** tear down every listener and observer it installed earlier in the same `bind()` call before letting the error propagate. Without this, the caller never receives the unbind function and the listener set leaks. This applies to **every** install-time throw, not only the initial-sync read. Cleanup callbacks that themselves throw during this fallback path SHOULD be swallowed; surfacing a cleanup-time secondary error in place of the original error is more confusing than useful.
 
 > **Partial-delivery state at the consumer.** Initial-sync delivers properties in declaration order. If `properties[0..k-1]` succeed but `properties[k]` throws, the consumer has already received `onUpdate(name, value)` calls for every successful property — those calls are observable and **final**. The adapter does NOT (and cannot) roll back consumer state on a subsequent throw. After `bind()` rethrows, the consumer therefore holds a partially-populated view of the target: keys it observed via successful `onUpdate` calls have real values, keys after the failure point have whatever default the consumer initialized with (typically nothing). Consumers that need all-or-nothing initial-sync semantics MUST snapshot their state before calling `bind()` and restore on caught exception themselves; the protocol does not provide a transactional initial sync.
 
-**If a *deferred* initial-sync (`syncOn: "connect"`) throws** the same cleanup runs — but the error has no synchronous caller to propagate to. The throw originates inside a `MutationObserver` callback (a microtask), so the runtime treats it as an uncaught error: browsers surface it via `window.onerror` / `reportError`, Node surfaces it via `process.on('uncaughtException')`, etc. The unbind function the caller already received remains valid; calling it after the deferred throw simply re-invokes the same already-run cleanups (which the [Teardown Contract](#teardown-contract) requires to be idempotent — `removeEventListener` on an already-removed listener is a no-op, `MutationObserver.disconnect()` on an already-disconnected observer is a no-op, and adapter-supplied cleanups MUST follow the same shape). The net effect is an effective no-op, not a literal one. Adapters SHOULD treat deferred-throw cleanup as a best-effort safety net — consumers who need structured error handling from initial-sync should use `syncOn: "call"` from inside their own lifecycle hook so that the throw lands on a frame they can catch.
+**If a *deferred* initial-sync (`syncOn: "connect"`) throws** the same cleanup runs — but the error has no synchronous caller to propagate to. The throw originates inside a `MutationObserver` callback (a microtask), so the runtime treats it as an uncaught error: browsers surface it via `window.onerror` / `reportError`, Node surfaces it via `process.on('uncaughtException')`, etc. The unbind function the caller already received remains valid; calling it after the deferred throw is a literal no-op thanks to the re-entry guard mandated by the idempotency MUST above (the throw path already set the closure's `disposed` flag, so the user's later `unbind()` returns immediately without re-walking the cleanup list). Adapters SHOULD treat deferred-throw cleanup as a best-effort safety net — consumers who need structured error handling from initial-sync should use `syncOn: "call"` from inside their own lifecycle hook so that the throw lands on a frame they can catch.
 
 **If `onUpdate` throws on a post-initial-sync event** — i.e. after `bind()` has returned and a normal change event fires the registered listener — the error propagates out of the event listener via the standard DOM dispatch path (i.e. it becomes an unhandled error on the dispatching event-loop turn). The listener remains attached; the adapter does NOT auto-unbind on consumer throws, and subsequent events continue to fire normally. Consumers that want fail-fast teardown on their own throws are responsible for calling the returned unbind from a catch in their `onUpdate`.
 

@@ -371,16 +371,23 @@ export function bind(
   }
 
   return () => {
-    // Exception-safe teardown: every cleanup runs, even if an earlier one
-    // throws. Without this, a Proxy-wrapped removeEventListener or an
-    // overridden observer.disconnect() that throws would prevent the
-    // remaining listeners from being removed — directly contradicting the
-    // teardown contract's "MUST remove every listener" rule. Secondary
-    // errors are swallowed (logged-by-runtime via the dispatch path on
-    // re-throw would be misleading here; this is best-effort teardown,
-    // not error reporting). This mirrors the synchronous-throw cleanup
-    // path used by runOrCleanup above.
+    // Idempotent teardown: the second and later invocations are an
+    // unconditional no-op, satisfying SPEC.md § Teardown Contract's
+    // "MUST be a safe no-op on subsequent calls" rule without depending
+    // on the constituent cleanups themselves being idempotent. This is
+    // symmetric with the registration-side defensive posture (we wrap
+    // the addEventListener loop in runOrCleanup precisely because a
+    // hostile Proxy can throw mid-loop — by the same logic, a hostile
+    // Proxy whose removeEventListener is non-idempotent must not be
+    // called twice).
+    if (disposed) return;
     disposed = true;
+    // Exception-safe teardown: every cleanup runs, even if an earlier one
+    // throws. Secondary errors are swallowed — this is best-effort
+    // teardown, not error reporting; surfacing a cleanup-time secondary
+    // error in place of the caller's expected silent unbind is more
+    // confusing than useful. Same shape as the runOrCleanup fallback
+    // above.
     for (const fn of cleanups) {
       try { fn(); } catch { /* swallow per teardown-contract semantics */ }
     }
