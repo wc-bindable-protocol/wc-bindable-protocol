@@ -1,3 +1,114 @@
+# v0.6.1
+
+Patch release. No source changes from v0.6.0.
+
+## Why
+
+The v0.6.0 npm publish completed cleanly for 17 of 19 packages, but `@wc-bindable/qwik` and `@wc-bindable/stencil` ended up in an inconsistent state on the registry: their `0.6.0` tarballs were uploaded, but the package metadata index was missing (`npm view` returned 404 while `registry.npmjs.org/<pkg>/0.6.0` returned 200). npm permanently reserves a version slot once a tarball lands, so `0.6.0` cannot be re-published for those two scopes.
+
+To restore lockstep alignment across the family, **all 19 packages were re-cut at `0.6.1`**.
+
+## Notes
+
+- `^0.6.0` dep ranges in adapters already accept `0.6.1` (npm caret rule for `0.x.y` with `x > 0`), so inter-package specifiers were left untouched.
+- The v0.6.0 git tag remains in place, but users should install `0.6.1` or newer.
+
+## Packages
+
+| Package | Version |
+|---------|---------|
+| `@wc-bindable/core` | 0.6.1 |
+| `@wc-bindable/react` | 0.6.1 |
+| `@wc-bindable/vue` | 0.6.1 |
+| `@wc-bindable/angular` | 0.6.1 |
+| `@wc-bindable/svelte` | 0.6.1 |
+| `@wc-bindable/alpine` | 0.6.1 |
+| `@wc-bindable/lit` | 0.6.1 |
+| `@wc-bindable/marko` | 0.6.1 |
+| `@wc-bindable/mithril` | 0.6.1 |
+| `@wc-bindable/preact` | 0.6.1 |
+| `@wc-bindable/qwik` | 0.6.1 |
+| `@wc-bindable/riot` | 0.6.1 |
+| `@wc-bindable/solid` | 0.6.1 |
+| `@wc-bindable/stencil` | 0.6.1 |
+| `@wc-bindable/vanjs` | 0.6.1 |
+| `@wc-bindable/mobx` | 0.6.1 |
+| `@wc-bindable/rxjs` | 0.6.1 |
+| `@wc-bindable/signals` | 0.6.1 |
+| `@wc-bindable/remote` | 0.6.1 |
+
+---
+
+# v0.6.0
+
+Substantial minor release. Adds **10 new adapter packages**, bringing the family to 19 total. Existing adapters from v0.5.0 are unchanged at the API level — no source-level migration is required.
+
+> **Publish note:** v0.6.0 only made it cleanly to 17 of 19 packages on npm. See [v0.6.1](#v061) for the fix. Users should install `0.6.1` or newer.
+
+## New Framework Adapters
+
+- **Lit** (`@wc-bindable/lit`) — `WcBindableController` (Lit ReactiveController integration)
+- **Marko** (`@wc-bindable/marko`) — `wcBindable()` helper, supports both Marko 5 (class components) and Marko 6 (Tags API via `<lifecycle>`)
+- **Mithril.js** (`@wc-bindable/mithril`) — `createWcBindable()` with `oncreate` / `onremove` hooks; hooks must attach to the bindable element vnode directly
+- **Qwik** (`@wc-bindable/qwik`) — `useWcBindable()`. Qwik 1.x via the main export; Qwik 2.x via the experimental `/v2` export
+- **Riot.js** (`@wc-bindable/riot`) — `createWcBindable()` with `{ update }` callback to trigger re-renders; bind from `onMounted` with `this.$("my-input")`
+- **Stencil** (`@wc-bindable/stencil`) — `WcBindableController` (Stencil custom-element controller)
+- **VanJS** (`@wc-bindable/vanjs`) — `createWcBindable()` exposes `binder.states.<name>` (one `van.state` per declared property). `bind()` should be deferred with `queueMicrotask` after `van.add()` so initial-sync sees post-connect values
+
+## New Non-Framework Reactivity Adapters
+
+- **MobX** (`@wc-bindable/mobx`) — `createWcBindable()` exposes `binder.state.<name>`, backed by a single `observable.object`. Writes are wrapped in `runInAction`; lazy keys are added with `set()`.
+  - **Design note**: state is created with `{ deep: false }` so MobX does *not* deep-enhance assigned arrays or plain objects. This preserves the wc-bindable contract that property values are passed as-is (`state.items === emittedArray` holds for any value the component dispatches). The trade-off — mutating a nested array/object in place will not trigger reactions — matches the protocol's intent: components publish whole values, consumers don't mutate them.
+- **RxJS** (`@wc-bindable/rxjs`) — `createWcBindable()` exposes `binder.subjects.<name>` (one `BehaviorSubject` per declared property), subscribable with standard RxJS operators.
+- **TC39 Signals** (`@wc-bindable/signals`) — `createWcBindable()` exposes `binder.signals.<name>` (one `Signal.State` per declared property) via `signal-polyfill`. Observe by wrapping reads in `Signal.Computed` and attaching `Signal.subtle.Watcher`.
+
+## Documentation
+
+- `README.md` Packages table and Quick-start snippets reorganized into a consistent tier order:
+  1. Vanilla / `@wc-bindable/core`
+  2. Major frameworks by share: React → Vue.js → Angular → Svelte
+  3. Other frameworks alphabetically: Alpine.js → Lit → Marko → Mithril.js → Preact → Qwik → Riot.js → SolidJS → Stencil → VanJS
+  4. Non-framework reactivity libs alphabetically: MobX → RxJS → TC39 Signals
+  5. `@wc-bindable/remote`
+- `examples/index.html` rows reordered to match the same tier order.
+- Framework display names normalized to their official forms: `Vue` → `Vue.js`, `Mithril` → `Mithril.js`, `Solid` → `SolidJS`.
+- Quick-start snippets added for the 7 packages that previously had only a Packages-table entry: Marko, Mithril.js, Riot.js, VanJS, TC39 Signals, MobX, RxJS.
+
+## Tooling
+
+- `CLAUDE.md` notes that `npm install` now requires `--legacy-peer-deps`. `@qwik.dev/core@2.0.0-beta.35` declares a peer of `vitest@">=2 <4"` but the workspace runs `vitest@^4`. The conflict is benign for the test suite, but plain `npm install` ERESOLVE-fails without the flag.
+
+## Compatibility
+
+- Existing v0.5.0 adapters (`@wc-bindable/core`, `react`, `vue`, `svelte`, `angular`, `solid`, `preact`, `alpine`, `remote`) are unchanged at the API level. No code changes required for v0.5.0 → v0.6.x migration.
+- All packages stay on the lockstep version line.
+
+## Packages
+
+| Package | Version |
+|---------|---------|
+| `@wc-bindable/core` | 0.6.0 |
+| `@wc-bindable/react` | 0.6.0 |
+| `@wc-bindable/vue` | 0.6.0 |
+| `@wc-bindable/angular` | 0.6.0 |
+| `@wc-bindable/svelte` | 0.6.0 |
+| `@wc-bindable/alpine` | 0.6.0 |
+| `@wc-bindable/lit` | 0.6.0 (new) |
+| `@wc-bindable/marko` | 0.6.0 (new) |
+| `@wc-bindable/mithril` | 0.6.0 (new) |
+| `@wc-bindable/preact` | 0.6.0 |
+| `@wc-bindable/qwik` | 0.6.0 (new) |
+| `@wc-bindable/riot` | 0.6.0 (new) |
+| `@wc-bindable/solid` | 0.6.0 |
+| `@wc-bindable/stencil` | 0.6.0 (new) |
+| `@wc-bindable/vanjs` | 0.6.0 (new) |
+| `@wc-bindable/mobx` | 0.6.0 (new) |
+| `@wc-bindable/rxjs` | 0.6.0 (new) |
+| `@wc-bindable/signals` | 0.6.0 (new) |
+| `@wc-bindable/remote` | 0.6.0 |
+
+---
+
 # v0.5.0
 
 ## `@wc-bindable/remote` — API additions
