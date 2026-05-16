@@ -1,19 +1,19 @@
-# @wc-bindable/react
+# @wc-bindable/preact
 
-React adapter for the **wc-bindable** protocol.
+Preact adapter for the **wc-bindable** protocol.
 
 ## Install
 
 ```bash
-npm install @wc-bindable/react react
+npm install @wc-bindable/preact preact
 ```
 
 ## Usage
 
 ```tsx
-import { useWcBindable } from "@wc-bindable/react";
+import { useWcBindable } from "@wc-bindable/preact";
 
-function App() {
+export function App() {
   const [ref, values] = useWcBindable<HTMLElement>({ value: "" });
 
   return (

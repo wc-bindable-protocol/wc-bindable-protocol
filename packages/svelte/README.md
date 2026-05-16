@@ -5,7 +5,7 @@ Svelte adapter for the **wc-bindable** protocol.
 ## Install
 
 ```bash
-npm install @wc-bindable/svelte @wc-bindable/core
+npm install @wc-bindable/svelte svelte
 ```
 
 ## Usage
