@@ -121,7 +121,7 @@ JavaScript allows throwing any value (`throw "oops"`, `throw null`, `throw { cod
 
 | Thrown value | `name` | `message` | `stack` |
 |---|---|---|---|
-| An `Error` instance (or subclass) | `error.name \|\| "Error"` | safely stringified `error.message` (empty string is permitted; see safe-stringification rule below) | `error.stack` if present and the producer's trust-boundary policy permits transmission (see security note above) |
+| An `Error` instance (or subclass) | `error.name \|\| "Error"` | safely stringified `error.message` (empty string is permitted; see safe-stringification rule below) | `error.stack` if present, defensively read (see stack-read rule below), and the producer's trust-boundary policy permits transmission (see security note above) |
 | Any other value (string / number / boolean / null / plain object / etc.) | `"NonErrorThrow"` | safely stringified `thrownValue` — typically the value's default coercion (`String(null)` → `"null"`, `String({a:1})` → `"[object Object]"`, etc.) (see safe-stringification rule below) | Omitted (no stack exists for a non-Error throw) |
 
 **Safe-stringification rule.** Naive `String(v)` can itself throw — `String(Object.create(null))` raises because the null-prototype object has no `toString`, and hostile objects with throwing `toString` / `valueOf` / `Symbol.toPrimitive` traps can throw arbitrarily. The producer MUST shield the canonicalization step, **and the shield MUST cover the property read itself, not only the `String(...)` coercion**. A helper that accepts an already-read value does NOT protect against hostile getters: in `safeString(error.name)` the `error.name` read happens at the call site, before any try/catch inside the helper can run. The conformant pattern is to pass the read as a thunk:
@@ -145,6 +145,22 @@ const messageForNonError = safeStringFrom(() => thrownValue, "<unstringifiable t
 ```
 
 The fallback strings shown above (`"Error"`, `""`, `"<unstringifiable thrown value>"`) match the rows of the table above; implementations MAY choose different non-empty sentinels for the unstringifiable case as long as the chosen string clearly identifies the safe-stringification fallback. Implementations that prefer an inline `try { ... } catch` over the helper MUST still keep the property read inside the catch — wrapping only the `String(...)` call is non-conformant.
+
+**Stack-read rule.** `error.stack` is also a property access and a subclass MAY install a hostile getter that throws, so the same defensive-read posture applies. Because `stack` is OPTIONAL on the wire (the envelope schema types it `stack?: string`), the producer MUST simply **omit** `stack` from the envelope when reading or stringifying it throws — there is no need for a sentinel fallback because the consumer is already required to cope with an absent `stack` (per § Security note on `stack`, producers routinely drop it on untrusted transports). Reference shape:
+
+```javascript
+// Best-effort, optional. Omit on any failure — never substitute a sentinel.
+let stack;
+try {
+  const raw = error.stack;
+  if (raw !== undefined) stack = String(raw);
+} catch { /* leave `stack` undefined → omitted from the envelope */ }
+// Producers MAY additionally redact / drop `stack` here per the security
+// note's untrusted-transport rule; that policy layer composes on top of
+// the defensive read, not in place of it.
+```
+
+The "omit on read-throw" behavior is also what makes the stack field's optionality robust under hostile inputs: the security note above already requires consumers to handle `stack === undefined`, so a producer that drops a throwing stack adds nothing the consumer has to learn.
 
 The literal string `"NonErrorThrow"` is normative: consumers MAY pattern-match on it to distinguish thrown-non-Error from thrown-Error at the surface.
 
