@@ -114,7 +114,7 @@ Adapters **MUST** ignore unknown top-level fields. Future versions of this speci
 | `event`  | `string`   | ✅       | The CustomEvent name dispatched when the property changes |
 | `getter` | `function` | ❌       | Extracts the new value from the event. Defaults to `e => e.detail` |
 
-Within a single `properties` array, every `name` MUST be unique. Behavior is undefined if duplicate names appear. Multiple property descriptors MAY share the same `event` name — adapters dispatch each one independently. The same `name` MAY appear in both `properties` (as an observable output) and `inputs` (as a settable input); this is a common pattern for two-way-bindable values (e.g. `value`).
+Within a single `properties` array, every `name` MUST be unique. A declaration that violates this rule is **invalid**: adapters MUST treat such a target as non-bindable (`bind()` returns its no-op cleanup, `isWcBindable()` MAY return `false` if the adapter checks; at minimum, no event listeners are installed). Adapters MAY warn or throw in development mode. Multiple property descriptors MAY share the same `event` name — adapters dispatch each one independently. The same `name` MAY appear in both `properties` (as an observable output) and `inputs` (as a settable input); this is a common pattern for two-way-bindable values (e.g. `value`).
 
 Adapters **MUST** ignore unknown fields on a property descriptor.
 
@@ -125,7 +125,7 @@ Adapters **MUST** ignore unknown fields on a property descriptor.
 | `name`      | `string` | ✅       | The settable property name on the target             |
 | `attribute` | `string` | ❌       | Declarative hint, see [SPEC-extensions.md](SPEC-extensions.md). Not interpreted by core. |
 
-Within `inputs`, every `name` MUST be unique. Adapters **MUST** ignore unknown fields on an input descriptor.
+Within `inputs`, every `name` MUST be unique. Duplicate names make the declaration **invalid** under the same rule given for properties above. Adapters **MUST** ignore unknown fields on an input descriptor.
 
 ### Command Descriptor
 
@@ -134,7 +134,7 @@ Within `inputs`, every `name` MUST be unique. Adapters **MUST** ignore unknown f
 | `name`  | `string`  | ✅       | The method name on the target                          |
 | `async` | `boolean` | ❌       | Declarative hint, see [SPEC-extensions.md](SPEC-extensions.md). Not interpreted by core. |
 
-Within `commands`, every `name` MUST be unique. Adapters **MUST** ignore unknown fields on a command descriptor.
+Within `commands`, every `name` MUST be unique. Duplicate names make the declaration **invalid** under the same rule given for properties above. Adapters **MUST** ignore unknown fields on a command descriptor.
 
 ---
 
@@ -361,6 +361,34 @@ export interface MyFetchValues {
 
 This interface represents the compile-time contract that complements the runtime contract (`static wcBindable`).
 
+### Input and Command Type Declarations
+
+Components that declare `inputs` or `commands` **should** export companion interfaces so that consumers, remote proxies, devtools, and codegen tools can type-check the input/command surface without re-deriving it:
+
+```typescript
+// my-fetch/types.ts
+export interface MyFetchValues {
+  value: unknown;
+  loading: boolean;
+  error: { status: number; statusText: string; body: string } | null;
+  status: number;
+}
+
+export interface MyFetchInputs {
+  url: string;
+  method: "GET" | "POST" | "PUT" | "DELETE";
+}
+
+export interface MyFetchCommands {
+  fetch(): Promise<unknown>;
+  abort(): void;
+}
+```
+
+The `Inputs` interface's keys MUST be a subset of `wcBindable.inputs[].name`. The `Commands` interface's keys MUST be a subset of `wcBindable.commands[].name`, and each method's signature should match the underlying instance method. Remote-aware tooling can compose these into a typed surface (`MyFetchValues & RemoteCallable<MyFetchInputs, MyFetchCommands>`) without re-deriving anything.
+
+This three-interface pattern (`Values` / `Inputs` / `Commands`) is the recommended shape for any component whose interface is non-trivial. Components that only expose `properties` can stick to `Values` alone.
+
 ### Adapter Usage
 
 Framework adapters **should** accept an optional generic type parameter for the values object. The first type parameter constrains the target type — use `EventTarget` for headless targets or `HTMLElement` (default) for DOM-mounted components:
@@ -386,9 +414,9 @@ When the type parameter is omitted, the values type defaults to `Record<string, 
 | Layer | Mechanism | Purpose |
 |-------|-----------|---------|
 | Runtime | `static wcBindable` + `CustomEvent` on `EventTarget` | Protocol detection, event binding, input/command declaration |
-| Compile-time | `export interface ...Values` | Type-safe access to bound values |
+| Compile-time | `export interface ...Values` (+ optional `...Inputs`, `...Commands`) | Type-safe access to bound values, input setters, and command callers |
 
-The type declaration is a **recommendation**, not a requirement. Components without type exports still work — consumers simply receive `unknown` values. The `import type` syntax ensures type declarations have zero runtime cost.
+The type declarations are **recommendations**, not requirements. Components without type exports still work — consumers simply receive `unknown` values. The `import type` syntax ensures type declarations have zero runtime cost.
 
 ---
 

@@ -4,6 +4,8 @@ Remote proxy for the **wc-bindable** protocol — connect Core and Shell over a 
 
 Splits the wc-bindable Core/Shell boundary across a network using WebSocket. The server runs the real Core; the client gets a proxy EventTarget that works transparently with `bind()` and framework adapters.
 
+> **For interop implementers:** the canonical wire-format and call-semantics specification is in [SPEC-extensions.md](../../SPEC-extensions.md) (Extensions 1 and 2). This README documents the reference implementation's API surface and operational behavior. If you are writing a third-party transport, proxy, or shell, target the SPEC; refer to this README only for examples and back-pressure / logging hooks.
+
 ## Install
 
 ```bash

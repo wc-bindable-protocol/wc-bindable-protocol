@@ -42,23 +42,47 @@ export interface WcBindableElement extends EventTarget {
   constructor: WcBindableConstructor;
 }
 
-/** Minimum protocol version this adapter understands. */
-export const SUPPORTED_PROTOCOL_VERSION = 1;
+/**
+ * Lowest protocol version this adapter is compatible with. The check is
+ * `decl.version >= MIN_COMPATIBLE_VERSION`, so this is a minimum, not a
+ * maximum — see SPEC.md § Versioning for the forward-compatibility policy.
+ */
+export const MIN_COMPATIBLE_VERSION = 1;
+
+/**
+ * @deprecated v0.7.0 alias kept for source compatibility. Use
+ * {@link MIN_COMPATIBLE_VERSION} — the name reflects the actual semantics
+ * (`decl.version >= MIN_COMPATIBLE_VERSION`). Scheduled for removal in v1.0.
+ */
+export const SUPPORTED_PROTOCOL_VERSION = MIN_COMPATIBLE_VERSION;
 
 const DEFAULT_GETTER = (e: Event): unknown => (e as CustomEvent).detail;
 
-export function isWcBindable(target: EventTarget): target is WcBindableElement {
+/**
+ * Read the wc-bindable declaration off `target` via the protocol's sole
+ * discovery path (`target.constructor.wcBindable`). Returns the declaration
+ * if it is shaped like a valid wc-bindable contract, or `undefined`
+ * otherwise.
+ *
+ * Prefer this helper over reading `target.constructor.wcBindable`
+ * directly. The helper centralizes the discovery rule so future protocol
+ * extensions (e.g. tooling that inspects a Symbol-keyed declaration or a
+ * registry) can be added without rewriting every consumer. Inside this
+ * package, `isWcBindable()` and `bind()` both go through this helper.
+ */
+export function getWcBindableDeclaration(
+  target: EventTarget,
+): WcBindableDeclaration | undefined {
   const decl = (target.constructor as { wcBindable?: WcBindableDeclaration }).wcBindable;
-  if (decl?.protocol !== "wc-bindable") return false;
-  // Forward-compatible version check: accept any integer >= the adapter's
-  // supported version. Future versions are required by the spec to remain
-  // backward-compatible at the `properties` binding contract level, and to
-  // express new functionality via fields that older adapters ignore.
-  return (
-    typeof decl.version === "number" &&
-    Number.isInteger(decl.version) &&
-    decl.version >= SUPPORTED_PROTOCOL_VERSION
-  );
+  if (decl?.protocol !== "wc-bindable") return undefined;
+  if (typeof decl.version !== "number" || !Number.isInteger(decl.version)) return undefined;
+  if (decl.version < MIN_COMPATIBLE_VERSION) return undefined;
+  if (!Array.isArray(decl.properties)) return undefined;
+  return decl;
+}
+
+export function isWcBindable(target: EventTarget): target is WcBindableElement {
+  return getWcBindableDeclaration(target) !== undefined;
 }
 
 export type UnbindFn = () => void;
@@ -110,9 +134,19 @@ export function bind(
   onUpdate: (name: string, value: unknown) => void,
   options?: BindOptions,
 ): UnbindFn {
-  if (!isWcBindable(target)) return () => {};
+  const decl = getWcBindableDeclaration(target);
+  if (decl === undefined) return () => {};
+  // Reject declarations with duplicate property names rather than producing
+  // double dispatch. SPEC.md classifies this as an invalid declaration; the
+  // adapter MAY treat the target as non-bindable. See SPEC.md § Property
+  // Descriptor.
+  const seen = new Set<string>();
+  for (const prop of decl.properties) {
+    if (seen.has(prop.name)) return () => {};
+    seen.add(prop.name);
+  }
 
-  const { properties } = target.constructor.wcBindable;
+  const { properties } = decl;
   const cleanups: (() => void)[] = [];
   let disposed = false;
 
