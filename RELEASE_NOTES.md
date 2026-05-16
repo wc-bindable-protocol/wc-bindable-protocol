@@ -1,3 +1,130 @@
+# v0.7.0
+
+Substantial pre-1.0 minor release. Tightens the core protocol contract on
+five long-standing gaps identified during review (initial-sync semantics,
+teardown contract, version forward-compatibility, `set` / `invoke`
+ordering, name-collision behavior) and adds an `@wc-bindable/extension`
+spec layer for the input/command surface. All 19 packages stay lockstep
+on `0.7.0`.
+
+## Behavior changes (pre-1.0 minor — review before upgrading)
+
+These are technically observable changes from `0.6.x`. Most consumers won't
+notice; a couple of edge-case integrations might.
+
+1. **Initial sync now uses the `in` operator** instead of
+   `target[name] !== undefined`. A property that is explicitly assigned
+   `undefined` on the target is now delivered to `onUpdate` on first sync
+   (previously skipped). Properties that the target does not declare at
+   all remain silently ignored — that case is unchanged. Frameworks that
+   shallow-equal compare `undefined → undefined` will re-render once
+   extra in this edge case.
+2. **`vanjs` / `mobx` / `rxjs` / `signals` binders default to
+   `syncOn: "connect"`.** `binder.bind(el)` no longer reads pre-connect
+   state if `el` is not yet in the DOM — it defers the initial-value read
+   until `el` is connected (observed via `MutationObserver` on
+   `document`). For already-connected elements and headless targets, the
+   behavior is unchanged. The previously-required pattern of "always call
+   `bind()` after `appendChild()`" is no longer necessary; either order
+   works.
+3. **`@wc-bindable/remote` `RemoteCoreProxy` adds a `has` trap.**
+   `"name" in proxy` now returns `true` for declared properties that the
+   proxy has cached a value for (previously always `false` for declared
+   properties). This is what makes core's new `in`-operator initial sync
+   work transparently against a remote proxy. Code that uses `in` to
+   detect "is this a non-proxy property" on a `RemoteCoreProxy` should
+   migrate to an explicit check.
+4. **`isWcBindable()` now accepts `version >= 1`** instead of
+   `version === 1`. v1 adapters will accept declarations from future v2+
+   components (per the new forward-compatibility policy: breaking
+   changes require a new `protocol` identifier, not a version bump).
+   Acceptance is strictly broader, so existing code is unaffected.
+
+## Spec changes
+
+- **SPEC.md** restructured:
+  - Teardown contract is now normative — `bind()` MUST return a function
+    that removes every listener and observer it installed, including the
+    no-op return for non-bindable targets.
+  - Initial-value synchronization mandates the `in` operator and explains
+    why the previous `!== undefined` gate is insufficient.
+  - Versioning section defines the forward-compatibility policy (`version
+    >= N` accept, additive-only bumps, new `protocol` identifier required
+    for breaks).
+  - Property / input / command descriptors gain `name` uniqueness rules,
+    explicit "ignore unknown fields" tolerance, and shared-event allowance
+    documentation.
+  - **Discovery Contract** section codifies that `target.constructor.wcBindable`
+    is the sole discovery path and that proxies/wrappers MUST expose an
+    equivalent isolated `constructor.wcBindable`.
+  - **Trust Boundaries** section documents that `getter` runs on the
+    consumer side and cannot cross a trust boundary as code.
+  - **Event detail vs Property Read** documents that the event payload is
+    authoritative when it diverges from a property re-read.
+  - Reference implementation guards `HTMLElement` / `document` /
+    `MutationObserver` with `typeof` so the code runs unmodified in
+    Node / Deno / Workers.
+
+- **SPEC-extensions.md** (new) extracts the optional input/command
+  invocation contract from core:
+  - `set` / `setWithAck` / `invoke` semantics, including explicit
+    at-most-once / no-at-least-once rationale (non-idempotent inputs).
+  - **Call-order preservation**: proxies MUST preserve caller order onto
+    a single logical channel; wire-level ordering is the transport's
+    responsibility (WebSocket inherits TCP order, so the documented
+    `set` → `await invoke` pattern is safe on it).
+  - `attribute` / `async` are declarative hints — core does not interpret
+    them.
+  - Initial-sync `undefined`-enumeration on the wire is explicitly tied
+    to core's `in`-operator semantics.
+
+## Added
+
+- **`bind(target, onUpdate, options?)`** accepts a `BindOptions` third
+  argument with `syncOn: "call" | "connect"`. `"call"` (default) is
+  backward-compatible; `"connect"` defers the initial-value read for
+  unconnected `HTMLElement`s.
+- **`UnbindFn`** and **`SUPPORTED_PROTOCOL_VERSION`** are now exported
+  from `@wc-bindable/core`.
+- **Shadow DOM limitation** for `syncOn: "connect"` is documented in
+  both SPEC.md and the `BindOptions` JSDoc — `MutationObserver` does not
+  traverse shadow roots, so ref-owning adapters SHOULD use their own
+  framework lifecycle hook with the default `syncOn: "call"`.
+
+## Tooling
+
+- **`.gitattributes`** (`* text=auto eol=lf` + binary list) and
+  **`.editorconfig`** added to lock line endings to LF across platforms
+  and enforce consistent indentation / final-newline / UTF-8. Pre-existing
+  files were already LF in the index; the new files prevent future
+  CRLF / LF drift from contributor-side `core.autocrlf` settings.
+
+## Packages
+
+| Package | Version |
+|---------|---------|
+| `@wc-bindable/core` | 0.7.0 |
+| `@wc-bindable/react` | 0.7.0 |
+| `@wc-bindable/vue` | 0.7.0 |
+| `@wc-bindable/angular` | 0.7.0 |
+| `@wc-bindable/svelte` | 0.7.0 |
+| `@wc-bindable/alpine` | 0.7.0 |
+| `@wc-bindable/lit` | 0.7.0 |
+| `@wc-bindable/marko` | 0.7.0 |
+| `@wc-bindable/mithril` | 0.7.0 |
+| `@wc-bindable/preact` | 0.7.0 |
+| `@wc-bindable/qwik` | 0.7.0 |
+| `@wc-bindable/riot` | 0.7.0 |
+| `@wc-bindable/solid` | 0.7.0 |
+| `@wc-bindable/stencil` | 0.7.0 |
+| `@wc-bindable/vanjs` | 0.7.0 |
+| `@wc-bindable/mobx` | 0.7.0 |
+| `@wc-bindable/rxjs` | 0.7.0 |
+| `@wc-bindable/signals` | 0.7.0 |
+| `@wc-bindable/remote` | 0.7.0 |
+
+---
+
 # v0.6.1
 
 Patch release. No source changes from v0.6.0.
