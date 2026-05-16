@@ -355,6 +355,22 @@ On `sync` response arrival, the proxy MUST replay the queue **in caller order** 
 On transport-terminal-failure (no `sync` response will ever arrive — `onClose` fired, send threw, etc.) before the queue drains: every pending entry on the queue MUST reject with the terminal-failure error, in caller order. Queue order is the only order observable to the caller, so settling out of order would corrupt user-level error-handling logic that expects "the first failed call is the first one I made".
 
 The consumer-side proxy SHOULD expose its queue depth as a diagnostic; large pre-sync bursts on a slow handshake are a common cause of memory growth that is invisible from outside the proxy.
+
+**Queue ordering is not transactional.** The FIFO replay rule above preserves *order*, not *dependency*. Concretely: if a queued `setWithAck` later rejects (because the producer turned out to be a legacy peer that does not advertise `setAck`, or because the assignment threw on the producer side), every subsequent queued `invoke` / `setWithAck` / `set` MUST still be processed per its own rules — the queue's failure of one entry does NOT cancel later entries automatically. A pattern like:
+
+```javascript
+proxy.setWithAck("url", "/api/users");  // queued
+proxy.invoke("fetch");                   // also queued, will run regardless of how the setWithAck settles
+```
+
+is unsafe if the `invoke` semantically depends on the `setWithAck` having been applied. The conformant pattern when an `invoke` depends on a prior input assignment is to `await` the assignment first:
+
+```javascript
+await proxy.setWithAck("url", "/api/users");  // throws if the assignment fails for any reason
+const result = await proxy.invoke("fetch");   // only reached if the assignment succeeded
+```
+
+This rule applies symmetrically to the steady-state (post-sync) case — the pre-sync queue is just the most visible place the distinction matters, because that is where a single sync response can convert a queue of optimistic calls into a mixture of rejections and successes in one step. The protocol does NOT model transactional batches; consumers that need all-or-nothing semantics across multiple proxy calls MUST build that on top.
 - **Fire-and-forget `set` (the `id`-less variant) is unaffected by this capability bit** — it is part of the baseline wire contract and every producer (legacy and current alike) MUST handle it regardless of `setAck` support.
 
   > **Legacy producer + id-bearing `set` from a non-conforming consumer.** A conforming consumer never sends an `id`-bearing `set` (i.e. a `setWithAck` request) to a legacy producer, because the consumer-side proxy rejects such calls synchronously when `setAck` is absent or `false`. The case "non-conforming or hand-rolled consumer sends an `id`-bearing `set` to a legacy producer" is therefore **out of scope** for this extension — both peers are outside the current contract, so behavior is implementation-defined. Legacy producers MAY reply with a `throw` envelope referencing the `id` (the most diagnostically useful response), MAY drop the message with a logger warning, or MAY ignore the `id` and silently apply the `set` as if it were fire-and-forget. None of these is non-conformant, because the consumer that sent the message is already non-conformant; the spec only governs interactions between conformant peers.
