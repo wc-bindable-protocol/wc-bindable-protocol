@@ -1,0 +1,35 @@
+{
+  "name": "@wc-bindable/stencil",
+  "version": "0.5.0",
+  "description": "Stencil adapter for wc-bindable protocol",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "@wc-bindable/core": "^0.5.0"
+  },
+  "peerDependencies": {
+    "@stencil/core": ">=3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wc-bindable-protocol/wc-bindable-protocol.git",
+    "directory": "packages/stencil"
+  },
+  "license": "MIT"
+}
