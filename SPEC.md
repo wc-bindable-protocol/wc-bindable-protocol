@@ -138,6 +138,20 @@ Within `commands`, every `name` MUST be unique. Adapters **MUST** ignore unknown
 
 ---
 
+## Discovery Contract
+
+Protocol detection (`isWcBindable(target)`) and binding (`bind(target, ...)`) both reach for the declaration via `target.constructor.wcBindable`. This is the **sole** discovery path defined by the protocol — there is no global registry, no symbol property, no fallback lookup.
+
+Any object an adapter is asked to bind against MUST therefore expose a `constructor` whose `wcBindable` property satisfies the [Schema](#schema):
+
+- A plain class that defines `static wcBindable = { ... }` satisfies this automatically — JavaScript's `instance.constructor` already references the class object.
+- A **wrapper or proxy** that stands in for a real `EventTarget` (for example, a `Proxy`-wrapped object whose `get`/`set` traps route to a remote Core, or a test double) MUST expose an `equivalent` `constructor.wcBindable` declaration. "Equivalent" means: same `protocol`, same `version` (or one satisfying the adapter's version check), same `properties` (including `event` names and `getter` semantics observable on the wrapper), and — when [SPEC-extensions.md § Extension 1](SPEC-extensions.md) is in use — the same `inputs` and `commands` membership as the wrapped target. Wrappers MAY rewrite `event` names internally (the `@wc-bindable/remote` `RemoteCoreProxy` uses synthetic per-property event names to disambiguate properties sharing a Core-side event), but the declaration the consumer reads via `target.constructor.wcBindable` MUST describe the events the wrapper actually dispatches, not the events the wrapped target dispatches.
+- Implementations that wrap one declaration per instance (i.e. multiple wrapped targets coexisting on the same page) MUST give each instance an **isolated** `constructor.wcBindable` — sharing a single constructor across instances with different declarations would break `isWcBindable()` and `bind()` for every instance after the first declaration write. The typical pattern is to synthesize a unique subclass per wrapped target.
+
+Adapters MUST NOT cache the declaration across binds — re-read `target.constructor.wcBindable` on each `bind()` call so that proxies whose declaration changes on reconnect are observed correctly.
+
+---
+
 ## Event Naming Convention
 
 Event names should follow the `namespace:property-changed` pattern.

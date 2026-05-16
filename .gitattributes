@@ -1,0 +1,26 @@
+# Force LF line endings on commit for all text files, regardless of the
+# committer's platform. Without this, Windows checkouts re-introduce CRLF
+# in Markdown / TypeScript / JSON whenever an editor saves them, producing
+# noisy line-ending-only diffs on cross-platform branches.
+#
+# To retroactively normalize already-committed CRLF files, run:
+#     git add --renormalize .
+# in a separate commit so the renormalization is reviewable on its own.
+
+* text=auto eol=lf
+
+# Binary file types that must never be normalized.
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.gif    binary
+*.ico    binary
+*.pdf    binary
+*.woff   binary
+*.woff2  binary
+*.ttf    binary
+*.otf    binary
+*.eot    binary
+*.zip    binary
+*.gz     binary
+*.tgz    binary
