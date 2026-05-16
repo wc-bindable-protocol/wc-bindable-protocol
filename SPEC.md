@@ -145,10 +145,21 @@ Protocol detection (`isWcBindable(target)`) and binding (`bind(target, ...)`) bo
 Any object an adapter is asked to bind against MUST therefore expose a `constructor` whose `wcBindable` property satisfies the [Schema](#schema):
 
 - A plain class that defines `static wcBindable = { ... }` satisfies this automatically — JavaScript's `instance.constructor` already references the class object.
-- A **wrapper or proxy** that stands in for a real `EventTarget` (for example, a `Proxy`-wrapped object whose `get`/`set` traps route to a remote Core, or a test double) MUST expose an `equivalent` `constructor.wcBindable` declaration. "Equivalent" means: same `protocol`, same `version` (or one satisfying the adapter's version check), same `properties` (including `event` names and `getter` semantics observable on the wrapper), and — when [SPEC-extensions.md § Extension 1](SPEC-extensions.md) is in use — the same `inputs` and `commands` membership as the wrapped target. Wrappers MAY rewrite `event` names internally (the `@wc-bindable/remote` `RemoteCoreProxy` uses synthetic per-property event names to disambiguate properties sharing a Core-side event), but the declaration the consumer reads via `target.constructor.wcBindable` MUST describe the events the wrapper actually dispatches, not the events the wrapped target dispatches.
+- A **wrapper or proxy** that stands in for a real `EventTarget` (for example, a `Proxy`-wrapped object whose `get`/`set` traps route to a remote Core, or a test double) MUST expose an `equivalent` `constructor.wcBindable` declaration. "Equivalent" means: same `protocol`, the same `version` integer as the wrapped target (the [Versioning](#versioning) policy guarantees every adapter accepts every `version >= 1`, so wrappers do not need a version-matching step), same `properties` (including `event` names and `getter` semantics observable on the wrapper), and — when [SPEC-extensions.md § Extension 1](SPEC-extensions.md) is in use — the same `inputs` and `commands` membership as the wrapped target. Wrappers MAY rewrite `event` names internally (the `@wc-bindable/remote` `RemoteCoreProxy` uses synthetic per-property event names to disambiguate properties sharing a Core-side event), but the declaration the consumer reads via `target.constructor.wcBindable` MUST describe the events the wrapper actually dispatches, not the events the wrapped target dispatches.
 - Implementations that wrap one declaration per instance (i.e. multiple wrapped targets coexisting on the same page) MUST give each instance an **isolated** `constructor.wcBindable` — sharing a single constructor across instances with different declarations would break `isWcBindable()` and `bind()` for every instance after the first declaration write. The typical pattern is to synthesize a unique subclass per wrapped target.
 
 Adapters MUST NOT cache the declaration across binds — re-read `target.constructor.wcBindable` on each `bind()` call so that proxies whose declaration changes on reconnect are observed correctly.
+
+### Discovery API
+
+Implementations **MUST** expose two discovery primitives whose contracts are observable by consumers:
+
+| Function | Returns | Contract |
+|---|---|---|
+| `getWcBindableDeclaration(target)` | `WcBindableDeclaration \| undefined` | Resolves the declaration via the rule above. Returns `undefined` if `target.constructor.wcBindable` is missing, has a `protocol` other than `"wc-bindable"`, has a non-integer `version`, has `version < 1`, or has a `properties` field that is not an array. MUST NOT throw. MUST NOT consult any source other than `target.constructor.wcBindable`. |
+| `isWcBindable(target)` | `boolean` | A type guard that is exactly equivalent to `getWcBindableDeclaration(target) !== undefined`. Implementations MAY (and SHOULD) implement it as that one-line forward. |
+
+The two functions are kept paired so that callers who need the declaration object (tooling, codegen, devtools, test inspection) read it once instead of probing for existence and then re-reading. Adapters that perform their own discovery MUST surface the same `boolean`-vs-declaration pair to be considered conforming. Naming is normative — third-party implementations of these helpers MUST use the same identifiers so consumers can swap implementations.
 
 ---
 
@@ -202,13 +213,23 @@ getter: (e) => e.target.value
 A reactivity system that supports this protocol should:
 
 1. Read `target.constructor.wcBindable`
-2. Verify `protocol === "wc-bindable"` and `version >= SUPPORTED_VERSION` (see [Versioning](#versioning))
+2. Verify `protocol === "wc-bindable"` and `version` is an integer `>= 1` (see [Versioning](#versioning))
 3. For each property descriptor:
    a. Attach an event listener for subsequent changes
    b. Perform the initial-value synchronization (see below)
 4. Return a function that removes every listener registered above (the **teardown contract**, see below)
 
 The `target` parameter accepts any `EventTarget` — this includes `HTMLElement` instances as well as headless `EventTarget` subclasses.
+
+### `onUpdate` callback shape
+
+The normative shape of the per-update callback passed to `bind()` is the **positional form**:
+
+```typescript
+type OnUpdate = (name: string, value: unknown) => void;
+```
+
+Third-party adapters that re-export `bind()` MUST preserve this signature. Higher-level binder layers (framework adapters that wrap `bind()` to drive React state, Vue refs, Angular outputs, etc.) MAY re-pack the call into a framework-idiomatic shape — for example, the Angular adapter dispatches a single-argument `{ name, value }` event on a Subject because Angular outputs are single-argument. Re-packing at the framework layer is permitted; **changing the positional signature of the protocol-level `bind()` callback is not.**
 
 ```javascript
 const DEFAULT_GETTER = (e) => e.detail;
@@ -279,12 +300,21 @@ Long-lived headless `Core` instances may outlive multiple consumers; without an 
 
 Initial value synchronization is a **required** part of the protocol (not merely an adapter implementation suggestion). For each declared property at bind time:
 
-- If `prop.name in target` is `true`, the adapter **MUST** read `target[prop.name]` and deliver the value (including when it is `undefined`) to the consumer immediately, before any events fire.
+- If `prop.name in target` is `true`, the adapter **MUST** read `target[prop.name]` and deliver the value (including when it is `undefined`) to the consumer.
 - If `prop.name in target` is `false` (the property does not exist on the target), the adapter **MUST** skip the initial synchronization for that property. This is not an error.
 
 The `in` operator is mandated specifically so that `undefined` can be distinguished from "property not declared on target". An earlier revision of this spec used `target[prop.name] !== undefined` as the gate; that gate cannot deliver a legitimately-`undefined` initial value, and is now superseded.
 
 Component authors **should** ensure that every `name` in the declaration corresponds to a readable property on the target instance.
+
+#### Ordering vs subsequent events
+
+The relative ordering of the initial-sync delivery and the first subsequent `onUpdate` triggered by an event depends on `syncOn`:
+
+- With `syncOn: "call"` (the default), the adapter **MUST** deliver the initial-sync values **before any subsequent change events fire on the same target**. Since `bind()` performs the synchronous initial-sync inside the same call that attaches event listeners, this ordering follows naturally as long as the host does not dispatch on the target re-entrantly inside `onUpdate`.
+- With `syncOn: "connect"`, the initial-sync read is intentionally deferred until the target becomes connected. **Any change event that fires between `bind()` return and the deferred initial-sync MUST be delivered to `onUpdate` in the order it arrives** — that is, an event arriving before the deferred sync is delivered first, and the deferred initial-sync runs afterwards with `target[prop.name]` read at sync time. The consumer therefore sees the most recent value last, regardless of the path it arrived on. This is the only sound interpretation when the read site is deferred; the `"before any events fire"` guarantee from `syncOn: "call"` is **not** in effect under `syncOn: "connect"`.
+
+In both modes, the **event payload is authoritative** in case the initial-sync read and a subsequent event disagree on the value — see [§ Event detail vs Property Read](#event-detail-vs-property-read).
 
 #### Deferring the Initial Sync Until Connection
 
@@ -295,7 +325,7 @@ bind(target, onUpdate, { syncOn: "connect" })
 ```
 
 - `syncOn: "call"` (default): perform the initial sync synchronously inside `bind()`. Backward-compatible behavior.
-- `syncOn: "connect"`: if the target is an `HTMLElement` that is not yet connected, defer the initial sync until the element becomes connected. The reference implementation observes the top-level `document` via a `MutationObserver`. For headless `EventTarget`s and already-connected elements, behaves like `"call"`. The DOM globals (`HTMLElement`, `document`, `MutationObserver`) are referenced through `typeof` guards so that the reference implementation runs unmodified in non-browser runtimes where these globals are undefined — in that case `syncOn: "connect"` silently falls back to the `"call"` path.
+- `syncOn: "connect"`: if the target is an `HTMLElement` that is not yet connected, defer the initial sync until the element becomes connected **for the first time**. The reference implementation observes the top-level `document` via a `MutationObserver`. For headless `EventTarget`s and already-connected elements, behaves like `"call"`. The DOM globals (`HTMLElement`, `document`, `MutationObserver`) are referenced through `typeof` guards so that the reference implementation runs unmodified in non-browser runtimes where these globals are undefined — in that case `syncOn: "connect"` silently falls back to the `"call"` path. **Disconnect → reconnect cycles after the first connection do NOT re-trigger the initial sync** — the observer disconnects as soon as the deferred sync fires once. Consumers that need a fresh initial-sync on every re-attach should unbind and re-bind from their own lifecycle hook.
 
 The returned unbind function tears down the `MutationObserver` as well, so cancelling a deferred bind is safe.
 
@@ -314,6 +344,8 @@ The protocol uses two independent reads of the property value:
 
 The two **SHOULD** be kept in agreement by the component author. If they diverge (e.g. a `detail` payload differs from the current property value), the **event payload is authoritative** — adapters do not re-read the property after an event fires. Component authors who cannot guarantee parity should derive `detail` from the property at dispatch time.
 
+> **Edge case — synchronous re-entry from a property getter.** Because adapters attach listeners before performing the initial-sync read (so that no event is missed during the read), a property whose getter synchronously dispatches a change event for the same property will cause `onUpdate` to fire twice during `bind()`: once with the event payload, once with the initial-sync read. The consumer observes both calls in dispatch order. Component authors **should not** dispatch from a getter; if the side effect is unavoidable, treat the event-payload-authoritative rule as still applying, and accept that the initial-sync delivery may overwrite the just-dispatched value in the consumer's state.
+
 ### Getter Errors
 
 If a `getter` function throws during event handling, the adapter **must not** swallow the error silently. The error should propagate naturally (i.e., be thrown from the event listener). This preserves normal JavaScript error semantics and allows component authors to detect bugs in their getter implementations.
@@ -324,11 +356,13 @@ Adapters **should not** wrap getter calls in try/catch unless they re-throw the 
 
 ## Versioning
 
-The protocol version is an integer. Future versions **MUST** remain backward-compatible at the `properties` binding contract level:
+The protocol version is an integer. Within a single `protocol` identifier (e.g. `"wc-bindable"`), every adapter and every declaration are mutually compatible by construction:
 
-- An adapter built for version `N` **MUST** accept any declaration whose `version` is `>= N`.
-- New optional fields (on the root, on property/input/command descriptors, or new root-level keys entirely) may be added in later versions. Older adapters **MUST** ignore fields they do not recognize.
-- Breaking changes to the `properties` binding contract (the shape of property descriptors, the meaning of `event` / `getter`, the initial-sync rule, the teardown contract) require a new `protocol` identifier (e.g. `"wc-bindable-2"`), **not** a version bump. This guarantees that a v1 adapter never silently misinterprets a future declaration.
+- An adapter **MUST** accept any declaration whose `version` is an integer `>= 1`, regardless of when the adapter was built or what version the adapter itself was originally designed against. Adapters **MUST NOT** impose an adapter-specific upper or lower version bound (e.g. "this v2 adapter only handles `version >= 2`"). Doing so would silently no-op against valid older declarations and is explicitly forbidden.
+- New optional fields (on the root, on property/input/command descriptors, or new root-level keys entirely) may be added in later versions. Adapters **MUST** ignore fields they do not recognize. The `version` field then becomes informational at the wire / discovery level — its primary role within a given `protocol` identifier is to flag the presence of newer optional fields, not to gate acceptance.
+- Breaking changes to the `properties` binding contract (the shape of property descriptors, the meaning of `event` / `getter`, the initial-sync rule, the teardown contract) require a new `protocol` identifier (e.g. `"wc-bindable-2"`), **not** a version bump. This guarantees both directions: a v1 adapter never silently misinterprets a future declaration **and** a future-version adapter never silently rejects a v1 declaration.
+
+In `@wc-bindable/core`, the exported constant `MIN_COMPATIBLE_VERSION` is pinned to `1` and serves only as a sanity check that the `version` field exists, is a number, is an integer, and is `>= 1`. It is **not** an adapter-version dial and MUST NOT be raised in future releases.
 
 | Version | Status  | Notes            |
 |---------|---------|------------------|

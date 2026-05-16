@@ -43,16 +43,24 @@ export interface WcBindableElement extends EventTarget {
 }
 
 /**
- * Lowest protocol version this adapter is compatible with. The check is
- * `decl.version >= MIN_COMPATIBLE_VERSION`, so this is a minimum, not a
- * maximum — see SPEC.md § Versioning for the forward-compatibility policy.
+ * Lowest protocol version any declaration may carry. Fixed at `1` for the
+ * `"wc-bindable"` protocol identifier and **NOT** adapter-specific —
+ * within a given `protocol` identifier, breaking changes require a new
+ * identifier rather than a version bump, so any version `>= 1` must be
+ * accepted by every adapter regardless of when the adapter was built.
+ * See SPEC.md § Versioning for the forward-compatibility policy.
  */
 export const MIN_COMPATIBLE_VERSION = 1;
 
 /**
  * @deprecated v0.7.0 alias kept for source compatibility. Use
- * {@link MIN_COMPATIBLE_VERSION} — the name reflects the actual semantics
- * (`decl.version >= MIN_COMPATIBLE_VERSION`). Scheduled for removal in v1.0.
+ * {@link MIN_COMPATIBLE_VERSION}. Scheduled for removal in v1.0.
+ *
+ * Historical note: this constant was originally intended to gate "the
+ * highest protocol version this adapter understands", which the
+ * forward-compatibility policy explicitly disallows. The check has always
+ * been `decl.version >= MIN_COMPATIBLE_VERSION`, and `MIN_COMPATIBLE_VERSION`
+ * is now pinned to the protocol-wide minimum (`1`).
  */
 export const SUPPORTED_PROTOCOL_VERSION = MIN_COMPATIBLE_VERSION;
 

@@ -49,6 +49,15 @@ The core protocol does NOT inspect this field.
 
 When `setWithAck` or `invoke` fails on the remote side, the consumer-side proxy SHOULD raise an `Error` whose `name`, `message`, and (when available) `stack` reflect the original throw. Implementations MAY attach the raw serialized payload as `cause`. Implementations MUST NOT silently swallow remote throws.
 
+### Transport lifecycle vocabulary
+
+The semantics tables above use two transport-state terms that this extension pins down here:
+
+- **Terminally failed.** The transport instance is past the point where it can recover without external action. Examples: the proxy has been `dispose()`d; the transport reported its `onClose` callback and the binding code has not reconnected; the underlying socket fired a non-resumable error (e.g. WebSocket close with policy-violation status, `MessagePort` close, Worker termination); the transport's `send` synchronously threw and the proxy decided to disconnect rather than buffer. **Transient outages — automatic reconnect attempts in progress, exponential-backoff retry windows, brief network blips that the transport is configured to mask — are NOT terminal.** A `set` call MUST throw synchronously when the transport is in the terminal state at call time; it MUST NOT throw on a transient outage. In the transient case the message either lands eventually (at-most-once semantics) or is dropped silently, which is exactly the gap `setWithAck` exists to make detectable.
+- **Disposed.** The proxy itself has had `dispose()` called. `set` MUST throw, `setWithAck` MUST reject, `invoke` MUST reject. The proxy MUST NOT accept a new transport after `dispose()`.
+
+A transport implementation MUST document which observable signal (`onClose` firing, `send` throwing, an explicit `dispose()` call) it treats as terminal, so callers know when to expect synchronous throws from `set`.
+
 ### Trust boundary
 
 This extension transports `set` and `invoke` calls across a trust boundary. The receiving side MUST treat all arguments as untrusted input. In particular:
@@ -57,7 +66,7 @@ This extension transports `set` and `invoke` calls across a trust boundary. The 
 - The remote side MUST NOT transport `getter` functions as code — `getter` is applied on the trusted side, and only the extracted value crosses the wire.
 - Authentication, authorization, rate limiting, and payload schema validation are the responsibility of the layer that owns the transport, not of this extension.
 
-See [packages/remote/README.md](packages/remote/README.md) for the canonical reference implementation and its concrete trust-boundary guidance.
+The core protocol's trust-boundary contract is defined in [SPEC.md § Trust Boundaries](SPEC.md#trust-boundaries); the above is the network-specific specialization of that contract. The remote reference implementation's concrete guardrails (auth handshake placement, back-pressure caps, logger injection) live in [packages/remote/README.md § Security model](packages/remote/README.md#security-model--trust-boundary).
 
 ---
 
@@ -69,7 +78,7 @@ This section is the **normative** wire-format specification for any implementati
 
 1. **Property-centric, not event-centric.** Each `properties[i]` becomes its own per-property message stream identified by `name`. Multiple property descriptors MAY share the same `event` name on the producer side; the wire MUST discriminate by `name`.
 2. **`getter` runs on the producer side only.** Functions are NEVER transported as code; only the extracted value crosses the wire. The consumer-side proxy MUST rewrite each `properties[i].event` to a unique synthetic per-property event name on the local declaration so `bind()` on the consumer can discriminate properties that originally shared an event name on the producer.
-3. **JSON-shape payloads only.** Every value the wire carries MUST round-trip through `JSON.stringify` / `JSON.parse`: plain objects, arrays, strings, finite numbers, booleans, `null`. `undefined`, `Date`, `Map`, `Set`, `BigInt`, typed arrays, class instances, functions, and cyclic objects are out of contract. Transports whose native channel could preserve richer values (e.g. `MessagePort` structured clone) MUST serialize at the boundary so every transport presents the same lossy view.
+3. **JSON-shape payloads only.** Every value the wire carries MUST round-trip through `JSON.stringify` / `JSON.parse`: plain objects, arrays, strings, finite numbers, booleans, `null`. `undefined`, `Date`, `Map`, `Set`, `BigInt`, typed arrays, class instances, functions, and cyclic objects are out of contract. Transports whose native channel could preserve richer values (e.g. `MessagePort` structured clone) MUST serialize at the boundary so every transport presents the same lossy view. **Handling of non-serializable values is normative:** the producer-side proxy MUST detect a serialization failure (either by attempting `JSON.stringify` and observing a thrown `TypeError`, or by a transport-level equivalent) and respond as follows: for an `update`/`sync` payload, the proxy MUST emit a logger warning naming the affected property and MUST drop the value (no `update` message for that change; the consumer continues observing the last successfully-transmitted value); for a `setWithAck`/`invoke` reply (`return` envelope), the proxy MUST instead emit a `throw` envelope referencing the same `id` so the pending consumer promise rejects with a typed error rather than hanging or resolving with corrupted data. The producer MUST NOT substitute a sentinel like `null` for a failed serialization — silent value mutation breaks the consumer's value-cache and `bind()` `onUpdate` contract.
 4. **FIFO ordering on a single (consumer, producer) channel.** The transport MUST preserve the order in which the proxy called `send()`. WebSocket-per-connection and `MessagePort`-per-port satisfy this; `BroadcastChannel` and fan-in / fan-out transports do not in general.
 5. **Per-channel single-shell semantics.** A given producer-side shell MUST serve exactly one consumer proxy at a time. Multiplexing N consumers onto one shell is out of scope; spawn N shells (one per channel) instead.
 

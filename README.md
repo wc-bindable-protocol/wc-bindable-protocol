@@ -371,10 +371,19 @@ bind(proxy, (name, value) => {
 
 proxy.set("url", "/api/users");
 const result = await proxy.invoke("fetch");
-// The WebSocket transport preserves message order, so `fetch` always
-// observes `url = "/api/users"`. On a transport that does not guarantee
-// order, sequence with `await proxy.setWithAck("url", ...)` first — see
-// SPEC-extensions.md § Call-order preservation.
+// Caveat: `set` is fire-and-forget (at-most-once). The WebSocket
+// transport preserves message *order*, so on a healthy connection
+// `fetch` always observes `url = "/api/users"`. But order != delivery —
+// during a transient outage the `set` can be silently dropped while the
+// later `invoke` still lands, causing `fetch` to run against a stale
+// `url` with no error. When `fetch` actually depends on `url` having
+// been applied, use the acknowledged path:
+//
+//   await proxy.setWithAck("url", "/api/users");
+//   const result = await proxy.invoke("fetch");
+//
+// See SPEC-extensions.md § Call-order preservation and § Transport
+// lifecycle vocabulary for the exact contract.
 ```
 
 ## Examples

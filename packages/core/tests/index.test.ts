@@ -56,7 +56,14 @@ describe("isWcBindable", () => {
     expect(SUPPORTED_PROTOCOL_VERSION).toBe(MIN_COMPATIBLE_VERSION);
   });
 
-  it("rejects versions below the adapter's supported version", () => {
+  it("pins MIN_COMPATIBLE_VERSION to 1 (the protocol-wide minimum, NOT adapter-specific)", () => {
+    // SPEC.md § Versioning forbids raising this constant within the
+    // "wc-bindable" protocol identifier — adapters MUST accept every
+    // version >= 1 regardless of when they were built.
+    expect(MIN_COMPATIBLE_VERSION).toBe(1);
+  });
+
+  it("rejects versions below the protocol-wide minimum (< 1)", () => {
     const el = createBindableElement({
       ...validDeclaration,
       version: 0,
