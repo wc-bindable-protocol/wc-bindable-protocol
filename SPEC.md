@@ -26,7 +26,7 @@ A producer is always also a valid consumer-side bind target (it has both), but a
 
 `HTMLElement` (a subclass of `EventTarget`) is the most common implementation target, as it enables DOM integration and framework binding via refs, but it is not required. This means the protocol works equally well in non-browser runtimes (Node.js, Deno, Cloudflare Workers, etc.) where `EventTarget` is available.
 
-The protocol requires no dependencies and relies solely on standard APIs: `static` class fields and `CustomEvent`.
+The protocol requires no library dependencies and relies solely on standard platform APIs: `static` class fields for the declaration, `addEventListener` / `removeEventListener` on the consumer-side bind target, and `dispatchEvent` + `CustomEvent` on the producer side. All four are part of the JavaScript / DOM / Web Components core; no `npm` runtime dependency is introduced.
 
 ---
 
@@ -245,7 +245,12 @@ getter: (e) => e.target.value
 
 ## Conformance Levels
 
-This specification has three independently claimable conformance levels. An implementation MUST be explicit about which it claims; the levels stack — Level 2 implies Level 1, Level 3 implies Levels 1 and 2 *for its JS bindings* (a non-JS Level-3 implementation is not bound by Level 2).
+This specification has three independently claimable conformance levels. An implementation MUST be explicit about which it claims. The levels stack as follows:
+
+- **Level 1 is always implied** by claiming any higher level: a Level 2 or Level 3 implementation MUST satisfy Level 1 unconditionally.
+- **Level 2 is implied only when the implementation has JS bindings**, because Level 2's rules — the normatively-named `bind` / `getWcBindableDeclaration` / `isWcBindable` exports — are JavaScript-specific. A non-JS Level-3 implementation (Python, Go, …) is NOT required to satisfy Level 2; a JS Level-3 implementation that also exposes a local-binding surface SHOULD additionally satisfy Level 2 for drop-in compatibility with the JS adapter ecosystem.
+
+Concretely: a Level 2 claim is `{1, 2}` (MUST). A Level 3 claim is `{1, 3}` for non-JS implementations and `{1, 3}` + Level 2 SHOULD for JS implementations.
 
 | Level | Name | What it covers | What it does NOT cover |
 |---|---|---|---|

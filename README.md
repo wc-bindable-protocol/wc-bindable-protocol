@@ -4,7 +4,7 @@
 
 The minimal, framework-agnostic protocol works for any **EventTarget-compatible bind target** — Web Components, headless `EventTarget` cores running in Node / Deno / Workers, and relay / remote proxies that expose `addEventListener` / `removeEventListener` (without necessarily extending `EventTarget` themselves) — so the same **declared interface** can be adapted to React, Vue, Svelte, Lit, plain `bind()` calls, and across-the-wire proxying. (Remote proxies expose an *observation-equivalent* declaration — same property / input / command names, synthetic per-property event names internally — rather than the byte-equal original.)
 
-The **core protocol has no runtime dependencies** — just `static` class fields and `CustomEvent`. Framework adapters depend only on their target framework (`@wc-bindable/react` on React, etc.); they do not pull in other frameworks.
+The **core protocol has zero `npm` runtime dependencies** — it runs on the platform's standard event-handling primitives (`addEventListener` / `removeEventListener` on the consumer side, `dispatchEvent` + `CustomEvent` on the producer side, plus `static` class fields for the declaration). Framework adapters depend only on their target framework (`@wc-bindable/react` on React, etc.); they do not pull in other frameworks.
 
 ## The whole protocol in one snippet
 
