@@ -238,11 +238,49 @@ A reactivity system that supports this protocol should:
 
 The `target` parameter accepts any `EventTarget` — this includes `HTMLElement` instances as well as headless `EventTarget` subclasses.
 
-### `bind()` and `onUpdate` shapes
+### Normative TypeScript surface
 
-The normative TypeScript surface of the protocol-level `bind()` and its callback is:
+The protocol-level public types and function signatures are:
 
 ```typescript
+// ── Declaration shape (the value on `Target.constructor.wcBindable`) ──
+
+interface WcBindableDeclaration {
+  protocol: "wc-bindable";
+  /** Integer >= 1. See SPEC.md § Versioning. */
+  version: number;
+  properties: WcBindablePropertyDescriptor[];
+  inputs?: WcBindableInputDescriptor[];
+  commands?: WcBindableCommandDescriptor[];
+}
+
+interface WcBindablePropertyDescriptor {
+  name: string;
+  event: string;
+  /** Defaults to `(e) => (e as CustomEvent).detail` when omitted. */
+  getter?: (event: Event) => unknown;
+}
+
+interface WcBindableInputDescriptor {
+  name: string;
+  /** Hint consumed by extensions (see SPEC-extensions.md); not interpreted by core. */
+  attribute?: string;
+}
+
+interface WcBindableCommandDescriptor {
+  name: string;
+  /** Hint consumed by extensions (see SPEC-extensions.md); not interpreted by core. */
+  async?: boolean;
+}
+
+/** A target that survives `isWcBindable()` — i.e. an EventTarget that exposes
+ *  a valid declaration on its constructor. */
+type WcBindableTarget = EventTarget & {
+  readonly constructor: { readonly wcBindable: WcBindableDeclaration };
+};
+
+// ── bind() and discovery ──
+
 type OnUpdate = (name: string, value: unknown) => void;
 type UnbindFn = () => void;
 
@@ -250,17 +288,26 @@ interface BindOptions {
   syncOn?: "call" | "connect";  // default: "call"
 }
 
+/** Discovery primitives. Both MUST accept `unknown` and never throw — see
+ *  § Discovery API for the full contract. `target` is typed `unknown`
+ *  (not `EventTarget`) precisely because the helper handles non-EventTarget
+ *  inputs (returning `undefined`) as part of its validation surface. */
+function getWcBindableDeclaration(target: unknown): WcBindableDeclaration | undefined;
+function isWcBindable(target: unknown): target is WcBindableTarget;
+
+/** Binding. The narrowed `WcBindableTarget` is what survives discovery; the
+ *  `EventTarget` parameter accepts any input and `bind()` internally calls
+ *  `getWcBindableDeclaration()` to discriminate. */
 function bind(
   target: EventTarget,
   onUpdate: OnUpdate,
   options?: BindOptions,
 ): UnbindFn;
-
-function getWcBindableDeclaration(target: EventTarget): WcBindableDeclaration | undefined;
-function isWcBindable(target: EventTarget): target is WcBindableElement;
 ```
 
 Third-party adapters that re-export `bind()` MUST preserve this signature, including the optional third argument. Higher-level binder layers (framework adapters that wrap `bind()` to drive React state, Vue refs, Angular outputs, etc.) MAY re-pack the callback into a framework-idiomatic shape — for example, the Angular adapter dispatches a single-argument `{ name, value }` event on a Subject because Angular outputs are single-argument. Re-packing at the framework layer is permitted; **changing the positional signature of the protocol-level `bind()` callback is not.** Additional optional fields on `BindOptions` MAY be added in later spec revisions; older implementations MUST ignore unrecognized fields rather than throw.
+
+The discovery primitives' parameter type is `unknown` deliberately: both `getWcBindableDeclaration` and `isWcBindable` are required to accept any input (a stray `null`, a plain object, a `Map` — anything callers might pass while probing for support) and return cleanly without throwing. Implementations that type the parameter more narrowly than `unknown` are non-conformant.
 
 ```javascript
 const DEFAULT_GETTER = (e) => e.detail;

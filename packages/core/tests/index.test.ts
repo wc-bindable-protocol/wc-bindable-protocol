@@ -206,6 +206,16 @@ describe("getWcBindableDeclaration", () => {
     expect(isWcBindable(t)).toBe(false);
   });
 
+  it("accepts arbitrary unknown inputs without throwing (null / primitives / plain objects)", () => {
+    // SPEC.md § Normative TypeScript surface: parameter type is `unknown`
+    // precisely so callers can probe any input.
+    for (const probe of [null, undefined, 0, "string", true, Symbol("x"), {}, [], new Map()]) {
+      expect(() => getWcBindableDeclaration(probe as unknown as EventTarget)).not.toThrow();
+      expect(getWcBindableDeclaration(probe as unknown as EventTarget)).toBeUndefined();
+      expect(isWcBindable(probe as unknown as EventTarget)).toBe(false);
+    }
+  });
+
   it("rejects targets that have a valid declaration but lack EventTarget capability", () => {
     // A plain object with the static-fields shape would pass the schema
     // check but bind() would throw on addEventListener. The capability

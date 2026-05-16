@@ -1,6 +1,6 @@
 # wc-bindable-protocol
 
-A minimal, framework-agnostic protocol that enables any Web Component to declare its reactive properties — and optionally its input properties and commands — so that any reactivity system can bind to them without framework-specific coupling.
+A minimal, framework-agnostic protocol that enables any `EventTarget`-based object — including Web Components, headless cores running in Node / Deno / Workers, and remote proxies — to declare its reactive outputs (and optionally its input properties and commands) so that any reactivity system can bind to them without framework-specific coupling.
 
 The **core protocol has no runtime dependencies** — just `static` class fields and `CustomEvent`. Framework adapters depend only on their target framework (`@wc-bindable/react` on React, etc.); they do not pull in other frameworks.
 
@@ -66,7 +66,7 @@ class MyInput extends HTMLElement {
 
 Any framework adapter can then automatically bind to those properties — no manual wiring needed. The optional `inputs` and `commands` fields declare the component's input interface for tooling, documentation, and remote proxying — they do not create automatic two-way synchronization. The *behavioral* semantics of those fields (`set`, `invoke`, the `attribute` and `async` hints) are defined in [SPEC-extensions.md](SPEC-extensions.md) — the core protocol itself is read-only on `properties`.
 
-When the adapter binds to an element, it reads the current value of each declared property (using `name in target` so an explicitly-`undefined` value is still delivered) and then listens for subsequent change events. `bind()` returns an unbind function that removes every listener it registered; adapters re-expose this so consumers can tear down cleanly. For DOM elements that have not yet been connected when `bind()` is called, pass `{ syncOn: "connect" }` to defer the initial read until `connectedCallback` has run — most framework adapters do this for you.
+When the adapter binds to an element, it reads the current value of each declared property (using `name in target` so an explicitly-`undefined` value is still delivered) and then listens for subsequent change events. `bind()` returns an unbind function that removes every listener it registered; adapters re-expose this so consumers can tear down cleanly. For DOM elements that have not yet been connected when `bind()` is called, pass `{ syncOn: "connect" }` to defer the initial read until `connectedCallback` has run. Framework adapters that bind from a mounted-element lifecycle hook (React `useEffect`, Vue `onMounted`, Angular `AfterViewInit`, etc.) use the default `syncOn: "call"` because the host already guarantees the element is attached; imperative binders that hand you an `el` you append later (VanJS, MobX, RxJS, Signals) default to `syncOn: "connect"`. See [SPEC-extensions.md § Extension 3](SPEC-extensions.md) for the full guidance.
 
 ## Security model
 

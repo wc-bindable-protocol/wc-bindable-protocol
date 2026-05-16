@@ -91,8 +91,15 @@ const DEFAULT_GETTER = (e: Event): unknown => (e as CustomEvent).detail;
  * package, `isWcBindable()` and `bind()` both go through this helper.
  */
 export function getWcBindableDeclaration(
-  target: EventTarget,
+  target: unknown,
 ): WcBindableDeclaration | undefined {
+  // SPEC.md § Discovery API contract: the parameter is `unknown` precisely
+  // so callers can probe arbitrary inputs (a stray null, a plain object,
+  // a Map, …) without first having to coerce to EventTarget. This helper
+  // MUST NOT throw on any input shape.
+  if (target === null || (typeof target !== "object" && typeof target !== "function")) {
+    return undefined;
+  }
   // SPEC.md § Overview pins EventTarget as the minimum target capability.
   // Reject targets that satisfy the declaration schema but cannot actually
   // be bound to — without this, `bind()` would throw on `addEventListener`
@@ -158,7 +165,7 @@ function isValidNamedList<T extends { name: string }>(
   return true;
 }
 
-export function isWcBindable(target: EventTarget): target is WcBindableElement {
+export function isWcBindable(target: unknown): target is WcBindableElement {
   return getWcBindableDeclaration(target) !== undefined;
 }
 
