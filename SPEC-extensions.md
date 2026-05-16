@@ -17,7 +17,7 @@ A *consumer-side proxy* that adopts this extension MUST expose the following sur
 | Method | Signature | Semantics |
 |---|---|---|
 | `set` | `set(name: string, value: unknown): void` | Fire-and-forget assignment of an input property. **At-most-once delivery.** No acknowledgement. Throws synchronously only if `name` is not declared in `inputs`, the transport has terminally failed, or the proxy is disposed. |
-| `setWithAck` | `setWithAck(name: string, value: unknown): Promise<void>` | Acknowledged assignment. The promise resolves when the remote side has accepted (or applied) the value, and rejects on remote validation failure, transport closure, timeout, or disposal. **At-least-once delivery is NOT promised** — that is, on transport failure the proxy will reject the pending call rather than silently retrying. Re-sending could re-apply a non-idempotent input (e.g. an increment, a write to an append-only log) twice, which the proxy has no way to detect; the conservative default is at-most-once and the caller is responsible for any retry. Implementations MAY layer exactly-once on top via per-call idempotency keys but MUST document the choice. |
+| `setWithAck` | `setWithAck(name: string, value: unknown): Promise<void>` | Acknowledged assignment. **The promise MUST NOT resolve before the JS-level assignment `target[name] = value` has executed on the trusted side**; it MUST reject if the assignment throws, the remote rejects the message as undeclared/invalid, the transport closes, the call times out, or the proxy is disposed. The proxy does NOT wait for asynchronous side effects of the setter (e.g. a setter that schedules background work) — components that need to gate `invoke` on async post-set work SHOULD expose a command instead so the caller can `await invoke()`. **At-least-once delivery is NOT promised** — on transport failure the proxy rejects rather than silently retrying, because re-sending could re-apply a non-idempotent input (an increment, a write to an append-only log) twice, which the proxy cannot detect. The conservative default is at-most-once and the caller is responsible for any retry. Implementations MAY layer exactly-once on top via per-call idempotency keys but MUST document the choice. |
 | `invoke` | `invoke(name: string, ...args: unknown[]): Promise<unknown>` | Calls a declared command. Resolves with the (serialized) return value, or rejects with a serialized form of the thrown error. Throws synchronously / rejects asynchronously if `name` is not in `commands`, the transport is closed, or the proxy is disposed. |
 
 The set of declared inputs and commands MUST be the same as the declarations exposed in `target.constructor.wcBindable.inputs` / `.commands` so that local and remote behavior agree.
@@ -63,14 +63,114 @@ See [packages/remote/README.md](packages/remote/README.md) for the canonical ref
 
 ## Extension 2 — Wire Format (Remote Proxying)
 
-Implementations that transport wc-bindable across a network MUST conform to a wire format that the consumer-side proxy and the producer-side proxy both agree on. The `@wc-bindable/remote` package defines one such format (JSON-only over a transport-agnostic message channel). A summary:
+This section is the **normative** wire-format specification for any implementation that transports wc-bindable across a network. Third-party implementations of the consumer-side proxy or the producer-side proxy MUST conform to this contract to interoperate with `@wc-bindable/remote` (the reference implementation). Concrete usage examples, error-handling tips, back-pressure controls, and framework-integration snippets live in [packages/remote/README.md](packages/remote/README.md); the contract itself is here.
 
-- The wire is **property-centric**, not event-centric. Each `properties[i]` becomes its own per-property message stream. This is necessary because multiple property descriptors may share the same `event` name on the Core side, and the wire must discriminate by `name`.
-- `getter` is applied on the producer side. Only the extracted value crosses the wire.
-- Initial `sync` carries a snapshot of currently-defined property values, mirroring core's `in` operator semantics: a property where `name in core` is `true` is transmitted (including when the value is `undefined`), and a property where `name in core` is `false` is omitted. Because JSON cannot represent `undefined` directly, the wire format MUST enumerate the names of properties whose current value is `undefined` in a separate field so the consumer can dispatch an explicit `undefined` event during initial sync rather than reading the omission as "not present". This is the cross-the-wire equivalent of the core's "exists-but-undefined → deliver / does-not-exist → skip" rule. See `packages/remote/README.md` § Connection lifecycle.
-- All values that cross the wire MUST be JSON-serializable. Implementations MAY support richer payloads on transports that allow it, but MUST NOT extend the contract in a way that breaks JSON-only consumers.
+### Design invariants
 
-A full wire-format specification lives in [packages/remote/README.md](packages/remote/README.md).
+1. **Property-centric, not event-centric.** Each `properties[i]` becomes its own per-property message stream identified by `name`. Multiple property descriptors MAY share the same `event` name on the producer side; the wire MUST discriminate by `name`.
+2. **`getter` runs on the producer side only.** Functions are NEVER transported as code; only the extracted value crosses the wire. The consumer-side proxy MUST rewrite each `properties[i].event` to a unique synthetic per-property event name on the local declaration so `bind()` on the consumer can discriminate properties that originally shared an event name on the producer.
+3. **JSON-shape payloads only.** Every value the wire carries MUST round-trip through `JSON.stringify` / `JSON.parse`: plain objects, arrays, strings, finite numbers, booleans, `null`. `undefined`, `Date`, `Map`, `Set`, `BigInt`, typed arrays, class instances, functions, and cyclic objects are out of contract. Transports whose native channel could preserve richer values (e.g. `MessagePort` structured clone) MUST serialize at the boundary so every transport presents the same lossy view.
+4. **FIFO ordering on a single (consumer, producer) channel.** The transport MUST preserve the order in which the proxy called `send()`. WebSocket-per-connection and `MessagePort`-per-port satisfy this; `BroadcastChannel` and fan-in / fan-out transports do not in general.
+5. **Per-channel single-shell semantics.** A given producer-side shell MUST serve exactly one consumer proxy at a time. Multiplexing N consumers onto one shell is out of scope; spawn N shells (one per channel) instead.
+
+### Message types — client → server
+
+```
+{ "type": "sync" }
+{ "type": "set", "name": string, "value": JsonValue }
+{ "type": "set", "name": string, "value": JsonValue, "id": string }   // setWithAck
+{ "type": "cmd", "name": string, "id": string, "args": JsonValue[] }  // invoke
+```
+
+- `set` without an `id` is fire-and-forget (Extension 1 `set`); with an `id` it requires an acknowledgement (Extension 1 `setWithAck`).
+- `cmd.id` is a client-allocated identifier (e.g. UUID v4) unique within the lifetime of the proxy. The producer MUST echo it back in the `return` / `throw` envelope.
+
+### Message types — server → client
+
+```
+// Initial sync response. `values` is { [name: string]: JsonValue }.
+// `undefinedProperties` enumerates names whose current value is `undefined` —
+// these are omitted from `values` because JSON cannot represent undefined.
+// See "Undefined enumeration" below.
+{
+  "type": "sync",
+  "values": { [name: string]: JsonValue },
+  "undefinedProperties"?: string[],
+  "capabilities"?: { "setAck"?: boolean },
+  "getterFailures"?: string[]
+}
+
+// Subsequent per-property change forwarded by the shell.
+{ "type": "update", "name": string, "value": JsonValue }
+
+// Reply to a setWithAck or invoke with matching id.
+{ "type": "return", "id": string, "value": JsonValue }
+{ "type": "throw",  "id": string, "error": { "name": string, "message": string, "stack"?: string } }
+```
+
+- `update` is dispatched for every change event the producer-side shell observes, after applying the producer-side `getter`. The `name` MUST be one declared in `properties`.
+- `return` / `throw` MUST reference an `id` issued by a prior client message. The producer MAY emit only ONE of `return` or `throw` for any given `id`. Implementations SHOULD reject unknown `id`s with a logger warning rather than throwing — late replies after an abort are normal.
+- `capabilities.setAck === true` advertises that the producer honors `setWithAck`. Consumers that issued `setWithAck` calls before the `sync` response MUST reject all of them with a clear error if `setAck` is absent or `false`.
+
+### Undefined enumeration
+
+This rule mirrors core's `in`-operator initial-sync semantics across the wire. The producer-side shell computes the initial sync snapshot as follows for each declared property `name`:
+
+- If `name in core` is `false` → omit from `values`, do NOT list in `undefinedProperties`. The consumer MUST treat this as "property not present" and MUST NOT dispatch an initial-sync event for it. (Subsequent `update` messages still apply normally.)
+- If `name in core` is `true` AND `core[name] !== undefined` → emit `values[name] = core[name]`.
+- If `name in core` is `true` AND `core[name] === undefined` → omit from `values` (JSON cannot represent `undefined`), AND list the `name` in `undefinedProperties`. The consumer MUST dispatch an initial-sync event with `value === undefined` for every `name` in `undefinedProperties`.
+
+Producers MAY omit the `undefinedProperties` field entirely when no declared property is currently `undefined`. Consumers MUST treat a missing field as an empty list.
+
+Legacy compatibility: a producer that predates the `undefinedProperties` field will simply omit it. Consumers SHOULD treat a re-sync that omits a previously-cached property as a revert-to-`undefined` event, even without the explicit list, so that long-running connections do not drift.
+
+### `setWithAck` end-to-end
+
+```
+client                                producer
+  │── { type: "set", name, value,    │
+  │     id: "abc" }               ──►│  validate name ∈ inputs
+  │                                   │  isReservedRemoteName(name)? throw
+  │                                   │  try: core[name] = value
+  │                                   │     (Extension 1: MUST execute before ack)
+  │   ◄── { type: "return",       ── │  ack with value: undefined
+  │         id: "abc",                │
+  │         value: undefined }        │
+```
+
+If the assignment throws synchronously, the producer MUST send a `throw` with the same `id`. If `name` is not declared as an input, the producer MUST send a `throw` with `id` (NOT a silent drop), so the client's pending `Promise` rejects with a useful error.
+
+### `invoke` end-to-end
+
+```
+client                                producer
+  │── { type: "cmd", name, id,       │
+  │     args: [...] }              ─►│  validate name ∈ commands
+  │                                   │  result = core[name](...args)
+  │                                   │  if result instanceof Promise: await
+  │   ◄── { type: "return",       ── │  resolve with serialized return value
+  │         id, value: result }       │
+  │   ◄── { type: "throw",        ── │  or with serialized thrown error
+  │         id, error: { ... } }      │
+```
+
+The producer's return value (sync or eventual `Promise` resolution) MUST be JSON-serializable. Producers MAY choose to wrap thrown values in an explicit serializable shape; consumers MUST surface them as JavaScript `Error` instances at the proxy boundary (see Extension 1 § Error envelope).
+
+### Reserved names
+
+Implementations MAY reserve a small namespace of `name` values for protocol-internal use (e.g. the reference implementation reserves names beginning with `@wc-bindable/`). Reserved names in a declaration's `properties` / `inputs` / `commands` MUST be rejected at proxy construction time and MUST NOT generate wire traffic. This is a safety net so a typo or hostile declaration cannot silently shadow protocol-level messages.
+
+### Conformance summary
+
+A wire-format implementation conforms to this extension when:
+
+1. Every client message and server message matches one of the shapes above.
+2. The five design invariants (property-centric, getter-on-producer, JSON shape, FIFO, single-shell) hold.
+3. `setWithAck` resolves only after the JS-level assignment has executed on the producer side (Extension 1).
+4. The undefined-enumeration rule mirrors core's `in`-operator semantics.
+5. Reserved names are rejected at proxy construction.
+
+`@wc-bindable/remote` 0.7.x is the reference implementation; [packages/remote/README.md](packages/remote/README.md) documents its operational specifics (back-pressure caps, logger injection, transport adapter contract for `BroadcastChannel` / `MessagePort` / `Worker`).
 
 ---
 

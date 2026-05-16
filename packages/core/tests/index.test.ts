@@ -1,5 +1,11 @@
 import { describe, it, expect, vi } from "vitest";
-import { bind, isWcBindable, SUPPORTED_PROTOCOL_VERSION } from "../src/index.js";
+import {
+  bind,
+  isWcBindable,
+  getWcBindableDeclaration,
+  MIN_COMPATIBLE_VERSION,
+  SUPPORTED_PROTOCOL_VERSION,
+} from "../src/index.js";
 import type { WcBindableDeclaration } from "../src/index.js";
 
 function createBindableElement(decl: WcBindableDeclaration): HTMLElement {
@@ -41,9 +47,13 @@ describe("isWcBindable", () => {
   it("accepts future protocol versions (forward-compat)", () => {
     const el = createBindableElement({
       ...validDeclaration,
-      version: SUPPORTED_PROTOCOL_VERSION + 1,
+      version: MIN_COMPATIBLE_VERSION + 1,
     });
     expect(isWcBindable(el)).toBe(true);
+  });
+
+  it("exposes SUPPORTED_PROTOCOL_VERSION as a deprecated alias for MIN_COMPATIBLE_VERSION", () => {
+    expect(SUPPORTED_PROTOCOL_VERSION).toBe(MIN_COMPATIBLE_VERSION);
   });
 
   it("rejects versions below the adapter's supported version", () => {
@@ -60,6 +70,40 @@ describe("isWcBindable", () => {
       version: 1.5,
     });
     expect(isWcBindable(el)).toBe(false);
+  });
+});
+
+describe("getWcBindableDeclaration", () => {
+  it("returns the declaration for a valid target", () => {
+    const el = createBindableElement(validDeclaration);
+    const decl = getWcBindableDeclaration(el);
+    expect(decl?.protocol).toBe("wc-bindable");
+    expect(decl?.properties[0].name).toBe("value");
+  });
+
+  it("returns undefined for non-bindable targets", () => {
+    expect(getWcBindableDeclaration(document.createElement("div"))).toBeUndefined();
+  });
+
+  it("returns undefined when protocol mismatches", () => {
+    const el = createBindableElement({
+      ...validDeclaration,
+      protocol: "other" as "wc-bindable",
+    });
+    expect(getWcBindableDeclaration(el)).toBeUndefined();
+  });
+
+  it("returns undefined when version is below MIN_COMPATIBLE_VERSION", () => {
+    const el = createBindableElement({ ...validDeclaration, version: 0 });
+    expect(getWcBindableDeclaration(el)).toBeUndefined();
+  });
+
+  it("returns undefined when properties is not an array", () => {
+    const el = createBindableElement({
+      ...validDeclaration,
+      properties: "nope" as unknown as never,
+    });
+    expect(getWcBindableDeclaration(el)).toBeUndefined();
   });
 });
 
@@ -145,6 +189,26 @@ describe("bind", () => {
 
     expect(typeof unbind).toBe("function");
     unbind(); // should not throw
+    expect(onUpdate).not.toHaveBeenCalled();
+  });
+
+  it("treats a declaration with duplicate property names as invalid (no-op bind)", () => {
+    const el = createBindableElement({
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [
+        { name: "value", event: "test:value-changed" },
+        { name: "value", event: "test:value-other" }, // duplicate name
+      ],
+    });
+    (el as unknown as Record<string, unknown>).value = "x";
+    const onUpdate = vi.fn();
+
+    const unbind = bind(el, onUpdate);
+    el.dispatchEvent(new CustomEvent("test:value-changed", { detail: "y" }));
+    el.dispatchEvent(new CustomEvent("test:value-other", { detail: "z" }));
+    unbind();
+
     expect(onUpdate).not.toHaveBeenCalled();
   });
 
