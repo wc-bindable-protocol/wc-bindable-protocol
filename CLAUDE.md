@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 This is an npm workspaces monorepo. Run from the repository root unless noted.
 
 ```bash
-npm install                   # bootstrap all workspaces
+npm install --legacy-peer-deps  # bootstrap all workspaces (see note below)
 npm test                      # run vitest across the whole repo (excludes integration/)
 npm run test:watch            # vitest watch mode
 npm run test:coverage         # workspace-aggregated coverage
@@ -28,6 +28,8 @@ Remote integration tests (Playwright, real WebSocket — excluded from `npm test
 ```bash
 npm run test:integration --workspace @wc-bindable/remote
 ```
+
+`npm install` requires `--legacy-peer-deps`: `@qwik.dev/core@2.0.0-beta.35` declares a peer of `vitest@">=2 <4"`, but the repo is on `vitest@^4`. The conflict is benign for our test suite, but plain `npm install` will ERESOLVE-fail.
 
 ## Architecture
 
