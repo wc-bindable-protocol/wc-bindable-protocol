@@ -187,8 +187,8 @@ The normative transport adapter contract — the full set of invariants a `Clien
 A few practical reminders that flow from the spec:
 
 - **WebSocket** (per-connection) and `MessagePort` (per-port) satisfy FIFO out of the box.
-- **`BroadcastChannel`** does NOT in the general case — different receivers can observe different orderings under tab suspension / throttling; use it only when all peers are in the same realm.
-- Even on transports whose native channel could carry structured-clone values, the adapter MUST serialize at the boundary (e.g. `JSON.stringify` on send, `JSON.parse` on receive) so every transport presents the same lossy view to the proxy/shell.
+- **`BroadcastChannel` is NOT conformant by itself** — it is a fan-out channel by design, and different receivers can observe different orderings under tab suspension / throttling. A `BroadcastChannel`-based adapter is conformant **only if** it wraps the channel to provide single-producer / single-consumer / FIFO / no-fanout semantics on top (typically by negotiating a per-connection id and filtering messages by it). Raw `BroadcastChannel` passed directly to a proxy is out of contract.
+- Even on transports whose native channel could carry structured-clone values, the adapter MUST validate every value as `JsonValue` **before** serializing it at the boundary (see [SPEC-extensions.md § Transport adapter contract](../../SPEC-extensions.md) invariant 2). `JSON.stringify` alone is not validation — it silently coerces `NaN` / `Infinity` to `null` and drops embedded `undefined` / functions / symbols, so a value can survive serialization with corrupted shape.
 
 ### Back-pressure
 

@@ -7,14 +7,18 @@
 
 ## Overview
 
-`wc-bindable-protocol` is a minimal, framework-agnostic protocol that enables any object satisfying the EventTarget contract — in practice, classes that extend `EventTarget`, but also plain proxies and adapters that structurally provide the same methods — to declare its reactive properties so that any reactivity system (React, Vue, Svelte, etc.) can bind to them without framework-specific coupling. Optionally, components can also declare their input properties and commands, providing a complete interface description that enables tooling, documentation generation, and remote proxying.
+`wc-bindable-protocol` is a minimal, framework-agnostic protocol. A **producer target** — typically a class that extends `EventTarget` (e.g. an `HTMLElement` subclass) — declares its reactive properties, and any reactivity system (React, Vue, Svelte, etc.) can `bind()` to it as a **consumer-side bind target** without framework-specific coupling. Optionally, components can also declare their input properties and commands, providing a complete interface description that enables tooling, documentation generation, and remote proxying.
 
-The minimum requirement is `EventTarget` — any object that participates in the standard EventTarget contract can take part in the protocol. The capability requirement splits by role:
+The capability requirement is **role-specific**, and the two roles MUST be kept distinct in any conformance discussion:
 
-- **A producer** (a target that *emits* change events for its declared properties) MUST be able to `dispatchEvent` so consumers can observe its updates. In practice this means extending `EventTarget` or a subclass such as `HTMLElement`.
-- **A consumer-side bind target** (anything passed to `bind()` — including the producer above, a `RemoteCoreProxy`, a test double, or a thin wrapper that only relays events) MUST expose `addEventListener` and `removeEventListener` as functions. `dispatchEvent` is NOT required at the bind site itself; a wrapper that re-emits events through its own internal channel can omit it as long as listeners receive the right events.
+| Role | Required methods | Required to satisfy |
+|---|---|---|
+| **Producer target** (emits change events; the thing a component author writes) | `addEventListener`, `removeEventListener`, `dispatchEvent` | Full EventTarget contract |
+| **Consumer-side bind target** (anything passed to `bind()` — the producer, OR a remote proxy / test double / relay wrapper) | `addEventListener`, `removeEventListener` | Subset — `dispatchEvent` is NOT required |
 
-`getWcBindableDeclaration()` enforces the consumer-side bindability check (presence of `addEventListener` / `removeEventListener`) — see [§ Discovery API](#discovery-api). The producer-side `dispatchEvent` requirement is a contract on the component author, not something the discovery helper can verify from the consumer side.
+A producer is always also a valid consumer-side bind target (it has both), but a consumer-side bind target is NOT required to be a producer. A relay wrapper that re-emits events through its own internal channel without exposing `dispatchEvent` is a valid bind target as long as listeners receive the events.
+
+`getWcBindableDeclaration()` enforces the **consumer-side** bindability check (presence of `addEventListener` / `removeEventListener` only) — see [§ Discovery API](#discovery-api). The producer-side `dispatchEvent` requirement is a contract on the component author, not something the discovery helper can verify from the consumer side.
 
 `HTMLElement` (a subclass of `EventTarget`) is the most common implementation target, as it enables DOM integration and framework binding via refs, but it is not required. This means the protocol works equally well in non-browser runtimes (Node.js, Deno, Cloudflare Workers, etc.) where `EventTarget` is available.
 
@@ -24,7 +28,8 @@ The protocol requires no dependencies and relies solely on standard APIs: `stati
 
 ## Goals
 
-- Allow any object satisfying the EventTarget contract (an `EventTarget` subclass or a structural duck-type with compatible `addEventListener` / `removeEventListener` / `dispatchEvent` methods) to declare bindable properties once
+- Allow any producer target (an `EventTarget` subclass or a structural duck-type with `addEventListener` / `removeEventListener` / `dispatchEvent`) to declare bindable properties once
+- Allow any consumer-side bind target (anything with `addEventListener` / `removeEventListener`, including relay proxies that omit `dispatchEvent`) to be passed to `bind()`
 - Optionally allow declaration of input properties and commands for a complete interface description
 - Allow any reactivity system to consume those declarations without prior knowledge of the component
 - Remain zero-dependency and runtime-only
@@ -322,11 +327,15 @@ function getWcBindableDeclaration(target: unknown): WcBindableDeclaration | unde
 function isWcBindable(target: unknown): target is WcBindableTarget;
 
 /** Binding. `target` is typed `unknown` for the same reason the discovery
- *  helpers are: bind() MUST NOT throw on any input shape, and callers
- *  routinely pass values that include null/undefined (e.g.
- *  `document.querySelector()` returns `Element | null`). bind() routes the
- *  input through `getWcBindableDeclaration()` and returns a no-op cleanup
- *  for every non-bindable value. */
+ *  helpers are: bind() MUST NOT throw **merely because** the target is
+ *  null, undefined, non-bindable, or schema-invalid — callers routinely
+ *  pass values that include null (e.g. `document.querySelector()` returns
+ *  `Element | null`) and the helper absorbs them, returning a no-op
+ *  cleanup. Once a valid bindable target is accepted, however, errors
+ *  thrown during the synchronous initial sync (a property getter, an `in`
+ *  trap, or the consumer's `onUpdate`) DO propagate to the caller — after
+ *  the adapter has torn down every listener and observer it installed.
+ *  See § Teardown Contract for the cleanup-on-throw rule. */
 function bind(
   target: unknown,
   onUpdate: OnUpdate,

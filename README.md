@@ -1,6 +1,8 @@
 # wc-bindable-protocol
 
-A minimal, framework-agnostic protocol that enables any `EventTarget`-based object — including Web Components, headless cores running in Node / Deno / Workers, and remote proxies — to declare its reactive outputs (and optionally its input properties and commands) so that any reactivity system can bind to them without framework-specific coupling.
+**wc-bindable lets a component publish "these properties can be observed, and these events mean they changed" in one standard place** — and any reactivity system reads that same place to wire up bindings without per-component glue.
+
+The minimal, framework-agnostic protocol works for any `EventTarget`-based object — including Web Components, headless cores running in Node / Deno / Workers, and remote proxies — so the same declaration drives React, Vue, Svelte, Lit, plain `bind()` calls, and across-the-wire transport equally.
 
 The **core protocol has no runtime dependencies** — just `static` class fields and `CustomEvent`. Framework adapters depend only on their target framework (`@wc-bindable/react` on React, etc.); they do not pull in other frameworks.
 
@@ -36,7 +38,7 @@ const unbind = bind(el, (name, value) => {
 
 > **One thing that surprises first-time readers:** `bind()` performs an initial-value read immediately, before any event has fired. In the snippet above the `value` getter is exposed on the prototype (so `"value" in el` is `true`) but no one has assigned to it yet, so the first line that lands in the console is `value = undefined`. That is correct behavior — the protocol delivers "the current value, even if it is `undefined`" — and it goes away as soon as the component is given a starting value (via `el.value = ...`, attribute reflection, or in the constructor). Reading the [SPEC.md § Initial Value Synchronization](SPEC.md#initial-value-synchronization) makes the rule explicit.
 
-That's it. The framework adapters below (`@wc-bindable/react`, `@wc-bindable/vue`, ...) are 30–60 LOC wrappers that pipe the same `(name, value)` callbacks into their framework's reactivity primitive — they add no new protocol concepts.
+That's it. The framework adapters below (`@wc-bindable/react`, `@wc-bindable/vue`, ...) are typically small wrappers that pipe the same `(name, value)` callbacks into their framework's reactivity primitive — they add no new protocol concepts.
 
 ## Why?
 
@@ -69,6 +71,8 @@ class MyInput extends HTMLElement {
 Any framework adapter can then automatically bind to those properties — no manual wiring needed. The optional `inputs` and `commands` fields declare the component's input interface for tooling, documentation, and remote proxying — they do not create automatic two-way synchronization. The *behavioral* semantics of those fields (`set`, `invoke`, the `attribute` and `async` hints) are defined in [SPEC-extensions.md](SPEC-extensions.md) — the core protocol itself is read-only on `properties`.
 
 When the adapter binds to an element, it reads the current value of each declared property (using `name in target` so an explicitly-`undefined` value is still delivered) and then listens for subsequent change events. `bind()` returns an unbind function that removes every listener it registered; adapters re-expose this so consumers can tear down cleanly. For DOM elements that have not yet been connected when `bind()` is called, pass `{ syncOn: "connect" }` to defer the initial read until `connectedCallback` has run. Framework adapters that bind from a mounted-element lifecycle hook (React `useEffect`, Vue `onMounted`, Angular `AfterViewInit`, etc.) use the default `syncOn: "call"` because the host already guarantees the element is attached; the imperative binders this repository ships for VanJS / MobX / RxJS / Signals currently pass `syncOn: "connect"` internally so callers do not have to sequence `appendChild()` and `binder.bind(el)` manually. This is a guideline ([SPEC-extensions.md § Extension 3](SPEC-extensions.md) is informational, not normative); third-party adapters are free to make a different choice as long as it matches their binder shape.
+
+> **Prefer `syncOn: "call"` whenever the adapter can observe a mounted lifecycle.** `syncOn: "connect"` is a fallback for imperative light-DOM insertion only — it does NOT replace a proper lifecycle hook. It installs a document-wide `MutationObserver`, it does NOT traverse shadow roots (a target appended into a shadow tree never fires the deferred sync), and a large number of simultaneous deferred binds means a corresponding number of document observers. Treat the option as "I have no lifecycle hook on this path"; if you do have one, bind from inside it with the default and skip the deferred path entirely.
 
 > **Note — Shadow DOM caveat for `syncOn: "connect"`.** The deferred path is observed via a `MutationObserver` attached to the top-level `document`, which does NOT traverse shadow roots. A target appended into another element's shadow tree becomes `isConnected === true` without firing the observer, and the deferred initial sync never runs. `syncOn: "connect"` is intended for light-DOM imperative insertion. If your adapter owns the element lifecycle (any of the framework hooks listed above), bind from the mounted hook with the default `syncOn: "call"` instead. See [SPEC.md § Deferring the Initial Sync Until Connection](SPEC.md#deferring-the-initial-sync-until-connection) for the full caveat list.
 
