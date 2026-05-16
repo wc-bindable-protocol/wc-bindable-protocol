@@ -124,17 +124,27 @@ JavaScript allows throwing any value (`throw "oops"`, `throw null`, `throw { cod
 | An `Error` instance (or subclass) | `error.name \|\| "Error"` | safely stringified `error.message` (empty string is permitted; see safe-stringification rule below) | `error.stack` if present and the producer's trust-boundary policy permits transmission (see security note above) |
 | Any other value (string / number / boolean / null / plain object / etc.) | `"NonErrorThrow"` | safely stringified `thrownValue` — typically the value's default coercion (`String(null)` → `"null"`, `String({a:1})` → `"[object Object]"`, etc.) (see safe-stringification rule below) | Omitted (no stack exists for a non-Error throw) |
 
-**Safe-stringification rule.** Naive `String(v)` can itself throw — `String(Object.create(null))` raises because the null-prototype object has no `toString`, and hostile objects with throwing `toString` / `valueOf` / `Symbol.toPrimitive` traps can throw arbitrarily. The producer MUST shield the canonicalization step:
+**Safe-stringification rule.** Naive `String(v)` can itself throw — `String(Object.create(null))` raises because the null-prototype object has no `toString`, and hostile objects with throwing `toString` / `valueOf` / `Symbol.toPrimitive` traps can throw arbitrarily. The producer MUST shield the canonicalization step, **and the shield MUST cover the property read itself, not only the `String(...)` coercion**. A helper that accepts an already-read value does NOT protect against hostile getters: in `safeString(error.name)` the `error.name` read happens at the call site, before any try/catch inside the helper can run. The conformant pattern is to pass the read as a thunk:
 
 ```javascript
 // Reference safe-stringification used by both rows of the table above.
-function safeString(v) {
-  try { return String(v); }
-  catch { return "<unstringifiable thrown value>"; }
+// `read` is a thunk so the property access happens INSIDE the try/catch,
+// shielding the canonicalization step against hostile getters that throw.
+function safeStringFrom(read, fallback) {
+  try {
+    const s = String(read());
+    return s || fallback;
+  } catch {
+    return fallback;
+  }
 }
+
+const name    = safeStringFrom(() => error.name,    "Error");                       // Error row
+const message = safeStringFrom(() => error.message, "");                            // Error row
+const messageForNonError = safeStringFrom(() => thrownValue, "<unstringifiable thrown value>"); // non-Error row
 ```
 
-The fallback string `"<unstringifiable thrown value>"` is RECOMMENDED but not normative — implementations MAY choose a different sentinel as long as it is non-empty and clearly identifies the safe-stringification fallback. The same rule applies to `error.name` in the `Error` row (a subclass with a hostile `name` getter); the `|| "Error"` fallback then catches both an empty string and a thrown access.
+The fallback strings shown above (`"Error"`, `""`, `"<unstringifiable thrown value>"`) match the rows of the table above; implementations MAY choose different non-empty sentinels for the unstringifiable case as long as the chosen string clearly identifies the safe-stringification fallback. Implementations that prefer an inline `try { ... } catch` over the helper MUST still keep the property read inside the catch — wrapping only the `String(...)` call is non-conformant.
 
 The literal string `"NonErrorThrow"` is normative: consumers MAY pattern-match on it to distinguish thrown-non-Error from thrown-Error at the surface.
 
