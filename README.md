@@ -51,22 +51,22 @@ This protocol intentionally does **not** cover:
 |---|---|
 | [@wc-bindable/core](packages/core/) | Protocol type definitions, `bind()` utility, and `isWcBindable()` type guard |
 | [@wc-bindable/react](packages/react/) | React hook — `useWcBindable()` |
-| [@wc-bindable/vue](packages/vue/) | Vue composable — `useWcBindable()` |
-| [@wc-bindable/preact](packages/preact/) | Preact hook — `useWcBindable()` |
-| [@wc-bindable/svelte](packages/svelte/) | Svelte action — `use:wcBindable` |
+| [@wc-bindable/vue](packages/vue/) | Vue.js composable — `useWcBindable()` |
 | [@wc-bindable/angular](packages/angular/) | Angular directive — `wcBindable` |
-| [@wc-bindable/solid](packages/solid/) | Solid primitive — `createWcBindable()` / `use:wcBindable` |
+| [@wc-bindable/svelte](packages/svelte/) | Svelte action — `use:wcBindable` |
 | [@wc-bindable/alpine](packages/alpine/) | Alpine.js plugin — `x-wc-bindable` directive |
 | [@wc-bindable/lit](packages/lit/) | Lit ReactiveController — `WcBindableController` |
-| [@wc-bindable/qwik](packages/qwik/) | Qwik composable — `useWcBindable()` (Qwik 1.x; Qwik 2.x via `/v2`, experimental) |
-| [@wc-bindable/stencil](packages/stencil/) | Stencil controller — `WcBindableController` |
 | [@wc-bindable/marko](packages/marko/) | Marko helper — `wcBindable()` (Marko 5 + 6) |
-| [@wc-bindable/mithril](packages/mithril/) | Mithril helper — `wcBindable()` / `createWcBindable()` |
+| [@wc-bindable/mithril](packages/mithril/) | Mithril.js helper — `wcBindable()` / `createWcBindable()` |
+| [@wc-bindable/preact](packages/preact/) | Preact hook — `useWcBindable()` |
+| [@wc-bindable/qwik](packages/qwik/) | Qwik composable — `useWcBindable()` (Qwik 1.x; Qwik 2.x via `/v2`, experimental) |
 | [@wc-bindable/riot](packages/riot/) | Riot.js helper — `wcBindable()` / `createWcBindable()` |
+| [@wc-bindable/solid](packages/solid/) | SolidJS primitive — `createWcBindable()` / `use:wcBindable` |
+| [@wc-bindable/stencil](packages/stencil/) | Stencil controller — `WcBindableController` |
 | [@wc-bindable/vanjs](packages/vanjs/) | VanJS helper — `wcBindable()` / `createWcBindable()` |
-| [@wc-bindable/signals](packages/signals/) | TC39 Signals (`signal-polyfill`) helper — `wcBindable()` / `createWcBindable()` |
 | [@wc-bindable/mobx](packages/mobx/) | MobX helper — `wcBindable()` / `createWcBindable()` |
 | [@wc-bindable/rxjs](packages/rxjs/) | RxJS helper — `wcBindable()` / `createWcBindable()` (one `BehaviorSubject` per property) |
+| [@wc-bindable/signals](packages/signals/) | TC39 Signals (`signal-polyfill`) helper — `wcBindable()` / `createWcBindable()` |
 | [@wc-bindable/remote](packages/remote/) | Remote proxy — connect Core and Shell over a network via WebSocket or custom transport |
 
 ## Quick start
@@ -92,18 +92,7 @@ function App() {
 }
 ```
 
-### Preact
-
-```tsx
-import { useWcBindable } from "@wc-bindable/preact";
-
-function App() {
-  const [ref, values] = useWcBindable<HTMLElement, { value: string }>({ value: "" });
-  return <my-input ref={ref} />;
-}
-```
-
-### Vue
+### Vue.js
 
 ```vue
 <script setup lang="ts">
@@ -115,17 +104,6 @@ const { ref: inputRef, values } = useWcBindable<HTMLElement, { value: string }>(
   <my-input ref="inputRef" />
   <p>{{ values.value }}</p>
 </template>
-```
-
-### Svelte
-
-```svelte
-<script>
-import { wcBindable } from "@wc-bindable/svelte";
-let value = $state("");
-</script>
-
-<my-input use:wcBindable={{ onUpdate: (name, v) => { if (name === "value") value = v; } }} />
 ```
 
 ### Angular
@@ -140,15 +118,15 @@ export class AppComponent {
 }
 ```
 
-### Solid
+### Svelte
 
-```tsx
-import { createWcBindable } from "@wc-bindable/solid";
+```svelte
+<script>
+import { wcBindable } from "@wc-bindable/svelte";
+let value = $state("");
+</script>
 
-function App() {
-  const [values, directive] = createWcBindable();
-  return <my-input ref={directive} />;
-}
+<my-input use:wcBindable={{ onUpdate: (name, v) => { if (name === "value") value = v; } }} />
 ```
 
 ### Alpine.js
@@ -168,6 +146,67 @@ function App() {
 </div>
 ```
 
+### Lit
+
+```ts
+import { LitElement, html } from "lit";
+import { createRef, ref } from "lit/directives/ref.js";
+import { WcBindableController } from "@wc-bindable/lit";
+
+class App extends LitElement {
+  private inputRef = createRef<HTMLElement>();
+  private input = new WcBindableController<{ value: string }>(
+    this, () => this.inputRef.value, { value: "" });
+
+  render() {
+    return html`<my-input ${ref(this.inputRef)}></my-input>
+                <p>${this.input.values.value}</p>`;
+  }
+}
+```
+
+### Marko
+
+```marko
+import { wcBindable } from "@wc-bindable/marko";
+
+<let/state = { value: "" } />
+<my-input/inputEl />
+<lifecycle
+  onMount() { this.unbind = wcBindable(inputEl, (n, v) => state = { ...state, [n]: v }); }
+  onDestroy() { this.unbind?.(); }
+/>
+<output>${state.value}</output>
+```
+
+### Mithril.js
+
+```ts
+import m from "mithril";
+import { createWcBindable } from "@wc-bindable/mithril";
+
+const Form = () => {
+  const binder = createWcBindable<{ value: string }>({ value: "" });
+  return {
+    view: () => m("div", [
+      m("my-input", { oncreate: binder.oncreate, onremove: binder.onremove }),
+      m("p", `value: ${binder.values.value}`),
+    ]),
+  };
+};
+```
+
+### Preact
+
+```tsx
+import { useWcBindable } from "@wc-bindable/preact";
+
+function App() {
+  const [ref, values] = useWcBindable<HTMLElement, { value: string }>({ value: "" });
+  return <my-input ref={ref} />;
+}
+```
+
 ### Qwik
 
 ```tsx
@@ -185,22 +224,33 @@ export const App = component$(() => {
 });
 ```
 
-### Lit
+### Riot.js
 
-```ts
-import { LitElement, html } from "lit";
-import { createRef, ref } from "lit/directives/ref.js";
-import { WcBindableController } from "@wc-bindable/lit";
+```html
+<my-form>
+  <my-input></my-input>
+  <p>value: { binder.values.value }</p>
 
-class App extends LitElement {
-  private inputRef = createRef<HTMLElement>();
-  private input = new WcBindableController<{ value: string }>(
-    this, () => this.inputRef.value, { value: "" });
+  <script>
+    import { createWcBindable } from "@wc-bindable/riot";
+    export default {
+      onBeforeMount() {
+        this.binder = createWcBindable({ value: "" }, { update: () => this.update() });
+      },
+      onMounted() { this.binder.bind(this.$("my-input")); },
+    };
+  </script>
+</my-form>
+```
 
-  render() {
-    return html`<my-input ${ref(this.inputRef)}></my-input>
-                <p>${this.input.values.value}</p>`;
-  }
+### SolidJS
+
+```tsx
+import { createWcBindable } from "@wc-bindable/solid";
+
+function App() {
+  const [values, directive] = createWcBindable();
+  return <my-input ref={directive} />;
 }
 ```
 
@@ -229,6 +279,63 @@ export class MyApp {
     );
   }
 }
+```
+
+### VanJS
+
+```ts
+import van from "vanjs-core";
+import { createWcBindable } from "@wc-bindable/vanjs";
+
+const binder = createWcBindable<{ count: number }>({ count: 0 });
+const el = document.createElement("my-counter");
+// Defer bind() until after van.add() has connected the element so the
+// initial-sync read sees post-connectedCallback() values.
+queueMicrotask(() => binder.bind(el));
+
+van.add(document.body, el, van.tags.p(() => `count: ${binder.states.count.val}`));
+```
+
+### MobX
+
+```ts
+import { autorun } from "mobx";
+import { createWcBindable } from "@wc-bindable/mobx";
+
+const binder = createWcBindable<{ count: number }>({ count: 0 });
+const el = document.createElement("my-counter");
+document.body.appendChild(el);
+binder.bind(el); // bind AFTER append so initial-sync sees post-connect values
+
+autorun(() => console.log(`count: ${binder.state.count}`));
+```
+
+### RxJS
+
+```ts
+import { createWcBindable } from "@wc-bindable/rxjs";
+
+const binder = createWcBindable<{ count: number }>({ count: 0 });
+const el = document.createElement("my-counter");
+document.body.appendChild(el);
+binder.bind(el); // bind AFTER append so initial-sync sees post-connect values
+
+binder.subjects.count.subscribe((count) => console.log(`count: ${count}`));
+```
+
+### TC39 Signals
+
+```ts
+import { Signal } from "signal-polyfill";
+import { createWcBindable } from "@wc-bindable/signals";
+
+const binder = createWcBindable<{ count: number }>({ count: 0 });
+const el = document.createElement("my-counter");
+document.body.appendChild(el);
+binder.bind(el); // bind AFTER append so initial-sync sees post-connect values
+
+const view = new Signal.Computed(() => `count: ${binder.signals.count.get()}`);
+// observe `view` via Signal.subtle.Watcher to drive rendering
 ```
 
 ### Remote (extracting Core to a server)
