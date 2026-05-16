@@ -54,7 +54,7 @@ class MyFetchCore extends EventTarget {
 
 This form works in any runtime that provides `EventTarget` and `CustomEvent` (browsers, Node.js, Deno, Cloudflare Workers, etc.).
 
-The `inputs` and `commands` fields are optional. When present, they declare the component's input interface — settable properties and callable methods — enabling tooling, documentation generation, and remote proxying. They do **not** create any implicit data flow; the consumer is responsible for explicitly setting properties and invoking methods.
+The `inputs` and `commands` fields are optional. When present, they declare the component's input interface — settable properties and callable methods — enabling tooling, documentation generation, and remote proxying. They do **not** create any implicit data flow; the consumer is responsible for explicitly setting properties and invoking methods. The semantics for *how* a consumer sets inputs and invokes commands (delivery guarantees, error handling, the role of `attribute` / `async`) are described in [SPEC-extensions.md](SPEC-extensions.md) — the core protocol itself does not interpret these fields.
 
 ### Web Component (HTMLElement)
 
@@ -88,7 +88,7 @@ class MyInput extends HTMLElement {
 
 `HTMLElement` extends `EventTarget`, so Web Components are fully compatible. This form is required when the component needs to be mounted in the DOM and accessed via framework refs.
 
-When declaring inputs for a Shell (HTMLElement), the optional `attribute` field indicates the corresponding HTML attribute. This information can be used by tooling to map between property assignment and attribute reflection.
+When declaring inputs for a Shell (HTMLElement), the optional `attribute` field indicates the corresponding HTML attribute. This information is purely declarative — see [SPEC-extensions.md](SPEC-extensions.md) for how tooling can use it.
 
 ---
 
@@ -99,10 +99,12 @@ When declaring inputs for a Shell (HTMLElement), the optional `attribute` field 
 | Field        | Type     | Required | Description                          |
 |--------------|----------|----------|--------------------------------------|
 | `protocol`   | `string` | ✅       | Must be `"wc-bindable"`              |
-| `version`    | `number` | ✅       | Must be integer `1`                  |
+| `version`    | `number` | ✅       | Integer `>= 1`. See [Versioning](#versioning). |
 | `properties` | `array`  | ✅       | List of bindable property descriptors |
-| `inputs`     | `array`  | ❌       | List of input property descriptors    |
-| `commands`   | `array`  | ❌       | List of command descriptors           |
+| `inputs`     | `array`  | ❌       | List of input property descriptors (see [SPEC-extensions.md](SPEC-extensions.md)) |
+| `commands`   | `array`  | ❌       | List of command descriptors (see [SPEC-extensions.md](SPEC-extensions.md)) |
+
+Adapters **MUST** ignore unknown top-level fields. Future versions of this specification may add new optional root keys; older adapters that do not recognize them must still bind successfully to `properties`.
 
 ### Property Descriptor
 
@@ -112,19 +114,27 @@ When declaring inputs for a Shell (HTMLElement), the optional `attribute` field 
 | `event`  | `string`   | ✅       | The CustomEvent name dispatched when the property changes |
 | `getter` | `function` | ❌       | Extracts the new value from the event. Defaults to `e => e.detail` |
 
+Within a single `properties` array, every `name` MUST be unique. Behavior is undefined if duplicate names appear. Multiple property descriptors MAY share the same `event` name — adapters dispatch each one independently. The same `name` MAY appear in both `properties` (as an observable output) and `inputs` (as a settable input); this is a common pattern for two-way-bindable values (e.g. `value`).
+
+Adapters **MUST** ignore unknown fields on a property descriptor.
+
 ### Input Descriptor
 
 | Field       | Type     | Required | Description                                          |
 |-------------|----------|----------|------------------------------------------------------|
 | `name`      | `string` | ✅       | The settable property name on the target             |
-| `attribute` | `string` | ❌       | The corresponding HTML attribute name (Shell only)   |
+| `attribute` | `string` | ❌       | Declarative hint, see [SPEC-extensions.md](SPEC-extensions.md). Not interpreted by core. |
+
+Within `inputs`, every `name` MUST be unique. Adapters **MUST** ignore unknown fields on an input descriptor.
 
 ### Command Descriptor
 
 | Field   | Type      | Required | Description                                            |
 |---------|-----------|----------|--------------------------------------------------------|
 | `name`  | `string`  | ✅       | The method name on the target                          |
-| `async` | `boolean` | ❌       | Whether the method returns a Promise. Defaults to `false` |
+| `async` | `boolean` | ❌       | Declarative hint, see [SPEC-extensions.md](SPEC-extensions.md). Not interpreted by core. |
+
+Within `commands`, every `name` MUST be unique. Adapters **MUST** ignore unknown fields on a command descriptor.
 
 ---
 
@@ -178,47 +188,117 @@ getter: (e) => e.target.value
 A reactivity system that supports this protocol should:
 
 1. Read `target.constructor.wcBindable`
-2. Verify `protocol === "wc-bindable"` and `version === 1`
+2. Verify `protocol === "wc-bindable"` and `version >= SUPPORTED_VERSION` (see [Versioning](#versioning))
 3. For each property descriptor:
-   a. Read the current value of `target[prop.name]` — if it is not `undefined`, deliver it to the consumer immediately (initial value synchronization)
-   b. Attach an event listener for subsequent changes
+   a. Attach an event listener for subsequent changes
+   b. Perform the initial-value synchronization (see below)
+4. Return a function that removes every listener registered above (the **teardown contract**, see below)
 
 The `target` parameter accepts any `EventTarget` — this includes `HTMLElement` instances as well as headless `EventTarget` subclasses.
 
 ```javascript
 const DEFAULT_GETTER = (e) => e.detail;
+const SUPPORTED_VERSION = 1;
 
-function bind(target, onUpdate) {
-  const { protocol, version, properties } = target.constructor.wcBindable;
+// DOM globals are referenced through these locals so that the reference
+// implementation runs unmodified in headless runtimes (Node, Deno,
+// Workers) where `HTMLElement` / `document` / `MutationObserver` are not
+// defined as globals. In a headless runtime all three are `undefined`,
+// `syncOn: "connect"` silently falls back to the synchronous `"call"`
+// path, and only `EventTarget`-based targets are touched.
+const HTMLElementCtor = typeof HTMLElement !== "undefined" ? HTMLElement : undefined;
+const documentRef = typeof document !== "undefined" ? document : undefined;
+const MutationObserverCtor =
+  typeof MutationObserver !== "undefined" ? MutationObserver : undefined;
 
-  if (protocol !== "wc-bindable" || version !== 1) return;
+function bind(target, onUpdate, options) {
+  const decl = target.constructor.wcBindable;
+  if (decl?.protocol !== "wc-bindable") return () => {};
+  if (!Number.isInteger(decl.version) || decl.version < SUPPORTED_VERSION) return () => {};
 
-  for (const prop of properties) {
+  const cleanups = [];
+  for (const prop of decl.properties) {
     const getter = prop.getter ?? DEFAULT_GETTER;
-    target.addEventListener(prop.event, (event) => {
-      onUpdate(prop.name, getter(event));
-    });
-
-    // Initial value synchronization
-    const current = target[prop.name];
-    if (current !== undefined) {
-      onUpdate(prop.name, current);
-    }
+    const handler = (event) => onUpdate(prop.name, getter(event));
+    target.addEventListener(prop.event, handler);
+    cleanups.push(() => target.removeEventListener(prop.event, handler));
   }
+
+  // Initial value synchronization — use `in` so that an explicitly-undefined
+  // property is still reported on first sync.
+  const initialSync = () => {
+    for (const prop of decl.properties) {
+      if (prop.name in target) onUpdate(prop.name, target[prop.name]);
+    }
+  };
+
+  const syncOn = options?.syncOn ?? "call";
+  const canDefer =
+    syncOn === "connect" &&
+    HTMLElementCtor !== undefined &&
+    target instanceof HTMLElementCtor &&
+    !target.isConnected &&
+    documentRef !== undefined &&
+    MutationObserverCtor !== undefined;
+
+  if (canDefer) {
+    const observer = new MutationObserverCtor(() => {
+      if (target.isConnected) { observer.disconnect(); initialSync(); }
+    });
+    observer.observe(documentRef, { childList: true, subtree: true });
+    cleanups.push(() => observer.disconnect());
+  } else {
+    initialSync();
+  }
+
+  return () => cleanups.forEach((fn) => fn());
 }
 ```
 
+### Teardown Contract
+
+`bind()` **MUST** return a function that, when called, removes every event listener (and any other resource — e.g. `MutationObserver`) the adapter installed during the call. This applies whether or not the target was actually bindable: a no-op cleanup function (`() => {}`) is the correct return value for non-`wc-bindable` targets.
+
+Long-lived headless `Core` instances may outlive multiple consumers; without an explicit teardown contract, listener leaks are guaranteed. Component-side `disconnectedCallback` cannot be relied on because headless Cores have no DOM lifecycle, and Web Components bound via framework refs may be reattached.
+
 ### Initial Value Synchronization
 
-Initial value synchronization is a **required** part of the protocol (not merely an adapter implementation suggestion). Adapters **must** read `target[prop.name]` at bind time for each declared property. If the value is not `undefined`, the adapter delivers it to the consumer immediately — before any events fire.
+Initial value synchronization is a **required** part of the protocol (not merely an adapter implementation suggestion). For each declared property at bind time:
 
-This ensures that targets whose properties are set before the adapter binds (e.g., server-rendered attributes, programmatic initialization) are correctly reflected in the consuming framework's state from the start.
+- If `prop.name in target` is `true`, the adapter **MUST** read `target[prop.name]` and deliver the value (including when it is `undefined`) to the consumer immediately, before any events fire.
+- If `prop.name in target` is `false` (the property does not exist on the target), the adapter **MUST** skip the initial synchronization for that property. This is not an error.
 
-Component authors **should** ensure that the property named in `name` is readable on the target instance and reflects the current state at any point in time.
+The `in` operator is mandated specifically so that `undefined` can be distinguished from "property not declared on target". An earlier revision of this spec used `target[prop.name] !== undefined` as the gate; that gate cannot deliver a legitimately-`undefined` initial value, and is now superseded.
+
+Component authors **should** ensure that every `name` in the declaration corresponds to a readable property on the target instance.
+
+#### Deferring the Initial Sync Until Connection
+
+When `target` is an `HTMLElement` and `bind()` is called before the element has been inserted into a document (so `connectedCallback` has not yet run), reading properties synchronously may observe pre-connection state. To address this, `bind()` accepts an optional third argument:
+
+```typescript
+bind(target, onUpdate, { syncOn: "connect" })
+```
+
+- `syncOn: "call"` (default): perform the initial sync synchronously inside `bind()`. Backward-compatible behavior.
+- `syncOn: "connect"`: if the target is an `HTMLElement` that is not yet connected, defer the initial sync until the element becomes connected. The reference implementation observes the top-level `document` via a `MutationObserver`. For headless `EventTarget`s and already-connected elements, behaves like `"call"`. The DOM globals (`HTMLElement`, `document`, `MutationObserver`) are referenced through `typeof` guards so that the reference implementation runs unmodified in non-browser runtimes where these globals are undefined — in that case `syncOn: "connect"` silently falls back to the `"call"` path.
+
+The returned unbind function tears down the `MutationObserver` as well, so cancelling a deferred bind is safe.
+
+> **Shadow DOM limitation.** A `MutationObserver` attached to `document` with `subtree: true` does **not** traverse shadow roots, so a target that is appended into another element's shadow tree will have `target.isConnected === true` without firing the observer — the deferred initial sync never runs. This is a structural limitation of `MutationObserver`, not a bug. Adapters that **own** the element (i.e. hold a ref to it via a framework lifecycle hook such as React `useEffect`, Vue `onMounted`, Stencil `componentDidLoad`, or a custom element's own `connectedCallback`) **SHOULD** call `bind(target, onUpdate)` (with the default `syncOn: "call"`) from inside that hook rather than relying on `syncOn: "connect"`. The deferred path is intended for callers who construct elements imperatively and append them into the light DOM in a separate step (e.g. the VanJS / MobX / RxJS / Signals binder pattern). Adapters that deferred-bind a large number of elements simultaneously should also be aware that each deferred bind installs one document-wide observer.
 
 ### Repeated Events for the Same Property
 
 When a component dispatches the same event multiple times, the adapter calls `onUpdate` for each occurrence. There is no batching, deduplication, or equality check — every event produces a callback. Consumers that need deduplication (e.g., skipping no-op re-renders) are responsible for implementing it on their side.
+
+### Event detail vs Property Read
+
+The protocol uses two independent reads of the property value:
+
+- **Initial sync** reads `target[prop.name]` directly.
+- **Subsequent updates** read `getter(event)`, defaulting to `event.detail`.
+
+The two **SHOULD** be kept in agreement by the component author. If they diverge (e.g. a `detail` payload differs from the current property value), the **event payload is authoritative** — adapters do not re-read the property after an event fires. Component authors who cannot guarantee parity should derive `detail` from the property at dispatch time.
 
 ### Getter Errors
 
@@ -226,16 +306,19 @@ If a `getter` function throws during event handling, the adapter **must not** sw
 
 Adapters **should not** wrap getter calls in try/catch unless they re-throw the error after performing cleanup.
 
-### Undeclared or Missing Properties
+---
 
-The `name` field in a property descriptor serves two purposes:
+## Versioning
 
-1. It is passed to `onUpdate` as the property identifier.
-2. It is used to read `target[name]` for initial value synchronization.
+The protocol version is an integer. Future versions **MUST** remain backward-compatible at the `properties` binding contract level:
 
-If `target[name]` is `undefined` at bind time (including when the property does not exist on the target), the adapter simply skips the initial synchronization for that property. This is not an error — the adapter proceeds normally and will still listen for the declared event.
+- An adapter built for version `N` **MUST** accept any declaration whose `version` is `>= N`.
+- New optional fields (on the root, on property/input/command descriptors, or new root-level keys entirely) may be added in later versions. Older adapters **MUST** ignore fields they do not recognize.
+- Breaking changes to the `properties` binding contract (the shape of property descriptors, the meaning of `event` / `getter`, the initial-sync rule, the teardown contract) require a new `protocol` identifier (e.g. `"wc-bindable-2"`), **not** a version bump. This guarantees that a v1 adapter never silently misinterprets a future declaration.
 
-Component authors **should** ensure that every `name` in the declaration corresponds to a readable property on the target instance. However, adapters **must not** throw or warn if the property is absent.
+| Version | Status  | Notes            |
+|---------|---------|------------------|
+| `1`     | ✅ Current | Initial specification. Required: `protocol`, `version`, `properties`. Optional: `inputs`, `commands`. Initial sync uses `in` operator. `bind()` returns an unbind function. |
 
 ---
 
@@ -295,14 +378,11 @@ The type declaration is a **recommendation**, not a requirement. Components with
 
 ---
 
-## Versioning
+## Trust Boundaries
 
-The protocol version is an integer. Breaking changes increment the version.  
-Adapters should check the version field before binding.
+The protocol assumes the `target` is trusted by the consumer: `getter` is an arbitrary function executed in the consumer's JavaScript context every time an event fires. Components should not declare a `getter` that performs anything other than pure extraction of the new value from the event.
 
-| Version | Status  | Notes            |
-|---------|---------|------------------|
-| `1`     | ✅ Current | Initial specification |
+When the protocol is proxied across a trust boundary (for example, `@wc-bindable/remote`, which connects a server-side Core to a client-side proxy), the `getter` cannot be transported as code — it is applied on the trusted side and only the extracted value crosses the wire. Implementations that bridge trust boundaries **MUST** document how `getter`, `set`, and `invoke` are translated; see [SPEC-extensions.md](SPEC-extensions.md) for one such treatment.
 
 ---
 
@@ -319,6 +399,9 @@ Functions (getters) cannot be expressed in JSON. A `static` field keeps everythi
 
 **Why are `inputs` and `commands` optional?**
 The protocol's primary purpose is reactive property binding (`properties`). The `inputs` and `commands` fields are an opt-in extension for components that wish to declare their full interface — for example, to enable remote proxying, tooling, or documentation generation. Components that only need one-way state observation can omit them entirely. Importantly, these fields are purely declarative — they do not create any automatic two-way synchronization between the component and the framework.
+
+**Why doesn't `bind()` interpret `inputs` and `commands` directly?**
+Doing so would require the core to take a position on call semantics (synchronous? batched? acked? error-mapped?) that varies wildly across runtimes. The core stays small by reading only `properties`; downstream specs build call semantics on top — see [SPEC-extensions.md](SPEC-extensions.md).
 
 **Is this a W3C standard?**
 No. This is a community protocol. Any EventTarget-based class or framework can adopt it independently.

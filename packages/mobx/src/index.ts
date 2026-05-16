@@ -41,11 +41,14 @@ export function createWcBindable<V extends object = Record<string, unknown>>(
         unbindFn = null;
       }
       if (!isWcBindable(el)) return;
+      // syncOn: "connect" defers the initial-value read until the element is
+      // attached to the document so users do not have to sequence
+      // bind() after appendChild() manually.
       unbindFn = bind(el, (name, value) => {
         runInAction(() => {
           set(state, name, value);
         });
-      });
+      }, { syncOn: "connect" });
     },
     unbind() {
       if (unbindFn) {

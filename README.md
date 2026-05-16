@@ -32,9 +32,9 @@ class MyInput extends HTMLElement {
 }
 ```
 
-Any framework adapter can then automatically bind to those properties — no manual wiring needed. The optional `inputs` and `commands` fields declare the component's input interface for tooling, documentation, and remote proxying — they do not create automatic two-way synchronization.
+Any framework adapter can then automatically bind to those properties — no manual wiring needed. The optional `inputs` and `commands` fields declare the component's input interface for tooling, documentation, and remote proxying — they do not create automatic two-way synchronization. The *behavioral* semantics of those fields (`set`, `invoke`, the `attribute` and `async` hints) are defined in [SPEC-extensions.md](SPEC-extensions.md) — the core protocol itself is read-only on `properties`.
 
-When the adapter binds to an element, it reads the current value of each declared property for initial synchronization, then listens for subsequent change events. This means your framework state is populated immediately, even if the component was initialized before binding.
+When the adapter binds to an element, it reads the current value of each declared property (using `name in target` so an explicitly-`undefined` value is still delivered) and then listens for subsequent change events. `bind()` returns an unbind function that removes every listener it registered; adapters re-expose this so consumers can tear down cleanly. For DOM elements that have not yet been connected when `bind()` is called, pass `{ syncOn: "connect" }` to defer the initial read until `connectedCallback` has run — most framework adapters do this for you.
 
 ## Non-goals
 
@@ -289,9 +289,7 @@ import { createWcBindable } from "@wc-bindable/vanjs";
 
 const binder = createWcBindable<{ count: number }>({ count: 0 });
 const el = document.createElement("my-counter");
-// Defer bind() until after van.add() has connected the element so the
-// initial-sync read sees post-connectedCallback() values.
-queueMicrotask(() => binder.bind(el));
+binder.bind(el); // initial-sync is deferred until the element is connected
 
 van.add(document.body, el, van.tags.p(() => `count: ${binder.states.count.val}`));
 ```
@@ -304,8 +302,8 @@ import { createWcBindable } from "@wc-bindable/mobx";
 
 const binder = createWcBindable<{ count: number }>({ count: 0 });
 const el = document.createElement("my-counter");
+binder.bind(el); // initial-sync is deferred until the element is connected
 document.body.appendChild(el);
-binder.bind(el); // bind AFTER append so initial-sync sees post-connect values
 
 autorun(() => console.log(`count: ${binder.state.count}`));
 ```
@@ -317,8 +315,8 @@ import { createWcBindable } from "@wc-bindable/rxjs";
 
 const binder = createWcBindable<{ count: number }>({ count: 0 });
 const el = document.createElement("my-counter");
+binder.bind(el); // initial-sync is deferred until the element is connected
 document.body.appendChild(el);
-binder.bind(el); // bind AFTER append so initial-sync sees post-connect values
 
 binder.subjects.count.subscribe((count) => console.log(`count: ${count}`));
 ```
@@ -331,8 +329,8 @@ import { createWcBindable } from "@wc-bindable/signals";
 
 const binder = createWcBindable<{ count: number }>({ count: 0 });
 const el = document.createElement("my-counter");
+binder.bind(el); // initial-sync is deferred until the element is connected
 document.body.appendChild(el);
-binder.bind(el); // bind AFTER append so initial-sync sees post-connect values
 
 const view = new Signal.Computed(() => `count: ${binder.signals.count.get()}`);
 // observe `view` via Signal.subtle.Watcher to drive rendering
@@ -365,6 +363,10 @@ bind(proxy, (name, value) => {
 
 proxy.set("url", "/api/users");
 const result = await proxy.invoke("fetch");
+// The WebSocket transport preserves message order, so `fetch` always
+// observes `url = "/api/users"`. On a transport that does not guarantee
+// order, sequence with `await proxy.setWithAck("url", ...)` first — see
+// SPEC-extensions.md § Call-order preservation.
 ```
 
 ## Examples
