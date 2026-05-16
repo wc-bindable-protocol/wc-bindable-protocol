@@ -41,6 +41,8 @@
     "lit": "^3.3.2",
     "marko": "^5.38.39",
     "@marko/vite": "5.4.10",
+    "mithril": "^2.3.8",
+    "@types/mithril": "^2.2.8",
     "preact": "^10.26.9",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
