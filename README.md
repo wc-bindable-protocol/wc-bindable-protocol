@@ -91,7 +91,7 @@ This protocol intentionally does **not** cover:
 
 | Package | Description |
 |---|---|
-| [@wc-bindable/core](packages/core/) | Protocol type definitions, `bind()` utility, and `isWcBindable()` type guard |
+| [@wc-bindable/core](packages/core/) | Protocol type definitions, `bind()` utility, `getWcBindableDeclaration()` and `isWcBindable()` discovery primitives |
 | [@wc-bindable/react](packages/react/) | React hook — `useWcBindable()` |
 | [@wc-bindable/vue](packages/vue/) | Vue.js composable — `useWcBindable()` |
 | [@wc-bindable/angular](packages/angular/) | Angular directive — `wcBindable` |

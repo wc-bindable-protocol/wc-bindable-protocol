@@ -39,6 +39,8 @@ class MyFetchCore extends EventTarget {
     properties: [
       { name: "value",   event: "my-fetch:value-changed" },
       { name: "loading", event: "my-fetch:loading-changed" },
+      { name: "error",   event: "my-fetch:error-changed" },
+      { name: "status",  event: "my-fetch:status-changed" },
     ],
     inputs: [
       { name: "url" },
@@ -51,6 +53,8 @@ class MyFetchCore extends EventTarget {
   };
 }
 ```
+
+The four properties above match the `MyFetchValues` interface used later in § Adapter Usage and the README's "exposes value, loading, error, and status" description — `properties[]` MUST enumerate every observable output that consumers will receive via `bind()` `onUpdate` and read from the corresponding `Values` interface.
 
 This form works in any runtime that provides `EventTarget` and `CustomEvent` (browsers, Node.js, Deno, Cloudflare Workers, etc.).
 
@@ -116,7 +120,7 @@ When `inputs` or `commands` is absent (`undefined`), consumers **MUST** treat it
 | `event`  | `string`   | ✅       | The CustomEvent name dispatched when the property changes |
 | `getter` | `function` | ❌       | Extracts the new value from the event. Defaults to `e => e.detail` |
 
-Within a single `properties` array, every `name` MUST be unique. A declaration that violates this rule is **invalid**: adapters MUST treat such a target as non-bindable (`bind()` returns its no-op cleanup, `isWcBindable()` MAY return `false` if the adapter checks; at minimum, no event listeners are installed). Adapters MAY warn or throw in development mode. Multiple property descriptors MAY share the same `event` name — adapters dispatch each one independently. The same `name` MAY appear in both `properties` (as an observable output) and `inputs` (as a settable input); this is a common pattern for two-way-bindable values (e.g. `value`).
+Within a single `properties` array, every `name` MUST be unique. A declaration that violates this rule is **invalid**: adapters MUST treat such a target as non-bindable. Per § Discovery API, `getWcBindableDeclaration()` MUST return `undefined` and `isWcBindable()` MUST return `false` for this case — the two helpers and `bind()` agree by construction. Adapters MAY additionally warn or throw in development mode. Multiple property descriptors MAY share the same `event` name — adapters dispatch each one independently. The same `name` MAY appear in both `properties` (as an observable output) and `inputs` (as a settable input); this is a common pattern for two-way-bindable values (e.g. `value`).
 
 An empty `properties: []` is **valid**: it describes a target that exposes no observable outputs (e.g. a command-only headless service whose surface is entirely in `commands`). `bind()` on such a target installs no listeners, performs no initial sync, and returns a no-op cleanup — this is a successful bind, not a non-bindable rejection.
 
@@ -129,7 +133,7 @@ Adapters **MUST** ignore unknown fields on a property descriptor.
 | `name`      | `string` | ✅       | The settable property name on the target             |
 | `attribute` | `string` | ❌       | Declarative hint, see [SPEC-extensions.md](SPEC-extensions.md). Not interpreted by core. |
 
-Within `inputs`, every `name` MUST be unique. Duplicate names make the declaration **invalid** under the same rule given for properties above. Adapters **MUST** ignore unknown fields on an input descriptor.
+Within `inputs`, every `name` MUST be unique. Duplicate names make the declaration **invalid** under the same rule given for properties above (`getWcBindableDeclaration()` MUST return `undefined`; `isWcBindable()` MUST return `false`). Adapters **MUST** ignore unknown fields on an input descriptor.
 
 ### Command Descriptor
 
@@ -138,7 +142,7 @@ Within `inputs`, every `name` MUST be unique. Duplicate names make the declarati
 | `name`  | `string`  | ✅       | The method name on the target                          |
 | `async` | `boolean` | ❌       | Declarative hint, see [SPEC-extensions.md](SPEC-extensions.md). Not interpreted by core. |
 
-Within `commands`, every `name` MUST be unique. Duplicate names make the declaration **invalid** under the same rule given for properties above. Adapters **MUST** ignore unknown fields on a command descriptor.
+Within `commands`, every `name` MUST be unique. Duplicate names make the declaration **invalid** under the same rule given for properties above (`getWcBindableDeclaration()` MUST return `undefined`; `isWcBindable()` MUST return `false`). Adapters **MUST** ignore unknown fields on a command descriptor.
 
 ---
 
@@ -149,7 +153,10 @@ Protocol detection (`isWcBindable(target)`) and binding (`bind(target, ...)`) bo
 Any object an adapter is asked to bind against MUST therefore expose a `constructor` whose `wcBindable` property satisfies the [Schema](#schema):
 
 - A plain class that defines `static wcBindable = { ... }` satisfies this automatically — JavaScript's `instance.constructor` already references the class object.
-- A **wrapper or proxy** that stands in for a real `EventTarget` (for example, a `Proxy`-wrapped object whose `get`/`set` traps route to a remote Core, or a test double) MUST expose an `equivalent` `constructor.wcBindable` declaration. "Equivalent" means: same `protocol`, the same `version` integer as the wrapped target (the [Versioning](#versioning) policy guarantees every adapter accepts every `version >= 1`, so wrappers do not need a version-matching step), same `properties` (including `event` names and `getter` semantics observable on the wrapper), and — when [SPEC-extensions.md § Extension 1](SPEC-extensions.md) is in use — the same `inputs` and `commands` membership as the wrapped target. Wrappers MAY rewrite `event` names internally (the `@wc-bindable/remote` `RemoteCoreProxy` uses synthetic per-property event names to disambiguate properties sharing a Core-side event), but the declaration the consumer reads via `target.constructor.wcBindable` MUST describe the events the wrapper actually dispatches, not the events the wrapped target dispatches.
+- A **wrapper or proxy** that stands in for a real `EventTarget` (for example, a `Proxy`-wrapped object whose `get`/`set` traps route to a remote Core, or a test double) MUST expose an `equivalent` `constructor.wcBindable` declaration — where "equivalent" means **observation-equivalent at the wrapper**, NOT byte-equal to the wrapped target's declaration. Specifically:
+
+  - The declaration the consumer reads via `target.constructor.wcBindable` MUST describe what the wrapper **actually** dispatches and exposes, not what the wrapped target dispatches and exposes. In particular, wrappers MAY (and often MUST) rewrite `event` names internally — the `@wc-bindable/remote` `RemoteCoreProxy` uses synthetic per-property event names like `@wc-bindable/remote:value` to disambiguate properties that shared a Core-side event. The wire layer translates between the two name spaces; the consumer sees only the wrapper's space.
+  - Required equivalences: same `protocol`; same `version` integer as the wrapped target (the [Versioning](#versioning) policy guarantees every adapter accepts every `version >= 1`, so wrappers do not need a version-matching step); same set of `name`s in `properties`; observable `getter` semantics at the wrapper that yield the same values a local consumer would have observed (in the remote case the wrapper omits `getter` entirely — see [SPEC-extensions.md § Extension 2](SPEC-extensions.md)); and — when [SPEC-extensions.md § Extension 1](SPEC-extensions.md) is in use — the same `inputs` and `commands` membership as the wrapped target.
 - Implementations that wrap one declaration per instance (i.e. multiple wrapped targets coexisting on the same page) MUST give each instance an **isolated** `constructor.wcBindable` — sharing a single constructor across instances with different declarations would break `isWcBindable()` and `bind()` for every instance after the first declaration write. The typical pattern is to synthesize a unique subclass per wrapped target.
 
 Adapters MUST NOT cache the declaration across binds — re-read `target.constructor.wcBindable` on each `bind()` call so that proxies whose declaration changes on reconnect are observed correctly.
@@ -163,7 +170,9 @@ Implementations **MUST** expose two discovery primitives whose contracts are obs
 | `getWcBindableDeclaration(target)` | `WcBindableDeclaration \| undefined` | Resolves the declaration via the rule above and **fully validates** it. Returns `undefined` if any of the following hold: `target` does not satisfy the minimum EventTarget capability (`typeof target.addEventListener !== "function"` or `typeof target.removeEventListener !== "function"`); `target.constructor.wcBindable` is missing; `protocol !== "wc-bindable"`; `version` is not an integer `>= 1`; `properties` is not an array; any property descriptor is missing a non-empty string `name` or `event`, or has a non-function `getter`; any input or command descriptor is missing a non-empty string `name`; any `name` is duplicated within `properties`, within `inputs`, or within `commands`. MUST NOT throw. MUST NOT consult any source other than `target.constructor.wcBindable` (and the EventTarget-capability test on `target` itself). |
 | `isWcBindable(target)` | `boolean` | A type guard that is exactly equivalent to `getWcBindableDeclaration(target) !== undefined`. Implementations MAY (and SHOULD) implement it as that one-line forward. |
 
-**Discovery is bindability.** Because `getWcBindableDeclaration()` performs the complete schema validation (including the duplicate-name rule that invalidates a declaration per § Property Descriptor / § Input Descriptor / § Command Descriptor), no declaration that survives this filter can silently no-op inside `bind()`. The earlier draft where `isWcBindable()` could return `true` for an invalid declaration while `bind()` returned a no-op cleanup is fixed: the two helpers now agree by construction. Consumers can therefore use `isWcBindable()` as the single decision point for "will `bind()` install listeners?".
+**Discovery is bindability — for `bind()` from `@wc-bindable/core`.** Because `getWcBindableDeclaration()` performs the complete schema validation (including the duplicate-name rule that invalidates a declaration per § Property Descriptor / § Input Descriptor / § Command Descriptor), no declaration that survives this filter can silently no-op inside `bind()`. Consumers can therefore use `isWcBindable()` as the single decision point for "will `bind()` install listeners?". (For why the discovery and bindability checks are unified rather than split, see [§ Appendix: Design rationale notes](#appendix-design-rationale-notes).)
+
+> **Scope.** This equivalence is normative for the core `bind()` only. Extensions MAY impose **additional** rejection conditions that core does not check — for example, [SPEC-extensions.md § Extension 2](SPEC-extensions.md) rejects declarations whose `properties` / `inputs` / `commands` names collide with reserved wire names at proxy-construction time. `isWcBindable(target) === true` therefore guarantees `bind()` will succeed but does NOT guarantee that constructing a remote proxy (or any other extension consumer) will succeed; extension-level checks are layered on top, and an extension that rejects a target SHOULD throw at construction with a clear error rather than silently fall back.
 
 The two functions are kept paired so that callers who need the declaration object (tooling, codegen, devtools, test inspection) read it once instead of probing for existence and then re-reading. Adapters that perform their own discovery MUST surface the same `boolean`-vs-declaration pair to be considered conforming. Naming is normative — third-party implementations of these helpers MUST use the same identifiers so consumers can swap implementations.
 
@@ -229,15 +238,29 @@ A reactivity system that supports this protocol should:
 
 The `target` parameter accepts any `EventTarget` — this includes `HTMLElement` instances as well as headless `EventTarget` subclasses.
 
-### `onUpdate` callback shape
+### `bind()` and `onUpdate` shapes
 
-The normative shape of the per-update callback passed to `bind()` is the **positional form**:
+The normative TypeScript surface of the protocol-level `bind()` and its callback is:
 
 ```typescript
 type OnUpdate = (name: string, value: unknown) => void;
+type UnbindFn = () => void;
+
+interface BindOptions {
+  syncOn?: "call" | "connect";  // default: "call"
+}
+
+function bind(
+  target: EventTarget,
+  onUpdate: OnUpdate,
+  options?: BindOptions,
+): UnbindFn;
+
+function getWcBindableDeclaration(target: EventTarget): WcBindableDeclaration | undefined;
+function isWcBindable(target: EventTarget): target is WcBindableElement;
 ```
 
-Third-party adapters that re-export `bind()` MUST preserve this signature. Higher-level binder layers (framework adapters that wrap `bind()` to drive React state, Vue refs, Angular outputs, etc.) MAY re-pack the call into a framework-idiomatic shape — for example, the Angular adapter dispatches a single-argument `{ name, value }` event on a Subject because Angular outputs are single-argument. Re-packing at the framework layer is permitted; **changing the positional signature of the protocol-level `bind()` callback is not.**
+Third-party adapters that re-export `bind()` MUST preserve this signature, including the optional third argument. Higher-level binder layers (framework adapters that wrap `bind()` to drive React state, Vue refs, Angular outputs, etc.) MAY re-pack the callback into a framework-idiomatic shape — for example, the Angular adapter dispatches a single-argument `{ name, value }` event on a Subject because Angular outputs are single-argument. Re-packing at the framework layer is permitted; **changing the positional signature of the protocol-level `bind()` callback is not.** Additional optional fields on `BindOptions` MAY be added in later spec revisions; older implementations MUST ignore unrecognized fields rather than throw.
 
 ```javascript
 const DEFAULT_GETTER = (e) => e.detail;
@@ -261,12 +284,9 @@ const MutationObserverCtor =
 // return undefined). This is the single source of truth for "is this
 // target safe to bind to" (see § Discovery API).
 //
-// Note on `typeof constructor`: in JavaScript a class is a function, so
-// `typeof MyClass === "function"`. Older revisions of this pseudocode
-// gated on `typeof ctor === "object"` and silently failed to discover
-// any class-based component — the most common case. The check below
-// uses optional chaining instead of a typeof gate, accepting both
-// function-typed (class) and object-typed constructors.
+// Implementation note: optional chaining (not a `typeof` gate) accepts
+// both function-typed class constructors and object-typed constructors.
+// See § Appendix: Design rationale notes for why.
 function getWcBindableDeclaration(target) {
   // Minimum capability check: target MUST be an EventTarget. A target that
   // ships a valid declaration but lacks add/removeEventListener would
@@ -370,7 +390,11 @@ function bind(target, onUpdate, options) {
 
 `bind()` **MUST** return a function that, when called, removes every event listener (and any other resource — e.g. `MutationObserver`) the adapter installed during the call. This applies whether or not the target was actually bindable: a no-op cleanup function (`() => {}`) is the correct return value for non-`wc-bindable` targets.
 
-**If the synchronous initial-sync step throws** — for example, a property's `in` trap throws, a property getter throws on read, or the consumer's `onUpdate` callback throws — the adapter **MUST** tear down every listener and observer it installed earlier in the same `bind()` call before letting the error propagate. Without this, the caller never receives the unbind function and the listener set leaks. The reference implementation routes both the synchronous and the deferred initial-sync paths through one cleanup-on-throw wrapper to satisfy this requirement. Cleanup callbacks that themselves throw during this fallback path SHOULD be swallowed; surfacing a cleanup-time secondary error in place of the original `initialSync` error is more confusing than useful.
+**If the synchronous initial-sync step throws** — for example, a property's `in` trap throws, a property getter throws on read, or the consumer's `onUpdate` callback throws — the adapter **MUST** tear down every listener and observer it installed earlier in the same `bind()` call before letting the error propagate. Without this, the caller never receives the unbind function and the listener set leaks. Cleanup callbacks that themselves throw during this fallback path SHOULD be swallowed; surfacing a cleanup-time secondary error in place of the original `initialSync` error is more confusing than useful.
+
+**If a *deferred* initial-sync (`syncOn: "connect"`) throws** the same cleanup runs — but the error has no synchronous caller to propagate to. The throw originates inside a `MutationObserver` callback (a microtask), so the runtime treats it as an uncaught error: browsers surface it via `window.onerror` / `reportError`, Node surfaces it via `process.on('uncaughtException')`, etc. The unbind function the caller already received remains valid but becomes a no-op since every cleanup it would have called has already run. Adapters SHOULD treat deferred-throw cleanup as a best-effort safety net — consumers who need structured error handling from initial-sync should use `syncOn: "call"` from inside their own lifecycle hook so that the throw lands on a frame they can catch.
+
+**If `onUpdate` throws on a post-initial-sync event** — i.e. after `bind()` has returned and a normal change event fires the registered listener — the error propagates out of the event listener via the standard DOM dispatch path (i.e. it becomes an unhandled error on the dispatching event-loop turn). The listener remains attached; the adapter does NOT auto-unbind on consumer throws, and subsequent events continue to fire normally. Consumers that want fail-fast teardown on their own throws are responsible for calling the returned unbind from a catch in their `onUpdate`.
 
 Long-lived headless `Core` instances may outlive multiple consumers; without an explicit teardown contract, listener leaks are guaranteed. Component-side `disconnectedCallback` cannot be relied on because headless Cores have no DOM lifecycle, and Web Components bound via framework refs may be reattached.
 
@@ -381,7 +405,7 @@ Initial value synchronization is a **required** part of the protocol (not merely
 - If `prop.name in target` is `true`, the adapter **MUST** read `target[prop.name]` and deliver the value (including when it is `undefined`) to the consumer.
 - If `prop.name in target` is `false` (the property does not exist on the target), the adapter **MUST** skip the initial synchronization for that property. This is not an error.
 
-The `in` operator is mandated specifically so that `undefined` can be distinguished from "property not declared on target". An earlier revision of this spec used `target[prop.name] !== undefined` as the gate; that gate cannot deliver a legitimately-`undefined` initial value, and is now superseded.
+The `in` operator is mandated specifically so that `undefined` can be distinguished from "property not declared on target". (For why, see [§ Appendix: Design rationale notes](#appendix-design-rationale-notes).)
 
 Component authors **should** ensure that every `name` in the declaration corresponds to a readable property on the target instance.
 
@@ -561,6 +585,24 @@ Doing so would require the core to take a position on call semantics (synchronou
 
 **Is this a W3C standard?**
 No. This is a community protocol. Any EventTarget-based class or framework can adopt it independently.
+
+---
+
+## Appendix: Design rationale notes
+
+These notes record the *why* behind a few decisions that earlier spec drafts surfaced inline. They are non-normative — the normative rules are stated where they belong in the main body — but third-party implementers may find them useful when judging an edge case the normative text does not directly address.
+
+**Why `getWcBindableDeclaration()` performs full validation (Discovery = bindability).**
+A pre-v0.7.1 draft of this spec validated only `protocol` / `version` / `properties` at discovery time and pushed name-uniqueness and descriptor-shape checks into `bind()`. The split caused `isWcBindable(target) === true` while `bind(target, ...)` silently returned a no-op cleanup — a footgun for any consumer that gated on `isWcBindable`. Moving the full schema check into the discovery helper makes the two functions agree by construction and removes the silent-no-op path.
+
+**Why the `in` operator gates initial sync (instead of `!== undefined`).**
+A pre-v0.7.0 draft used `if (target[prop.name] !== undefined)` as the initial-sync gate. That gate cannot deliver a property whose current value is legitimately `undefined`, conflating "the value is undefined" with "the property is not exposed on the target". The `in`-operator gate distinguishes the two and lets components declare an initial-`undefined` state without losing the first delivery; the consequence (an extra `onUpdate(name, undefined)` for properties whose value is `undefined`) is accepted as the correct behavior.
+
+**Why the reference pseudocode uses optional chaining (not a `typeof` gate) on `target.constructor`.**
+A class declaration in JavaScript is a function (`typeof MyClass === "function"`), not an object. A pre-v0.7.1 draft of the pseudocode gated on `typeof ctor === "object"` and silently failed to discover any class-based component — the single most common shape in the wild. Optional chaining inside a `try / catch` accepts both function-typed (class) and object-typed constructors and satisfies the "MUST NOT throw" rule even when `target` is a null-prototype-like object.
+
+**Why `MIN_COMPATIBLE_VERSION` is pinned to `1` (and adapter-specific bounds are forbidden).**
+The forward-compatibility policy — "breaking changes get a new `protocol` identifier, not a version bump" — implies symmetric compatibility within a given `protocol` identifier. A future v2 adapter that gated on `decl.version >= 2` would silently no-op against valid v1 declarations, producing exactly the regression the policy was meant to prevent. Pinning the constant to `1` and naming it `MIN_COMPATIBLE_VERSION` (a minimum, not a maximum) reflects this and makes the bound obviously protocol-wide rather than adapter-specific.
 
 ---
 

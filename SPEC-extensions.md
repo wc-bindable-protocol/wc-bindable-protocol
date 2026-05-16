@@ -60,7 +60,7 @@ Implementations MUST honor:
 
 #### Call-order preservation
 
-Implementations **MUST** preserve the caller's invocation order when serializing `set` / `setWithAck` / `invoke` onto a single logical channel. That is, the proxy itself MUST NOT reorder calls — message N is handed to the transport strictly before message N+1.
+Implementations **MUST** preserve the caller's invocation order when serializing `set` / `setWithAck` / `setWithAckOptions` / `invoke` / `invokeWithOptions` (and any other future `*WithOptions` variant) onto a single logical channel. That is, the proxy itself MUST NOT reorder calls — message N is handed to the transport strictly before message N+1, regardless of which entry point the caller used.
 
 Wire-level ordering between two messages then depends on the transport's own delivery guarantees:
 
@@ -85,18 +85,18 @@ The core protocol does NOT inspect this field.
 
 When `setWithAck` or `invoke` fails on the remote side, the consumer-side proxy SHOULD raise an `Error` whose `name`, `message`, and (when available) `stack` reflect the original throw. Implementations MAY attach the raw serialized payload as `cause`. Implementations MUST NOT silently swallow remote throws.
 
-### Transport lifecycle vocabulary
+### Transport lifecycle vocabulary *(shared by Extensions 1 and 2)*
 
-The semantics tables above use two transport-state terms that this extension pins down here:
+These transport-state terms are referenced by both the Extension 1 method semantics above and the Extension 2 wire format below. They are defined here for proximity to the Extension 1 throw-vs-reject table; Extension 2 cross-references this section rather than redefining the vocabulary.
 
 - **Terminally failed.** The transport instance is past the point where it can recover without external action. Examples: the proxy has been `dispose()`d; the transport reported its `onClose` callback and the binding code has not reconnected; the underlying socket fired a non-resumable error (e.g. WebSocket close with policy-violation status, `MessagePort` close, Worker termination); the transport's `send` synchronously threw and the proxy decided to disconnect rather than buffer. **Transient outages — automatic reconnect attempts in progress, exponential-backoff retry windows, brief network blips that the transport is configured to mask — are NOT terminal.** A `set` call MUST throw synchronously when the transport is in the terminal state at call time; it MUST NOT throw on a transient outage. In the transient case the message either lands eventually (at-most-once semantics) or is dropped silently, which is exactly the gap `setWithAck` exists to make detectable.
 - **Disposed.** The proxy itself has had `dispose()` called. `set` MUST throw, `setWithAck` MUST reject, `invoke` MUST reject. The proxy MUST NOT accept a new transport after `dispose()`.
 
 A transport implementation MUST document which observable signal (`onClose` firing, `send` throwing, an explicit `dispose()` call) it treats as terminal, so callers know when to expect synchronous throws from `set`.
 
-### Trust boundary
+### Trust boundary *(shared by Extensions 1 and 2)*
 
-This extension transports `set` and `invoke` calls across a trust boundary. The receiving side MUST treat all arguments as untrusted input. In particular:
+Both Extension 1 (the call surface) and Extension 2 (the wire format) operate across a trust boundary. The receiving side MUST treat all arguments as untrusted input. In particular:
 
 - The remote side MUST validate that the message references a declared `inputs` / `commands` name before reaching the Core.
 - The remote side MUST NOT transport `getter` functions as code — `getter` is applied on the trusted side, and only the extracted value crosses the wire.
@@ -199,7 +199,7 @@ This section is the **normative** wire-format specification for any implementati
 
 - `update` is dispatched for every change event the producer-side shell observes, after applying the producer-side `getter`. The `name` MUST be one declared in `properties`.
 - `return` / `throw` MUST reference an `id` issued by a prior client message. The producer MAY emit only ONE of `return` or `throw` for any given `id`. Implementations SHOULD reject unknown `id`s with a logger warning rather than throwing — late replies after an abort are normal.
-- `capabilities.setAck === true` advertises that the producer honors `setWithAck`. Consumers that issued `setWithAck` calls before the `sync` response MUST reject all of them with a clear error if `setAck` is absent or `false`. **Fire-and-forget `set` (the `id`-less variant) is unaffected by this capability bit** — it is part of the baseline wire contract and every producer MUST handle it regardless of `setAck` support. A producer that signals `setAck: false` is opting out only of the acknowledged path.
+- `capabilities.setAck === true` advertises that the producer honors `setWithAck`. Consumers that issued `setWithAck` calls **before** the `sync` response MUST reject all of them with a clear error if `setAck` is absent or `false`. Calls issued **after** a `sync` response whose `setAck` is absent or `false` MUST be rejected synchronously by the consumer-side proxy with the same clear error; the proxy MUST NOT send a `setWithAck` message it knows the producer will not handle. **Fire-and-forget `set` (the `id`-less variant) is unaffected by this capability bit** — it is part of the baseline wire contract and every producer MUST handle it regardless of `setAck` support. A producer that signals `setAck: false` is opting out only of the acknowledged path.
 
 #### Return envelope value field
 
@@ -260,13 +260,15 @@ There is no in-band signal for update-time getter failures (no `updateGetterFail
 client                                producer
   │── { type: "set", name, value,    │
   │     id: "abc" }               ──►│  validate name ∈ inputs
-  │                                   │  isReservedRemoteName(name)? throw
+  │                                   │  isReservedRemoteName(name)? throw  (†)
   │                                   │  try: core[name] = value
   │                                   │     (Extension 1: MUST execute before ack)
   │   ◄── { type: "return",       ── │  ack with no value key (Promise<void>)
   │         id: "abc" }               │     ↑ "value" field is omitted per
   │                                   │       § Return envelope value field
 ```
+
+> **(†) Defense-in-depth.** Per § Reserved names, reserved-name declarations MUST be rejected at proxy construction time, so a conforming consumer-side proxy will never send a `set` whose `name` is reserved. The producer-side check here exists to handle non-conforming or hostile consumers that bypass construction-time validation (e.g. by hand-rolling the wire frame). Producers MUST keep this check in place even though conforming consumers should make it unreachable.
 
 If the assignment throws synchronously, the producer MUST send a `throw` with the same `id`. If `name` is not declared as an input, the producer MUST send a `throw` with `id` (NOT a silent drop), so the client's pending `Promise` rejects with a useful error.
 
