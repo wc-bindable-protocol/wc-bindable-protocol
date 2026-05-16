@@ -45,6 +45,18 @@ The console output is two lines: `value = hello` (the initial-sync read) followe
 
 That's it. The framework adapters below (`@wc-bindable/react`, `@wc-bindable/vue`, ...) are typically small wrappers that pipe the same `(name, value)` callbacks into their framework's reactivity primitive — they add no new protocol concepts.
 
+## The protocol in three layers
+
+If the snippet above feels small and the remote / wire-format material later feels large, that is because they live at different layers. Most consumers only ever need Layer 1.
+
+| Layer | What it adds | When you use it | Where it lives |
+|---|---|---|---|
+| **1. Local observation** | `static wcBindable` declaration + `bind()` callback. Discovers reactive outputs and delivers their values. Zero runtime dependencies. | Always — this is what every framework adapter wraps. | [`@wc-bindable/core`](packages/core/), [SPEC.md](SPEC.md) |
+| **2. Interface declaration** | Optional `inputs` and `commands` arrays on the same declaration. Pure metadata — no behavior at this layer, just type / doc / tooling surface. | When a tool (devtools, codegen, remote proxy, docs generator) wants to know "what can I write to / call on this component". | [SPEC.md § Schema](SPEC.md#schema) |
+| **3. Remote transport profile** | `set` / `setWithAck` / `invoke` call semantics, JSON-shape wire format, declaration fingerprint, transport adapter contract. Builds on Layers 1 + 2; turns the same declaration into a network protocol. | When the Core needs to run on a different process / runtime / machine than the consumer. | [`@wc-bindable/remote`](packages/remote/), [SPEC-extensions.md](SPEC-extensions.md) |
+
+The "no runtime dependencies" claim refers to Layer 1, which is what `@wc-bindable/core` ships. Layers 2 and 3 are opt-in; loading them does not retroactively complicate a Layer-1-only consumer.
+
 ## Why?
 
 - **Write once, use everywhere** — A Web Component that implements this protocol works with React, Vue, Svelte, Angular, Solid, and any future framework without modification.

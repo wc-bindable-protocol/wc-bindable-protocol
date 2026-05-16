@@ -12,6 +12,13 @@ import { buildDeclarationFingerprint } from "./declarationFingerprint.js";
 
 const REMOTE_CAPABILITIES: RemoteCapabilities = {
   setAck: true,
+  // Advertised so consumers can distinguish a modern producer that has
+  // no undefined / failed-getter properties at the moment ("field
+  // present, list empty") from a legacy producer that does not know
+  // about these fields at all ("field absent"). See SPEC-extensions.md
+  // § sync response capabilities.
+  undefinedProperties: true,
+  getterFailures: true,
 };
 
 const DEFAULT_GETTER = (event: Event): unknown => (event as CustomEvent).detail;

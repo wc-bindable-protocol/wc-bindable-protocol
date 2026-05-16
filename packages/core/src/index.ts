@@ -212,9 +212,19 @@ export interface BindOptions {
    *   connected to a document, defer the initial-value read until the
    *   element becomes connected (i.e. after `connectedCallback` has run).
    *   For headless `EventTarget`s and already-connected elements, behaves
-   *   like `"call"`. Useful when `bind()` is called before
-   *   `appendChild()` / `customElement.upgrade()` so the read sees the
-   *   post-connection state.
+   *   like `"call"`.
+   *
+   *   **Read this as `"light-dom-connect"`.** The option is narrowly
+   *   scoped — it observes via a `MutationObserver` on the top-level
+   *   `document`, which (a) does NOT traverse shadow roots, so a target
+   *   appended into a shadow tree never fires the deferred sync, and
+   *   (b) installs one document-wide observer per deferred bind. It is
+   *   the right tool for one specific use case: a caller that has an
+   *   `el` reference it will hand to a host (`document.body.appendChild`,
+   *   `van.add`, MobX root mount) at a later point and does not want to
+   *   sequence "append before bind" manually. It is NOT a general-purpose
+   *   lifecycle abstraction; prefer the default `"call"` from inside a
+   *   framework's mounted lifecycle hook whenever you have one.
    *
    *   Implementation detail: connection is detected via a `MutationObserver`
    *   on the top-level `document`. `MutationObserver` does NOT traverse

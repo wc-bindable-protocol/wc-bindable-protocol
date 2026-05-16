@@ -102,7 +102,7 @@ describe("RemoteShellProxy", () => {
     expect(send).toHaveBeenCalledWith(expect.objectContaining({
       type: "sync",
       values: { value: null, loading: false },
-      capabilities: { setAck: true },
+      capabilities: expect.objectContaining({ setAck: true }),
     }));
   });
 
@@ -156,7 +156,7 @@ describe("RemoteShellProxy", () => {
     expect(send).toHaveBeenCalledWith(expect.objectContaining({
       type: "sync",
       values: {},
-      capabilities: { setAck: true },
+      capabilities: expect.objectContaining({ setAck: true }),
       undefinedProperties: ["missing"],
     }));
   });
@@ -310,7 +310,7 @@ describe("RemoteShellProxy", () => {
     expect(send).toHaveBeenCalledWith(expect.objectContaining({
       type: "sync",
       values: { ok: "value" },
-      capabilities: { setAck: true },
+      capabilities: expect.objectContaining({ setAck: true }),
       getterFailures: ["bad"],
     }));
     expect(errorSpy).toHaveBeenCalledWith(
@@ -356,7 +356,7 @@ describe("RemoteShellProxy", () => {
     expect(send).toHaveBeenNthCalledWith(1, expect.objectContaining({
       type: "sync",
       values: { value: "snapshot", status: "current" },
-      capabilities: { setAck: true },
+      capabilities: expect.objectContaining({ setAck: true }),
     }));
     expect(send).toHaveBeenNthCalledWith(2, {
       type: "update",
@@ -410,7 +410,7 @@ describe("RemoteShellProxy", () => {
     handler!({ type: "sync" });
 
     expect(sent).toEqual([
-      expect.objectContaining({ type: "sync", values: { value: "snapshot", status: "current" }, capabilities: { setAck: true } }),
+      expect.objectContaining({ type: "sync", values: { value: "snapshot", status: "current" }, capabilities: expect.objectContaining({ setAck: true }) }),
       { type: "update", name: "status", value: "queued" },
       { type: "update", name: "status", value: "after-flush" },
     ]);
@@ -878,7 +878,7 @@ describe("RemoteShellProxy", () => {
 
     // Handler still alive — subsequent sync request is processed.
     handler!({ type: "sync" });
-    expect(send).toHaveBeenCalledWith(expect.objectContaining({ type: "sync", values: {}, capabilities: { setAck: true } }));
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ type: "sync", values: {}, capabilities: expect.objectContaining({ setAck: true }) }));
 
     errorSpy.mockRestore();
   });
@@ -1580,7 +1580,7 @@ describe("RemoteShellProxy", () => {
       expect(send).toHaveBeenCalledWith(expect.objectContaining({
         type: "sync",
         values: { ready: true },
-        capabilities: { setAck: true },
+        capabilities: expect.objectContaining({ setAck: true }),
         undefinedProperties: ["value", "status"],
       }));
     });
@@ -1605,7 +1605,7 @@ describe("RemoteShellProxy", () => {
       expect(payload).toEqual(expect.objectContaining({
         type: "sync",
         values: { value: 42 },
-        capabilities: { setAck: true },
+        capabilities: expect.objectContaining({ setAck: true }),
       }));
       expect(payload).not.toHaveProperty("undefinedProperties");
     });
@@ -1640,7 +1640,7 @@ describe("RemoteShellProxy", () => {
       expect(send).toHaveBeenCalledWith(expect.objectContaining({
         type: "sync",
         values: { ok: "hello" },
-        capabilities: { setAck: true },
+        capabilities: expect.objectContaining({ setAck: true }),
         getterFailures: ["bad"],
         undefinedProperties: ["undef"],
       }));

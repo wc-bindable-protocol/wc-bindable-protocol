@@ -189,11 +189,7 @@ Implementations **MUST** expose two discovery primitives whose contracts are obs
 
 The two functions are kept paired so that callers who need the declaration object (tooling, codegen, devtools, test inspection) read it once instead of probing for existence and then re-reading. Adapters that perform their own discovery MUST surface the same `boolean`-vs-declaration pair to be considered conforming. Naming is normative — third-party implementations of these helpers MUST use the same identifiers so consumers can swap implementations.
 
-> **Why identifier naming is normative.** This protocol's pitch is "zero dependencies, just `static` fields + `CustomEvent`", and mandating helper names is admittedly more API surface than that pitch implies. The justification: the data shape on `target.constructor.wcBindable` alone is not enough to make an `@wc-bindable/core` consumer and a third-party reimplementation (Deno port, web-component-devtools-style runtime inspector, a forked monorepo) drop-in compatible. If one names the helper `getDeclaration()` and another `readWcBindable()`, every adapter and tool downstream has to dual-import or rename. The exact same argument applies to `bind()`: every framework adapter in the ecosystem (`@wc-bindable/react`, `@wc-bindable/vue`, ...) does `import { bind } from "@wc-bindable/core"` at the top of the file; a third-party reimplementation that exports `attach` instead would be data-shape-conformant but break every downstream adapter at the import line.
->
-> The three normatively-named identifiers are therefore: **`bind`**, **`getWcBindableDeclaration`**, **`isWcBindable`**. Implementations MUST export them under these names. Type names (`OnUpdate`, `UnbindFn`, `BindOptions`, `WcBindableDeclaration`, ...) are NOT normatively named — TypeScript users can re-import them under any local alias without breaking interop, because the runtime call shape stays the same. Constants (`MIN_COMPATIBLE_VERSION`) are likewise not normatively named (per § Versioning).
->
-> The constraint is intentionally narrow: only the three runtime entry points whose names cross the import boundary in the wild are pinned.
+The identifier names `bind`, `getWcBindableDeclaration`, and `isWcBindable` are normative — but **only at the Core JS API compatibility level** (Level 2 below), not at the protocol level. A non-JS implementation that satisfies the underlying protocol contract is conformant at Level 1 regardless of what it calls its functions; the name pinning is what makes a *JavaScript* third-party reimplementation an import-line drop-in for `@wc-bindable/core`. See § Conformance Levels for the explicit separation.
 
 ---
 
@@ -239,6 +235,22 @@ getter: (e) => e.detail.value
 // reusing a native DOM event
 getter: (e) => e.target.value
 ```
+
+---
+
+## Conformance Levels
+
+This specification has three independently claimable conformance levels. An implementation MUST be explicit about which it claims; the levels stack — Level 2 implies Level 1, Level 3 implies Levels 1 and 2 *for its JS bindings* (a non-JS Level-3 implementation is not bound by Level 2).
+
+| Level | Name | What it covers | What it does NOT cover |
+|---|---|---|---|
+| **1** | **Protocol conformance** | The `static wcBindable` declaration shape (§ Schema); the consumer-side EventTarget capability rule (§ Overview); the event-naming convention; the default-and-custom `getter` rule; the `in`-operator initial sync rule with its `syncOn` modes; the teardown / exception-safety / partial-delivery rules. Language-agnostic — a Deno, Bun, Python, or Go implementation is conformant at Level 1 as long as the declaration semantics and behavior match. | The names exported from the implementation; the wire format. |
+| **2** | **Core JS API compatibility** | Everything in Level 1, PLUS the three normatively-named exports: **`bind`**, **`getWcBindableDeclaration`**, **`isWcBindable`** (with the TypeScript surface and parameter shapes defined in § bind() and onUpdate shapes). This is what makes a JavaScript reimplementation an import-line drop-in for `@wc-bindable/core` — every framework adapter does `import { bind } from "@wc-bindable/core"`, and a fork that exported `attach` instead would break every adapter even if it satisfied Level 1. | The remote wire format (Extension 2). |
+| **3** | **Remote wire conformance** | Everything in Level 1, PLUS the wire-format invariants in [SPEC-extensions.md § Extension 2](SPEC-extensions.md) — message shapes, FIFO / JSON-shape / single-shell invariants, undefined enumeration, declaration fingerprint, transport adapter contract. An implementation that consumes or produces wc-bindable across a network MUST satisfy this. If the implementation also exposes JS bindings to local consumers, those bindings SHOULD additionally satisfy Level 2 for drop-in compatibility with the JS adapter ecosystem. | Application-specific transport choice; back-pressure policy beyond the spec minimums. |
+
+**Type names** (`OnUpdate`, `UnbindFn`, `BindOptions`, `WcBindableDeclaration`, ...) are NOT normatively named at any level — TypeScript users can re-import them under any local alias without breaking interop because the runtime call shape stays the same. **Constants** (`MIN_COMPATIBLE_VERSION`) are likewise not normatively named (per § Versioning); only their values are pinned. Level 2's identifier-name rule is intentionally narrow: only the three runtime entry points whose names cross the import boundary in the wild are pinned.
+
+A non-JavaScript Level-1 implementation (for example, a Python sidecar that owns wc-bindable component instances inside a CPython runtime and exposes change events via a local socket) is a fully valid producer; it does not need to invent or expose anything called `bind`. If that same implementation also speaks the Extension 2 wire format to a JS consumer, it claims Level 1 + Level 3, not Level 2.
 
 ---
 
@@ -569,7 +581,7 @@ The protocol uses two independent reads of the property value:
 
 The two **SHOULD** be kept in agreement by the component author. If they diverge (e.g. a `detail` payload differs from the current property value), the **event payload is authoritative** — adapters do not re-read the property after an event fires. Component authors who cannot guarantee parity should derive `detail` from the property at dispatch time.
 
-> **Edge case — synchronous re-entry from a property getter.** Because adapters attach listeners before performing the initial-sync read (so that no event is missed during the read), a property whose getter synchronously dispatches a change event for the same property will cause `onUpdate` to fire twice during `bind()`: once with the event payload, once with the initial-sync read. The consumer observes both calls in dispatch order. Component authors **should not** dispatch from a getter; if the side effect is unavoidable, treat the event-payload-authoritative rule as still applying, and accept that the initial-sync delivery may overwrite the just-dispatched value in the consumer's state.
+> **Producer-side rule — property getters MUST be side-effect-free.** A `wcBindable`-declared property's getter (or the equivalent attribute-backed read on a Web Component) **SHOULD** be a pure read of the current value. In particular, a getter that synchronously dispatches a `wc-bindable`-declared change event during the initial-sync read is **non-conforming** at the producer side: adapters attach listeners *before* performing the initial-sync read (so no event is missed during the read), so the dispatch from the getter and the initial-sync read both reach the consumer, in dispatch order, producing a double `onUpdate` whose second value depends on whatever was read last. Conformant adapters are NOT required to detect, deduplicate, or repair this re-entrant case — the protocol's defense is to forbid it at the producer. If a side effect is genuinely unavoidable (e.g. a sensor whose read materializes the value), the producer SHOULD perform the side effect on construction or in a dedicated initializer, NOT inside the getter.
 
 ### Getter Errors
 

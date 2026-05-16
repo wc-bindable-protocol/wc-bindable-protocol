@@ -16,7 +16,7 @@ A *consumer-side proxy* that adopts this extension MUST expose the following sur
 
 | Method | Signature | Semantics |
 |---|---|---|
-| `set` | `set(name: string, value: unknown): void` | Fire-and-forget assignment of an input property. **At-most-once delivery.** No acknowledgement. Throws synchronously if `name` is not declared in `inputs`, the transport is terminally failed, the proxy is disposed, or — when [Extension 2](#extension-2--wire-format-remote-proxying) is adopted — `value` fails the consumer-side `JsonValue` validation. Because `set` returns `void`, synchronous throw is the only channel the caller has to learn about any of these conditions. |
+| `set` | `set(name: string, value: unknown): void` | **Fast path — unsafe by design.** Fire-and-forget assignment of an input property. **At-most-once delivery, NO acknowledgement, silent drop on transient transport failure.** Throws synchronously if `name` is not declared in `inputs`, the transport is terminally failed, the proxy is disposed, or — when [Extension 2](#extension-2--wire-format-remote-proxying) is adopted — `value` fails the consumer-side `JsonValue` validation; but on a *transient* outage the message can simply not arrive and the caller will never know. Use this only when (a) you can tolerate the message being lost and (b) no later `invoke` depends on this assignment having been applied. For anything else, use `setWithAck`. The faster latency (no round-trip) is the only reason to choose this row. |
 | `setWithAck` | `setWithAck(name: string, value: unknown): Promise<void>` | Acknowledged assignment. **The promise MUST NOT resolve before the JS-level assignment `target[name] = value` has executed on the trusted side**; it MUST reject if `name` is not declared in `inputs`, the assignment throws, the remote rejects the message, the transport is terminally failed, the call times out, the proxy is disposed, or — when [Extension 2](#extension-2--wire-format-remote-proxying) is adopted — `value` fails consumer-side `JsonValue` validation. Like `invoke`, **all protocol-level failures MUST reach the caller as a `Promise` rejection**, not a synchronous throw; the only sync throws permitted are programmer errors outside the protocol surface. The proxy does NOT wait for asynchronous side effects of the setter (e.g. a setter that schedules background work) — components that need to gate `invoke` on async post-set work SHOULD expose a command instead so the caller can `await invoke()`. **At-least-once delivery is NOT promised** — on transport failure the proxy rejects rather than silently retrying, because re-sending could re-apply a non-idempotent input (an increment, a write to an append-only log) twice, which the proxy cannot detect. The conservative default is at-most-once and the caller is responsible for any retry. Implementations MAY layer exactly-once on top via per-call idempotency keys but MUST document the choice. |
 | `setWithAckOptions` | `setWithAckOptions(name: string, value: unknown, options?: AckOptions): Promise<void>` | Same semantics as `setWithAck` plus per-call lifecycle controls; see § AckOptions. |
 | `invoke` | `invoke(name: string, ...args: unknown[]): Promise<unknown>` | Calls a declared command. Resolves with the (serialized) return value, or rejects with a serialized form of the thrown error. **MUST return a rejected `Promise`** (not a synchronous throw) for every protocol-level failure: `name` is not declared in `commands`, the proxy is disposed, the transport is terminally failed, the call timed out, the call was aborted, or — when [Extension 2](#extension-2--wire-format-remote-proxying) is adopted — any of `args` fails consumer-side `JsonValue` validation. Implementations SHOULD NOT throw synchronously except for programmer errors outside the protocol surface (e.g. `name` is not a string, the proxy receiver is not bound). Routing all protocol-level failures through `Promise` rejection keeps `await invoke(...)` totalizing — `try / catch` around the await catches every failure mode. |
@@ -86,6 +86,13 @@ The core protocol does NOT inspect this field.
 
 When `setWithAck` or `invoke` fails on the remote side, the consumer-side proxy SHOULD raise an `Error` whose `name`, `message`, and (when available) `stack` reflect the original throw. Implementations MAY attach the raw serialized payload as `cause`. Implementations MUST NOT silently swallow remote throws.
 
+> **Security note on `stack`.** A producer-side stack trace typically includes internal file paths, function names, and runtime version markers — sensitive metadata that should NOT cross an untrusted trust boundary. The `stack` field is therefore conditional:
+>
+> - On **trusted development transports** (in-process, same-team WebSocket between vetted services, local debugging tools) producers MAY include the full `stack` to ease diagnostics.
+> - On **untrusted network boundaries** (anything reachable from a user-controlled client, third-party integration, public API surface) producers **SHOULD** omit `stack` entirely, or redact it (strip absolute paths / function names / leave only the producer-side line count) before serializing the throw envelope.
+>
+> Consumers MUST cope with `stack` being absent — it is already typed `stack?: string` (optional) precisely so producers can drop it without breaking the schema. This rule is symmetric with the existing principle that "auth / authorization / rate limiting / payload schema validation are the responsibility of the layer that owns the transport" — leaking internals via stack traces is the same class of concern, just on the reverse direction.
+
 ### Transport lifecycle vocabulary *(shared by Extensions 1 and 2)*
 
 These transport-state terms are referenced by both the Extension 1 method semantics above and the Extension 2 wire format below. They are defined here for proximity to the Extension 1 throw-vs-reject table; Extension 2 cross-references this section rather than redefining the vocabulary.
@@ -144,6 +151,17 @@ This section is the **normative** wire-format specification for any implementati
    - Arrays: every element MUST itself satisfy `isJsonValue`. Sparse holes (positions where `i in arr === false`) MUST be **rejected**; the earlier "treat as `null`" alternative is removed because it introduces silent shape change between transports and defeats the validate-before-serialize principle. Callers that need to transmit "this index is unset" MUST encode it explicitly (`null`, or a sentinel they define).
    - Cyclic references: traversal MUST detect a cycle (typically via a `WeakSet` of seen objects) and reject the value; otherwise the validator stack-overflows on adversarial input.
 
+   **Error reporting.** When `isJsonValue(v)` returns false, the validator SHOULD surface a **path-aware** error that names the failing sub-location, so the caller can diagnose the issue without re-walking the input by hand. The recommended format is a JSONPath-style expression rooted at `$`, with `.<key>` for object keys and `[<n>]` for array indices, plus the offending type. Examples:
+
+   ```
+   $.items[3].createdAt is Date, expected JsonValue
+   $.config.timeout is NaN (non-finite numbers are not JsonValue)
+   $ is cyclic at $.parent.child[0].parent
+   $.payload[Symbol(meta)] is symbol-keyed (rejected; opt-in compatibility required)
+   ```
+
+   Implementations MAY use a different path syntax as long as the offending location can be located in the original input from the error message alone. Plain "value is not JsonValue" without a path is permitted but discouraged — it forces the caller into bisect-style debugging on large objects.
+
    **Handling of non-`JsonValue` values is normative — on both sides of the wire:**
 
    *Producer-side (server → client traffic):*
@@ -195,7 +213,11 @@ This section is the **normative** wire-format specification for any implementati
   "type": "sync",
   "values": { [name: string]: JsonValue },
   "undefinedProperties"?: string[],
-  "capabilities"?: { "setAck"?: boolean },
+  "capabilities"?: {
+    "setAck"?: boolean,
+    "undefinedProperties"?: boolean,  // producer understands the field
+    "getterFailures"?: boolean         // producer understands the field
+  },
   "getterFailures"?: string[],
   "declarationFingerprint"?: {
     "version": number,
@@ -219,6 +241,8 @@ This section is the **normative** wire-format specification for any implementati
 - `update` is dispatched for every change event the producer-side shell observes, after applying the producer-side `getter`. The `name` MUST be one declared in `properties`.
 - `return` / `throw` MUST reference an `id` issued by a prior client message. The producer MAY emit only ONE of `return` or `throw` for any given `id`. Implementations SHOULD reject unknown `id`s with a logger warning rather than throwing — late replies after an abort are normal.
 - `capabilities.setAck === true` advertises that the producer honors `setWithAck`. Consumers that issued `setWithAck` calls **before** the `sync` response MUST reject all of them with a clear error if `setAck` is absent or `false`. Calls issued **after** a `sync` response whose `setAck` is absent or `false` MUST be rejected by the consumer-side proxy with the same clear error — concretely, `setWithAck` / `setWithAckOptions` MUST **synchronously return an already-rejected `Promise`** (not throw synchronously, consistent with the Promise-rejection rule for protocol-level failures in § Methods). The proxy MUST NOT send a `setWithAck` message it knows the producer will not handle. **Fire-and-forget `set` (the `id`-less variant) is unaffected by this capability bit** — it is part of the baseline wire contract and every producer MUST handle it regardless of `setAck` support. A producer that signals `setAck: false` is opting out only of the acknowledged path.
+- `capabilities.undefinedProperties === true` advertises that the producer understands and emits the `undefinedProperties` field. Modern producers SHOULD always set this capability; the **capability bit, not the field's presence**, is the disambiguator that lets a consumer tell a modern producer with no undefined values (`undefinedProperties: true`, list empty or omitted) from a legacy producer that does not know about the field (`undefinedProperties` capability absent). The consumer-side revert-to-`undefined` legacy heuristic (see § Undefined enumeration "Legacy compatibility") MUST fire only when the capability is absent. A modern producer with the capability set MAY still omit the field when the list would be empty.
+- `capabilities.getterFailures === true` advertises that the producer understands and emits the `getterFailures` field. Same disambiguation rationale as `undefinedProperties` above — a modern producer with no failures and a legacy producer that does not know about the field both result in `getterFailures` being absent on the wire; the capability bit is what tells them apart.
 
 #### Return envelope value field
 

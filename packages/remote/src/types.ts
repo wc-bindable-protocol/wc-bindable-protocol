@@ -8,6 +8,24 @@ export type ClientMessage =
 
 export interface RemoteCapabilities {
   setAck?: boolean;
+  /**
+   * Set by producers that understand the `undefinedProperties` field on
+   * sync responses. Consumers SHOULD use this flag (not the mere
+   * presence of the field) to decide whether to apply the
+   * revert-to-undefined legacy heuristic: a modern producer with
+   * `undefinedProperties: true` and an empty list means "no undefined
+   * values, do not revert"; a legacy producer that omits both this
+   * capability and the field is the only case where the heuristic
+   * should fire.
+   */
+  undefinedProperties?: boolean;
+  /**
+   * Set by producers that understand the `getterFailures` field on
+   * sync responses. Same disambiguation rationale as above —
+   * separates "modern producer, no failures" from "legacy producer,
+   * concept does not exist".
+   */
+  getterFailures?: boolean;
 }
 
 /**

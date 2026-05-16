@@ -607,18 +607,26 @@ export class RemoteCoreProxy extends EventTarget {
           this._values[name] = undefined;
           this.dispatchEvent(new CustomEvent(eventName, { detail: undefined }));
         }
-        // Fallback for legacy servers that do not send `undefinedProperties`:
-        // reset declared properties that were cached but omitted from this
-        // sync so re-syncs still observe reverted-to-undefined values.
-        for (const name of this._eventsByName.keys()) {
-          if (Object.prototype.hasOwnProperty.call(msg.values, name)) continue;
-          /* v8 ignore next -- getterFailures only appears when an omitted property failed during sync */
-          if (getterFailures.has(name)) continue;
-          if (undefinedProperties.has(name)) continue;
-          if (this._values[name] === undefined) continue;
-          this._values[name] = undefined;
-          const eventName = this._eventsByName.get(name)!;
-          this.dispatchEvent(new CustomEvent(eventName, { detail: undefined }));
+        // Fallback ONLY for legacy servers that do not advertise the
+        // `undefinedProperties` capability. A modern producer that
+        // advertises the capability and sends `undefinedProperties: []`
+        // is explicitly stating "no undefined values right now"; reverting
+        // every omitted-but-cached property to undefined in that case
+        // would be a spurious state change. The capability bit (not just
+        // the field's presence) is the disambiguator — modern producers
+        // MAY omit the empty array even with the capability set.
+        const supportsUndefinedProperties = msg.capabilities?.undefinedProperties === true;
+        if (!supportsUndefinedProperties) {
+          for (const name of this._eventsByName.keys()) {
+            if (Object.prototype.hasOwnProperty.call(msg.values, name)) continue;
+            /* v8 ignore next -- getterFailures only appears when an omitted property failed during sync */
+            if (getterFailures.has(name)) continue;
+            if (undefinedProperties.has(name)) continue;
+            if (this._values[name] === undefined) continue;
+            this._values[name] = undefined;
+            const eventName = this._eventsByName.get(name)!;
+            this.dispatchEvent(new CustomEvent(eventName, { detail: undefined }));
+          }
         }
         break;
       }
