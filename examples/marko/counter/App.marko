@@ -1,0 +1,39 @@
+import { wcBindable } from "@wc-bindable/marko";
+import "../../vanilla/counter/my-counter.js";
+import appSource from "./App.marko?raw";
+
+class {
+  onCreate() {
+    this.state = { values: {} };
+  }
+  onMount() {
+    this.unbind = wcBindable(this.getEl("counter"), (name, value) => {
+      this.state.values = { ...this.state.values, [name]: value };
+    });
+  }
+  onDestroy() {
+    if (this.unbind) this.unbind();
+  }
+}
+
+$ const COUNTER_TAG = "my-counter";
+
+<div style="font-family: system-ui, sans-serif; max-width: 600px; margin: 40px auto; padding: 0 20px">
+  <p><a href="/index.html">&larr; Examples</a></p>
+  <h1>wc-bindable: Marko - Counter</h1>
+
+  <div style="margin: 24px 0; padding: 16px; border: 1px solid #ddd; border-radius: 8px">
+    <div style="font-weight: 600; margin-bottom: 8px">Counter Component</div>
+    <${COUNTER_TAG} key="counter"/>
+  </div>
+
+  <div style="margin: 24px 0; padding: 16px; border: 1px solid #ddd; border-radius: 8px">
+    <div style="font-weight: 600; margin-bottom: 8px">Bound Values (via wcBindable)</div>
+    <pre style="font-size: 14px; color: #2563eb">${JSON.stringify(state.values, null, 2)}</pre>
+  </div>
+
+  <details style="margin: 24px 0; padding: 16px; border: 1px solid #ddd; border-radius: 8px">
+    <summary style="font-weight: 600; margin-bottom: 8px; cursor: pointer">Source Code</summary>
+    <pre style="font-size: 13px; overflow: auto; margin: 8px 0 0; padding: 12px; background: #f8fafc; border-radius: 4px"><code>${appSource}</code></pre>
+  </details>
+</div>

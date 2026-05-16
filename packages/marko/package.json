@@ -1,0 +1,38 @@
+{
+  "name": "@wc-bindable/marko",
+  "version": "0.5.0",
+  "description": "Marko adapter for wc-bindable protocol",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest run tests",
+    "test:watch": "vitest tests",
+    "test:integration": "vitest run --config vitest.integration.config.ts integration"
+  },
+  "dependencies": {
+    "@wc-bindable/core": "^0.5.0"
+  },
+  "peerDependencies": {
+    "marko": ">=5"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wc-bindable-protocol/wc-bindable-protocol.git",
+    "directory": "packages/marko"
+  },
+  "license": "MIT"
+}

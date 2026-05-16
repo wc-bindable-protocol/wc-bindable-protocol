@@ -58,6 +58,7 @@ This protocol intentionally does **not** cover:
 | [@wc-bindable/lit](packages/lit/) | Lit ReactiveController — `WcBindableController` |
 | [@wc-bindable/qwik](packages/qwik/) | Qwik composable — `useWcBindable()` (Qwik 1.x; Qwik 2.x via `/v2`, experimental) |
 | [@wc-bindable/stencil](packages/stencil/) | Stencil controller — `WcBindableController` |
+| [@wc-bindable/marko](packages/marko/) | Marko helper — `wcBindable()` (Marko 5 + 6) |
 | [@wc-bindable/remote](packages/remote/) | Remote proxy — connect Core and Shell over a network via WebSocket or custom transport |
 
 ## Quick start

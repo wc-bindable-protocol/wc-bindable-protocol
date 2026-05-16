@@ -1,0 +1,19 @@
+import { wcBindable } from "@wc-bindable/marko";
+
+class {
+  onCreate() {
+    this.state = { value: "" };
+  }
+  onMount() {
+    this.unbind = wcBindable(this.getEl("input"), (name, value) => {
+      this.state[name] = value;
+    });
+  }
+  onDestroy() {
+    if (this.unbind) this.unbind();
+  }
+}
+
+$ const TAG = "integration-input";
+<${TAG} key="input"/>
+<output data-testid="out">${state.value}</output>
