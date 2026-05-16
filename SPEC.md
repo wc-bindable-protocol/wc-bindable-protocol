@@ -530,22 +530,27 @@ function bind(target, onUpdate, options) {
     MutationObserverCtor !== undefined;
 
   if (canDefer) {
-    // Single-path observer disposal: both the success path inside the
-    // callback and the unbind cleanup path go through disposeObserver,
-    // which guards against double-disconnect via its own flag. This
-    // matters for a hostile / counting `observer.disconnect()` override
-    // (see § Teardown Contract threat model).
+    // Observer setup is wrapped in runOrCleanup so a throw from the
+    // MutationObserver constructor or from observe() does not leak the
+    // listeners installed by the registration loop above (§ Teardown
+    // Contract names "the deferred-sync observer's setup" explicitly).
+    // disposeObserver is pushed to cleanups BEFORE observe() so the
+    // catch path can find it even if observe() throws — observer would
+    // be undefined in that window, so the helper guards with `?.`.
+    let observer;
     let observerDisposed = false;
     const disposeObserver = () => {
       if (observerDisposed) return;
       observerDisposed = true;
-      observer.disconnect();
+      observer?.disconnect();
     };
-    const observer = new MutationObserverCtor(() => {
-      if (et.isConnected) { disposeObserver(); runOrCleanup(initialSync); }
-    });
-    observer.observe(documentRef, { childList: true, subtree: true });
     cleanups.push(disposeObserver);
+    runOrCleanup(() => {
+      observer = new MutationObserverCtor(() => {
+        if (et.isConnected) { disposeObserver(); runOrCleanup(initialSync); }
+      });
+      observer.observe(documentRef, { childList: true, subtree: true });
+    });
   } else {
     runOrCleanup(initialSync);
   }

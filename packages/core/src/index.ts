@@ -356,29 +356,39 @@ export function bind(
     // BindOptions.syncOn JSDoc.
     // Deferred initialSync errors are routed through runOrCleanup so the
     // listener set installed by bind() is torn down before the error
-    // surfaces — same contract as the synchronous path.
+    // surfaces — same contract as the synchronous path. The observer
+    // *setup* (constructor + observe()) is ALSO wrapped in runOrCleanup
+    // because § Teardown Contract explicitly names "the deferred-sync
+    // observer's setup" as an install-time throw the cleanup MUST cover;
+    // a hostile MutationObserverCtor / observe() that throws would
+    // otherwise leak the listeners attached by the registration loop.
     const htmlTarget = et as HTMLElement;
     // Single-path observer disposal: the callback's success path and the
     // unbind cleanup path both go through `disposeObserver`, which guards
     // against double-disconnect via its own `observerDisposed` flag. This
     // matters for a hostile / counting `observer.disconnect()` override —
-    // SPEC.md § Teardown Contract names that exact threat as in-scope,
-    // and the previous shape called disconnect() twice on the success-
-    // then-throw path.
+    // SPEC.md § Teardown Contract names that exact threat as in-scope.
+    // `observer` is declared as a `let` so disposeObserver can be pushed
+    // to `cleanups` BEFORE the (possibly-throwing) constructor+observe
+    // pair; the optional chain on `observer?.disconnect()` makes the
+    // helper a safe no-op in the "pushed but not yet assigned" window.
+    let observer: MutationObserver | undefined;
     let observerDisposed = false;
     const disposeObserver = () => {
       if (observerDisposed) return;
       observerDisposed = true;
-      observer.disconnect();
+      observer?.disconnect();
     };
-    const observer = new MutationObserverCtor(() => {
-      if (htmlTarget.isConnected) {
-        disposeObserver();
-        runOrCleanup(initialSync);
-      }
-    });
-    observer.observe(documentRef, { childList: true, subtree: true });
     cleanups.push(disposeObserver);
+    runOrCleanup(() => {
+      observer = new MutationObserverCtor(() => {
+        if (htmlTarget.isConnected) {
+          disposeObserver();
+          runOrCleanup(initialSync);
+        }
+      });
+      observer.observe(documentRef, { childList: true, subtree: true });
+    });
   } else {
     runOrCleanup(initialSync);
   }

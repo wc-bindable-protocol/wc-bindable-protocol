@@ -280,6 +280,41 @@ describe("getWcBindableDeclaration", () => {
     expect(() => bind(new EmptyCore(), "nope" as unknown as () => void)).toThrow(TypeError);
   });
 
+  it("does not leak listeners when MutationObserver.observe() throws during deferred-sync setup", () => {
+    // Regression for Issue C: when the deferred-sync observer setup
+    // throws (a hostile MutationObserverCtor or observe() that raises),
+    // the registration loop's already-installed listeners must be torn
+    // down before the error reaches the caller. Previously the canDefer
+    // block sat OUTSIDE runOrCleanup, so an observe() throw escaped
+    // unprotected and the listeners leaked.
+    const el = createBindableElement(validDeclaration);
+    const realRemove = el.removeEventListener.bind(el);
+    const removeSpy = vi.fn(realRemove);
+    el.removeEventListener = removeSpy as typeof el.removeEventListener;
+
+    // Sabotage MutationObserver.observe so the deferred-sync setup
+    // throws synchronously.
+    const realObserve = MutationObserver.prototype.observe;
+    const observeSpy = vi.spyOn(MutationObserver.prototype, "observe")
+      .mockImplementation(() => { throw new Error("observe trap"); });
+    try {
+      const onUpdate = vi.fn();
+      expect(() => bind(el, onUpdate, { syncOn: "connect" })).toThrow("observe trap");
+      // The registration loop already attached one listener for "value".
+      // The cleanup-on-throw path must have removed it before the throw
+      // propagated, so the spy records exactly one removeEventListener call.
+      expect(removeSpy).toHaveBeenCalledTimes(1);
+      expect(removeSpy).toHaveBeenCalledWith("test:value-changed", expect.any(Function));
+
+      // Confirm there really is no listener left by dispatching the event.
+      el.dispatchEvent(new CustomEvent("test:value-changed", { detail: "leaked?" }));
+      expect(onUpdate).not.toHaveBeenCalled();
+    } finally {
+      observeSpy.mockRestore();
+      MutationObserver.prototype.observe = realObserve;
+    }
+  });
+
   it("disposes the deferred-sync observer exactly once across both the success callback and unbind", async () => {
     // Regression: the previous shape called observer.disconnect() twice
     // on the success-then-throw path (once manually in the callback's
