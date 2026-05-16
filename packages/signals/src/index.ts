@@ -41,6 +41,9 @@ export function createWcBindable<V extends object = Record<string, unknown>>(
         unbindFn = null;
       }
       if (!isWcBindable(el)) return;
+      // syncOn: "connect" defers the initial-value read until the element is
+      // attached to the document so users do not have to sequence
+      // bind() after appendChild() manually.
       unbindFn = bind(el, (name, value) => {
         const existing = signals[name];
         if (existing) {
@@ -48,7 +51,7 @@ export function createWcBindable<V extends object = Record<string, unknown>>(
         } else {
           signals[name] = new Signal.State(value);
         }
-      });
+      }, { syncOn: "connect" });
     },
     unbind() {
       if (unbindFn) {

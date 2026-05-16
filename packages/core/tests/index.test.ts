@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { bind, isWcBindable } from "../src/index.js";
+import { bind, isWcBindable, SUPPORTED_PROTOCOL_VERSION } from "../src/index.js";
 import type { WcBindableDeclaration } from "../src/index.js";
 
 function createBindableElement(decl: WcBindableDeclaration): HTMLElement {
@@ -38,10 +38,26 @@ describe("isWcBindable", () => {
     expect(isWcBindable(el)).toBe(false);
   });
 
-  it("returns false when version does not match", () => {
+  it("accepts future protocol versions (forward-compat)", () => {
     const el = createBindableElement({
       ...validDeclaration,
-      version: 2 as 1,
+      version: SUPPORTED_PROTOCOL_VERSION + 1,
+    });
+    expect(isWcBindable(el)).toBe(true);
+  });
+
+  it("rejects versions below the adapter's supported version", () => {
+    const el = createBindableElement({
+      ...validDeclaration,
+      version: 0,
+    });
+    expect(isWcBindable(el)).toBe(false);
+  });
+
+  it("rejects non-integer versions", () => {
+    const el = createBindableElement({
+      ...validDeclaration,
+      version: 1.5,
     });
     expect(isWcBindable(el)).toBe(false);
   });
@@ -142,14 +158,27 @@ describe("bind", () => {
     expect(onUpdate).toHaveBeenCalledWith("value", "initial");
   });
 
-  it("does not call onUpdate for undefined initial values", () => {
+  it("skips initial sync when the declared property is not exposed on the target", () => {
     const el = createBindableElement(validDeclaration);
-    // value is not set, so it should be undefined
+    // value is not assigned; "value" is not declared as a prototype property either.
     const onUpdate = vi.fn();
 
     bind(el, onUpdate);
 
     expect(onUpdate).not.toHaveBeenCalled();
+  });
+
+  it("delivers an explicitly-undefined initial value (in operator)", () => {
+    // The previous "undefined sentinel" rule could not distinguish "value is
+    // undefined" from "property not on target". The current rule uses `in`,
+    // so an own property holding undefined is delivered.
+    const el = createBindableElement(validDeclaration);
+    (el as unknown as Record<string, unknown>).value = undefined;
+    const onUpdate = vi.fn();
+
+    bind(el, onUpdate);
+
+    expect(onUpdate).toHaveBeenCalledWith("value", undefined);
   });
 
   it("synchronizes multiple initial values", () => {
@@ -170,5 +199,70 @@ describe("bind", () => {
     expect(onUpdate).toHaveBeenCalledTimes(2);
     expect(onUpdate).toHaveBeenCalledWith("value", "hello");
     expect(onUpdate).toHaveBeenCalledWith("checked", true);
+  });
+
+  describe("syncOn: connect", () => {
+    it("defers initial sync until the element is connected", async () => {
+      const el = createBindableElement(validDeclaration);
+      (el as unknown as Record<string, unknown>).value = "early";
+      const onUpdate = vi.fn();
+
+      bind(el, onUpdate, { syncOn: "connect" });
+      expect(onUpdate).not.toHaveBeenCalled();
+
+      // Mutate the value after bind() but before connection — when the
+      // element is connected, the deferred initial sync should observe the
+      // most recent value rather than the value at bind() time.
+      (el as unknown as Record<string, unknown>).value = "late";
+      document.body.appendChild(el);
+
+      // MutationObserver delivery is microtask-queued; wait for it.
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(onUpdate).toHaveBeenCalledWith("value", "late");
+      document.body.removeChild(el);
+    });
+
+    it("syncs immediately when the element is already connected", () => {
+      const el = createBindableElement(validDeclaration);
+      (el as unknown as Record<string, unknown>).value = "connected";
+      document.body.appendChild(el);
+
+      const onUpdate = vi.fn();
+      bind(el, onUpdate, { syncOn: "connect" });
+
+      expect(onUpdate).toHaveBeenCalledWith("value", "connected");
+      document.body.removeChild(el);
+    });
+
+    it("unbind() cancels a pending deferred sync", async () => {
+      const el = createBindableElement(validDeclaration);
+      (el as unknown as Record<string, unknown>).value = "v";
+      const onUpdate = vi.fn();
+
+      const unbind = bind(el, onUpdate, { syncOn: "connect" });
+      unbind();
+      document.body.appendChild(el);
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(onUpdate).not.toHaveBeenCalled();
+      document.body.removeChild(el);
+    });
+
+    it("falls back to immediate sync for headless EventTargets", () => {
+      class HeadlessCore extends EventTarget {
+        static wcBindable: WcBindableDeclaration = {
+          protocol: "wc-bindable",
+          version: 1,
+          properties: [{ name: "value", event: "test:value-changed" }],
+        };
+        value = "headless";
+      }
+
+      const onUpdate = vi.fn();
+      bind(new HeadlessCore(), onUpdate, { syncOn: "connect" });
+
+      expect(onUpdate).toHaveBeenCalledWith("value", "headless");
+    });
   });
 });

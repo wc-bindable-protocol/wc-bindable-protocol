@@ -39,8 +39,10 @@ Stateful helper. Pre-creates one `Signal.State` per key in `initialValues` and
 keeps each signal's value in sync with the component's matching declared
 property.
 
-Returns `{ signals, bind, unbind }`. Call `bind(el)` once the element is in the
-DOM, `unbind()` when you're tearing the view down. Read the current value with
+Returns `{ signals, bind, unbind }`. Call `bind(el)` to attach to the
+element (safe to call before or after it is connected to the DOM — the
+initial-value read is deferred via `syncOn: "connect"`); call `unbind()`
+when you're tearing the view down. Read the current value with
 `signals.<name>.get()`; observe changes by wrapping that read in a
 `Signal.Computed` and attaching a `Signal.subtle.Watcher`.
 
@@ -85,8 +87,8 @@ import "./my-counter.js";
 const binder = createWcBindable<{ count: number }>({ count: 0 });
 
 const el = document.createElement("my-counter");
+binder.bind(el); // initial-sync is deferred until the element is connected
 document.body.appendChild(el);
-binder.bind(el); // bind AFTER append so initial-sync sees post-connect values
 
 const out = document.createElement("p");
 document.body.appendChild(out);

@@ -35,9 +35,11 @@ Stateful helper. Pre-creates one `van.state` per key in `initialValues` and
 keeps each state's `.val` in sync with the component's matching declared
 property.
 
-Returns `{ states, bind, unbind }`. Call `bind(el)` once the element is in the
-DOM, `unbind()` when you're tearing the view down. Inside a VanJS template,
-read `states.<name>.val` from a function expression to get reactive updates.
+Returns `{ states, bind, unbind }`. Call `bind(el)` to attach to the element
+(safe to call before or after it is connected to the DOM — the initial-value
+read is deferred via `syncOn: "connect"`); call `unbind()` when you're
+tearing the view down. Inside a VanJS template, read `states.<name>.val`
+from a function expression to get reactive updates.
 
 ```ts
 const binder = createWcBindable<{ value: string; checked: boolean }>({
@@ -58,11 +60,11 @@ created lazily on first event, accessible via `binder.states[name]`.
 ## Usage
 
 VanJS has no "after mount" lifecycle hook — you compose DOM nodes directly,
-and `van.add()` connects them synchronously. Call `bind()` **after** the
-element is connected to the DOM so its `connectedCallback()` has run and the
-initial-sync read sees post-connect values. The simplest way is to defer the
-`bind()` call with `queueMicrotask`, which fires right after the surrounding
-`van.add()` finishes.
+and `van.add()` connects them synchronously. `binder.bind()` is safe to call
+either before or after the element is connected: it forwards
+`{ syncOn: "connect" }` to the underlying `bind()`, so the initial-value
+read is automatically deferred until the element is attached to the
+document.
 
 ```ts
 import van from "vanjs-core";
@@ -75,9 +77,7 @@ function App() {
   const binder = createWcBindable<{ count: number }>({ count: 0 });
 
   const myCounter = document.createElement("my-counter");
-  // Defer: van.add() below appends the element synchronously, then this
-  // microtask fires with the element already connected.
-  queueMicrotask(() => binder.bind(myCounter));
+  binder.bind(myCounter); // initial-sync waits until van.add() connects it
 
   return div(
     myCounter,
@@ -89,12 +89,11 @@ function App() {
 van.add(document.body, App());
 ```
 
-> Binding before mount **also** works for components that initialize their
-> bindable properties in their constructor (e.g. via class fields) and
-> dispatch a change event for every later mutation. But components that only
-> populate their bindable values in `connectedCallback()` without dispatching
-> an event there will be missed by the initial sync if `bind()` runs first.
-> Deferring is the safe default.
+> The deferred initial sync covers the case where a component only populates
+> its bindable values inside `connectedCallback()` without dispatching an
+> event for that initial assignment. For components that initialize in the
+> constructor and dispatch on every later mutation, immediate or deferred
+> binding produces the same result.
 
 ### Low-level usage
 

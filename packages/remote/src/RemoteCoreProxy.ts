@@ -634,6 +634,10 @@ export class RemoteCoreProxy extends EventTarget {
     return this._eventsByName.has(name);
   }
 
+  _hasCachedValue(name: string): boolean {
+    return Object.prototype.hasOwnProperty.call(this._values, name);
+  }
+
   _isDeclaredInput(name: string): boolean {
     return this._inputs.has(name);
   }
@@ -648,6 +652,17 @@ export class RemoteCoreProxy extends EventTarget {
 // be bound to the real target, not the Proxy — browsers throw "Illegal
 // invocation" when native methods are called with a Proxy as `this`.
 const handler: ProxyHandler<RemoteCoreProxy> = {
+  // Make `in` reflect what bind()'s initial sync can actually read: a
+  // declared property is reported as present only when a value has been
+  // cached (i.e. the server has synced or pushed an update for it). Without
+  // this trap, `"value" in proxy` would fall through to the underlying
+  // RemoteCoreProxy class and return false even for declared properties.
+  has(target, prop) {
+    if (typeof prop === "string" && target._hasCachedValue(prop)) {
+      return true;
+    }
+    return Reflect.has(target, prop);
+  },
   get(target, prop) {
     if (typeof prop === "string" && target._hasDeclaredProperty(prop)) {
       return target._getCachedValue(prop);
