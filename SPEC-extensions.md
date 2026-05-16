@@ -218,7 +218,7 @@ This section is the **normative** wire-format specification for any implementati
 
 - `update` is dispatched for every change event the producer-side shell observes, after applying the producer-side `getter`. The `name` MUST be one declared in `properties`.
 - `return` / `throw` MUST reference an `id` issued by a prior client message. The producer MAY emit only ONE of `return` or `throw` for any given `id`. Implementations SHOULD reject unknown `id`s with a logger warning rather than throwing — late replies after an abort are normal.
-- `capabilities.setAck === true` advertises that the producer honors `setWithAck`. Consumers that issued `setWithAck` calls **before** the `sync` response MUST reject all of them with a clear error if `setAck` is absent or `false`. Calls issued **after** a `sync` response whose `setAck` is absent or `false` MUST be rejected synchronously by the consumer-side proxy with the same clear error; the proxy MUST NOT send a `setWithAck` message it knows the producer will not handle. **Fire-and-forget `set` (the `id`-less variant) is unaffected by this capability bit** — it is part of the baseline wire contract and every producer MUST handle it regardless of `setAck` support. A producer that signals `setAck: false` is opting out only of the acknowledged path.
+- `capabilities.setAck === true` advertises that the producer honors `setWithAck`. Consumers that issued `setWithAck` calls **before** the `sync` response MUST reject all of them with a clear error if `setAck` is absent or `false`. Calls issued **after** a `sync` response whose `setAck` is absent or `false` MUST be rejected by the consumer-side proxy with the same clear error — concretely, `setWithAck` / `setWithAckOptions` MUST **synchronously return an already-rejected `Promise`** (not throw synchronously, consistent with the Promise-rejection rule for protocol-level failures in § Methods). The proxy MUST NOT send a `setWithAck` message it knows the producer will not handle. **Fire-and-forget `set` (the `id`-less variant) is unaffected by this capability bit** — it is part of the baseline wire contract and every producer MUST handle it regardless of `setAck` support. A producer that signals `setAck: false` is opting out only of the acknowledged path.
 
 #### Return envelope value field
 
@@ -330,6 +330,54 @@ The producer's return value (sync or eventual `Promise` resolution) MUST be JSON
 ### Reserved names
 
 Implementations MAY reserve a small namespace of `name` values for protocol-internal use (e.g. the reference implementation reserves names beginning with `@wc-bindable/`). Reserved names in a declaration's `properties` / `inputs` / `commands` MUST be rejected at proxy construction time and MUST NOT generate wire traffic. This is a safety net so a typo or hostile declaration cannot silently shadow protocol-level messages.
+
+### Transport adapter contract
+
+A custom transport — anything other than the reference WebSocket transport bundled with `@wc-bindable/remote` — MUST implement two narrow interfaces, one per side of the wire:
+
+```typescript
+interface ClientTransport {
+  /** Hand a single client message to the wire. MAY throw synchronously
+   *  for a terminal failure; transient outages MUST be masked. */
+  send(message: ClientMessage): void;
+
+  /** Register the single handler that receives inbound server messages.
+   *  Called once during proxy construction. Multiple registrations are
+   *  out of contract. */
+  onMessage(handler: (message: ServerMessage) => void): void;
+
+  /** Optional. If implemented, called when the transport observes a
+   *  terminal close. MUST fire at most once per connection lifetime.
+   *  Subsequent transport events MUST be ignored after onClose. */
+  onClose?(handler: () => void): void;
+
+  /** Optional. MUST be idempotent. Releases transport resources; the
+   *  proxy calls this on dispose() and on `_handleSendFailure`. */
+  dispose?(): void;
+}
+
+interface ServerTransport {
+  /** Symmetric to ClientTransport.send. */
+  send(message: ServerMessage): void;
+  /** Symmetric to ClientTransport.onMessage. */
+  onMessage(handler: (message: ClientMessage) => void): void;
+  /** Symmetric to ClientTransport.onClose. */
+  onClose?(handler: () => void): void;
+  /** Symmetric to ClientTransport.dispose. */
+  dispose?(): void;
+}
+```
+
+A transport implementation conforms when **all** of the following hold:
+
+1. **FIFO delivery on a single channel.** Messages handed to `send()` are observed by the peer's `onMessage` in the same order. The fingerprint, sync-time `update` buffering, and `setWithAck` / `invoke` matching rules all depend on this. Per-connection WebSocket and per-port `MessagePort` satisfy it; `BroadcastChannel` and any fan-in / fan-out transport that does not collapse to a single ordered stream **do not** in the general case and are out of contract unless wrapped.
+2. **JSON-shape payload only at the boundary.** Even on transports whose native channel could carry structured-clone values (`MessagePort`, `Worker.postMessage`), the transport adapter MUST serialize at the boundary — i.e. call `JSON.stringify` on send and `JSON.parse` on receive, or otherwise enforce that every value matches `JsonValue` (see § Design invariants invariant 3). This presents every transport with the same lossy view to the proxy/shell and prevents a payload that survives one transport from silently changing shape on another.
+3. **`onClose` is at-most-once.** Reconnect is modeled as constructing a fresh transport instance and passing it to `RemoteCoreProxy.reconnect()` (or equivalent), not as re-firing `onClose` on the same instance.
+4. **`dispose()` is idempotent.** The proxy / shell call `dispose()` on terminal failure AND on its own teardown; double-invocation is normal traffic, not an error condition.
+5. **Single-handler `onMessage`.** Exactly one handler is registered per transport lifetime; multiple registrations are out of contract.
+6. **No silent message manipulation.** The transport MUST NOT rewrite message fields, coalesce frames, or insert synthetic messages. The proxy/shell rely on a 1:1 mapping between `send()` and `onMessage` invocations.
+
+Transport-specific concerns *outside* the normative contract — back-pressure caps, logger injection, framework-integration examples, the concrete WebSocket / `BroadcastChannel` / `MessagePort` / `Worker` implementations bundled with `@wc-bindable/remote` — are documented in [packages/remote/README.md](packages/remote/README.md). That document is operational guidance, not normative; this section is the spec a third-party transport must satisfy to interoperate with any conformant proxy/shell.
 
 ### Conformance summary
 

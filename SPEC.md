@@ -7,7 +7,7 @@
 
 ## Overview
 
-`wc-bindable-protocol` is a minimal, framework-agnostic protocol that enables any class extending `EventTarget` to declare its reactive properties so that any reactivity system (React, Vue, Svelte, etc.) can bind to them without framework-specific coupling. Optionally, components can also declare their input properties and commands, providing a complete interface description that enables tooling, documentation generation, and remote proxying.
+`wc-bindable-protocol` is a minimal, framework-agnostic protocol that enables any object satisfying the EventTarget contract — in practice, classes that extend `EventTarget`, but also plain proxies and adapters that structurally provide the same methods — to declare its reactive properties so that any reactivity system (React, Vue, Svelte, etc.) can bind to them without framework-specific coupling. Optionally, components can also declare their input properties and commands, providing a complete interface description that enables tooling, documentation generation, and remote proxying.
 
 The minimum requirement is `EventTarget` — any object that participates in the standard EventTarget contract can take part in the protocol. The capability requirement splits by role:
 
@@ -24,7 +24,7 @@ The protocol requires no dependencies and relies solely on standard APIs: `stati
 
 ## Goals
 
-- Allow any EventTarget-based class to declare bindable properties once
+- Allow any object satisfying the EventTarget contract (an `EventTarget` subclass or a structural duck-type with compatible `addEventListener` / `removeEventListener` / `dispatchEvent` methods) to declare bindable properties once
 - Optionally allow declaration of input properties and commands for a complete interface description
 - Allow any reactivity system to consume those declarations without prior knowledge of the component
 - Remain zero-dependency and runtime-only
@@ -283,9 +283,25 @@ interface WcBindableCommandDescriptor {
   async?: boolean;
 }
 
-/** A target that survives `isWcBindable()` — i.e. an EventTarget that exposes
- *  a valid declaration on its constructor. */
-type WcBindableTarget = EventTarget & {
+/** A target that survives `isWcBindable()` — i.e. anything that exposes
+ *  the consumer-side EventTarget surface (add/removeEventListener) AND a
+ *  valid declaration on its `constructor`. The type is structural — it does
+ *  NOT extend `EventTarget` — because the consumer-side bind contract does
+ *  not require `dispatchEvent`: a relay-only proxy that re-emits events
+ *  through its own internal channel is a valid bind target. Including
+ *  `EventTarget` in the intersection would let a `isWcBindable()` narrowing
+ *  falsely promise `dispatchEvent` on such proxies. */
+type WcBindableTarget = {
+  addEventListener(
+    type: string,
+    listener: EventListenerOrEventListenerObject | null,
+    options?: boolean | AddEventListenerOptions,
+  ): void;
+  removeEventListener(
+    type: string,
+    listener: EventListenerOrEventListenerObject | null,
+    options?: boolean | EventListenerOptions,
+  ): void;
   readonly constructor: { readonly wcBindable: WcBindableDeclaration };
 };
 
@@ -441,8 +457,12 @@ function bind(target, onUpdate, options) {
   };
 
   const syncOn = options?.syncOn ?? "call";
+  // Short-circuit when there are no observable properties: the deferred
+  // path has nothing to do, and installing a MutationObserver here would
+  // violate the "empty properties returns a real no-op cleanup" rule.
   const canDefer =
     syncOn === "connect" &&
+    decl.properties.length > 0 &&
     HTMLElementCtor !== undefined &&
     et instanceof HTMLElementCtor &&
     !et.isConnected &&
@@ -459,7 +479,14 @@ function bind(target, onUpdate, options) {
     runOrCleanup(initialSync);
   }
 
-  return () => cleanups.forEach((fn) => fn());
+  return () => {
+    // Exception-safe teardown: every cleanup runs even if an earlier one
+    // throws. Required by the "MUST remove every listener" rule (see
+    // § Teardown Contract).
+    for (const fn of cleanups) {
+      try { fn(); } catch { /* swallow per teardown-contract semantics */ }
+    }
+  };
 }
 ```
 
@@ -472,6 +499,8 @@ function bind(target, onUpdate, options) {
 **If a *deferred* initial-sync (`syncOn: "connect"`) throws** the same cleanup runs — but the error has no synchronous caller to propagate to. The throw originates inside a `MutationObserver` callback (a microtask), so the runtime treats it as an uncaught error: browsers surface it via `window.onerror` / `reportError`, Node surfaces it via `process.on('uncaughtException')`, etc. The unbind function the caller already received remains valid but becomes a no-op since every cleanup it would have called has already run. Adapters SHOULD treat deferred-throw cleanup as a best-effort safety net — consumers who need structured error handling from initial-sync should use `syncOn: "call"` from inside their own lifecycle hook so that the throw lands on a frame they can catch.
 
 **If `onUpdate` throws on a post-initial-sync event** — i.e. after `bind()` has returned and a normal change event fires the registered listener — the error propagates out of the event listener via the standard DOM dispatch path (i.e. it becomes an unhandled error on the dispatching event-loop turn). The listener remains attached; the adapter does NOT auto-unbind on consumer throws, and subsequent events continue to fire normally. Consumers that want fail-fast teardown on their own throws are responsible for calling the returned unbind from a catch in their `onUpdate`.
+
+**If a cleanup callback itself throws during the consumer-invoked unbind** — for example, a `Proxy`-wrapped target whose `removeEventListener` raises, or an overridden `observer.disconnect()` — the adapter **MUST** continue running the remaining cleanup callbacks instead of aborting. Without this, a single misbehaving cleanup at the head of the list would orphan every later listener and observer the same `bind()` installed, contradicting the "MUST remove every listener" rule. The conformant pattern is to wrap each cleanup invocation in `try { ... } catch {}` and swallow secondary errors; teardown is best-effort, not error-reporting. (Same rationale and shape as the synchronous initial-sync throw path described above.)
 
 Long-lived headless `Core` instances may outlive multiple consumers; without an explicit teardown contract, listener leaks are guaranteed. Component-side `disconnectedCallback` cannot be relied on because headless Cores have no DOM lifecycle, and Web Components bound via framework refs may be reattached.
 
@@ -623,6 +652,8 @@ bind(core, (name, value) => { /* ... */ });
 ```
 
 When the type parameter is omitted, the values type defaults to `Record<string, unknown>`, preserving backward compatibility.
+
+Several adapters in this repository (React, Preact, Vue, Vanjs, Mobx, Rxjs, Signals, Mithril, Riot, Stencil, Lit) also accept an **optional initial-values object** as the first call-site argument — e.g. `useWcBindable<HTMLElement, MyCounterValues>({ count: 0 })` — so the consumer's local state has a meaningful starting shape before the first declared event fires (or before initial sync resolves on a remote proxy). This is an adapter-level convention, not a protocol-level requirement; the core `bind()` itself takes no such argument and the spec does not mandate one. Adapters that adopt it SHOULD treat the object as a shallow initial state and SHOULD overwrite each key as soon as the matching `(name, value)` arrives from the protocol.
 
 ### Two-Layer Contract
 

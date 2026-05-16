@@ -199,13 +199,16 @@ npm run examples
 
 Open `http://localhost:5173` to see the example index.
 
-### Headless Web Components
+### Web Components as invisible service layers
+
+> Terminology note: this section talks about DOM-mounted Web Components that have no visual surface (e.g. `<my-fetch>`). It is **not** the same as the "headless target" concept in SPEC.md, which refers to plain `EventTarget` subclasses that run with no DOM at all (Node / Deno / Workers). Both patterns benefit from the protocol; they differ in whether the target is in the document tree.
 
 The `<my-fetch>` example demonstrates using Web Components as **invisible service layers** — not UI widgets. The component handles HTTP requests internally and exposes `value`, `loading`, `error`, and `status` via the protocol. Framework code contains zero async logic:
 
 ```tsx
 // React — no fetch(), no async/await, no loading state management
-const [ref, values] = useWcBindable<MyFetchElement, MyFetchValues>();
+import type { MyFetchValues } from "./my-fetch/types.js";
+const [ref, values] = useWcBindable<HTMLElement, MyFetchValues>();
 // values.loading, values.value, values.error — all reactive
 ```
 

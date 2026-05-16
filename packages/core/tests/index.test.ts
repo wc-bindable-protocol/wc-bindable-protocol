@@ -192,6 +192,73 @@ describe("getWcBindableDeclaration", () => {
     expect(getWcBindableDeclaration(el)).not.toBeUndefined();
   });
 
+  it("does NOT install a MutationObserver under syncOn:connect when properties is empty", () => {
+    // Regression: a previous draft would install a document-wide observer
+    // for an empty-properties / unconnected / syncOn:connect bind, breaking
+    // the "empty properties returns a no-op cleanup" promise. The fix
+    // short-circuits the deferred path when properties.length === 0.
+    class EmptyCore extends HTMLElement {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+        commands: [{ name: "ping" }],
+      };
+    }
+    const tag = `empty-${Math.random().toString(36).slice(2, 8)}`;
+    customElements.define(tag, EmptyCore);
+    const el = document.createElement(tag);
+    // Intentionally NOT connected.
+    const observeSpy = vi.spyOn(MutationObserver.prototype, "observe");
+    try {
+      const unbind = bind(el, () => {}, { syncOn: "connect" });
+      expect(observeSpy).not.toHaveBeenCalled();
+      unbind();
+    } finally {
+      observeSpy.mockRestore();
+    }
+  });
+
+  it("cleans up all listeners even when an earlier cleanup throws (exception-safe unbind)", () => {
+    // Regression: unbind previously aborted on the first throwing cleanup,
+    // leaving later listeners attached. Now wraps each cleanup in try/catch.
+    class TwoEventCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [
+          { name: "a", event: "test:a" },
+          { name: "b", event: "test:b" },
+        ],
+      };
+    }
+    const core = new TwoEventCore();
+    // Sabotage the first removeEventListener call so it throws once.
+    const real = core.removeEventListener.bind(core);
+    let sabotaged = false;
+    core.removeEventListener = vi.fn((type: string, listener: EventListenerOrEventListenerObject) => {
+      if (!sabotaged) {
+        sabotaged = true;
+        // Still actually remove the listener so the next dispatch test reflects
+        // teardown intent. The throw is the contract violation we want to
+        // recover from.
+        real(type, listener);
+        throw new Error("remove threw");
+      }
+      real(type, listener);
+    });
+
+    const onUpdate = vi.fn();
+    const unbind = bind(core, onUpdate);
+    expect(() => unbind()).not.toThrow();
+
+    // After unbind, neither event should reach onUpdate.
+    onUpdate.mockClear();
+    core.dispatchEvent(new CustomEvent("test:a", { detail: 1 }));
+    core.dispatchEvent(new CustomEvent("test:b", { detail: 2 }));
+    expect(onUpdate).not.toHaveBeenCalled();
+  });
+
   it("accepts properties: [] (commands-only headless target is bindable)", () => {
     class CommandsOnly extends EventTarget {
       static wcBindable: WcBindableDeclaration = {

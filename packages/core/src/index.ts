@@ -38,8 +38,26 @@ export type WcBindableConstructor = (new (...args: unknown[]) => EventTarget) & 
   wcBindable: WcBindableDeclaration;
 };
 
-export interface WcBindableElement extends EventTarget {
-  constructor: WcBindableConstructor;
+/**
+ * Structural type narrowed by `isWcBindable()`. Requires only the
+ * consumer-side EventTarget surface (`addEventListener` /
+ * `removeEventListener`) plus a `constructor.wcBindable` declaration —
+ * `dispatchEvent` is intentionally NOT required so a relay-only proxy that
+ * re-emits events through its own internal channel can still be a valid
+ * bind target. See SPEC.md § Overview for the consumer-vs-producer split.
+ */
+export interface WcBindableElement {
+  addEventListener(
+    type: string,
+    listener: EventListenerOrEventListenerObject | null,
+    options?: boolean | AddEventListenerOptions,
+  ): void;
+  removeEventListener(
+    type: string,
+    listener: EventListenerOrEventListenerObject | null,
+    options?: boolean | EventListenerOptions,
+  ): void;
+  readonly constructor: WcBindableConstructor;
 }
 
 /**
@@ -287,8 +305,16 @@ export function bind(
   };
 
   const syncOn = options?.syncOn ?? "call";
+  // A declaration with empty `properties` has nothing to initial-sync, so
+  // there is no work the deferred path could meaningfully do — short-
+  // circuiting here keeps the "empty properties returns a real no-op
+  // cleanup" promise from § Property Descriptor even under syncOn:"connect".
+  // Without this, we would install a document-wide MutationObserver whose
+  // callback only ever runs an empty loop, and the returned cleanup would
+  // include the observer.disconnect() — i.e. NOT a no-op.
   const canDefer =
     syncOn === "connect" &&
+    properties.length > 0 &&
     HTMLElementCtor !== undefined &&
     et instanceof HTMLElementCtor &&
     !et.isConnected &&
@@ -317,7 +343,18 @@ export function bind(
   }
 
   return () => {
+    // Exception-safe teardown: every cleanup runs, even if an earlier one
+    // throws. Without this, a Proxy-wrapped removeEventListener or an
+    // overridden observer.disconnect() that throws would prevent the
+    // remaining listeners from being removed — directly contradicting the
+    // teardown contract's "MUST remove every listener" rule. Secondary
+    // errors are swallowed (logged-by-runtime via the dispatch path on
+    // re-throw would be misleading here; this is best-effort teardown,
+    // not error reporting). This mirrors the synchronous-throw cleanup
+    // path used by runOrCleanup above.
     disposed = true;
-    cleanups.forEach((fn) => fn());
+    for (const fn of cleanups) {
+      try { fn(); } catch { /* swallow per teardown-contract semantics */ }
+    }
   };
 }

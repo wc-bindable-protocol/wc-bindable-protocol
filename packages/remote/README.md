@@ -169,7 +169,7 @@ useEffect(() => {
 
 ## Custom transport
 
-The `ClientTransport` and `ServerTransport` interfaces are intentionally minimal. Implement them to use any transport — WebSocket, WebTransport, MessagePort, BroadcastChannel, Worker postMessage, etc. — as long as it can satisfy the protocol contract below.
+The `ClientTransport` and `ServerTransport` interfaces are intentionally minimal. Implement them to use any transport — WebSocket, WebTransport, MessagePort, BroadcastChannel, Worker postMessage, etc. — as long as it can satisfy the protocol contract.
 
 ```typescript
 import type { ClientTransport, ClientMessage, ServerMessage } from "@wc-bindable/remote";
@@ -182,12 +182,13 @@ class MyCustomTransport implements ClientTransport {
 
 ### Transport contract
 
-The protocol relies on two invariants. Either failing to hold them silently breaks `sync` / `update` ordering or produces values that survive the wire but should not.
+The normative transport adapter contract — the full set of invariants a `ClientTransport` / `ServerTransport` implementation MUST satisfy to interoperate with `RemoteCoreProxy` and `RemoteShellProxy` — lives in [SPEC-extensions.md § Transport adapter contract](../../SPEC-extensions.md). It covers FIFO delivery on a single channel, JSON-shape payload boundary enforcement, `onClose` at-most-once semantics, `dispose()` idempotency, single-handler `onMessage`, and the no-silent-message-manipulation rule. Third-party transports MUST target that spec; this README is operational guidance, not normative.
 
-1. **FIFO delivery between a given (client, server) pair.** `sync` responses, `update` messages, `return` / `throw` replies, and post-sync updates must be observed by the peer in the order the sender called `send()`. The sequence-number-free design depends on this, and `RemoteShellProxy`'s sync-time update buffering only works if the transport preserves that order end-to-end. WebSocket (per-connection) and `MessagePort` (per-port) satisfy this. `BroadcastChannel` does **not** in the general case — different receivers can observe different orderings under tab suspension / throttling; use it only when all peers are in the same realm. Transports that fan-in from multiple senders or coalesce retries must collapse back to a single ordered stream before handing to the handler.
-2. **JSON-compatible payloads only.** The existing proxy/shell implementations assume the wire format is what `JSON.stringify` / `JSON.parse` round-trip faithfully: plain objects, arrays, strings, finite numbers, booleans, `null`. Values such as `Date`, `Map`, `Set`, `BigInt`, typed arrays, class instances, functions, or cyclic objects are out of contract — even on transports like `MessagePort` whose native structured clone would preserve them, custom transports **must** serialize at the boundary (e.g. call `JSON.stringify` / `JSON.parse` themselves) so every transport presents the same lossy, JSON-shape view to `RemoteCoreProxy` and `RemoteShellProxy`. Otherwise a message that survives one transport will silently change shape on another, and error-serialization / value-cache invariants break.
+A few practical reminders that flow from the spec:
 
-In addition, the optional `onClose(handler)` hook should fire at most once per connection lifetime, and `dispose()` (if implemented) must be idempotent — `RemoteShellProxy` and `RemoteCoreProxy` both rely on these when they tear down or reconnect.
+- **WebSocket** (per-connection) and `MessagePort` (per-port) satisfy FIFO out of the box.
+- **`BroadcastChannel`** does NOT in the general case — different receivers can observe different orderings under tab suspension / throttling; use it only when all peers are in the same realm.
+- Even on transports whose native channel could carry structured-clone values, the adapter MUST serialize at the boundary (e.g. `JSON.stringify` on send, `JSON.parse` on receive) so every transport presents the same lossy view to the proxy/shell.
 
 ### Back-pressure
 
