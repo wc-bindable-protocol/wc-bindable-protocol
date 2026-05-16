@@ -264,6 +264,8 @@ getter: (e) => e.target.value
 
 ## Conformance Levels
 
+> **Implementers: see [CONFORMANCE.md](CONFORMANCE.md)** for a starter set of test vectors covering the rules below that are easy to violate in ways that compile and pass naive smoke tests. The file is necessary-but-not-sufficient: passing every vector does not imply full conformance, but failing any indicates a concrete bug this specification calls out in prose.
+
 This specification has three independently claimable conformance levels. An implementation MUST be explicit about which it claims. The levels stack as follows:
 
 - **Level 1 is always implied** by claiming any higher level, but only for the *applicable facet(s)* defined in § Level 1 facets below. A Level 2 or Level 3 claim does NOT automatically require both 1P and 1O; see § Level 1 facets → "Facet implication for higher levels" for the per-level facet rule.

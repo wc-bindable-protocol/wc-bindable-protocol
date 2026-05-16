@@ -670,6 +670,8 @@ Transport-specific concerns *outside* the normative contract — back-pressure c
 
 A wire-format implementation conforms to this extension when:
 
+> Half of these rules have runnable starter vectors in [CONFORMANCE.md](CONFORMANCE.md) — specifically the `has`-trap pre-sync rule, the `update`-with-no-`value` undefined preservation, `JsonValue` validation, `setWithAck` ordering, and the legacy-`setAck` rejection path. Pass that file before claiming Extension 2 conformance; it is necessary, not sufficient.
+
 1. Every client message and server message matches one of the shapes above.
 2. The five design invariants (property-centric, getter-on-producer, JSON shape, FIFO, single-shell) hold.
 3. **Producers MUST advertise `capabilities.setAck: true` and MUST honor `setWithAck`** (the promise resolves only after the JS-level assignment has executed; see Extension 1 § Methods). A producer that omits the capability or advertises `false` is a legacy / non-current producer, NOT a current-version conformant one; consumers MUST interoperate with legacy producers for backward compatibility, but new producer implementations cannot claim conformance without the acknowledged path.
