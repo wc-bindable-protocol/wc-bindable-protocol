@@ -56,6 +56,7 @@ This protocol intentionally does **not** cover:
 | [@wc-bindable/angular](packages/angular/) | Angular directive — `wcBindable` |
 | [@wc-bindable/solid](packages/solid/) | Solid primitive — `createWcBindable()` / `use:wcBindable` |
 | [@wc-bindable/lit](packages/lit/) | Lit ReactiveController — `WcBindableController` |
+| [@wc-bindable/qwik](packages/qwik/) | Qwik composable — `useWcBindable()` (Qwik 1.x; Qwik 2.x via `/v2`, experimental) |
 | [@wc-bindable/remote](packages/remote/) | Remote proxy — connect Core and Shell over a network via WebSocket or custom transport |
 | [@wc-bindable/ai](packages/ai/) | Headless AI inference component — OpenAI, Anthropic, Azure OpenAI, and Google (Gemini) with SSE streaming, no provider SDK |
 | [@wc-bindable/auth0](packages/auth0/) | Headless Auth0 authentication component — local (token in DOM for `fetch`) and remote (gatekeeper over authenticated WebSocket) modes |
@@ -125,6 +126,23 @@ function App() {
   const [values, directive] = createWcBindable();
   return <my-input ref={directive} />;
 }
+```
+
+### Qwik
+
+```tsx
+import { component$ } from "@builder.io/qwik";
+import { useWcBindable } from "@wc-bindable/qwik";
+
+export const App = component$(() => {
+  const { ref, values } = useWcBindable<HTMLElement, { value: string }>({ value: "" });
+  return (
+    <>
+      <my-input ref={ref}></my-input>
+      <p>{values.value}</p>
+    </>
+  );
+});
 ```
 
 ### Lit
