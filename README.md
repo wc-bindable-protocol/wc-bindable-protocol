@@ -31,7 +31,7 @@ import { bind } from "@wc-bindable/core";
 
 const el = new MyInput();
 el.value = "hello";              // optional initial state
-document.body.appendChild(el);   // attach so the consumer can find it
+document.body.appendChild(el);   // attach (optional with default syncOn: "call" — bind() works on detached elements too; useful here so any connectedCallback runs before bind() reads initial state)
 
 const unbind = bind(el, (name, value) => {
   console.log(`${name} =`, value); // fires for the initial value and every change
@@ -287,12 +287,14 @@ await proxy.setWithAck("url", "/api/users");
 const result = await proxy.invoke("fetch");
 ```
 
-Three things to keep in mind on the remote path; all three have authoritative treatments in SPEC-extensions:
+Four things to keep in mind on the remote path; all four have authoritative treatments in SPEC-extensions:
 
 - **Prefer `setWithAck` over `set` when an `invoke` depends on the prior write.** `set` is fire-and-forget (at-most-once, can be silently dropped on a transient outage); `setWithAck` waits for the JS-level assignment on the trusted side. Full caveat: [SPEC-extensions.md § Methods](SPEC-extensions.md#methods), the `set` row.
 - **`setWithAck` does NOT wait for async side effects of the setter** (database writes, downstream pipelines). If the next command depends on async work, model it as its own command. Full contract: [SPEC-extensions.md § Methods](SPEC-extensions.md#methods), the `setWithAck` row.
 - **The proxy's call queue is FIFO, NOT transactional.** A later `invoke` does not auto-cancel if an earlier queued `setWithAck` ends up rejecting (e.g. the producer turns out to be a legacy peer without `setAck` support). When a command depends on a prior input assignment, `await` the assignment first — the snippet's `await proxy.setWithAck(...)` before `await proxy.invoke(...)` is the conformant pattern, not just stylistic. Full rule: [SPEC-extensions.md § Pre-sync call state machine](SPEC-extensions.md#pre-sync-call-state-machine) → "Queue ordering is not transactional".
 - **Every value crossing the wire MUST be a `JsonValue`.** Encode `Date` / `Map` / `Set` / `BigInt` / class instances (including `Error`) into plain JSON objects at the application boundary before sending or returning them. Full algorithm: [SPEC-extensions.md § Extension 2 invariant 3](SPEC-extensions.md#extension-2--wire-format-remote-proxying).
+
+> ⚠ **Known divergence in `@wc-bindable/remote` 0.7.x.** A producer-side transition into `undefined` currently delivers `null` (not `undefined`) to `bind()` callbacks because of the `CustomEvent.detail` WebIDL coercion — the cached `proxy.<name>` correctly reads `undefined`, but the listener-delivered value disagrees. This is [CONFORMANCE.md vector 6](CONFORMANCE.md) and is tracked for a follow-up release; the spec rule in [SPEC-extensions.md § CustomEvent `detail` and undefined preservation](SPEC-extensions.md#customevent-detail-and-undefined-preservation) is authoritative. Until then, if your application semantically distinguishes `undefined` from `null` on a remote-driven property, treat the `null` arriving in `onUpdate` as the symptom and read the cached `proxy.<name>` to recover the producer-intended `undefined`.
 
 For the full wire format, error envelope, back-pressure controls, transport adapter contract, and security model, see [SPEC-extensions.md](SPEC-extensions.md) and [packages/remote/README.md](packages/remote/README.md).
 
