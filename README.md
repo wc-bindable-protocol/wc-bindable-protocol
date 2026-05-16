@@ -1,6 +1,6 @@
 # wc-bindable-protocol
 
-> **Authoritative scope of this document.** README explains the protocol's concept, the one-snippet end-to-end use, the package layout, and entry points to the rest of the docs. **Normative rules live in [SPEC.md](SPEC.md) (core protocol) and [SPEC-extensions.md](SPEC-extensions.md) (input/command invocation + wire format).** Runnable conformance vectors live in [CONFORMANCE.md](CONFORMANCE.md). Where README and SPEC disagree, SPEC is authoritative.
+> **Authoritative scope of this document.** README explains the protocol's concept, the one-snippet end-to-end use, the package layout, and entry points to the rest of the docs. **Normative rules live in [SPEC.md](SPEC.md) (core protocol) and [SPEC-extensions.md](SPEC-extensions.md) (input/command invocation + wire format).** Runnable conformance vectors live in [CONFORMANCE.md](CONFORMANCE.md). Where README disagrees with SPEC.md or SPEC-extensions.md, those are authoritative.
 
 **wc-bindable lets a component publish "these properties can be observed, and these events mean they changed" in one standard place** — and any reactivity system reads that same place to wire up bindings without per-component glue.
 

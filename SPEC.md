@@ -3,7 +3,7 @@
 **Protocol:** `wc-bindable`  
 **Version:** 1  
 
-> **Authoritative scope of this document.** SPEC.md is the **authoritative source for the core protocol contract** — the `static wcBindable` declaration schema, the `bind()` / `getWcBindableDeclaration()` / `isWcBindable()` runtime surface, initial-sync semantics, the teardown contract, the conformance levels, and the versioning policy. Behavioral extensions (input/command invocation, the remote wire format) live in [SPEC-extensions.md](SPEC-extensions.md); runnable test vectors live in [CONFORMANCE.md](CONFORMANCE.md); narrative overview and quick-start live in [README.md](README.md). Where any of those disagree with the rules below, this document is authoritative.
+> **Authoritative scope of this document.** SPEC.md is the **authoritative source for the core protocol contract** — the `static wcBindable` declaration schema, the `bind()` / `getWcBindableDeclaration()` / `isWcBindable()` runtime surface, initial-sync semantics, the teardown contract, the conformance levels, and the versioning policy. Behavioral extensions (input/command invocation, the remote wire format) live in [SPEC-extensions.md](SPEC-extensions.md); runnable test vectors live in [CONFORMANCE.md](CONFORMANCE.md); narrative overview and quick-start live in [README.md](README.md). Where any of those disagree with a core rule below, this document is authoritative.
 
 ## Requirements language
 
