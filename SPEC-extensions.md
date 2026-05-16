@@ -334,7 +334,27 @@ This section is the **normative** wire-format specification for any implementati
   > - `undefinedProperties: true` and `getterFailures: true` — **SHOULD** be advertised by new producer implementations. These are diagnostic / classification fields; their absence degrades the consumer-side disambiguation between "modern producer with no undefined values" and "legacy producer" (see the per-capability rules below), but no safety mechanism breaks. Producers that omit them are still current-conformant, just less informative.
   >
   > The split between MUST and SHOULD here is what lets the consumer side detect a legacy peer via field absence while keeping the consumer's parser happy with both shapes.
-- Consumers that issued `setWithAck` calls **before** the `sync` response MUST reject all of them with a clear error if `setAck` is absent or `false`. Calls issued **after** a `sync` response whose `setAck` is absent or `false` MUST be rejected by the consumer-side proxy with the same clear error — concretely, `setWithAck` / `setWithAckOptions` MUST **synchronously return an already-rejected `Promise`** (not throw synchronously, consistent with the Promise-rejection rule for protocol-level failures in § Methods). The proxy MUST NOT send a `setWithAck` message it knows the producer will not handle.
+- Consumers that issued `setWithAck` calls **before** the `sync` response MUST reject all of them with a clear error if `setAck` is absent or `false`. Calls issued **after** a `sync` response whose `setAck` is absent or `false` MUST be rejected by the consumer-side proxy with the same clear error — concretely, `setWithAck` / `setWithAckOptions` MUST **synchronously return an already-rejected `Promise`** (not throw synchronously, consistent with the Promise-rejection rule for protocol-level failures in § Methods). The proxy MUST NOT send a `setWithAck` message it knows the producer will not handle. See § Pre-sync call state machine below for the full pre-sync queueing rules.
+
+##### Pre-sync call state machine
+
+The behavior of `setWithAck` / `setWithAckOptions` calls issued **between proxy construction and the arrival of the first `sync` response** is normative, because optimistic-send vs. queue-then-replay vs. immediate-reject produce wildly different interop bugs in the field. The contract is:
+
+| Call site | Pre-sync behavior (before first `sync` response) |
+|---|---|
+| `setWithAck` / `setWithAckOptions` | **MUST queue.** Do NOT send the wire message yet — `setAck` capability is unknown, and sending a `setWithAck` to a producer that ends up advertising `setAck: false` (or absent) is forbidden by the "MUST NOT send a message it knows the producer will not handle" rule above. The returned `Promise` stays pending. |
+| `invoke` / `invokeWithOptions` | MUST queue on the same queue, so per-caller FIFO is preserved across mixed `setWithAck` + `invoke` traffic. |
+| `set` (fire-and-forget) | MAY send immediately, because fire-and-forget `set` is unaffected by `setAck` (it is part of the baseline wire contract; see the bullet above). Implementations that queue it instead — to preserve global call-order with later `setWithAck` / `invoke` — are also conformant. The reference implementation queues. |
+
+On `sync` response arrival, the proxy MUST replay the queue **in caller order** (FIFO across all queued call sites — `setWithAck`, `setWithAckOptions`, `invoke`, `invokeWithOptions`, and `set` if it was queued):
+
+- If `setAck === true`: each queued `setWithAck` / `setWithAckOptions` is serialized onto the wire after `sync`-response processing completes. Each queued `invoke` / `invokeWithOptions` is serialized in the same order. Queued fire-and-forget `set` (if any) is sent in order too.
+- If `setAck` is absent or `false`: each queued `setWithAck` / `setWithAckOptions` MUST reject (returning an already-settled rejected `Promise` if not yet observed by the caller) with the same clear error described in the bullet above; no wire message is sent for them. Queued `invoke` / `invokeWithOptions` and `set` are unaffected — they MUST be sent in caller order (their semantics do not depend on `setAck`).
+- The proxy MUST NOT issue any of the deferred wire messages until the `sync` response has been fully processed (capability bits applied, fingerprint compared, initial-sync events dispatched). Doing so earlier risks the producer seeing an `invoke` whose semantics depend on an input the queued `setWithAck` was supposed to apply first, except inverted relative to the consumer's intended order.
+
+On transport-terminal-failure (no `sync` response will ever arrive — `onClose` fired, send threw, etc.) before the queue drains: every pending entry on the queue MUST reject with the terminal-failure error, in caller order. Queue order is the only order observable to the caller, so settling out of order would corrupt user-level error-handling logic that expects "the first failed call is the first one I made".
+
+The consumer-side proxy SHOULD expose its queue depth as a diagnostic; large pre-sync bursts on a slow handshake are a common cause of memory growth that is invisible from outside the proxy.
 - **Fire-and-forget `set` (the `id`-less variant) is unaffected by this capability bit** — it is part of the baseline wire contract and every producer (legacy and current alike) MUST handle it regardless of `setAck` support.
 
   > **Legacy producer + id-bearing `set` from a non-conforming consumer.** A conforming consumer never sends an `id`-bearing `set` (i.e. a `setWithAck` request) to a legacy producer, because the consumer-side proxy rejects such calls synchronously when `setAck` is absent or `false`. The case "non-conforming or hand-rolled consumer sends an `id`-bearing `set` to a legacy producer" is therefore **out of scope** for this extension — both peers are outside the current contract, so behavior is implementation-defined. Legacy producers MAY reply with a `throw` envelope referencing the `id` (the most diagnostically useful response), MAY drop the message with a logger warning, or MAY ignore the `id` and silently apply the `set` as if it were fire-and-forget. None of these is non-conformant, because the consumer that sent the message is already non-conformant; the spec only governs interactions between conformant peers.
@@ -436,6 +456,78 @@ Consumer-side rules:
 - Subsequent `update` messages for the same `name` (after the getter recovers) MUST be applied normally — the failure does NOT taint the property permanently.
 
 Producers MAY omit `getterFailures` when no read failed. Consumers MUST treat a missing field as an empty list.
+
+#### Consumer-side sync-response handling — reference pseudocode
+
+The prose above gives the normative rules for `values` / `undefinedProperties` / `getterFailures` and their capability bits; the pseudocode below shows how those rules compose into a single sync-response handler so implementations do not have to re-derive the branching from the running text. It is **non-normative** — the prose is authoritative — but mirrors what `@wc-bindable/remote`'s consumer-side proxy does on every `sync` arrival.
+
+```javascript
+// Consumer-side proxy: process one inbound `sync` response.
+// `prev` is the per-property cache snapshot before this sync (used for the
+// legacy revert-to-undefined heuristic).
+function processSync(msg, prev, capabilities, logger) {
+  const declaredNames = new Set(declaration.properties.map(p => p.name));
+  const values             = msg.values             ?? {};
+  const undefinedProps     = msg.undefinedProperties ?? [];
+  const getterFailures     = msg.getterFailures      ?? [];
+
+  // 1) Apply explicit values. Each entry produces an initial-sync event.
+  for (const [name, value] of Object.entries(values)) {
+    if (!declaredNames.has(name)) continue;       // not in local declaration — drop silently
+    cache.set(name, value);
+    dispatchInitialSync(name, value);             // observed via bind() onUpdate
+  }
+
+  // 2) Apply explicit-undefined enumeration. MUST preserve `undefined`
+  //    (not `null`) at the bind() boundary — see § CustomEvent `detail`
+  //    and undefined preservation.
+  if (capabilities?.undefinedProperties === true) {
+    for (const name of undefinedProps) {
+      if (!declaredNames.has(name)) continue;
+      cache.set(name, undefined);
+      dispatchInitialSyncUndefined(name);         // sentinel-or-bypass path
+    }
+  } else {
+    // Legacy producer — capability absent. Fall back to the revert-to-
+    // undefined heuristic for previously-cached names that vanished from
+    // `values`. Known to misclassify getter failures as undefined resets;
+    // see "Known lossy interaction (legacy producers only)" blockquote.
+    for (const name of declaredNames) {
+      const wasCached  = prev.has(name);
+      const stillThere = name in values;
+      if (wasCached && !stillThere) {
+        cache.set(name, undefined);
+        dispatchInitialSyncUndefined(name);
+      }
+    }
+  }
+
+  // 3) Apply getterFailures. Property-level, non-fatal, NO state assertion.
+  //    Do NOT touch the cache or dispatch — log only.
+  if (capabilities?.getterFailures === true) {
+    for (const name of getterFailures) {
+      if (!declaredNames.has(name)) continue;
+      logger.warn(`producer getter failed during sync: ${name}`);
+      // intentionally: no cache write, no dispatch
+    }
+  }
+  // (Legacy producers cannot send getterFailures, so step 3 is a no-op
+  // for them by construction — and the legacy fallback in step 2 then
+  // misclassifies a failed read as an undefined reset.  That misclassi-
+  // fication is the "Known lossy interaction" called out above.)
+
+  // 4) Compare the producer's declarationFingerprint with the local
+  //    fingerprint and log a warning on mismatch. Continue processing
+  //    regardless — fingerprint is diagnostic, not gating.
+  compareFingerprint(msg.declarationFingerprint, localFingerprint, logger);
+}
+```
+
+Three things to notice in the branching:
+
+1. **Capability bit, NOT field presence**, drives the modern-vs-legacy split (steps 2 and 3). A modern producer with no undefined values sends `capabilities.undefinedProperties: true` and an empty (or omitted) `undefinedProperties` list; a legacy producer sends nothing in either slot. The two are distinguishable only by the capability bit.
+2. **`getterFailures` does NOT touch the cache.** It is a *property-level* failure assertion, not a state assertion; previously-cached non-`undefined` values stay cached, and a subsequent successful `update` for the same name will replace them normally.
+3. **Step 2's legacy fallback always processes BEFORE step 3.** This is the structural reason the "Known lossy interaction" misclassification cannot be repaired on the consumer side: by the time step 3 would have evidence that the missing-from-`values` property was actually a getter failure (not an undefined reset), step 2 has already written `undefined` into the cache and dispatched the spurious event. The capability bit's role is to *skip* step 2's heuristic entirely so step 3's explicit-failure list becomes authoritative.
 
 #### Declaration fingerprint
 
@@ -576,7 +668,7 @@ The wire format is *almost* fully prescriptive, but a small number of validation
 
 All other validation rules — finite-number gate, plain-object prototype check, accessor rejection, sparse-hole rejection, array dense-and-surface-only rule, non-enumerable string-key rejection on plain objects, cycle detection — are fully prescriptive and admit no implementation-defined variation. A `JsonValue` predicate that rejects on one of them in implementation A but accepts in implementation B is non-conformant.
 
-`@wc-bindable/remote` 0.7.x is the reference implementation; [packages/remote/README.md](packages/remote/README.md) documents its operational specifics (back-pressure caps, logger injection, transport adapter contract for `BroadcastChannel` / `MessagePort` / `Worker`).
+`@wc-bindable/remote` 0.7.x is the **current implementation** and the basis for this specification, but it is **not yet a complete conformance oracle**: at least one normative rule in this document (the undefined-preservation rule in § CustomEvent `detail` and undefined preservation) is not yet satisfied by 0.7.x — see the "Reference implementation status (informative)" blockquote in that section for the specific gap. Where this spec and 0.7.x diverge, **the spec is authoritative**; the package will track toward full conformance in subsequent releases. [packages/remote/README.md](packages/remote/README.md) documents its operational specifics (back-pressure caps, logger injection, transport adapter contract for `BroadcastChannel` / `MessagePort` / `Worker`).
 
 ---
 
