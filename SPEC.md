@@ -106,6 +106,21 @@ class MyInput extends HTMLElement {
       { name: "clear" },
     ],
   };
+
+  // Initial-sync parity requirement — see § Appendix: Design rationale notes
+  // → "Why a custom getter is NOT applied during initial sync". The custom
+  // `getter` above extracts `e.detail.checked` from the event, but initial
+  // sync reads `target.checked` directly (no Event to feed the getter), so
+  // the component MUST expose `checked` as a property returning the same
+  // shape the getter would extract. Without this exposure the initial-sync
+  // value and the post-change value disagree on every bind.
+  get checked() { return this._checked; }
+  set checked(v) {
+    this._checked = v;
+    this.dispatchEvent(
+      new CustomEvent("my-input:checked-changed", { detail: { checked: v } }),
+    );
+  }
 }
 ```
 
@@ -252,7 +267,18 @@ This specification has three independently claimable conformance levels. An impl
 - **Level 1 is always implied** by claiming any higher level, but only for the *applicable facet(s)* defined in § Level 1 facets below. A Level 2 or Level 3 claim does NOT automatically require both 1P and 1O; see § Level 1 facets → "Facet implication for higher levels" for the per-level facet rule.
 - **Level 2 is implied only when the implementation has JS bindings**, because Level 2's rules — the normatively-named `bind` / `getWcBindableDeclaration` / `isWcBindable` exports — are JavaScript-specific. A non-JS Level-3 implementation (Python, Go, …) is NOT required to satisfy Level 2; a JS Level-3 implementation that also exposes a local-binding surface SHOULD additionally satisfy Level 2 for drop-in compatibility with the JS adapter ecosystem.
 
-Concretely: a Level 2 claim is `{1, 2}` (MUST). A Level 3 claim is `{1, 3}` for non-JS implementations and `{1, 3}` + Level 2 SHOULD for JS implementations.
+**Claim shorthand (with facet annotation).** The level numbers compose with the 1P / 1O facets defined in § Level 1 facets below. The shorthand `{1O, 2}` means "Level 1 observer facet plus Level 2 conformance"; the shorthand never elides the facet because Level 2 / Level 3 each touch a specific facet, not "all of Level 1". Use these claim shapes:
+
+| Claim | Reading |
+|---|---|
+| `{1O, 2}` | Level 2 conformant observer-side library (e.g. a third-party `bind()` reimplementation that ships no producer helpers). |
+| `{1O + 1P, 2}` | Level 2 conformant library that also ships producer helpers (`@wc-bindable/core` itself). |
+| `{1P, 3-producer}` | Producer-side remote shell (typical: a non-JS sidecar that emits but does not observe). |
+| `{1O, 3-consumer}` | Consumer-side remote proxy without a local-binding facade. |
+| `{1O + 1P, 3-both}` | Implementation that ships both Level 3 sides (`@wc-bindable/remote`). |
+| `{1O + 1P, 2, 3-both}` | A JS Level-3 implementation that also exposes a local-binding surface; SHOULD additionally satisfy Level 2 for drop-in compatibility. |
+
+A non-JS Level-3 implementation that is producer-only declares `{1P, 3-producer}` and is NOT obligated to satisfy 1O or Level 2 — its sidecar role is to emit, not to observe. The facet-implication rules in § Level 1 facets below are the authoritative source for which facets each level claim requires; this shorthand exists only to give release-notes / package-metadata a compact way to refer to a conformance claim.
 
 | Level | Name | What it covers | What it does NOT cover |
 |---|---|---|---|
@@ -465,30 +491,48 @@ function isValidNamedList(list, isValidEntry) {
   if (!Array.isArray(list)) return false;
   const seen = new Set();
   for (const entry of list) {
-    if (!isValidEntry(entry) || seen.has(entry.name)) return false;
-    seen.add(entry.name);
+    // Snapshot `entry.name` ONCE — a hostile accessor on a Proxy-wrapped
+    // descriptor that returns a different string on each read could
+    // otherwise pass isValidEntry's uniqueness-bearing read with one
+    // value and then dodge `seen.has` / `seen.add` here with another.
+    // The validator MUST keep the uniqueness gate tied to the same
+    // observed value the rest of the schema check saw.
+    if (!isValidEntry(entry)) return false;
+    const name = entry.name;
+    if (typeof name !== "string" || seen.has(name)) return false;
+    seen.add(name);
   }
   return true;
 }
 function isValidPropertyDescriptor(p) {
-  return p && typeof p === "object"
-    && typeof p.name === "string" && p.name.length > 0
-    && typeof p.event === "string" && p.event.length > 0
-    && (p.getter === undefined || typeof p.getter === "function");
+  if (!p || typeof p !== "object") return false;
+  // Same single-read rule: pull every Schema-typed field into a local
+  // before validating it, so a hostile getter cannot present one shape
+  // to the validator and another to the consumer downstream.
+  const name = p.name;
+  const event = p.event;
+  const getter = p.getter;
+  return typeof name === "string" && name.length > 0
+    && typeof event === "string" && event.length > 0
+    && (getter === undefined || typeof getter === "function");
 }
 function isValidInputDescriptor(p) {
   if (!p || typeof p !== "object") return false;
-  if (typeof p.name !== "string" || p.name.length === 0) return false;
+  const name = p.name;
+  const attribute = p.attribute;
+  if (typeof name !== "string" || name.length === 0) return false;
   // `attribute` is a Schema-typed optional string. Validate the type even
   // though core does not interpret it — see SPEC-extensions.md.
-  if (p.attribute !== undefined && typeof p.attribute !== "string") return false;
+  if (attribute !== undefined && typeof attribute !== "string") return false;
   return true;
 }
 function isValidCommandDescriptor(p) {
   if (!p || typeof p !== "object") return false;
-  if (typeof p.name !== "string" || p.name.length === 0) return false;
+  const name = p.name;
+  const asyncFlag = p.async;
+  if (typeof name !== "string" || name.length === 0) return false;
   // `async` is a Schema-typed optional boolean. Same rationale as `attribute`.
-  if (p.async !== undefined && typeof p.async !== "boolean") return false;
+  if (asyncFlag !== undefined && typeof asyncFlag !== "boolean") return false;
   return true;
 }
 
@@ -638,7 +682,7 @@ The `in` operator is mandated specifically so that `undefined` can be distinguis
 
 Component authors **should** ensure that every `name` in the declaration corresponds to a readable property on the target instance.
 
-> **Note for remote / proxy targets.** A remote-proxied target observes the same rule from the consumer side, but the underlying values arrive **asynchronously** over the wire rather than from a synchronous property read. The bridging is the consumer-side proxy's responsibility: until the producer's `sync` message lands, `prop.name in proxy` is `false` and the in-operator check correctly skips initial sync; on `sync` arrival the proxy populates its cache and dispatches per-property `CustomEvent`s, which the listener installed by `bind()` then receives as if they were ordinary change events. See [SPEC-extensions.md § Extension 2](SPEC-extensions.md#extension-2--wire-format-remote-proxying) for the wire-format details and § Undefined enumeration for how `undefined` is bridged across JSON's representation gap.
+> **Note for remote / proxy targets.** A remote-proxied target observes the same rule from the consumer side, but the underlying values arrive **asynchronously** over the wire rather than from a synchronous property read. The bridging is the consumer-side proxy's responsibility: until the producer's `sync` message lands, `prop.name in proxy` MUST be `false` so the in-operator check correctly skips initial sync; on `sync` arrival the proxy populates its cache and dispatches per-property `CustomEvent`s, which the listener installed by `bind()` then receives as if they were ordinary change events. This is the consumer-side proxy's normative `has`-trap contract — formalized in [SPEC-extensions.md § Consumer-side proxy `has` trap contract](SPEC-extensions.md) — without which a JS Proxy-based consumer that passes `has` through to the underlying object would let `bind()` fire a spurious early initial-sync and then re-fire on sync arrival. See [SPEC-extensions.md § Extension 2](SPEC-extensions.md#extension-2--wire-format-remote-proxying) for the wire-format details and § Undefined enumeration for how `undefined` is bridged across JSON's representation gap.
 
 #### Ordering vs subsequent events
 
