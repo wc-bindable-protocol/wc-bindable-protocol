@@ -435,6 +435,51 @@ describe("RemoteShellProxy", () => {
     });
   });
 
+  it("omits the value key when a property transitions to undefined (post-sync undefined transition)", () => {
+    // SPEC-extensions § Update envelope value field: producer MUST omit
+    // the `value` key when emitting an update for a property that has
+    // transitioned to undefined. The consumer treats absent value as
+    // undefined on receipt.
+    //
+    // Note: CustomEvent coerces `detail: undefined` to `null` per the DOM
+    // spec, so to actually drive the getter return value to undefined we
+    // need a custom getter on the declaration.
+    class UndefinedTransitionCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [
+          { name: "value", event: "ut:value-changed", getter: () => undefined },
+        ],
+      };
+      get value(): undefined { return undefined; }
+    }
+    const core = new UndefinedTransitionCore();
+    const send = vi.fn();
+    let handler: ((msg: ClientMessage) => void) | null = null;
+    const server: ServerTransport = {
+      send,
+      onMessage: (h) => { handler = h; },
+    };
+
+    new RemoteShellProxy(core, server);
+    core.dispatchEvent(new CustomEvent("ut:value-changed", { detail: "anything" }));
+
+    expect(send).toHaveBeenCalledWith({
+      type: "update",
+      name: "value",
+      // intentionally no `value` key
+    });
+    // Inspect the raw call: the `value` key must NOT exist on the sent
+    // object — vitest's matcher cannot distinguish missing key from
+    // key-with-undefined, but Object.hasOwn discriminates honestly. The
+    // wire serializer (JSON.stringify) would drop both forms identically,
+    // so this assertion is mostly belt-and-braces, but it pins the
+    // producer-side construction shape that SPEC-extensions mandates.
+    const sent = send.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(Object.prototype.hasOwnProperty.call(sent, "value")).toBe(false);
+  });
+
   it("logs and swallows update send failures", () => {
     const core = new TestCore();
     const server: ServerTransport = {

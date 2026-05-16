@@ -242,7 +242,10 @@ This section is the **normative** wire-format specification for any implementati
 }
 
 // Subsequent per-property change forwarded by the shell.
-{ "type": "update", "name": string, "value": JsonValue }
+// `value` is OPTIONAL by the same JSON-no-undefined rule as the return
+// envelope: an absent `value` key represents a transition to `undefined`
+// on the producer side. See "Update envelope value field" below.
+{ "type": "update", "name": string, "value"?: JsonValue }
 
 // Reply to a setWithAck or invoke with matching id.
 // `value` is OPTIONAL. Its absence and its concrete shape have different
@@ -252,9 +255,11 @@ This section is the **normative** wire-format specification for any implementati
 { "type": "throw",  "id": string, "error": { "name": string, "message": string, "stack"?: string } }
 ```
 
-- `update` is dispatched for every change event the producer-side shell observes, after applying the producer-side `getter`. The `name` MUST be one declared in `properties`.
+- `update` is dispatched for every change event the producer-side shell observes, after applying the producer-side `getter`. The `name` SHOULD be one declared in the producer's `properties` (see § Undeclared-name update handling below for the consumer-side behavior when it is not).
 - `return` / `throw` MUST reference an `id` issued by a prior client message. The producer MAY emit only ONE of `return` or `throw` for any given `id`. Implementations SHOULD reject unknown `id`s with a logger warning rather than throwing — late replies after an abort are normal.
 - `capabilities.setAck === true` advertises that the producer honors `setWithAck`. **For an Extension 2 producer to claim current conformance, `setAck` MUST be advertised as `true`** (`setWithAck` is part of the consumer-side proxy's mandatory surface in § Methods; a producer that does not implement it leaves a documented safety mechanism unusable across the wire). A producer that omits `capabilities.setAck` or advertises `false` is a **legacy / non-current** producer — it can be interoperated with for fire-and-forget `set` and for property observation, but it does not satisfy the current version of this extension. Consumers MUST still cope with legacy producers (their `setWithAck` calls reject as described below) for backward compatibility, but new producer implementations MUST advertise `setAck: true`.
+
+  > **Wire schema vs conformance.** The capabilities object and its fields are typed OPTIONAL in the wire schema above so legacy producers that predate any given capability can still send a well-formed `sync` response. The current-conformance MUSTs in this list (`setAck: true`, `undefinedProperties: true`, `getterFailures: true`) tighten that schema-level optionality at the conformance level: a new producer implementation is well-formed without these fields but is not *current-conformant* without them. This split — "schema-optional, conformance-required" — is what lets the consumer side detect a legacy peer via field absence while keeping the consumer's parser happy with both shapes.
 - Consumers that issued `setWithAck` calls **before** the `sync` response MUST reject all of them with a clear error if `setAck` is absent or `false`. Calls issued **after** a `sync` response whose `setAck` is absent or `false` MUST be rejected by the consumer-side proxy with the same clear error — concretely, `setWithAck` / `setWithAckOptions` MUST **synchronously return an already-rejected `Promise`** (not throw synchronously, consistent with the Promise-rejection rule for protocol-level failures in § Methods). The proxy MUST NOT send a `setWithAck` message it knows the producer will not handle.
 - **Fire-and-forget `set` (the `id`-less variant) is unaffected by this capability bit** — it is part of the baseline wire contract and every producer (legacy and current alike) MUST handle it regardless of `setAck` support.
 - `capabilities.undefinedProperties === true` advertises that the producer understands and emits the `undefinedProperties` field. Modern producers SHOULD always set this capability; the **capability bit, not the field's presence**, is the disambiguator that lets a consumer tell a modern producer with no undefined values (`undefinedProperties: true`, list empty or omitted) from a legacy producer that does not know about the field (`undefinedProperties` capability absent). The consumer-side revert-to-`undefined` legacy heuristic (see § Undefined enumeration "Legacy compatibility") MUST fire only when the capability is absent. A modern producer with the capability set MAY still omit the field when the list would be empty.
@@ -271,6 +276,27 @@ This section is the **normative** wire-format specification for any implementati
   - Any other JsonValue → set `value: <that JsonValue>`. Consumers MUST resolve the pending promise with the deserialized value.
 
 The earlier "value: undefined" pseudocode in the end-to-end diagrams was a JS-level shorthand; on the wire it always serialized as a missing key (because `JSON.stringify` drops own properties whose value is `undefined`), and that omission is now the normative encoding.
+
+#### Update envelope value field
+
+The exact same key-presence rule applies to the `update` envelope: `value` is OPTIONAL, and an absent `value` represents the producer-side state transition to `undefined`. This is how a producer signals a **post-sync transition into `undefined`** — sync-time `undefined` lives in the snapshot's `undefinedProperties` list (because it concerns multiple properties at once), but per-property transitions during normal operation use the update envelope, and JSON's inability to carry `undefined` would otherwise leave producers no way to express the transition at all.
+
+- The producer-side shell observes a change event for `name` and reads (or recomputes) the current value:
+  - If the value is `undefined` → emit `{ "type": "update", "name": <name> }` (omit `value`).
+  - If the value is `null` → emit `{ "type": "update", "name": <name>, "value": null }`. Like the return envelope, `null` and `undefined` are wire-distinguishable by key presence.
+  - Otherwise → emit `{ "type": "update", "name": <name>, "value": <JsonValue> }` after `JsonValue` validation.
+- The consumer-side proxy treats absent `value` as `undefined`: it updates its local cache to `undefined`, then dispatches a per-property `CustomEvent` with `detail: undefined`, so `bind()` consumers see the transition through their normal `onUpdate(name, undefined)` callback.
+- Producers that need to advertise their understanding of this rule SHOULD set `capabilities.undefinedProperties: true` on the sync response — the same capability bit already covers the sync-time `undefined` enumeration and now also confirms post-sync `undefined` transitions are emitted. Legacy producers (capability absent) cannot signal post-sync `undefined` transitions at all; the consumer's only recovery in that case is a fresh `sync` request, which the producer MAY trigger by closing and reopening the transport. This is a known irrecoverable gap of the legacy wire shape (see § Undefined enumeration "Known lossy interaction").
+
+#### Undeclared-name update handling
+
+If the consumer-side proxy receives an `update` whose `name` is not in its local `properties` declaration (typically caused by a declaration-fingerprint mismatch where the producer exposes a property the consumer's local declaration does not know about), the consumer:
+
+- MUST NOT throw or close the transport. The wire stays well-formed at the protocol level even if the application-level shape disagrees.
+- MUST drop the `update` silently with respect to state — no event is dispatched to `bind()` consumers, no entry is written to the proxy's value cache.
+- SHOULD log the drop at warn level naming the rejected `name`, so operators following up on a fingerprint-mismatch warning have a per-message trail.
+
+This "liberal drop with warn" stance lets a partial-deploy or version-drift scenario continue working for the names both sides do agree on, while making the disagreement visible in logs. The reference `RemoteCoreProxy` implementation follows exactly this contract.
 
 ### Undefined enumeration
 

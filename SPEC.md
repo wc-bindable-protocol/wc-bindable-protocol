@@ -139,7 +139,7 @@ When `inputs` or `commands` is absent (`undefined`), consumers **MUST** treat it
 
 Within a single `properties` array, every `name` MUST be unique. A declaration that violates this rule is **invalid**: adapters MUST treat such a target as non-bindable. Per § Discovery API, `getWcBindableDeclaration()` MUST return `undefined` and `isWcBindable()` MUST return `false` for this case — the two helpers and `bind()` agree by construction. Adapters MAY additionally warn or throw in development mode. Multiple property descriptors MAY share the same `event` name — adapters dispatch each one independently. The same `name` MAY appear in both `properties` (as an observable output) and `inputs` (as a settable input); this is a common pattern for two-way-bindable values (e.g. `value`).
 
-An empty `properties: []` is **valid**: it describes a target that exposes no observable outputs (e.g. a command-only headless service whose surface is entirely in `commands`). `bind()` on such a target installs no listeners, performs no initial sync, and returns a no-op cleanup — this is a successful bind, not a non-bindable rejection.
+An empty `properties: []` is **valid**: it describes a target that exposes no observable outputs (e.g. a command-only headless service whose surface is entirely in `commands`). `bind()` on such a target installs no listeners, performs no initial sync, and returns a **functionally no-op** cleanup — a normal closure whose internal cleanup list is empty, so invoking it does nothing observable. The literal `() => {}` form is permitted for non-bindable targets (see [§ Teardown Contract](#teardown-contract)) but is not required here; either shape satisfies the contract because the observable behavior is the same.
 
 Adapters **MUST** ignore unknown fields on a property descriptor.
 
@@ -221,7 +221,7 @@ When `getter` is omitted, the protocol defines the default getter as:
 (e) => e.detail
 ```
 
-Reactivity system adapters **must** implement this default. Component authors **should** dispatch `CustomEvent` with the new value set directly as `detail`:
+Reactivity system adapters **MUST** implement this default. Component authors **SHOULD** dispatch `CustomEvent` with the new value set directly as `detail`:
 
 ```javascript
 this.dispatchEvent(new CustomEvent('my-input:value-changed', { detail: this._value }));
@@ -478,6 +478,13 @@ function bind(target, onUpdate, options) {
   const et = /** @type {EventTarget} */ (target);
 
   const cleanups = [];
+  // disposed is declared BEFORE runOrCleanup so the catch path can mark
+  // teardown as already-done. Without this, a deferred-sync throw runs
+  // every cleanup but leaves `disposed` false, and the user's later
+  // unbind() re-walks the cleanup list — defeating the unconditional
+  // idempotency MUST from § Teardown Contract for the very hostile-
+  // Proxy case the rule exists to protect.
+  let disposed = false;
   // Wrapper: if the registration loop, the initial-sync read, or the
   // consumer's onUpdate throws, the listeners installed so far must NOT
   // leak — tear down every cleanup recorded to date and rethrow. The
@@ -486,6 +493,7 @@ function bind(target, onUpdate, options) {
   // trap throws on the Nth iteration. See § Teardown Contract.
   const runOrCleanup = (fn) => {
     try { fn(); } catch (err) {
+      disposed = true;
       cleanups.forEach((c) => { try { c(); } catch {} });
       throw err;
     }
@@ -531,15 +539,13 @@ function bind(target, onUpdate, options) {
     runOrCleanup(initialSync);
   }
 
-  let disposed = false;
   return () => {
     // Re-entry guard: second and later invocations are an unconditional
-    // no-op (§ Teardown Contract). This holds regardless of whether the
-    // constituent cleanups are themselves idempotent, mirroring the
-    // defensive posture used at registration time (runOrCleanup wraps
-    // the addEventListener loop because a hostile Proxy can throw
-    // mid-loop; by the same logic a hostile non-idempotent
-    // removeEventListener must not be called twice).
+    // no-op (§ Teardown Contract). `disposed` may already be true here
+    // if runOrCleanup's catch path tore down earlier; that case turns
+    // the user's unbind() into a literal no-op without re-walking the
+    // cleanup list, which is what the unconditional idempotency MUST
+    // requires for hostile non-idempotent removeEventListener targets.
     if (disposed) return;
     disposed = true;
     // Exception-safe teardown: every cleanup runs even if an earlier one
@@ -624,13 +630,13 @@ The protocol uses two independent reads of the property value:
 
 The two **SHOULD** be kept in agreement by the component author. If they diverge (e.g. a `detail` payload differs from the current property value), the **event payload is authoritative** — adapters do not re-read the property after an event fires. Component authors who cannot guarantee parity should derive `detail` from the property at dispatch time.
 
-> **Producer-side rule — property getters MUST be side-effect-free.** A `wcBindable`-declared property's getter (or the equivalent attribute-backed read on a Web Component) **SHOULD** be a pure read of the current value. In particular, a getter that synchronously dispatches a `wc-bindable`-declared change event during the initial-sync read is **non-conforming** at the producer side: adapters attach listeners *before* performing the initial-sync read (so no event is missed during the read), so the dispatch from the getter and the initial-sync read both reach the consumer, in dispatch order, producing a double `onUpdate` whose second value depends on whatever was read last. Conformant adapters are NOT required to detect, deduplicate, or repair this re-entrant case — the protocol's defense is to forbid it at the producer. If a side effect is genuinely unavoidable (e.g. a sensor whose read materializes the value), the producer SHOULD perform the side effect on construction or in a dedicated initializer, NOT inside the getter.
+> **Producer-side rule — property getters MUST be side-effect-free with respect to wc-bindable change events.** A `wcBindable`-declared property's getter (or the equivalent attribute-backed read on a Web Component) **SHOULD** be a pure read of the current value as a general matter, and **MUST NOT** synchronously dispatch a `wc-bindable`-declared change event during the read (the stronger rule for the specific re-entrant case). Adapters attach listeners *before* performing the initial-sync read (so no event is missed during the read), so a getter that re-enters via `dispatchEvent` causes both the dispatch and the initial-sync read to reach the consumer in dispatch order, producing a double `onUpdate` whose second value depends on whatever was read last. Conformant adapters are NOT required to detect, deduplicate, or repair this re-entrant case — the protocol's defense is to forbid it at the producer. If a side effect is genuinely unavoidable (e.g. a sensor whose read materializes the value), the producer **SHOULD** perform the side effect on construction or in a dedicated initializer, NOT inside the getter; an unavoidable non-event side effect (e.g. a benign cache fill) is permitted under the general SHOULD-be-pure rule but is not the same as the MUST NOT on event dispatch.
 
 ### Getter Errors
 
-If a `getter` function throws during event handling, the adapter **must not** swallow the error silently. The error should propagate naturally (i.e., be thrown from the event listener). This preserves normal JavaScript error semantics and allows component authors to detect bugs in their getter implementations.
+If a `getter` function throws during event handling, the adapter **MUST NOT** swallow the error silently. The error **MUST** propagate naturally (i.e., be thrown from the event listener). This preserves normal JavaScript error semantics and allows component authors to detect bugs in their getter implementations.
 
-Adapters **should not** wrap getter calls in try/catch unless they re-throw the error after performing cleanup.
+Adapters **SHOULD NOT** wrap getter calls in try/catch unless they re-throw the error after performing cleanup.
 
 ---
 

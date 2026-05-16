@@ -84,7 +84,7 @@ export type ServerMessage =
        */
       declarationFingerprint?: DeclarationFingerprint;
     }
-  | { type: "update"; name: string; value: unknown }
+  | { type: "update"; name: string; value?: unknown }
   | { type: "return"; id: string; value: unknown }
   | { type: "throw"; id: string; error: unknown };
 

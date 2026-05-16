@@ -262,7 +262,14 @@ export class RemoteShellProxy {
       const handler = (event: Event) => {
         try {
           const value = getter(event);
-          const message: ServerMessage = { type: "update", name: prop.name, value };
+          // Omit the `value` key entirely when the property transitions
+          // to `undefined`. JSON cannot represent undefined and absent
+          // key is the normative encoding per SPEC-extensions § Update
+          // envelope value field. The consumer treats absent as
+          // undefined on receipt.
+          const message: ServerMessage = value === undefined
+            ? { type: "update", name: prop.name }
+            : { type: "update", name: prop.name, value };
           if (this._isBuildingSyncSnapshot) {
             this._queuedSyncUpdates.push({
               message,
