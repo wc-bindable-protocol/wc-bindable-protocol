@@ -530,11 +530,22 @@ function bind(target, onUpdate, options) {
     MutationObserverCtor !== undefined;
 
   if (canDefer) {
+    // Single-path observer disposal: both the success path inside the
+    // callback and the unbind cleanup path go through disposeObserver,
+    // which guards against double-disconnect via its own flag. This
+    // matters for a hostile / counting `observer.disconnect()` override
+    // (see § Teardown Contract threat model).
+    let observerDisposed = false;
+    const disposeObserver = () => {
+      if (observerDisposed) return;
+      observerDisposed = true;
+      observer.disconnect();
+    };
     const observer = new MutationObserverCtor(() => {
-      if (et.isConnected) { observer.disconnect(); runOrCleanup(initialSync); }
+      if (et.isConnected) { disposeObserver(); runOrCleanup(initialSync); }
     });
     observer.observe(documentRef, { childList: true, subtree: true });
-    cleanups.push(() => observer.disconnect());
+    cleanups.push(disposeObserver);
   } else {
     runOrCleanup(initialSync);
   }
@@ -562,7 +573,9 @@ function bind(target, onUpdate, options) {
 
 `bind()` **MUST** return a function that, when called, removes every event listener (and any other resource — e.g. `MutationObserver`) the adapter installed during the call. This applies whether or not the target was actually bindable: a no-op cleanup function (`() => {}`) is the correct return value for non-`wc-bindable` targets.
 
-The returned cleanup function MUST be **idempotent** — calling it more than once MUST be a safe no-op on subsequent calls. The conforming way to satisfy this is a **re-entry guard inside the returned closure** (a `disposed` flag that the closure sets on first call and checks on every entry), so the idempotency MUST hold unconditionally rather than depending on each constituent cleanup being idempotent in isolation. The cleanups the adapter records internally (typically `removeEventListener` and `MutationObserver.disconnect()` invocations) happen to be idempotent in the browser standard library, but a hostile target — for instance a `Proxy`-wrapped relay whose `removeEventListener` raises or counts each call — is exactly the kind of bind target this spec accepts elsewhere; the closure-level guard makes the idempotency rule symmetric with the registration-side defensive wrapping in the reference implementation. Idempotency is also what makes the deferred-throw safety net (described below) work cleanly: the caller's later `unbind()` call simply returns early because the throw path already set `disposed = true`.
+The returned cleanup function MUST be **idempotent** — calling it more than once MUST be a safe no-op on subsequent calls. The conforming way to satisfy this is a **re-entry guard inside the returned closure** (a `disposed` flag that the closure sets on first call and checks on every entry), so the idempotency MUST hold unconditionally rather than depending on each constituent cleanup being idempotent in isolation. The cleanups the adapter records internally (typically `removeEventListener` and `MutationObserver.disconnect()` invocations) happen to be idempotent in the browser standard library, but a hostile target — for instance a `Proxy`-wrapped relay whose `removeEventListener` raises or counts each call — is exactly the kind of bind target this spec accepts elsewhere; the closure-level guard makes the idempotency rule symmetric with the registration-side defensive wrapping in the reference implementation.
+
+The `disposed` flag is also set by `runOrCleanup`'s catch path on **every** install-time throw, not only on the deferred path: a synchronous install-time throw (a hostile `addEventListener` failing on the Nth iteration during the registration loop, or a getter throwing during the synchronous initial sync) also marks the closure as already-disposed before re-throwing. Because the caller in the synchronous-throw case never receives the unbind function (the rethrow happens before `bind()` returns), the disposed flag in that case is unobservable from outside — but maintaining the invariant uniformly across both paths keeps the closure's idempotency rule trivially provable and avoids per-path special-casing inside the returned closure. The deferred-path observability is described below.
 
 **If anything inside `bind()` throws while installing resources** — including the listener-registration loop (e.g. a `Proxy`-wrapped relay target's `addEventListener` throws via a `get` trap on the Nth iteration), the synchronous initial-sync step (a property's `in` trap throws, a property getter throws on read, the consumer's `onUpdate` callback throws), or the deferred-sync observer's setup — the adapter **MUST** tear down every listener and observer it installed earlier in the same `bind()` call before letting the error propagate. Without this, the caller never receives the unbind function and the listener set leaks. This applies to **every** install-time throw, not only the initial-sync read. Cleanup callbacks that themselves throw during this fallback path SHOULD be swallowed; surfacing a cleanup-time secondary error in place of the original error is more confusing than useful.
 

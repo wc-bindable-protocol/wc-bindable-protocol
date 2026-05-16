@@ -280,6 +280,37 @@ describe("getWcBindableDeclaration", () => {
     expect(() => bind(new EmptyCore(), "nope" as unknown as () => void)).toThrow(TypeError);
   });
 
+  it("disposes the deferred-sync observer exactly once across both the success callback and unbind", async () => {
+    // Regression: the previous shape called observer.disconnect() twice
+    // on the success-then-throw path (once manually in the callback's
+    // success branch, then again via cleanups iteration). Standard
+    // MutationObserver is idempotent so the bug was invisible, but
+    // SPEC.md § Teardown Contract names "overridden observer.disconnect()"
+    // as in-scope of the hostile-target threat model. The single-path
+    // disposeObserver helper guarantees one call total, regardless of
+    // path (success-then-unbind, success-then-throw, etc.).
+    const el = createBindableElement(validDeclaration);
+    const disconnectSpy = vi.spyOn(MutationObserver.prototype, "disconnect");
+    try {
+      const unbind = bind(el, () => {}, { syncOn: "connect" });
+      document.body.appendChild(el);
+      // MutationObserver microtask: callback fires → disposeObserver()
+      // → disconnect() #1 → initialSync runs successfully.
+      await new Promise((r) => setTimeout(r, 0));
+      expect(disconnectSpy).toHaveBeenCalledTimes(1);
+      // unbind path: cleanups include disposeObserver, which is already
+      // disposed → MUST NOT call disconnect() a second time.
+      unbind();
+      expect(disconnectSpy).toHaveBeenCalledTimes(1);
+      // Idempotent unbind: calling again still keeps disconnect at 1.
+      unbind();
+      expect(disconnectSpy).toHaveBeenCalledTimes(1);
+      document.body.removeChild(el);
+    } finally {
+      disconnectSpy.mockRestore();
+    }
+  });
+
   it("unbind() is unconditionally idempotent — second call does not re-invoke cleanups", () => {
     // Regression for the idempotency MUST in § Teardown Contract: the
     // returned closure SHOULD guard re-entry with a `disposed` flag so a

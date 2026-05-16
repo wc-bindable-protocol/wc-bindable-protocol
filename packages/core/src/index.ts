@@ -358,14 +358,27 @@ export function bind(
     // listener set installed by bind() is torn down before the error
     // surfaces — same contract as the synchronous path.
     const htmlTarget = et as HTMLElement;
+    // Single-path observer disposal: the callback's success path and the
+    // unbind cleanup path both go through `disposeObserver`, which guards
+    // against double-disconnect via its own `observerDisposed` flag. This
+    // matters for a hostile / counting `observer.disconnect()` override —
+    // SPEC.md § Teardown Contract names that exact threat as in-scope,
+    // and the previous shape called disconnect() twice on the success-
+    // then-throw path.
+    let observerDisposed = false;
+    const disposeObserver = () => {
+      if (observerDisposed) return;
+      observerDisposed = true;
+      observer.disconnect();
+    };
     const observer = new MutationObserverCtor(() => {
       if (htmlTarget.isConnected) {
-        observer.disconnect();
+        disposeObserver();
         runOrCleanup(initialSync);
       }
     });
     observer.observe(documentRef, { childList: true, subtree: true });
-    cleanups.push(() => observer.disconnect());
+    cleanups.push(disposeObserver);
   } else {
     runOrCleanup(initialSync);
   }
