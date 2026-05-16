@@ -50,6 +50,7 @@
     "riot": "^10.1.4",
     "rollup-plugin-riot": "^10.0.0",
     "rxjs": "^7.8.2",
+    "signal-polyfill": "^0.2.2",
     "solid-js": "^1.9.11",
     "svelte": "^5.53.7",
     "typescript": "^5.9.3",
