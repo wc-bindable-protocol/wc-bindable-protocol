@@ -55,6 +55,7 @@ This protocol intentionally does **not** cover:
 | [@wc-bindable/svelte](packages/svelte/) | Svelte action — `use:wcBindable` |
 | [@wc-bindable/angular](packages/angular/) | Angular directive — `wcBindable` |
 | [@wc-bindable/solid](packages/solid/) | Solid primitive — `createWcBindable()` / `use:wcBindable` |
+| [@wc-bindable/lit](packages/lit/) | Lit ReactiveController — `WcBindableController` |
 | [@wc-bindable/remote](packages/remote/) | Remote proxy — connect Core and Shell over a network via WebSocket or custom transport |
 | [@wc-bindable/ai](packages/ai/) | Headless AI inference component — OpenAI, Anthropic, Azure OpenAI, and Google (Gemini) with SSE streaming, no provider SDK |
 | [@wc-bindable/auth0](packages/auth0/) | Headless Auth0 authentication component — local (token in DOM for `fetch`) and remote (gatekeeper over authenticated WebSocket) modes |
@@ -123,6 +124,25 @@ import { createWcBindable } from "@wc-bindable/solid";
 function App() {
   const [values, directive] = createWcBindable();
   return <my-input ref={directive} />;
+}
+```
+
+### Lit
+
+```ts
+import { LitElement, html } from "lit";
+import { createRef, ref } from "lit/directives/ref.js";
+import { WcBindableController } from "@wc-bindable/lit";
+
+class App extends LitElement {
+  private inputRef = createRef<HTMLElement>();
+  private input = new WcBindableController<{ value: string }>(
+    this, () => this.inputRef.value, { value: "" });
+
+  render() {
+    return html`<my-input ${ref(this.inputRef)}></my-input>
+                <p>${this.input.values.value}</p>`;
+  }
 }
 ```
 
