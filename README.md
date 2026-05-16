@@ -118,6 +118,23 @@ This protocol intentionally does **not** cover:
 npm install @wc-bindable/core @wc-bindable/react
 ```
 
+### Vanilla (`@wc-bindable/core` alone)
+
+For a target you already hold a reference to, call `bind()` directly — every adapter below is a thin wrapper around this same primitive:
+
+```ts
+import { bind } from "@wc-bindable/core";
+
+const el = document.querySelector("my-input");
+const unbind = bind(el, (name, value) => {
+  // fires once for every declared property's initial value, then once per change event
+  console.log(`${name} =`, value);
+});
+
+// later, when the view is torn down:
+unbind();
+```
+
 ### React
 
 ```tsx
@@ -134,299 +151,28 @@ function App() {
 }
 ```
 
-### Vue.js
+### Other framework adapters
 
-```vue
-<script setup lang="ts">
-import { useWcBindable } from "@wc-bindable/vue";
-const { ref: inputRef, values } = useWcBindable<HTMLElement, { value: string }>({ value: "" });
-</script>
+Every other adapter follows the same pattern (`useWcBindable` / `createWcBindable` / `WcBindableController` / `use:wcBindable` — exact name varies). The detailed snippet for each lives in its own README; click through for the idiomatic call shape.
 
-<template>
-  <my-input ref="inputRef" />
-  <p>{{ values.value }}</p>
-</template>
-```
-
-### Angular
-
-```typescript
-@Component({
-  imports: [WcBindableDirective],
-  template: `<my-input wcBindable (wcBindableChange)="onUpdate($event)" />`,
-})
-export class AppComponent {
-  onUpdate(e: { name: string; value: unknown }) { /* ... */ }
-}
-```
-
-### Svelte
-
-```svelte
-<script>
-import { wcBindable } from "@wc-bindable/svelte";
-let value = $state("");
-</script>
-
-<my-input use:wcBindable={{ onUpdate: (name, v) => { if (name === "value") value = v; } }} />
-```
-
-### Alpine.js
-
-```html
-<script type="module">
-  import Alpine from "alpinejs";
-  import wcBindable from "@wc-bindable/alpine";
-
-  Alpine.plugin(wcBindable);
-  Alpine.start();
-</script>
-
-<div x-data="{ value: '' }">
-  <my-input x-wc-bindable></my-input>
-  <p x-text="value"></p>
-</div>
-```
-
-### Lit
-
-```ts
-import { LitElement, html } from "lit";
-import { createRef, ref } from "lit/directives/ref.js";
-import { WcBindableController } from "@wc-bindable/lit";
-
-class App extends LitElement {
-  private inputRef = createRef<HTMLElement>();
-  private input = new WcBindableController<{ value: string }>(
-    this, () => this.inputRef.value, { value: "" });
-
-  render() {
-    return html`<my-input ${ref(this.inputRef)}></my-input>
-                <p>${this.input.values.value}</p>`;
-  }
-}
-```
-
-### Marko
-
-```marko
-import { wcBindable } from "@wc-bindable/marko";
-
-<let/state = { value: "" } />
-<my-input/inputEl />
-<lifecycle
-  onMount() { this.unbind = wcBindable(inputEl, (n, v) => state = { ...state, [n]: v }); }
-  onDestroy() { this.unbind?.(); }
-/>
-<output>${state.value}</output>
-```
-
-### Mithril.js
-
-```ts
-import m from "mithril";
-import { createWcBindable } from "@wc-bindable/mithril";
-
-const Form = () => {
-  const binder = createWcBindable<{ value: string }>({ value: "" });
-  return {
-    view: () => m("div", [
-      m("my-input", { oncreate: binder.oncreate, onremove: binder.onremove }),
-      m("p", `value: ${binder.values.value}`),
-    ]),
-  };
-};
-```
-
-### Preact
-
-```tsx
-import { useWcBindable } from "@wc-bindable/preact";
-
-function App() {
-  const [ref, values] = useWcBindable<HTMLElement, { value: string }>({ value: "" });
-  return <my-input ref={ref} />;
-}
-```
-
-### Qwik
-
-```tsx
-import { component$ } from "@builder.io/qwik";
-import { useWcBindable } from "@wc-bindable/qwik";
-
-export const App = component$(() => {
-  const { ref, values } = useWcBindable<HTMLElement, { value: string }>({ value: "" });
-  return (
-    <>
-      <my-input ref={ref}></my-input>
-      <p>{values.value}</p>
-    </>
-  );
-});
-```
-
-### Riot.js
-
-```html
-<my-form>
-  <my-input></my-input>
-  <p>value: { binder.values.value }</p>
-
-  <script>
-    import { createWcBindable } from "@wc-bindable/riot";
-    export default {
-      onBeforeMount() {
-        this.binder = createWcBindable({ value: "" }, { update: () => this.update() });
-      },
-      onMounted() { this.binder.bind(this.$("my-input")); },
-    };
-  </script>
-</my-form>
-```
-
-### SolidJS
-
-```tsx
-import { createWcBindable } from "@wc-bindable/solid";
-
-function App() {
-  const [values, directive] = createWcBindable();
-  return <my-input ref={directive} />;
-}
-```
-
-### Stencil
-
-```tsx
-import { Component, h } from "@stencil/core";
-import { WcBindableController } from "@wc-bindable/stencil";
-
-@Component({ tag: "my-app" })
-export class MyApp {
-  private inputRef?: HTMLElement;
-  private input = new WcBindableController<{ value: string }>(
-    this, () => this.inputRef, { value: "" });
-
-  connectedCallback() { this.input.connect(); }
-  disconnectedCallback() { this.input.disconnect(); }
-  componentDidRender() { this.input.update(); }
-
-  render() {
-    return (
-      <div>
-        <my-input ref={(el) => (this.inputRef = el)}></my-input>
-        <p>{this.input.values.value}</p>
-      </div>
-    );
-  }
-}
-```
-
-### VanJS
-
-```ts
-import van from "vanjs-core";
-import { createWcBindable } from "@wc-bindable/vanjs";
-
-const binder = createWcBindable<{ count: number }>({ count: 0 });
-const el = document.createElement("my-counter");
-binder.bind(el); // initial-sync is deferred until the element is connected
-
-van.add(document.body, el, van.tags.p(() => `count: ${binder.states.count.val}`));
-```
-
-### MobX
-
-```ts
-import { autorun } from "mobx";
-import { createWcBindable } from "@wc-bindable/mobx";
-
-const binder = createWcBindable<{ count: number }>({ count: 0 });
-const el = document.createElement("my-counter");
-binder.bind(el); // initial-sync is deferred until the element is connected
-document.body.appendChild(el);
-
-autorun(() => console.log(`count: ${binder.state.count}`));
-```
-
-### RxJS
-
-```ts
-import { createWcBindable } from "@wc-bindable/rxjs";
-
-const binder = createWcBindable<{ count: number }>({ count: 0 });
-const el = document.createElement("my-counter");
-binder.bind(el); // initial-sync is deferred until the element is connected
-document.body.appendChild(el);
-
-binder.subjects.count.subscribe((count) => console.log(`count: ${count}`));
-```
-
-### TC39 Signals
-
-```ts
-import { Signal } from "signal-polyfill";
-import { createWcBindable } from "@wc-bindable/signals";
-
-const binder = createWcBindable<{ count: number }>({ count: 0 });
-const el = document.createElement("my-counter");
-binder.bind(el); // initial-sync is deferred until the element is connected
-document.body.appendChild(el);
-
-const view = new Signal.Computed(() => `count: ${binder.signals.count.get()}`);
-// observe `view` via Signal.subtle.Watcher to drive rendering
-```
-
-### Remote (extracting Core to a server)
-
-The `@wc-bindable/remote` package splits the wc-bindable Core/Shell boundary across a network. The server runs the real Core; the client gets a proxy `EventTarget` that works transparently with `bind()` and framework adapters.
-
-```typescript
-// Server
-import { RemoteShellProxy, WebSocketServerTransport } from "@wc-bindable/remote";
-const core = new MyFetchCore();
-const shell = new RemoteShellProxy(core, new WebSocketServerTransport(socket));
-```
-
-```typescript
-// Client
-import { createRemoteCoreProxy, WebSocketClientTransport } from "@wc-bindable/remote";
-import { bind } from "@wc-bindable/core";
-
-const proxy = createRemoteCoreProxy(
-  MyFetchCore.wcBindable,
-  new WebSocketClientTransport(new WebSocket("ws://localhost:3000")),
-);
-
-bind(proxy, (name, value) => {
-  console.log(name, value); // works exactly as if Core were local
-});
-
-proxy.set("url", "/api/users");
-const result = await proxy.invoke("fetch");
-// Caveat: `set` is fire-and-forget (at-most-once). The WebSocket
-// transport preserves message *order*, so on a healthy connection
-// `fetch` always observes `url = "/api/users"`. But order != delivery —
-// during a transient outage the `set` can be silently dropped while the
-// later `invoke` still lands, causing `fetch` to run against a stale
-// `url` with no error. When `fetch` actually depends on `url` having
-// been applied, use the acknowledged path:
-//
-//   await proxy.setWithAck("url", "/api/users");
-//   const result = await proxy.invoke("fetch");
-//
-// Further nuance: `setWithAck` resolves once the JS-level assignment
-// `core.url = "/api/users"` has run on the trusted side. It does NOT
-// wait for any asynchronous side effects the setter may schedule
-// (database write, network round-trip, validation pipeline, …). If the
-// downstream command depends on that async work being complete, model
-// the work as its own command and `await invoke(...)` it — `set` /
-// `setWithAck` only guarantee the synchronous slice. See
-// SPEC-extensions.md § Call-order preservation, § Transport lifecycle
-// vocabulary, and the `setWithAck` row of the Methods table for the
-// exact contracts.
-```
+| Adapter | Quick reference |
+|---|---|
+| [@wc-bindable/vue](packages/vue/README.md) | `useWcBindable()` composable returning `{ ref, values }` |
+| [@wc-bindable/angular](packages/angular/README.md) | `wcBindable` directive emitting `(wcBindableChange)` |
+| [@wc-bindable/svelte](packages/svelte/README.md) | `use:wcBindable={{ onUpdate }}` action |
+| [@wc-bindable/preact](packages/preact/README.md) | `useWcBindable()` hook (React-shaped) |
+| [@wc-bindable/solid](packages/solid/README.md) | `createWcBindable()` returning `[values, directive]` |
+| [@wc-bindable/lit](packages/lit/README.md) | `WcBindableController` (Lit ReactiveController) |
+| [@wc-bindable/stencil](packages/stencil/README.md) | `WcBindableController` (Stencil controller) |
+| [@wc-bindable/alpine](packages/alpine/README.md) | `x-wc-bindable` directive (Alpine plugin) |
+| [@wc-bindable/marko](packages/marko/README.md) | `wcBindable()` helper (Marko 5 & 6) |
+| [@wc-bindable/mithril](packages/mithril/README.md) | `createWcBindable()` with `oncreate` / `onremove` |
+| [@wc-bindable/qwik](packages/qwik/README.md) | `useWcBindable()` (Qwik 1.x; Qwik 2.x via `/v2`) |
+| [@wc-bindable/riot](packages/riot/README.md) | `createWcBindable()` with `{ update }` callback |
+| [@wc-bindable/vanjs](packages/vanjs/README.md) | `createWcBindable()` exposing `binder.states.<name>` |
+| [@wc-bindable/mobx](packages/mobx/README.md) | `createWcBindable()` exposing `binder.state.<name>` (one observable) |
+| [@wc-bindable/rxjs](packages/rxjs/README.md) | `createWcBindable()` exposing `binder.subjects.<name>` (BehaviorSubject per property) |
+| [@wc-bindable/signals](packages/signals/README.md) | `createWcBindable()` exposing `binder.signals.<name>` (TC39 Signals via `signal-polyfill`) |
 
 ## Examples
 
@@ -458,6 +204,48 @@ The `<my-fetch>` example demonstrates using Web Components as **invisible servic
 const [ref, values] = useWcBindable<MyFetchElement, MyFetchValues>();
 // values.loading, values.value, values.error — all reactive
 ```
+
+## Advanced: extracting Core to a server
+
+For most use cases, ignore this section — the local-binding examples above are the protocol's main path. Read on only if you want to run the Core on a server and have the client interact with it through a network transport.
+
+The `@wc-bindable/remote` package splits the wc-bindable Core/Shell boundary across a network. The server runs the real Core; the client gets a proxy `EventTarget` that works transparently with `bind()` and every framework adapter — the consumer-side code is identical to the local case.
+
+```typescript
+// Server
+import { RemoteShellProxy, WebSocketServerTransport } from "@wc-bindable/remote";
+const core = new MyFetchCore();
+const shell = new RemoteShellProxy(core, new WebSocketServerTransport(socket));
+```
+
+```typescript
+// Client
+import { createRemoteCoreProxy, WebSocketClientTransport } from "@wc-bindable/remote";
+import { bind } from "@wc-bindable/core";
+
+const proxy = createRemoteCoreProxy(
+  MyFetchCore.wcBindable,
+  new WebSocketClientTransport(new WebSocket("ws://localhost:3000")),
+);
+
+bind(proxy, (name, value) => {
+  console.log(name, value); // works exactly as if Core were local
+});
+
+proxy.set("url", "/api/users");
+const result = await proxy.invoke("fetch");
+```
+
+> **Delivery vs. ordering.** `set` is fire-and-forget (at-most-once). The WebSocket transport preserves message *order*, so on a healthy connection `fetch` always observes `url = "/api/users"`. But order ≠ delivery — during a transient outage the `set` can be silently dropped while the later `invoke` still lands, causing `fetch` to run against a stale `url` with no error returned. When `fetch` semantically depends on `url` having been applied, use the acknowledged path:
+>
+> ```typescript
+> await proxy.setWithAck("url", "/api/users");
+> const result = await proxy.invoke("fetch");
+> ```
+>
+> Further nuance: `setWithAck` resolves once the JS-level assignment `core.url = "/api/users"` has executed on the trusted side. It does **not** wait for any asynchronous side effects the setter may schedule (database write, network round-trip, validation pipeline, …). If the downstream command depends on that async work completing, model the work as its own command and `await invoke(...)` it.
+
+For the full wire format, error envelope, back-pressure controls, transport adapter contract, and security model, see [SPEC-extensions.md](SPEC-extensions.md) and [packages/remote/README.md](packages/remote/README.md).
 
 ## Development
 
