@@ -1,0 +1,87 @@
+<app>
+  <div style="font-family: system-ui, sans-serif; max-width: 700px; margin: 40px auto; padding: 0 20px">
+    <p><a href="/index.html">← Examples</a></p>
+    <h1>wc-bindable: Riot.js — Fetch</h1>
+
+    <my-fetch manual></my-fetch>
+
+    <div style="margin: 24px 0; padding: 16px; border: 1px solid #ddd; border-radius: 8px">
+      <div style="font-weight: 600; margin-bottom: 8px">Request</div>
+      <div style="display: flex; gap: 8px; align-items: center">
+        <input
+          type="text"
+          value={ state.url }
+          oninput={ onUrlInput }
+          style="flex: 1; padding: 6px 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px"
+        />
+        <button
+          onclick={ onFetch }
+          disabled={ state.values.loading }
+          style="padding: 6px 16px; border: 1px solid #ccc; border-radius: 4px; background: #f5f5f5; cursor: pointer"
+        >Fetch</button>
+        <button
+          onclick={ onAbort }
+          style="padding: 6px 16px; border: 1px solid #ccc; border-radius: 4px; background: #f5f5f5; cursor: pointer"
+        >Abort</button>
+      </div>
+    </div>
+
+    <div style="margin: 24px 0; padding: 16px; border: 1px solid #ddd; border-radius: 8px">
+      <div style="font-weight: 600; margin-bottom: 8px">Bound State (via createWcBindable)</div>
+      <div style="display: flex; gap: 16px; font-size: 14px; margin-bottom: 8px">
+        <span style={ loadingBadgeStyle() }>loading: <strong>{ String(state.values.loading) }</strong></span>
+        <span>status: <strong>{ state.values.status || "—" }</strong></span>
+      </div>
+      <div if={ state.values.error } style="background: #fee2e2; color: #991b1b; padding: 8px; border-radius: 4px; margin-bottom: 8px">{ JSON.stringify(state.values.error, null, 2) }</div>
+      <pre style="background: #f5f5f5; padding: 12px; border-radius: 4px; max-height: 300px; overflow: auto; font-size: 13px; white-space: pre-wrap; word-break: break-word">{ state.values.value ? JSON.stringify(state.values.value, null, 2) : "— No response yet —" }</pre>
+    </div>
+
+    <details style="margin: 24px 0; padding: 16px; border: 1px solid #ddd; border-radius: 8px">
+      <summary style="font-weight: 600; cursor: pointer">Source Code</summary>
+      <pre style="font-size: 13px; overflow: auto; margin: 8px 0 0; padding: 12px; background: #f8fafc; border-radius: 4px"><code>{ source }</code></pre>
+    </details>
+  </div>
+
+  <script>
+    import { createWcBindable } from "@wc-bindable/riot";
+    import "../../vanilla/fetch/my-fetch.js";
+    import source from "./App.riot?raw";
+
+    export default {
+      source,
+      onBeforeMount() {
+        this.binder = createWcBindable(
+          { value: null, loading: false, error: null, status: 0 },
+          { update: () => this.update() },
+        );
+        this.state = {
+          url: "https://jsonplaceholder.typicode.com/posts/1",
+          values: this.binder.values,
+        };
+      },
+      onMounted() {
+        this.fetchEl = this.$("my-fetch");
+        this.binder.bind(this.fetchEl);
+      },
+      onBeforeUnmount() {
+        this.binder.unbind();
+        this.fetchEl = null;
+      },
+      onUrlInput(e) {
+        this.update({ url: e.target.value });
+      },
+      onFetch() {
+        if (!this.fetchEl) return;
+        this.fetchEl.url = this.state.url;
+        this.fetchEl.fetch();
+      },
+      onAbort() {
+        this.fetchEl?.abort();
+      },
+      loadingBadgeStyle() {
+        const loading = !!this.state.values.loading;
+        return `padding: 2px 8px; border-radius: 4px; background: ${loading ? "#fef3c7" : "#d1fae5"}; color: ${loading ? "#92400e" : "#065f46"}`;
+      },
+    };
+  </script>
+</app>

@@ -1,0 +1,54 @@
+<app>
+  <div style="font-family: system-ui, sans-serif; max-width: 600px; margin: 40px auto; padding: 0 20px">
+    <p><a href="/index.html">← Examples</a></p>
+    <h1>wc-bindable: Riot.js — Lit Todo</h1>
+
+    <div style="margin: 24px 0; padding: 16px; border: 1px solid #ddd; border-radius: 8px">
+      <div style="font-weight: 600; margin-bottom: 8px">
+        Lit Todo Component
+        <span if={ state.values.count != null } style="display: inline-block; background: #2563eb; color: white; border-radius: 12px; padding: 2px 10px; font-size: 13px; margin-left: 8px">{ state.values.count }</span>
+      </div>
+      <lit-todo></lit-todo>
+    </div>
+
+    <div style="margin: 24px 0; padding: 16px; border: 1px solid #ddd; border-radius: 8px">
+      <div style="font-weight: 600; margin-bottom: 8px">Bound Values (via createWcBindable)</div>
+      <pre style="font-size: 14px; color: #2563eb">{ JSON.stringify(state.values, null, 2) }</pre>
+    </div>
+
+    <div if={ (state.values.items || []).length > 0 } style="margin: 24px 0; padding: 16px; border: 1px solid #ddd; border-radius: 8px">
+      <div style="font-weight: 600; margin-bottom: 8px">Riot-rendered item list (from bound state)</div>
+      <ul>
+        <li each={ item in state.values.items }>{ item }</li>
+      </ul>
+    </div>
+
+    <details style="margin: 24px 0; padding: 16px; border: 1px solid #ddd; border-radius: 8px">
+      <summary style="font-weight: 600; cursor: pointer">Source Code</summary>
+      <pre style="font-size: 13px; overflow: auto; margin: 8px 0 0; padding: 12px; background: #f8fafc; border-radius: 4px"><code>{ source }</code></pre>
+    </details>
+  </div>
+
+  <script>
+    import { createWcBindable } from "@wc-bindable/riot";
+    import "../../vanilla/lit-todo/lit-todo.ts";
+    import source from "./App.riot?raw";
+
+    export default {
+      source,
+      onBeforeMount() {
+        this.binder = createWcBindable(
+          { items: [], count: 0 },
+          { update: () => this.update() },
+        );
+        this.state = { values: this.binder.values };
+      },
+      onMounted() {
+        this.binder.bind(this.$("lit-todo"));
+      },
+      onBeforeUnmount() {
+        this.binder.unbind();
+      },
+    };
+  </script>
+</app>

@@ -6,6 +6,7 @@ import { svelte } from "@sveltejs/vite-plugin-svelte";
 import solid from "vite-plugin-solid";
 import { qwikVite } from "@builder.io/qwik/optimizer";
 import marko from "@marko/vite";
+import riot from "rollup-plugin-riot";
 import path from "path";
 
 function collectExampleInputs(rootDir: string): Record<string, string> {
@@ -78,12 +79,14 @@ export default defineConfig({
       config: () => ({ esbuild: { jsx: "automatic" } }),
     },
     marko({ linked: false }),
+    riot(),
   ],
   resolve: {
     alias: {
       "@wc-bindable/core": path.resolve(__dirname, "../packages/core/src/index.ts"),
       "@wc-bindable/marko": path.resolve(__dirname, "../packages/marko/src/index.ts"),
       "@wc-bindable/mithril": path.resolve(__dirname, "../packages/mithril/src/index.ts"),
+      "@wc-bindable/riot": path.resolve(__dirname, "../packages/riot/src/index.ts"),
       // Marko 5's nested @internal/* modules ship Node and browser variants,
       // but Vite's dep optimizer doesn't honor their "browser" export
       // condition and picks the Node entries — which use setImmediate and
