@@ -2,6 +2,8 @@
 
 This document describes optional contracts that build on the core [SPEC.md](SPEC.md). The core protocol intentionally interprets only `properties` — the `inputs` and `commands` declarations, along with the `attribute` and `async` hints, are purely declarative at the core level. Their *behavioral* meaning is layered on top by the extensions below.
 
+> The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, **MAY**, **REQUIRED**, **RECOMMENDED**, and **OPTIONAL** carry the [BCP 14](https://www.rfc-editor.org/info/bcp14) / [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119) / [RFC 8174](https://www.rfc-editor.org/rfc/rfc8174) meanings when they appear in all capitals. See [SPEC.md § Requirements language](SPEC.md#requirements-language).
+
 Implementations MAY adopt one extension without adopting the others. A consumer that uses only `bind()` from `@wc-bindable/core` does not need any of this document.
 
 ---
@@ -55,7 +57,7 @@ interface AckOptions {
 Implementations MUST honor:
 
 - A default timeout. The reference implementation uses `30_000` ms. Other implementations MAY choose a different default but MUST document it. `timeoutMs: 0` disables the timeout; `timeoutMs: undefined` (or `options` omitted) applies the default.
-- Invalid `timeoutMs` (negative, non-finite, non-numeric) MUST cause the returned promise to reject synchronously with a `RangeError`-shaped error rather than be silently ignored.
+- Invalid `timeoutMs` (negative, non-finite, non-numeric) is a **protocol-level failure** — the implementation MUST surface it via Promise rejection, never a synchronous throw, consistent with the same rule for all `setWithAck` / `invoke` protocol-level failures in § Methods. Concretely, `setWithAckOptions` / `invokeWithOptions` MUST **synchronously return an already-rejected Promise** carrying a `RangeError`-shaped error rather than throw synchronously or silently coerce / ignore the value. The phrase "synchronously reject" in this spec always means "synchronously return a rejected Promise", never "throw".
 - Pre-aborted signals (`signal.aborted === true` at call time) MUST cause the returned promise to reject immediately without sending any wire message.
 - After timeout or abort settles the caller's promise, the proxy MUST NOT re-settle it if a late `return` / `throw` envelope arrives for the same `id`. The late envelope MUST be dropped, and the proxy SHOULD log the drop at warn level so the unexpected delivery is visible to diagnostics. (See § Transport lifecycle vocabulary for the terminal-vs-transient terminology that interacts with this.)
 
@@ -291,7 +293,7 @@ Producers MAY omit `getterFailures` when no read failed. Consumers MUST treat a 
 The optional `declarationFingerprint` field on a sync response carries a canonical structural summary of the producer's `wcBindable`:
 
 - `version` — the integer version of the producer's declaration.
-- `properties`, `inputs`, `commands` — the **sorted, deduplicated** lists of declared `name`s on each surface. Event names are NOT included: the consumer-side proxy rewrites them to synthetic per-property identifiers (see § Design invariants invariant 2), so cross-the-wire event-name comparison would always report differences and defeat the purpose.
+- `properties`, `inputs`, `commands` — the **sorted, deduplicated** lists of declared `name`s on each surface. Event names are NOT included: the consumer-side proxy rewrites them to synthetic per-property identifiers (see § Design invariants invariant 2), so cross-the-wire event-name comparison would always report differences and defeat the purpose. (Dedup is a no-op for valid declarations — name uniqueness within each list is already required by [SPEC.md § Property / Input / Command Descriptor](SPEC.md#property-descriptor); the dedup step here is defense-in-depth against a malformed or hostile producer that bypasses construction-time validation, not a feature of the canonical algorithm.)
 
 Producers SHOULD include the field on every sync response. The cost is `O(N)` in declaration size and a few hundred bytes of wire payload; the benefit is structural-mismatch detection before the first `set` / `invoke` reaches the producer.
 

@@ -57,6 +57,8 @@ If the snippet above feels small and the remote / wire-format material later fee
 
 The "no runtime dependencies" claim refers to Layer 1, which is what `@wc-bindable/core` ships. Layers 2 and 3 are opt-in; loading them does not retroactively complicate a Layer-1-only consumer.
 
+A small clarification on the Layer 1 "just `static` class fields and `CustomEvent`" framing: when the consumer opts into `bind(target, onUpdate, { syncOn: "connect" })`, the deferred-sync path touches three more environment globals — `HTMLElement`, `document`, `MutationObserver`. They are referenced through `typeof` guards, so importing `@wc-bindable/core` itself never fails in Node / Deno / Workers where those globals are absent; the deferred path simply degrades to the synchronous `"call"` behavior in that case. Layer 1 thus retains the no-dependency posture in the package-manifest sense (no `npm` deps), while still being able to take advantage of DOM globals when they happen to exist.
+
 ## Why?
 
 - **Write once, use everywhere** — A Web Component that implements this protocol works with React, Vue, Svelte, Angular, Solid, and any future framework without modification.

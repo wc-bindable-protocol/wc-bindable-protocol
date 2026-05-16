@@ -219,6 +219,67 @@ describe("getWcBindableDeclaration", () => {
     }
   });
 
+  it("cleans up already-registered listeners when a later addEventListener throws (no leak)", () => {
+    // Regression for the registration-loop leak: if addEventListener throws
+    // on the Nth property (e.g. a Proxy-wrapped relay target whose `get`
+    // trap throws), the first N-1 listeners must be torn down before the
+    // error reaches the caller. Without the fix, those listeners stayed
+    // attached and bind() never returned an unbind function.
+    const declarations: WcBindableDeclaration = {
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [
+        { name: "a", event: "test:a" },
+        { name: "b", event: "test:b" },
+      ],
+    };
+
+    class HostileCore extends EventTarget {
+      static wcBindable = declarations;
+      _callCount = 0;
+      addEventListener(type: string, listener: EventListenerOrEventListenerObject): void {
+        this._callCount++;
+        if (this._callCount === 2) throw new Error("simulated trap throw");
+        super.addEventListener(type, listener);
+      }
+    }
+
+    const core = new HostileCore();
+    const realRemove = core.removeEventListener.bind(core);
+    const removeSpy = vi.fn((type: string, listener: EventListenerOrEventListenerObject) => {
+      realRemove(type, listener);
+    });
+    core.removeEventListener = removeSpy;
+
+    const onUpdate = vi.fn();
+    expect(() => bind(core, onUpdate)).toThrow("simulated trap throw");
+
+    // The first listener (for "a") was registered before the throw, and the
+    // cleanup-on-throw wrapper must have removed it before propagating.
+    expect(removeSpy).toHaveBeenCalledTimes(1);
+    expect(removeSpy).toHaveBeenCalledWith("test:a", expect.any(Function));
+
+    // Dispatching the leaked event should NOT reach onUpdate.
+    core.dispatchEvent(new CustomEvent("test:a", { detail: 1 }));
+    expect(onUpdate).not.toHaveBeenCalled();
+  });
+
+  it("throws synchronously when onUpdate is not a function", () => {
+    // Empty-properties target: a deferred error would never fire because
+    // there are no events to deliver. SPEC § onUpdate validity SHOULD-throws
+    // up front so the bug is visible at bind-time.
+    class EmptyCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+      };
+    }
+    expect(() => bind(new EmptyCore(), null as unknown as () => void)).toThrow(TypeError);
+    expect(() => bind(new EmptyCore(), 42 as unknown as () => void)).toThrow(TypeError);
+    expect(() => bind(new EmptyCore(), "nope" as unknown as () => void)).toThrow(TypeError);
+  });
+
   it("cleans up all listeners even when an earlier cleanup throws (exception-safe unbind)", () => {
     // Regression: unbind previously aborted on the first throwing cleanup,
     // leaving later listeners attached. Now wraps each cleanup in try/catch.

@@ -258,6 +258,13 @@ export function bind(
   onUpdate: (name: string, value: unknown) => void,
   options?: BindOptions,
 ): UnbindFn {
+  // Programmer error: a non-function onUpdate cannot be reached for an
+  // empty-properties target (no event would ever fire it), so defer-and-let-
+  // it-throw would silently accept the bug. Reject it synchronously here.
+  // See SPEC.md § onUpdate validity.
+  if (typeof onUpdate !== "function") {
+    throw new TypeError("bind: onUpdate must be a function");
+  }
   // Discovery performs the full schema validation (descriptor shapes,
   // name-uniqueness within properties/inputs/commands). A declaration that
   // survives this check is safe to bind without further validation here —
@@ -275,20 +282,43 @@ export function bind(
   const cleanups: (() => void)[] = [];
   let disposed = false;
 
-  for (const prop of properties) {
-    const getter = prop.getter ?? DEFAULT_GETTER;
-    const handler = (event: Event) => onUpdate(prop.name, getter(event));
-    et.addEventListener(prop.event, handler);
-    cleanups.push(() => et.removeEventListener(prop.event, handler));
-  }
+  // Run an arbitrary function and, if it throws, tear down every cleanup
+  // installed so far before rethrowing. Used to wrap BOTH the listener
+  // registration loop (a `Proxy`-wrapped addEventListener can throw via
+  // a `get` trap on the registry method — see SPEC.md § Overview, which
+  // permits relay / Proxy wrappers as valid bind targets) AND the
+  // synchronous initial-sync pass (a property's `in` trap, a getter, or
+  // the consumer's `onUpdate` callback can throw). Without this wrapper,
+  // a throw at registration leaves N-1 listeners attached without ever
+  // returning the unbind function to the caller — a permanent leak.
+  const runOrCleanup = (fn: () => void) => {
+    try {
+      fn();
+    } catch (err) {
+      disposed = true;
+      cleanups.forEach((c) => {
+        try { c(); } catch { /* swallow secondary errors during cleanup */ }
+      });
+      throw err;
+    }
+  };
+
+  runOrCleanup(() => {
+    for (const prop of properties) {
+      const getter = prop.getter ?? DEFAULT_GETTER;
+      const handler = (event: Event) => onUpdate(prop.name, getter(event));
+      et.addEventListener(prop.event, handler);
+      cleanups.push(() => et.removeEventListener(prop.event, handler));
+    }
+  });
 
   // initialSync may throw if:
   //   - a property's `name in target` trap (e.g. on a Proxy) throws,
   //   - reading `target[prop.name]` invokes a getter that throws, or
   //   - the consumer's `onUpdate` callback throws.
-  // If we don't catch it here, the listeners attached above leak — the
-  // caller never receives the unbind function. Catch, tear down every
-  // resource installed so far, and rethrow so the caller sees the error.
+  // Wrapped in the same runOrCleanup as the registration loop above so
+  // listeners and any deferred-sync observer are torn down before the
+  // error reaches the caller.
   const initialSync = () => {
     if (disposed) return;
     for (const prop of properties) {
@@ -299,18 +329,6 @@ export function bind(
         const current = (et as unknown as Record<string, unknown>)[prop.name];
         onUpdate(prop.name, current);
       }
-    }
-  };
-
-  const runOrCleanup = (fn: () => void) => {
-    try {
-      fn();
-    } catch (err) {
-      disposed = true;
-      cleanups.forEach((c) => {
-        try { c(); } catch { /* swallow secondary errors during cleanup */ }
-      });
-      throw err;
     }
   };
 

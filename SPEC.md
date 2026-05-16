@@ -3,6 +3,10 @@
 **Protocol:** `wc-bindable`  
 **Version:** 1  
 
+## Requirements language
+
+The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, **MAY**, **REQUIRED**, **RECOMMENDED**, and **OPTIONAL** in this document and its extensions ([SPEC-extensions.md](SPEC-extensions.md)) are to be interpreted as described in [BCP 14](https://www.rfc-editor.org/info/bcp14) — [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119) and [RFC 8174](https://www.rfc-editor.org/rfc/rfc8174) — when, and only when, they appear in all capitals. Lowercase uses of these words ("a target must be …") carry their natural-English meaning and are non-normative.
+
 ---
 
 ## Overview
@@ -70,7 +74,7 @@ The four properties above match the `MyFetchValues` interface used later in § A
 
 This form works in any runtime that provides `EventTarget` and `CustomEvent` (browsers, Node.js, Deno, Cloudflare Workers, etc.).
 
-The `inputs` and `commands` fields are optional. When present, they declare the component's input interface — settable properties and callable methods — enabling tooling, documentation generation, and remote proxying. They do **not** create any implicit data flow; the consumer is responsible for explicitly setting properties and invoking methods. The semantics for *how* a consumer sets inputs and invokes commands (delivery guarantees, error handling, the role of `attribute` / `async`) are described in [SPEC-extensions.md](SPEC-extensions.md) — the core protocol itself does not interpret these fields.
+The `inputs` and `commands` fields are optional. When present, they declare the component's input interface — settable properties and callable methods — enabling tooling, documentation generation, and remote proxying. They do **not** create any implicit data flow; the consumer is responsible for explicitly setting properties and invoking methods. The semantics for *how* a consumer sets inputs and invokes commands (delivery guarantees, error handling, the role of `attribute` / `async`) are described in [SPEC-extensions.md § Extension 1](SPEC-extensions.md#extension-1--inputcommand-invocation) — the core protocol itself does not interpret these fields.
 
 ### Web Component (HTMLElement)
 
@@ -143,7 +147,7 @@ Adapters **MUST** ignore unknown fields on a property descriptor.
 | Field       | Type     | Required | Description                                          |
 |-------------|----------|----------|------------------------------------------------------|
 | `name`      | `string` | ✅       | The settable property name on the target             |
-| `attribute` | `string` | ❌       | Declarative hint, see [SPEC-extensions.md](SPEC-extensions.md). Not interpreted by core. |
+| `attribute` | `string` | ❌       | Declarative hint, see [SPEC-extensions.md § The `attribute` hint](SPEC-extensions.md#the-attribute-hint). Not interpreted by core. |
 
 Within `inputs`, every `name` MUST be unique. Duplicate names make the declaration **invalid** under the same rule given for properties above (`getWcBindableDeclaration()` MUST return `undefined`; `isWcBindable()` MUST return `false`). Adapters **MUST** ignore unknown fields on an input descriptor.
 
@@ -152,7 +156,7 @@ Within `inputs`, every `name` MUST be unique. Duplicate names make the declarati
 | Field   | Type      | Required | Description                                            |
 |---------|-----------|----------|--------------------------------------------------------|
 | `name`  | `string`  | ✅       | The method name on the target                          |
-| `async` | `boolean` | ❌       | Declarative hint, see [SPEC-extensions.md](SPEC-extensions.md). Not interpreted by core. |
+| `async` | `boolean` | ❌       | Declarative hint, see [SPEC-extensions.md § The `async` hint](SPEC-extensions.md#the-async-hint). Not interpreted by core. |
 
 Within `commands`, every `name` MUST be unique. Duplicate names make the declaration **invalid** under the same rule given for properties above (`getWcBindableDeclaration()` MUST return `undefined`; `isWcBindable()` MUST return `false`). Adapters **MUST** ignore unknown fields on a command descriptor.
 
@@ -268,6 +272,10 @@ A reactivity system that supports this protocol should:
 > **This 4-step list is a simplification.** The full, normative validation that `bind()` MUST perform — descriptor-shape checks (non-empty string `name` / `event`, function-or-undefined `getter`), name-uniqueness within `properties` / `inputs` / `commands`, the EventTarget-capability check on `target` itself, and the MUST-NOT-throw guard for pathological constructors — is specified in [§ Discovery API](#discovery-api). The reference implementation that follows this guide routes the validation through `getWcBindableDeclaration()`, which performs all of the above; if you re-implement `bind()` from scratch following only the 4 steps above, you will reproduce the "isWcBindable returns true but bind silently no-ops" footgun that the discovery-is-bindability rule exists to prevent. Always consult § Discovery API for the complete check set.
 
 The `target` parameter accepts any `EventTarget` — this includes `HTMLElement` instances as well as headless `EventTarget` subclasses.
+
+### `onUpdate` validity
+
+`onUpdate` is the consumer's callback channel for both initial-sync deliveries and subsequent event-driven updates. Its TypeScript signature is normative (see [§ Normative TypeScript surface](#normative-typescript-surface)), but the spec also pins runtime behavior when the caller passes something that is not a function: `bind()` MUST treat a non-function `onUpdate` as a **programmer error** (outside the protocol surface per the same classification used for `invoke` / `setWithAck` in [SPEC-extensions.md § Methods](SPEC-extensions.md#methods)) and SHOULD throw a `TypeError` synchronously at call time. Implementations MAY defer detection — e.g. let the first attempted invocation throw naturally — but this is discouraged because for an empty-`properties` target (legitimate per § Property Descriptor) the deferred detection never fires and the bug is silent. The recommended pattern is `if (typeof onUpdate !== "function") throw new TypeError(...)` at the top of `bind()`, before discovery.
 
 ### Normative TypeScript surface
 
@@ -456,28 +464,33 @@ function bind(target, onUpdate, options) {
   const et = /** @type {EventTarget} */ (target);
 
   const cleanups = [];
-  for (const prop of decl.properties) {
-    const getter = prop.getter ?? DEFAULT_GETTER;
-    const handler = (event) => onUpdate(prop.name, getter(event));
-    et.addEventListener(prop.event, handler);
-    cleanups.push(() => et.removeEventListener(prop.event, handler));
-  }
+  // Wrapper: if the registration loop, the initial-sync read, or the
+  // consumer's onUpdate throws, the listeners installed so far must NOT
+  // leak — tear down every cleanup recorded to date and rethrow. The
+  // registration loop is wrapped because a Proxy-wrapped relay target
+  // (permitted by § Overview) may have an `addEventListener` whose `get`
+  // trap throws on the Nth iteration. See § Teardown Contract.
+  const runOrCleanup = (fn) => {
+    try { fn(); } catch (err) {
+      cleanups.forEach((c) => { try { c(); } catch {} });
+      throw err;
+    }
+  };
+
+  runOrCleanup(() => {
+    for (const prop of decl.properties) {
+      const getter = prop.getter ?? DEFAULT_GETTER;
+      const handler = (event) => onUpdate(prop.name, getter(event));
+      et.addEventListener(prop.event, handler);
+      cleanups.push(() => et.removeEventListener(prop.event, handler));
+    }
+  });
 
   // Initial value synchronization — use `in` so that an explicitly-undefined
   // property is still reported on first sync.
   const initialSync = () => {
     for (const prop of decl.properties) {
       if (prop.name in et) onUpdate(prop.name, et[prop.name]);
-    }
-  };
-
-  // Wrapper: if initialSync (or `onUpdate` called from it) throws, the
-  // listeners installed above must NOT leak — tear them down and rethrow.
-  // See § Teardown Contract.
-  const runOrCleanup = (fn) => {
-    try { fn(); } catch (err) {
-      cleanups.forEach((c) => { try { c(); } catch {} });
-      throw err;
     }
   };
 
@@ -519,7 +532,7 @@ function bind(target, onUpdate, options) {
 
 `bind()` **MUST** return a function that, when called, removes every event listener (and any other resource — e.g. `MutationObserver`) the adapter installed during the call. This applies whether or not the target was actually bindable: a no-op cleanup function (`() => {}`) is the correct return value for non-`wc-bindable` targets.
 
-**If the synchronous initial-sync step throws** — for example, a property's `in` trap throws, a property getter throws on read, or the consumer's `onUpdate` callback throws — the adapter **MUST** tear down every listener and observer it installed earlier in the same `bind()` call before letting the error propagate. Without this, the caller never receives the unbind function and the listener set leaks. Cleanup callbacks that themselves throw during this fallback path SHOULD be swallowed; surfacing a cleanup-time secondary error in place of the original `initialSync` error is more confusing than useful.
+**If anything inside `bind()` throws while installing resources** — including the listener-registration loop (e.g. a `Proxy`-wrapped relay target's `addEventListener` throws via a `get` trap on the Nth iteration), the synchronous initial-sync step (a property's `in` trap throws, a property getter throws on read, the consumer's `onUpdate` callback throws), or the deferred-sync observer's setup — the adapter **MUST** tear down every listener and observer it installed earlier in the same `bind()` call before letting the error propagate. Without this, the caller never receives the unbind function and the listener set leaks. This applies to **every** install-time throw, not only the initial-sync read. Cleanup callbacks that themselves throw during this fallback path SHOULD be swallowed; surfacing a cleanup-time secondary error in place of the original error is more confusing than useful.
 
 > **Partial-delivery state at the consumer.** Initial-sync delivers properties in declaration order. If `properties[0..k-1]` succeed but `properties[k]` throws, the consumer has already received `onUpdate(name, value)` calls for every successful property — those calls are observable and **final**. The adapter does NOT (and cannot) roll back consumer state on a subsequent throw. After `bind()` rethrows, the consumer therefore holds a partially-populated view of the target: keys it observed via successful `onUpdate` calls have real values, keys after the failure point have whatever default the consumer initialized with (typically nothing). Consumers that need all-or-nothing initial-sync semantics MUST snapshot their state before calling `bind()` and restore on caught exception themselves; the protocol does not provide a transactional initial sync.
 
@@ -549,7 +562,7 @@ The relative ordering of the initial-sync delivery and the first subsequent `onU
 - With `syncOn: "call"` (the default), the adapter **MUST** attach event listeners and perform the initial-sync read within the same synchronous frame of `bind()`. As a consequence, no event the adapter itself observes can fire on the target *between* the listener attach and the initial-sync delivery — the in-frame ordering is the adapter's enforceable guarantee. Once the initial sync has been delivered and `bind()` has returned, subsequent events follow normal listener-delivery order. The only way an event can interleave the initial sync at all is if `onUpdate` synchronously re-enters the target via `dispatchEvent` while the initial-sync loop is running; the adapter cannot prevent this re-entry, and component / consumer authors SHOULD NOT do it. The event-payload-authoritative rule (see [§ Event detail vs Property Read](#event-detail-vs-property-read)) covers any resulting ordering anomaly.
 - With `syncOn: "connect"`, the initial-sync read is intentionally deferred until the target becomes connected. **Any change event that fires between `bind()` return and the deferred initial-sync MUST be delivered to `onUpdate` in the order it arrives** — that is, an event arriving before the deferred sync is delivered first, and the deferred initial-sync runs afterwards with `target[prop.name]` read at sync time. The consumer therefore sees the most recent value last, regardless of the path it arrived on. This is the only sound interpretation when the read site is deferred; the `"before any events fire"` guarantee from `syncOn: "call"` is **not** in effect under `syncOn: "connect"`.
 
-In both modes, the **event payload is authoritative** in case the initial-sync read and a subsequent event disagree on the value — see [§ Event detail vs Property Read](#event-detail-vs-property-read).
+In `syncOn: "call"` the **event payload is authoritative** in case the initial-sync read and a subsequent event disagree on the value — see [§ Event detail vs Property Read](#event-detail-vs-property-read). **In `syncOn: "connect"` this rule is overridden by the ordering rule above**: the deferred initial-sync runs *after* any events that fired pre-connection, reads `target[prop.name]` at sync time, and that read is what the consumer's state holds last. The deferred-sync read therefore wins over a pre-connection event payload, which is the opposite of the call-mode authority direction. This is a deliberate compromise — in the deferred case, the producer is expected to NOT dispatch wc-bindable change events on an unconnected element (no real consumer is observing changes yet), and if it does, the sync-time property read is the better source of truth at the moment the consumer first becomes attentive. Producers that genuinely need event-payload-wins semantics on an unconnected target MUST use `syncOn: "call"` from a host lifecycle hook instead.
 
 #### Deferring the Initial Sync Until Connection
 
@@ -746,6 +759,9 @@ A pre-v0.7.0 draft used `if (target[prop.name] !== undefined)` as the initial-sy
 
 **Why the reference pseudocode uses optional chaining (not a `typeof` gate) on `target.constructor`.**
 A class declaration in JavaScript is a function (`typeof MyClass === "function"`), not an object. A pre-v0.7.1 draft of the pseudocode gated on `typeof ctor === "object"` and silently failed to discover any class-based component — the single most common shape in the wild. Optional chaining inside a `try / catch` accepts both function-typed (class) and object-typed constructors and satisfies the "MUST NOT throw" rule even when `target` is a null-prototype-like object.
+
+**Why a custom `getter` is NOT applied during initial sync.**
+The default getter (`e => e.detail`) is applied to subsequent change events but not to the initial-sync read; the initial sync reads `target[prop.name]` directly. This is deliberate: there is no `Event` object to feed the getter on the initial pass, so applying it would require the adapter to synthesize one with a fake `detail`, which is exactly the kind of impedance mismatch this protocol tries to avoid. The cost is a small asymmetry — a component that declares `getter: (e) => e.detail.checked` MUST also expose `target.checked` returning the same shape the getter would extract, so the two paths produce equal values for the same logical state. The spec mandates this alignment as a SHOULD (see § Event detail vs Property Read); enforcing it as a MUST is impossible without runtime invocation of the getter at construction, which would defeat the headless-component goal. Component authors who genuinely cannot maintain the parity should expose the extracted value directly as the property and use the default getter.
 
 **Why the minimum version is pinned to `1` (and adapter-specific bounds are forbidden).**
 The forward-compatibility policy — "breaking changes get a new `protocol` identifier, not a version bump" — implies symmetric compatibility within a given `protocol` identifier. A future v2 adapter that gated on `decl.version >= 2` would silently no-op against valid v1 declarations, producing exactly the regression the policy was meant to prevent. The reference implementation materializes this minimum as the constant `MIN_COMPATIBLE_VERSION = 1` (the *name* is implementation-local, not part of the normative API — only the discovery helper names are pinned per § Discovery API), and the constant's value MUST NOT be raised in future releases under the `"wc-bindable"` identifier.
