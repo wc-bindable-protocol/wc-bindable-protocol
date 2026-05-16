@@ -53,6 +53,7 @@
     "solid-js": "^1.9.11",
     "svelte": "^5.53.7",
     "typescript": "^5.9.3",
+    "vanjs-core": "^1.5.5",
     "vite-plugin-solid": "^2.11.11",
     "vitest": "^4.0.18",
     "vue": "^3.5.29",
