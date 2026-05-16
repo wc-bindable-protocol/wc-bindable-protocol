@@ -2,7 +2,7 @@
 
 **wc-bindable lets a component publish "these properties can be observed, and these events mean they changed" in one standard place** — and any reactivity system reads that same place to wire up bindings without per-component glue.
 
-The minimal, framework-agnostic protocol works for any **EventTarget-compatible bind target** — Web Components, headless `EventTarget` cores running in Node / Deno / Workers, and relay / remote proxies that expose `addEventListener` / `removeEventListener` (without necessarily extending `EventTarget` themselves) — so the same declaration drives React, Vue, Svelte, Lit, plain `bind()` calls, and across-the-wire transport equally.
+The minimal, framework-agnostic protocol works for any **EventTarget-compatible bind target** — Web Components, headless `EventTarget` cores running in Node / Deno / Workers, and relay / remote proxies that expose `addEventListener` / `removeEventListener` (without necessarily extending `EventTarget` themselves) — so the same **declared interface** can be adapted to React, Vue, Svelte, Lit, plain `bind()` calls, and across-the-wire proxying. (Remote proxies expose an *observation-equivalent* declaration — same property / input / command names, synthetic per-property event names internally — rather than the byte-equal original.)
 
 The **core protocol has no runtime dependencies** — just `static` class fields and `CustomEvent`. Framework adapters depend only on their target framework (`@wc-bindable/react` on React, etc.); they do not pull in other frameworks.
 
