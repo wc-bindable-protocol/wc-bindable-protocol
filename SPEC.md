@@ -3,6 +3,8 @@
 **Protocol:** `wc-bindable`  
 **Version:** 1  
 
+> **Authoritative scope of this document.** SPEC.md is the **authoritative source for the core protocol contract** — the `static wcBindable` declaration schema, the `bind()` / `getWcBindableDeclaration()` / `isWcBindable()` runtime surface, initial-sync semantics, the teardown contract, the conformance levels, and the versioning policy. Behavioral extensions (input/command invocation, the remote wire format) live in [SPEC-extensions.md](SPEC-extensions.md); runnable test vectors live in [CONFORMANCE.md](CONFORMANCE.md); narrative overview and quick-start live in [README.md](README.md). Where any of those disagree with the rules below, this document is authoritative.
+
 ## Requirements language
 
 The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, **MAY**, **REQUIRED**, **RECOMMENDED**, and **OPTIONAL** in this document and its extensions ([SPEC-extensions.md](SPEC-extensions.md)) are to be interpreted as described in [BCP 14](https://www.rfc-editor.org/info/bcp14) — [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119) and [RFC 8174](https://www.rfc-editor.org/rfc/rfc8174) — when, and only when, they appear in all capitals. Lowercase uses of these words ("a target must be …") carry their natural-English meaning and are non-normative.

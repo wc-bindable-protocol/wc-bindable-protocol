@@ -1,5 +1,7 @@
 # wc-bindable-protocol Extensions
 
+> **Authoritative scope of this document.** SPEC-extensions.md is the **authoritative source for the optional contracts layered on top of core**: Extension 1 (input/command invocation — `set` / `setWithAck` / `invoke` and their lifecycle surface), Extension 2 (the remote wire format — message shapes, JsonValue validation, capability bits, transport adapter contract, the consumer-side `has`-trap rule, `CustomEvent.detail` undefined preservation), and Extension 3 (informational `syncOn` guidance). Core rules (`bind()`, discovery, teardown, conformance levels, versioning) live in [SPEC.md](SPEC.md); runnable test vectors live in [CONFORMANCE.md](CONFORMANCE.md). Where README / packages-level docs disagree with the rules below, this document is authoritative.
+
 This document describes optional contracts that build on the core [SPEC.md](SPEC.md). The core protocol intentionally interprets only `properties` — the `inputs` and `commands` declarations, along with the `attribute` and `async` hints, are purely declarative at the core level. Their *behavioral* meaning is layered on top by the extensions below.
 
 > The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, **MAY**, **REQUIRED**, **RECOMMENDED**, and **OPTIONAL** carry the [BCP 14](https://www.rfc-editor.org/info/bcp14) / [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119) / [RFC 8174](https://www.rfc-editor.org/rfc/rfc8174) meanings when they appear in all capitals. See [SPEC.md § Requirements language](SPEC.md#requirements-language).
