@@ -65,6 +65,7 @@ This protocol intentionally does **not** cover:
 | [@wc-bindable/riot](packages/riot/) | Riot.js helper — `wcBindable()` / `createWcBindable()` |
 | [@wc-bindable/vanjs](packages/vanjs/) | VanJS helper — `wcBindable()` / `createWcBindable()` |
 | [@wc-bindable/signals](packages/signals/) | TC39 Signals (`signal-polyfill`) helper — `wcBindable()` / `createWcBindable()` |
+| [@wc-bindable/mobx](packages/mobx/) | MobX helper — `wcBindable()` / `createWcBindable()` |
 | [@wc-bindable/remote](packages/remote/) | Remote proxy — connect Core and Shell over a network via WebSocket or custom transport |
 
 ## Quick start

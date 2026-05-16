@@ -89,6 +89,7 @@ export default defineConfig({
       "@wc-bindable/riot": path.resolve(__dirname, "../packages/riot/src/index.ts"),
       "@wc-bindable/vanjs": path.resolve(__dirname, "../packages/vanjs/src/index.ts"),
       "@wc-bindable/signals": path.resolve(__dirname, "../packages/signals/src/index.ts"),
+      "@wc-bindable/mobx": path.resolve(__dirname, "../packages/mobx/src/index.ts"),
       // Marko 5's nested @internal/* modules ship Node and browser variants,
       // but Vite's dep optimizer doesn't honor their "browser" export
       // condition and picks the Node entries — which use setImmediate and
