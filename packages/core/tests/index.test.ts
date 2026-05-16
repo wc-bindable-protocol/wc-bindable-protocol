@@ -205,6 +205,22 @@ describe("getWcBindableDeclaration", () => {
     expect(getWcBindableDeclaration(t)).toBeUndefined();
     expect(isWcBindable(t)).toBe(false);
   });
+
+  it("rejects targets that have a valid declaration but lack EventTarget capability", () => {
+    // A plain object with the static-fields shape would pass the schema
+    // check but bind() would throw on addEventListener. The capability
+    // check up front rejects it so isWcBindable() and bind() agree.
+    class NotAnEventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [{ name: "value", event: "test:e" }],
+      };
+    }
+    const fake = new NotAnEventTarget() as unknown as EventTarget;
+    expect(getWcBindableDeclaration(fake)).toBeUndefined();
+    expect(isWcBindable(fake)).toBe(false);
+  });
 });
 
 describe("bind", () => {
@@ -290,6 +306,25 @@ describe("bind", () => {
     expect(typeof unbind).toBe("function");
     unbind(); // should not throw
     expect(onUpdate).not.toHaveBeenCalled();
+  });
+
+  it("cleans up listeners when initial-sync throws (no leak)", () => {
+    const el = createBindableElement(validDeclaration);
+    (el as unknown as Record<string, unknown>).value = "initial";
+
+    // onUpdate throws during the synchronous initial sync. bind() MUST
+    // tear down the listener it just installed and rethrow.
+    const onUpdate = vi.fn(() => {
+      throw new Error("consumer blew up");
+    });
+
+    expect(() => bind(el, onUpdate)).toThrow("consumer blew up");
+
+    // If the listener leaked, this dispatch would call onUpdate again.
+    const onUpdateAfter = vi.fn();
+    onUpdate.mockImplementation(onUpdateAfter);
+    el.dispatchEvent(new CustomEvent("test:value-changed", { detail: "post-leak-check" }));
+    expect(onUpdateAfter).not.toHaveBeenCalled();
   });
 
   it("treats a declaration with duplicate property names as invalid — both isWcBindable and bind agree", () => {

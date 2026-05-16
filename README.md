@@ -2,7 +2,39 @@
 
 A minimal, framework-agnostic protocol that enables any Web Component to declare its reactive properties — and optionally its input properties and commands — so that any reactivity system can bind to them without framework-specific coupling.
 
-No dependencies. Just `static` class fields and `CustomEvent`.
+The **core protocol has no runtime dependencies** — just `static` class fields and `CustomEvent`. Framework adapters depend only on their target framework (`@wc-bindable/react` on React, etc.); they do not pull in other frameworks.
+
+## The whole protocol in one snippet
+
+The simplest possible end-to-end use, with no framework adapter at all:
+
+```javascript
+// 1. Component side — declare what's bindable and dispatch on change.
+class MyInput extends HTMLElement {
+  static wcBindable = {
+    protocol: "wc-bindable",
+    version: 1,
+    properties: [{ name: "value", event: "my-input:value-changed" }],
+  };
+  set value(v) {
+    this._value = v;
+    this.dispatchEvent(new CustomEvent("my-input:value-changed", { detail: v }));
+  }
+  get value() { return this._value; }
+}
+customElements.define("my-input", MyInput);
+
+// 2. Consumer side — call bind() and react.
+import { bind } from "@wc-bindable/core";
+
+const el = document.querySelector("my-input");
+const unbind = bind(el, (name, value) => {
+  console.log(`${name} =`, value); // fires for the initial value and every change
+});
+// later: unbind();
+```
+
+That's it. The framework adapters below (`@wc-bindable/react`, `@wc-bindable/vue`, ...) are 30–60 LOC wrappers that pipe the same `(name, value)` callbacks into their framework's reactivity primitive — they add no new protocol concepts.
 
 ## Why?
 
@@ -39,6 +71,8 @@ When the adapter binds to an element, it reads the current value of each declare
 ## Security model
 
 wc-bindable assumes the target you bind to is **trusted code you intentionally loaded**. A custom-element `getter` is an arbitrary function executed in the consumer's JavaScript context on every event — do not bind to components whose `getter` implementations you did not vet.
+
+**Treat a `static wcBindable` declaration like executable component code, not like inert metadata.** Because the `getter` field is a function, a wc-bindable declaration is fundamentally different from a JSON or schema artifact — loading a component from an untrusted source loads a function-valued field that will run with consumer-context privileges on every dispatched event. Threat models that allow "just serialized metadata" but disallow "third-party code" need to treat declarations as the latter.
 
 For remote targets (`@wc-bindable/remote`), the proxy layer is a **protocol layer, not a security boundary**: authentication, authorization, rate limiting, and per-message payload validation are the responsibility of the layer that owns the transport. Do not expose a Core directly to an untrusted peer without those guardrails. `getter` functions are NEVER transported as code — they run on the trusted side and only extracted values cross the wire.
 

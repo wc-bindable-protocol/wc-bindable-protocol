@@ -93,6 +93,14 @@ const DEFAULT_GETTER = (e: Event): unknown => (e as CustomEvent).detail;
 export function getWcBindableDeclaration(
   target: EventTarget,
 ): WcBindableDeclaration | undefined {
+  // SPEC.md § Overview pins EventTarget as the minimum target capability.
+  // Reject targets that satisfy the declaration schema but cannot actually
+  // be bound to — without this, `bind()` would throw on `addEventListener`
+  // later, defeating the "discovery == bindability" contract.
+  const t = target as { addEventListener?: unknown; removeEventListener?: unknown };
+  if (typeof t?.addEventListener !== "function" || typeof t?.removeEventListener !== "function") {
+    return undefined;
+  }
   // Guard against pathological targets (e.g. `Object.create(null)` — no
   // constructor at all; a constructor that throws on `wcBindable` access).
   // The contract is "MUST NOT throw", so any error path returns undefined.
@@ -222,6 +230,13 @@ export function bind(
     cleanups.push(() => target.removeEventListener(prop.event, handler));
   }
 
+  // initialSync may throw if:
+  //   - a property's `name in target` trap (e.g. on a Proxy) throws,
+  //   - reading `target[prop.name]` invokes a getter that throws, or
+  //   - the consumer's `onUpdate` callback throws.
+  // If we don't catch it here, the listeners attached above leak — the
+  // caller never receives the unbind function. Catch, tear down every
+  // resource installed so far, and rethrow so the caller sees the error.
   const initialSync = () => {
     if (disposed) return;
     for (const prop of properties) {
@@ -232,6 +247,18 @@ export function bind(
         const current = (target as unknown as Record<string, unknown>)[prop.name];
         onUpdate(prop.name, current);
       }
+    }
+  };
+
+  const runOrCleanup = (fn: () => void) => {
+    try {
+      fn();
+    } catch (err) {
+      disposed = true;
+      cleanups.forEach((c) => {
+        try { c(); } catch { /* swallow secondary errors during cleanup */ }
+      });
+      throw err;
     }
   };
 
@@ -249,16 +276,19 @@ export function bind(
     // run the initial sync once. The observer is also torn down by unbind().
     // NOTE: MutationObserver does not traverse shadow roots; see
     // BindOptions.syncOn JSDoc.
+    // Deferred initialSync errors are routed through runOrCleanup so the
+    // listener set installed by bind() is torn down before the error
+    // surfaces — same contract as the synchronous path.
     const observer = new MutationObserverCtor(() => {
       if ((target as HTMLElement).isConnected) {
         observer.disconnect();
-        initialSync();
+        runOrCleanup(initialSync);
       }
     });
     observer.observe(documentRef, { childList: true, subtree: true });
     cleanups.push(() => observer.disconnect());
   } else {
-    initialSync();
+    runOrCleanup(initialSync);
   }
 
   return () => {

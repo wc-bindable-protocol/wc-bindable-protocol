@@ -160,7 +160,7 @@ Implementations **MUST** expose two discovery primitives whose contracts are obs
 
 | Function | Returns | Contract |
 |---|---|---|
-| `getWcBindableDeclaration(target)` | `WcBindableDeclaration \| undefined` | Resolves the declaration via the rule above and **fully validates** it. Returns `undefined` if any of the following hold: `target.constructor.wcBindable` is missing; `protocol !== "wc-bindable"`; `version` is not an integer `>= 1`; `properties` is not an array; any property descriptor is missing a non-empty string `name` or `event`, or has a non-function `getter`; any input or command descriptor is missing a non-empty string `name`; any `name` is duplicated within `properties`, within `inputs`, or within `commands`. MUST NOT throw. MUST NOT consult any source other than `target.constructor.wcBindable`. |
+| `getWcBindableDeclaration(target)` | `WcBindableDeclaration \| undefined` | Resolves the declaration via the rule above and **fully validates** it. Returns `undefined` if any of the following hold: `target` does not satisfy the minimum EventTarget capability (`typeof target.addEventListener !== "function"` or `typeof target.removeEventListener !== "function"`); `target.constructor.wcBindable` is missing; `protocol !== "wc-bindable"`; `version` is not an integer `>= 1`; `properties` is not an array; any property descriptor is missing a non-empty string `name` or `event`, or has a non-function `getter`; any input or command descriptor is missing a non-empty string `name`; any `name` is duplicated within `properties`, within `inputs`, or within `commands`. MUST NOT throw. MUST NOT consult any source other than `target.constructor.wcBindable` (and the EventTarget-capability test on `target` itself). |
 | `isWcBindable(target)` | `boolean` | A type guard that is exactly equivalent to `getWcBindableDeclaration(target) !== undefined`. Implementations MAY (and SHOULD) implement it as that one-line forward. |
 
 **Discovery is bindability.** Because `getWcBindableDeclaration()` performs the complete schema validation (including the duplicate-name rule that invalidates a declaration per § Property Descriptor / § Input Descriptor / § Command Descriptor), no declaration that survives this filter can silently no-op inside `bind()`. The earlier draft where `isWcBindable()` could return `true` for an invalid declaration while `bind()` returned a no-op cleanup is fixed: the two helpers now agree by construction. Consumers can therefore use `isWcBindable()` as the single decision point for "will `bind()` install listeners?".
@@ -256,12 +256,30 @@ const MutationObserverCtor =
 
 // Discovery — full schema validation, including descriptor shape and
 // name-uniqueness within properties / inputs / commands. MUST NOT throw
-// (target without a constructor, target with a non-object constructor,
-// any other edge — return undefined). This is the single source of truth
-// for "is this target safe to bind to" (see § Discovery API).
+// (target without a constructor, target with a constructor whose
+// `wcBindable` getter throws, target that is `null`-prototype-like —
+// return undefined). This is the single source of truth for "is this
+// target safe to bind to" (see § Discovery API).
+//
+// Note on `typeof constructor`: in JavaScript a class is a function, so
+// `typeof MyClass === "function"`. Older revisions of this pseudocode
+// gated on `typeof ctor === "object"` and silently failed to discover
+// any class-based component — the most common case. The check below
+// uses optional chaining instead of a typeof gate, accepting both
+// function-typed (class) and object-typed constructors.
 function getWcBindableDeclaration(target) {
-  const ctor = target?.constructor;
-  const decl = ctor && typeof ctor === "object" ? ctor.wcBindable : undefined;
+  // Minimum capability check: target MUST be an EventTarget. A target that
+  // ships a valid declaration but lacks add/removeEventListener would
+  // throw inside bind() later — reject it here so isWcBindable() and
+  // bind() agree by construction.
+  if (typeof target?.addEventListener !== "function") return undefined;
+  if (typeof target?.removeEventListener !== "function") return undefined;
+  let decl;
+  try {
+    decl = target?.constructor?.wcBindable;
+  } catch {
+    return undefined;
+  }
   if (decl?.protocol !== "wc-bindable") return undefined;
   if (!Number.isInteger(decl.version) || decl.version < MIN_COMPATIBLE_VERSION) return undefined;
   if (!isValidNamedList(decl.properties, isValidPropertyDescriptor)) return undefined;
@@ -315,6 +333,16 @@ function bind(target, onUpdate, options) {
     }
   };
 
+  // Wrapper: if initialSync (or `onUpdate` called from it) throws, the
+  // listeners installed above must NOT leak — tear them down and rethrow.
+  // See § Teardown Contract.
+  const runOrCleanup = (fn) => {
+    try { fn(); } catch (err) {
+      cleanups.forEach((c) => { try { c(); } catch {} });
+      throw err;
+    }
+  };
+
   const syncOn = options?.syncOn ?? "call";
   const canDefer =
     syncOn === "connect" &&
@@ -326,12 +354,12 @@ function bind(target, onUpdate, options) {
 
   if (canDefer) {
     const observer = new MutationObserverCtor(() => {
-      if (target.isConnected) { observer.disconnect(); initialSync(); }
+      if (target.isConnected) { observer.disconnect(); runOrCleanup(initialSync); }
     });
     observer.observe(documentRef, { childList: true, subtree: true });
     cleanups.push(() => observer.disconnect());
   } else {
-    initialSync();
+    runOrCleanup(initialSync);
   }
 
   return () => cleanups.forEach((fn) => fn());
@@ -341,6 +369,8 @@ function bind(target, onUpdate, options) {
 ### Teardown Contract
 
 `bind()` **MUST** return a function that, when called, removes every event listener (and any other resource — e.g. `MutationObserver`) the adapter installed during the call. This applies whether or not the target was actually bindable: a no-op cleanup function (`() => {}`) is the correct return value for non-`wc-bindable` targets.
+
+**If the synchronous initial-sync step throws** — for example, a property's `in` trap throws, a property getter throws on read, or the consumer's `onUpdate` callback throws — the adapter **MUST** tear down every listener and observer it installed earlier in the same `bind()` call before letting the error propagate. Without this, the caller never receives the unbind function and the listener set leaks. The reference implementation routes both the synchronous and the deferred initial-sync paths through one cleanup-on-throw wrapper to satisfy this requirement. Cleanup callbacks that themselves throw during this fallback path SHOULD be swallowed; surfacing a cleanup-time secondary error in place of the original `initialSync` error is more confusing than useful.
 
 Long-lived headless `Core` instances may outlive multiple consumers; without an explicit teardown contract, listener leaks are guaranteed. Component-side `disconnectedCallback` cannot be relied on because headless Cores have no DOM lifecycle, and Web Components bound via framework refs may be reattached.
 

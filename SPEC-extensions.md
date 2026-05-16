@@ -18,9 +18,45 @@ A *consumer-side proxy* that adopts this extension MUST expose the following sur
 |---|---|---|
 | `set` | `set(name: string, value: unknown): void` | Fire-and-forget assignment of an input property. **At-most-once delivery.** No acknowledgement. Throws synchronously only if `name` is not declared in `inputs`, the transport has terminally failed, or the proxy is disposed. |
 | `setWithAck` | `setWithAck(name: string, value: unknown): Promise<void>` | Acknowledged assignment. **The promise MUST NOT resolve before the JS-level assignment `target[name] = value` has executed on the trusted side**; it MUST reject if the assignment throws, the remote rejects the message as undeclared/invalid, the transport closes, the call times out, or the proxy is disposed. The proxy does NOT wait for asynchronous side effects of the setter (e.g. a setter that schedules background work) — components that need to gate `invoke` on async post-set work SHOULD expose a command instead so the caller can `await invoke()`. **At-least-once delivery is NOT promised** — on transport failure the proxy rejects rather than silently retrying, because re-sending could re-apply a non-idempotent input (an increment, a write to an append-only log) twice, which the proxy cannot detect. The conservative default is at-most-once and the caller is responsible for any retry. Implementations MAY layer exactly-once on top via per-call idempotency keys but MUST document the choice. |
+| `setWithAckOptions` | `setWithAckOptions(name: string, value: unknown, options?: AckOptions): Promise<void>` | Same semantics as `setWithAck` plus per-call lifecycle controls; see § AckOptions. |
 | `invoke` | `invoke(name: string, ...args: unknown[]): Promise<unknown>` | Calls a declared command. Resolves with the (serialized) return value, or rejects with a serialized form of the thrown error. Throws synchronously / rejects asynchronously if `name` is not in `commands`, the transport is closed, or the proxy is disposed. |
+| `invokeWithOptions` | `invokeWithOptions(name: string, args: unknown[], options?: AckOptions): Promise<unknown>` | Same semantics as `invoke` plus per-call lifecycle controls; see § AckOptions. |
 
 The set of declared inputs and commands MUST be the same as the declarations exposed in `target.constructor.wcBindable.inputs` / `.commands` so that local and remote behavior agree.
+
+#### AckOptions
+
+`setWithAckOptions` and `invokeWithOptions` accept an optional second/third argument:
+
+```typescript
+interface AckOptions {
+  /**
+   * Maximum milliseconds the proxy will keep the pending promise open before
+   * rejecting with a TimeoutError. `0` disables the timeout for this call.
+   * If omitted, the implementation's default applies; implementations MUST
+   * document this default.
+   */
+  timeoutMs?: number;
+  /**
+   * If signalled before the pending promise settles, the promise rejects
+   * with the signal's `reason` (or a synthetic AbortError). Abort is a
+   * **local** cancellation — the proxy removes the pending entry and
+   * rejects the caller's promise; the wire message MAY have already left
+   * the proxy, and any subsequent `return` / `throw` envelope from the
+   * producer for the same `id` MUST be silently ignored by the consumer
+   * (logged at warn level). The protocol does NOT send a wire-level
+   * cancellation.
+   */
+  signal?: AbortSignal;
+}
+```
+
+Implementations MUST honor:
+
+- A default timeout. The reference implementation uses `30_000` ms. Other implementations MAY choose a different default but MUST document it. `timeoutMs: 0` disables the timeout; `timeoutMs: undefined` (or `options` omitted) applies the default.
+- Invalid `timeoutMs` (negative, non-finite, non-numeric) MUST cause the returned promise to reject synchronously with a `RangeError`-shaped error rather than be silently ignored.
+- Pre-aborted signals (`signal.aborted === true` at call time) MUST cause the returned promise to reject immediately without sending any wire message.
+- After timeout or abort settles the caller's promise, the proxy MUST NOT also re-settle it if a late `return` / `throw` arrives for the same `id`; the late envelope is logged at warn level and dropped (see § Transport lifecycle vocabulary for the disposal/terminal vocabulary that interacts with this).
 
 #### Call-order preservation
 
@@ -99,11 +135,26 @@ This section is the **normative** wire-format specification for any implementati
 
    **`JSON.stringify` alone is NOT sufficient validation.** `JSON.stringify` silently coerces `NaN`/`Infinity` to `null`, silently drops object own-properties whose value is `undefined`, a function, or a symbol, and silently drops symbol-keyed properties. A value can therefore pass `JSON.stringify` without throwing while being silently mutated into a different shape on the wire. Producers MUST validate values as `JsonValue` via an explicit deep traversal **before** handing them to the transport — a typed predicate `isJsonValue(v)` is the conformant primitive. (Implementations MAY use `JSON.stringify` followed by a structural compare of the parsed result to the original; raw `try { JSON.stringify(v) }` is non-conformant.)
 
-   **Handling of non-`JsonValue` values is normative:**
+   **Handling of non-`JsonValue` values is normative — on both sides of the wire:**
+
+   *Producer-side (server → client traffic):*
 
    - For an `update` / `sync` payload, the producer MUST emit a logger warning naming the affected property and MUST drop the value — no `update` message for that change; the consumer continues observing the last successfully-transmitted value.
    - For a `setWithAck` / `invoke` reply (`return` envelope), the producer MUST instead emit a `throw` envelope referencing the same `id`, so the pending consumer promise rejects with a typed error rather than hanging or resolving with corrupted data.
    - The producer MUST NOT substitute a sentinel like `null` for a failed serialization. Silent value mutation breaks the consumer's value-cache and the `bind()` `onUpdate` contract.
+
+   *Consumer-side (client → server traffic):*
+
+   - The consumer-side proxy MUST validate `set.value` and `cmd.args` against `JsonValue` **before** handing the message to the transport. The same deep-validation rule applies; `JSON.stringify`-and-catch alone is non-conformant for the reasons given above.
+   - For `setWithAck` and `invoke`, a validation failure MUST cause the returned promise to reject locally with a typed error. No wire message is sent.
+   - For fire-and-forget `set` (no `id`), a validation failure MUST cause `set()` to throw synchronously. The proxy MUST NOT silently drop a non-serializable input — the caller has no other channel to learn about it.
+
+   *Producer-side handling of malformed inbound messages:*
+
+   - The producer MUST reject any inbound message that fails JSON-shape validation (`set` without a string `name`; `cmd` without a string `name`, without a string `id`, or with `args` that is not an array; any envelope with extra unknown keys MUST still be processed, per the "ignore unknown fields" rule from core, but type-mismatched required keys MUST be rejected).
+   - For an inbound `setWithAck` / `cmd` that has an `id` but is otherwise malformed, the producer MUST emit a `throw` envelope referencing that `id` so the consumer's pending promise rejects with a clear error rather than hanging.
+   - For an inbound fire-and-forget `set` that is malformed (no `id`), the producer cannot reply. It MUST log a warning and drop the message. This is the documented gap of the fire-and-forget channel.
+   - The producer MUST NOT touch the Core (no setter invocation, no command call) until validation succeeds. Validation is the first step on the producer side.
 4. **FIFO ordering on a single (consumer, producer) channel.** The transport MUST preserve the order in which the proxy called `send()`. WebSocket-per-connection and `MessagePort`-per-port satisfy this; `BroadcastChannel` and fan-in / fan-out transports do not in general.
 5. **Per-channel single-shell semantics.** A given producer-side shell MUST serve exactly one consumer proxy at a time. Multiplexing N consumers onto one shell is out of scope; spawn N shells (one per channel) instead.
 
@@ -191,6 +242,17 @@ Consumer-side rules:
 - Subsequent `update` messages for the same `name` (after the getter recovers) MUST be applied normally — the failure does NOT taint the property permanently.
 
 Producers MAY omit `getterFailures` when no read failed. Consumers MUST treat a missing field as an empty list.
+
+#### Update-time getter failure
+
+The same property-level, non-fatal treatment applies when a `getter` throws during the producer-side handling of a *subsequent* change event (i.e. when building an `update` message, not during initial sync):
+
+- The producer MUST emit a logger warning naming the property whose getter threw.
+- The producer MUST drop the affected `update` — no message is sent. The consumer continues observing the last successfully-transmitted value.
+- This is NOT a protocol-level error. The wire stays well-formed, the connection stays open, and the producer keeps processing every other property's event stream normally.
+- A subsequent successful event for the same property — whether on a different change or after the getter recovers — MUST be applied normally as an `update`. A previous failure does NOT taint the property permanently.
+
+There is no in-band signal for update-time getter failures (no `updateGetterFailures` field), because change events are property-scoped and re-emit naturally; the next successful event carries the consumer back to a fresh value. If a getter is *permanently* broken, the consumer simply never observes a new `update` for that property — diagnostics live in the producer-side logger.
 
 ### `setWithAck` end-to-end
 
