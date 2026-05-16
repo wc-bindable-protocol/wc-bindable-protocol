@@ -190,7 +190,7 @@ Any object an adapter is asked to bind against MUST therefore expose a `construc
 - A **wrapper or proxy** that stands in for a real `EventTarget` (for example, a `Proxy`-wrapped object whose `get`/`set` traps route to a remote Core, or a test double) MUST expose an `equivalent` `constructor.wcBindable` declaration — where "equivalent" means **observation-equivalent at the wrapper**, NOT byte-equal to the wrapped target's declaration. Specifically:
 
   - The declaration the consumer reads via `target.constructor.wcBindable` MUST describe what the wrapper **actually** dispatches and exposes, not what the wrapped target dispatches and exposes. In particular, wrappers MAY (and often MUST) rewrite `event` names internally — the `@wc-bindable/remote` `RemoteCoreProxy` uses synthetic per-property event names like `@wc-bindable/remote:value` to disambiguate properties that shared a Core-side event. The wire layer translates between the two name spaces; the consumer sees only the wrapper's space.
-  - Required equivalences: same `protocol`; same set of `name`s in `properties`; observable `getter` semantics at the wrapper that yield the same values a local consumer would have observed (in the remote case the wrapper omits `getter` entirely — see [SPEC-extensions.md § Extension 2](SPEC-extensions.md)); and — when [SPEC-extensions.md § Extension 1](SPEC-extensions.md) is in use — the same `inputs` and `commands` membership as the wrapped target.
+  - Required equivalences: same `protocol`; same set of `name`s in `properties`; observable `getter` semantics at the wrapper that yield the same values a local consumer would have observed (in the remote case the wrapper omits `getter` entirely, with one narrow carve-out for sentinel-unwrapping getters used solely to round-trip `undefined` across the `CustomEvent.detail` boundary — see [SPEC-extensions.md § Extension 2](SPEC-extensions.md) → Design invariants invariant 2 and § CustomEvent `detail` and undefined preservation); and — when [SPEC-extensions.md § Extension 1](SPEC-extensions.md) is in use — the same `inputs` and `commands` membership as the wrapped target.
   - **Version reporting.** The wrapper MUST report the same `version` integer that the wrapped target's declaration carries. The wrapper does NOT need to verify or "match" the version against anything before reporting it — the [Versioning](#versioning) policy guarantees every adapter on either side accepts every integer `>= 1`, so wrappers simply propagate the value faithfully. (Reporting fidelity is required; a separate matching/checking step is not.)
 - Implementations that wrap one declaration per instance (i.e. multiple wrapped targets coexisting on the same page) MUST give each instance an **isolated** `constructor.wcBindable` — sharing a single constructor across instances with different declarations would break `isWcBindable()` and `bind()` for every instance after the first declaration write. The typical pattern is to synthesize a unique subclass per wrapped target.
 
@@ -491,12 +491,21 @@ function isValidNamedList(list, isValidEntry) {
   if (!Array.isArray(list)) return false;
   const seen = new Set();
   for (const entry of list) {
-    // Snapshot `entry.name` ONCE — a hostile accessor on a Proxy-wrapped
-    // descriptor that returns a different string on each read could
-    // otherwise pass isValidEntry's uniqueness-bearing read with one
-    // value and then dodge `seen.has` / `seen.add` here with another.
-    // The validator MUST keep the uniqueness gate tied to the same
-    // observed value the rest of the schema check saw.
+    // Snapshot `entry.name` ONCE WITHIN THIS FUNCTION so the uniqueness
+    // gate (`seen.has` / `seen.add`) reads the same value the type check
+    // a few lines below it reads — a hostile accessor on a Proxy-wrapped
+    // descriptor that returns a different string on successive reads
+    // would otherwise allow the second read to dodge the first read's
+    // gate. NOTE: this only locks the uniqueness gate to ONE read inside
+    // this function; it does NOT guarantee that downstream consumers
+    // (isValidEntry's own re-reads, the later bind() registration loop,
+    // initial-sync property access) observe the same value. Full read
+    // consistency across the discovery → bind() pipeline would require
+    // discovery to hand bind() a normalized snapshot of the declaration
+    // rather than re-walking the live target; this implementation does
+    // not do that because the spec's threat model (target is trusted —
+    // see § Trust Boundaries) considers the additional hardening
+    // unnecessary.
     if (!isValidEntry(entry)) return false;
     const name = entry.name;
     if (typeof name !== "string" || seen.has(name)) return false;
@@ -506,9 +515,11 @@ function isValidNamedList(list, isValidEntry) {
 }
 function isValidPropertyDescriptor(p) {
   if (!p || typeof p !== "object") return false;
-  // Same single-read rule: pull every Schema-typed field into a local
-  // before validating it, so a hostile getter cannot present one shape
-  // to the validator and another to the consumer downstream.
+  // Same single-read rule as isValidNamedList, with the same scope
+  // caveat: this protects the type checks WITHIN this function from
+  // seeing different values across the three `typeof` reads, but
+  // bind() still re-reads `prop.name` / `prop.event` / `prop.getter`
+  // independently. Threat-model-acceptable for trusted targets.
   const name = p.name;
   const event = p.event;
   const getter = p.getter;
