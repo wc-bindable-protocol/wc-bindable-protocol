@@ -404,33 +404,34 @@ const MutationObserverCtor =
 // both function-typed class constructors and object-typed constructors.
 // See § Appendix: Design rationale notes for why.
 function getWcBindableDeclaration(target) {
-  // Every property read on `target` lives inside the same try because the
-  // MUST-NOT-throw contract covers hostile Proxy targets whose `get`
-  // traps can throw on access — including the very `addEventListener` /
-  // `removeEventListener` reads used for the capability check below.
-  if (target === null || (typeof target !== "object" && typeof target !== "function")) {
-    return undefined;
-  }
-  let addListener, removeListener, decl;
+  // The entire body lives inside one try/catch because the MUST-NOT-throw
+  // contract covers EVERY property read during validation — not just the
+  // initial `target` reads but also hostile declaration / descriptor
+  // getters (a Proxy `wcBindable` whose `protocol` getter raises, a
+  // Proxy property descriptor whose `name` getter raises, …). Any thrown
+  // access during validation funnels to the same `return undefined`.
   try {
-    addListener = target.addEventListener;
-    removeListener = target.removeEventListener;
-    decl = target.constructor?.wcBindable;
+    if (target === null || (typeof target !== "object" && typeof target !== "function")) {
+      return undefined;
+    }
+    const addListener = target.addEventListener;
+    const removeListener = target.removeEventListener;
+    const decl = target.constructor?.wcBindable;
+    // Minimum capability check: target MUST be a consumer-side bind
+    // target. A target that ships a valid declaration but lacks
+    // add/removeEventListener would throw inside bind() later — reject
+    // it here so isWcBindable() and bind() agree by construction.
+    if (typeof addListener !== "function") return undefined;
+    if (typeof removeListener !== "function") return undefined;
+    if (decl?.protocol !== "wc-bindable") return undefined;
+    if (!Number.isInteger(decl.version) || decl.version < MIN_COMPATIBLE_VERSION) return undefined;
+    if (!isValidNamedList(decl.properties, isValidPropertyDescriptor)) return undefined;
+    if (decl.inputs !== undefined && !isValidNamedList(decl.inputs, isValidInputDescriptor)) return undefined;
+    if (decl.commands !== undefined && !isValidNamedList(decl.commands, isValidCommandDescriptor)) return undefined;
+    return decl;
   } catch {
     return undefined;
   }
-  // Minimum capability check: target MUST be an EventTarget consumer-side
-  // bind target. A target that ships a valid declaration but lacks
-  // add/removeEventListener would throw inside bind() later — reject it
-  // here so isWcBindable() and bind() agree by construction.
-  if (typeof addListener !== "function") return undefined;
-  if (typeof removeListener !== "function") return undefined;
-  if (decl?.protocol !== "wc-bindable") return undefined;
-  if (!Number.isInteger(decl.version) || decl.version < MIN_COMPATIBLE_VERSION) return undefined;
-  if (!isValidNamedList(decl.properties, isValidPropertyDescriptor)) return undefined;
-  if (decl.inputs !== undefined && !isValidNamedList(decl.inputs, isValidInputDescriptor)) return undefined;
-  if (decl.commands !== undefined && !isValidNamedList(decl.commands, isValidCommandDescriptor)) return undefined;
-  return decl;
 }
 
 function isWcBindable(target) {

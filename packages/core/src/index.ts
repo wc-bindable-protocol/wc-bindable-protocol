@@ -114,39 +114,40 @@ export function getWcBindableDeclaration(
   // SPEC.md § Discovery API contract: the parameter is `unknown` precisely
   // so callers can probe arbitrary inputs (a stray null, a plain object,
   // a Map, …) without first having to coerce to EventTarget. This helper
-  // MUST NOT throw on any input shape — including hostile Proxy targets
-  // whose `get` traps throw on property access. Every property read on
-  // `target` therefore lives inside a single try/catch.
-  if (target === null || (typeof target !== "object" && typeof target !== "function")) {
-    return undefined;
-  }
-  let addListener: unknown;
-  let removeListener: unknown;
-  let decl: WcBindableDeclaration | undefined;
+  // MUST NOT throw on ANY input shape — not only hostile Proxy targets
+  // whose `get` traps throw on `target` property access, but also hostile
+  // declaration / descriptor objects whose getters throw (e.g. a Proxy
+  // `wcBindable` whose `protocol` getter raises, a Proxy property
+  // descriptor whose `name` getter raises). The whole body therefore
+  // lives inside a single try/catch — any thrown access during
+  // validation funnels to the same `return undefined`.
   try {
-    addListener = (target as { addEventListener?: unknown }).addEventListener;
-    removeListener = (target as { removeEventListener?: unknown }).removeEventListener;
+    if (target === null || (typeof target !== "object" && typeof target !== "function")) {
+      return undefined;
+    }
+    const addListener = (target as { addEventListener?: unknown }).addEventListener;
+    const removeListener = (target as { removeEventListener?: unknown }).removeEventListener;
     const ctor = (target as { constructor?: { wcBindable?: WcBindableDeclaration } }).constructor;
-    decl = ctor?.wcBindable;
+    const decl = ctor?.wcBindable;
+
+    // SPEC.md § Overview pins EventTarget as the minimum consumer-side
+    // capability. Reject targets that satisfy the declaration schema but
+    // cannot actually be bound to — without this, `bind()` would throw
+    // on `addEventListener` later, defeating the "discovery == bindability"
+    // contract.
+    if (typeof addListener !== "function" || typeof removeListener !== "function") return undefined;
+    if (decl?.protocol !== "wc-bindable") return undefined;
+    if (typeof decl.version !== "number" || !Number.isInteger(decl.version)) return undefined;
+    if (decl.version < MIN_COMPATIBLE_VERSION) return undefined;
+    if (!Array.isArray(decl.properties)) return undefined;
+    if (!isValidNamedList(decl.properties, isValidPropertyDescriptor)) return undefined;
+    if (decl.inputs !== undefined && !isValidNamedList(decl.inputs, isValidInputDescriptor)) return undefined;
+    if (decl.commands !== undefined && !isValidNamedList(decl.commands, isValidCommandDescriptor)) return undefined;
+
+    return decl;
   } catch {
     return undefined;
   }
-  // SPEC.md § Overview pins EventTarget as the minimum consumer-side
-  // capability. Reject targets that satisfy the declaration schema but
-  // cannot actually be bound to — without this, `bind()` would throw on
-  // `addEventListener` later, defeating the "discovery == bindability"
-  // contract.
-  if (typeof addListener !== "function" || typeof removeListener !== "function") return undefined;
-  if (decl?.protocol !== "wc-bindable") return undefined;
-  if (typeof decl.version !== "number" || !Number.isInteger(decl.version)) return undefined;
-  if (decl.version < MIN_COMPATIBLE_VERSION) return undefined;
-  if (!Array.isArray(decl.properties)) return undefined;
-
-  if (!isValidNamedList(decl.properties, isValidPropertyDescriptor)) return undefined;
-  if (decl.inputs !== undefined && !isValidNamedList(decl.inputs, isValidInputDescriptor)) return undefined;
-  if (decl.commands !== undefined && !isValidNamedList(decl.commands, isValidCommandDescriptor)) return undefined;
-
-  return decl;
 }
 
 function isValidPropertyDescriptor(p: unknown): p is WcBindableProperty {

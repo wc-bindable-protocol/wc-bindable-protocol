@@ -460,6 +460,51 @@ describe("getWcBindableDeclaration", () => {
     }
   });
 
+  it("returns undefined when a hostile wcBindable declaration's getter throws on schema fields", () => {
+    // SPEC.md § Discovery API MUST NOT throw covers hostile declarations
+    // too, not only hostile targets. A Proxy `wcBindable` whose `protocol`
+    // or `version` getter raises must funnel to `undefined` rather than
+    // crash the discovery helper.
+    const hostileDecl = new Proxy({} as Partial<WcBindableDeclaration>, {
+      get(_t, prop) {
+        if (prop === "protocol" || prop === "version" || prop === "properties") {
+          throw new Error(`decl trap rejected ${String(prop)}`);
+        }
+        return undefined;
+      },
+    });
+    class HostileDeclCore extends EventTarget {
+      static get wcBindable(): WcBindableDeclaration { return hostileDecl as WcBindableDeclaration; }
+    }
+    const target = new HostileDeclCore();
+    expect(() => getWcBindableDeclaration(target)).not.toThrow();
+    expect(getWcBindableDeclaration(target)).toBeUndefined();
+    expect(() => bind(target, () => {})).not.toThrow();
+  });
+
+  it("returns undefined when a hostile property descriptor's getter throws on `name`", () => {
+    // Same MUST NOT throw coverage, one level deeper: a Proxy descriptor
+    // inside `properties` whose `name` getter raises during isValidNamedList
+    // iteration must also funnel to `undefined`.
+    const hostileDescriptor = new Proxy({}, {
+      get(_t, prop) {
+        if (prop === "name") throw new Error("descriptor trap rejected name");
+        return undefined;
+      },
+    });
+    class HostileDescCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [hostileDescriptor as unknown as { name: string; event: string }],
+      };
+    }
+    const target = new HostileDescCore();
+    expect(() => getWcBindableDeclaration(target)).not.toThrow();
+    expect(getWcBindableDeclaration(target)).toBeUndefined();
+    expect(() => bind(target, () => {})).not.toThrow();
+  });
+
   it("returns undefined (does not throw) when a hostile Proxy throws on capability access", () => {
     // SPEC.md § Discovery API: getWcBindableDeclaration MUST NOT throw on
     // any input shape, including hostile Proxy targets whose `get` trap
