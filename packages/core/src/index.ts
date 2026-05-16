@@ -114,28 +114,29 @@ export function getWcBindableDeclaration(
   // SPEC.md § Discovery API contract: the parameter is `unknown` precisely
   // so callers can probe arbitrary inputs (a stray null, a plain object,
   // a Map, …) without first having to coerce to EventTarget. This helper
-  // MUST NOT throw on any input shape.
+  // MUST NOT throw on any input shape — including hostile Proxy targets
+  // whose `get` traps throw on property access. Every property read on
+  // `target` therefore lives inside a single try/catch.
   if (target === null || (typeof target !== "object" && typeof target !== "function")) {
     return undefined;
   }
-  // SPEC.md § Overview pins EventTarget as the minimum target capability.
-  // Reject targets that satisfy the declaration schema but cannot actually
-  // be bound to — without this, `bind()` would throw on `addEventListener`
-  // later, defeating the "discovery == bindability" contract.
-  const t = target as { addEventListener?: unknown; removeEventListener?: unknown };
-  if (typeof t?.addEventListener !== "function" || typeof t?.removeEventListener !== "function") {
-    return undefined;
-  }
-  // Guard against pathological targets (e.g. `Object.create(null)` — no
-  // constructor at all; a constructor that throws on `wcBindable` access).
-  // The contract is "MUST NOT throw", so any error path returns undefined.
+  let addListener: unknown;
+  let removeListener: unknown;
   let decl: WcBindableDeclaration | undefined;
   try {
+    addListener = (target as { addEventListener?: unknown }).addEventListener;
+    removeListener = (target as { removeEventListener?: unknown }).removeEventListener;
     const ctor = (target as { constructor?: { wcBindable?: WcBindableDeclaration } }).constructor;
     decl = ctor?.wcBindable;
   } catch {
     return undefined;
   }
+  // SPEC.md § Overview pins EventTarget as the minimum consumer-side
+  // capability. Reject targets that satisfy the declaration schema but
+  // cannot actually be bound to — without this, `bind()` would throw on
+  // `addEventListener` later, defeating the "discovery == bindability"
+  // contract.
+  if (typeof addListener !== "function" || typeof removeListener !== "function") return undefined;
   if (decl?.protocol !== "wc-bindable") return undefined;
   if (typeof decl.version !== "number" || !Number.isInteger(decl.version)) return undefined;
   if (decl.version < MIN_COMPATIBLE_VERSION) return undefined;

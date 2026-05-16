@@ -61,7 +61,7 @@ The "no runtime dependencies" claim refers to Layer 1, which is what `@wc-bindab
 
 ## Why?
 
-- **Write once, use everywhere** — A Web Component that implements this protocol works with React, Vue, Svelte, Angular, Solid, and any future framework without modification.
+- **Write once, use everywhere** — A Web Component that implements this protocol can be adapted to React, Vue, Svelte, Angular, Solid, and future frameworks without per-component glue. The component itself never changes; only a thin per-framework adapter ports the protocol callback into that framework's reactivity primitive.
 - **No more manual wrappers** — Framework adapters automatically discover bindable properties and wire up event listeners. No per-component glue code needed.
 - **Clear separation of concerns** — Component authors declare *what* is bindable; framework consumers decide *how* to bind. Neither side needs to know about the other.
 
@@ -88,6 +88,8 @@ class MyInput extends HTMLElement {
 ```
 
 Any framework adapter can then automatically bind to those properties — no manual wiring needed. The optional `inputs` and `commands` fields declare the component's input interface for tooling, documentation, and remote proxying — they do not create automatic two-way synchronization. The *behavioral* semantics of those fields (`set`, `invoke`, the `attribute` and `async` hints) are defined in [SPEC-extensions.md](SPEC-extensions.md) — the core protocol itself is read-only on `properties`.
+
+> **Behavior vs. schema validation.** Core does not execute or interpret `inputs` / `commands` at all — only `properties` drive `bind()`. Discovery still validates the schema of `inputs` / `commands` when present, however, so a malformed `attribute` or `async` field invalidates the declaration as a whole and `bind()` returns its no-op cleanup. The split is intentional: core stays narrow on *runtime behavior*, but the discovery contract is *well-formedness* — which has to be complete for downstream tools (codegen, remote proxy, devtools) to trust what they see.
 
 When the adapter binds to an element, it reads the current value of each declared property (using `name in target` so an explicitly-`undefined` value is still delivered) and then listens for subsequent change events. `bind()` returns an unbind function that removes every listener it registered; adapters re-expose this so consumers can tear down cleanly.
 
@@ -280,6 +282,8 @@ const result = await proxy.invoke("fetch");
 > **When to use the fire-and-forget `proxy.set()` instead.** `set` is a faster, non-acknowledged write — at-most-once delivery, no round-trip wait. The WebSocket transport preserves message *order*, so on a healthy connection `fetch` after `set` always observes the new value. But order ≠ delivery — during a transient outage the `set` can be silently dropped while the later `invoke` still lands, causing `fetch` to run against a stale `url` with no error returned. Reach for `set` only when the downstream call does NOT depend on this assignment having been applied (e.g. an update-only-side-effect input, or a write that is naturally re-driven by a later event). When in doubt, prefer `setWithAck`. (Canonical statement: [SPEC-extensions.md § Methods](SPEC-extensions.md#methods), the `set` row.)
 >
 > **Further nuance.** `setWithAck` resolves once the JS-level assignment has executed on the trusted side. It does **not** wait for any asynchronous side effects the setter may schedule (database write, network round-trip, validation pipeline, …). If the downstream command depends on that async work completing, model the work as its own command and `await invoke(...)` it.
+>
+> **Remote payloads are JSON-shape only.** Every value that crosses the wire — `set` / `setWithAck` arguments, `invoke` arguments, command return values, property update values — MUST be a `JsonValue`: plain objects, arrays, strings, finite numbers, booleans, `null`. Producers and consumers reject `Date`, `Map`, `Set`, `BigInt`, typed arrays, class instances (including custom `Error` subclasses), functions, symbols, cyclic references, non-finite numbers, sparse arrays, arrays with extra string keys, and objects with non-enumerable string keys. Encode them into plain JSON objects at the application boundary before returning them from a command or passing them as an argument (e.g. `date.toISOString()`, `[...map.entries()]`, `error.message` instead of the `Error` object itself). The full algorithm with worked examples is in [SPEC-extensions.md § Design invariants](SPEC-extensions.md#extension-2--wire-format-remote-proxying) invariant 3.
 
 For the full wire format, error envelope, back-pressure controls, transport adapter contract, and security model, see [SPEC-extensions.md](SPEC-extensions.md) and [packages/remote/README.md](packages/remote/README.md).
 

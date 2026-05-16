@@ -404,18 +404,27 @@ const MutationObserverCtor =
 // both function-typed class constructors and object-typed constructors.
 // See § Appendix: Design rationale notes for why.
 function getWcBindableDeclaration(target) {
-  // Minimum capability check: target MUST be an EventTarget. A target that
-  // ships a valid declaration but lacks add/removeEventListener would
-  // throw inside bind() later — reject it here so isWcBindable() and
-  // bind() agree by construction.
-  if (typeof target?.addEventListener !== "function") return undefined;
-  if (typeof target?.removeEventListener !== "function") return undefined;
-  let decl;
+  // Every property read on `target` lives inside the same try because the
+  // MUST-NOT-throw contract covers hostile Proxy targets whose `get`
+  // traps can throw on access — including the very `addEventListener` /
+  // `removeEventListener` reads used for the capability check below.
+  if (target === null || (typeof target !== "object" && typeof target !== "function")) {
+    return undefined;
+  }
+  let addListener, removeListener, decl;
   try {
-    decl = target?.constructor?.wcBindable;
+    addListener = target.addEventListener;
+    removeListener = target.removeEventListener;
+    decl = target.constructor?.wcBindable;
   } catch {
     return undefined;
   }
+  // Minimum capability check: target MUST be an EventTarget consumer-side
+  // bind target. A target that ships a valid declaration but lacks
+  // add/removeEventListener would throw inside bind() later — reject it
+  // here so isWcBindable() and bind() agree by construction.
+  if (typeof addListener !== "function") return undefined;
+  if (typeof removeListener !== "function") return undefined;
   if (decl?.protocol !== "wc-bindable") return undefined;
   if (!Number.isInteger(decl.version) || decl.version < MIN_COMPATIBLE_VERSION) return undefined;
   if (!isValidNamedList(decl.properties, isValidPropertyDescriptor)) return undefined;
@@ -624,8 +633,10 @@ When `target` is an `HTMLElement` and `bind()` is called before the element has 
 bind(target, onUpdate, { syncOn: "connect" })
 ```
 
-- `syncOn: "call"` (default): perform the initial sync synchronously inside `bind()`. Backward-compatible behavior.
+- `syncOn: "call"` (default): perform the initial sync synchronously inside `bind()`. Backward-compatible behavior. Also the fallback for any value other than `"connect"` — see the unknown-value rule below.
 - `syncOn: "connect"`: if the target is an `HTMLElement` that is not yet connected, defer the initial sync until the element becomes connected **for the first time**. The reference implementation observes the top-level `document` via a `MutationObserver`. For headless `EventTarget`s and already-connected elements, behaves like `"call"`. The DOM globals (`HTMLElement`, `document`, `MutationObserver`) are referenced through `typeof` guards so that the reference implementation runs unmodified in non-browser runtimes where these globals are undefined — in that case `syncOn: "connect"` silently falls back to the `"call"` path. **Disconnect → reconnect cycles after the first connection do NOT re-trigger the initial sync** — the observer disconnects as soon as the deferred sync fires once. Consumers that need a fresh initial-sync on every re-attach should unbind and re-bind from their own lifecycle hook.
+
+**Unknown `syncOn` values MUST be treated as `"call"`.** TypeScript narrows the field to the `"call" | "connect"` literal union, but JavaScript callers can pass any string (or any value). An implementation MUST NOT throw on an unrecognized value; it MUST fall back to the synchronous default. This matches `bind()`'s overall "MUST NOT throw on invalid input" posture from [§ Normative TypeScript surface](#normative-typescript-surface) — `syncOn` is an input field like any other, and a typo (`"later"`, `"defer"`) is a programmer error best handled by a safe fallback that the consumer can notice via the observed behavior, not by a hard runtime throw. Future spec revisions MAY add new `syncOn` values; older implementations that pre-date those values will then behave as if the caller passed `"call"`, preserving forward compatibility.
 
 The returned unbind function tears down the `MutationObserver` as well, so cancelling a deferred bind is safe.
 

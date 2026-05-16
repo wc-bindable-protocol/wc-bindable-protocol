@@ -460,6 +460,27 @@ describe("getWcBindableDeclaration", () => {
     }
   });
 
+  it("returns undefined (does not throw) when a hostile Proxy throws on capability access", () => {
+    // SPEC.md § Discovery API: getWcBindableDeclaration MUST NOT throw on
+    // any input shape, including hostile Proxy targets whose `get` trap
+    // throws on access to addEventListener / removeEventListener /
+    // constructor. The capability check must therefore live inside the
+    // try/catch alongside the constructor read.
+    const hostile = new Proxy({}, {
+      get(_t, prop) {
+        if (prop === "addEventListener" || prop === "removeEventListener" || prop === "constructor") {
+          throw new Error(`proxy trap rejected access to ${String(prop)}`);
+        }
+        return undefined;
+      },
+    });
+    expect(() => getWcBindableDeclaration(hostile)).not.toThrow();
+    expect(getWcBindableDeclaration(hostile)).toBeUndefined();
+    expect(() => isWcBindable(hostile)).not.toThrow();
+    expect(isWcBindable(hostile)).toBe(false);
+    expect(() => bind(hostile, () => {})).not.toThrow();
+  });
+
   it("rejects targets that have a valid declaration but lack EventTarget capability", () => {
     // A plain object with the static-fields shape would pass the schema
     // check but bind() would throw on addEventListener. The capability
