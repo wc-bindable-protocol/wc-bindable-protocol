@@ -26,7 +26,7 @@ A producer is always also a valid consumer-side bind target (it has both), but a
 
 `HTMLElement` (a subclass of `EventTarget`) is the most common implementation target, as it enables DOM integration and framework binding via refs, but it is not required. This means the protocol works equally well in non-browser runtimes (Node.js, Deno, Cloudflare Workers, etc.) where `EventTarget` is available.
 
-The protocol requires no library dependencies and relies solely on standard platform APIs: `static` class fields for the declaration, `addEventListener` / `removeEventListener` on the consumer-side bind target, and `dispatchEvent` + `CustomEvent` on the producer side. All four are part of the JavaScript / DOM / Web Components core; no `npm` runtime dependency is introduced.
+The protocol requires no library dependencies and relies solely on standard platform APIs: `static` class fields for the declaration, `addEventListener` / `removeEventListener` on the consumer-side bind target, and `dispatchEvent` + `CustomEvent` on the producer side. All of these are part of the JavaScript / DOM / Web Components core; no `npm` runtime dependency is introduced.
 
 ---
 
