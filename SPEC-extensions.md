@@ -21,7 +21,12 @@ The reference implementation `@wc-bindable/remote` exposes two shapes for the co
 | `RemoteCoreProxy` | class | The underlying constructor. Subclassed internally per declaration to give each instance an isolated `constructor.wcBindable` (see [SPEC.md § Discovery Contract](SPEC.md#discovery-contract)). Most consumers do NOT construct it directly. |
 | `createRemoteCoreProxy(declaration, transport, options?)` | factory function | Returns an instance of a per-declaration subclass of `RemoteCoreProxy`, additionally wrapped in a JavaScript `Proxy` so declared property names (e.g. `proxy.value`) resolve from the internal cache. **This is the recommended entry point.** |
 
-`set` / `setWithAck` / `setWithAckOptions` / `invoke` / `invokeWithOptions` / `reconnect` / `dispose` are **instance methods on the object returned by `createRemoteCoreProxy()`**. References elsewhere in this document of the form `RemoteCoreProxy.<method>` mean "invoked on a `RemoteCoreProxy` instance", not "a static on the class". Third-party implementations of Extension 1 MAY use any factory name as long as the returned object exposes the methods enumerated in § Methods below; only the *method* names are normative to the call-site interop (consistent with the discovery-helper naming rule in [SPEC.md § Conformance Levels](SPEC.md#conformance-levels)).
+`set` / `setWithAck` / `setWithAckOptions` / `invoke` / `invokeWithOptions` / `reconnect` / `dispose` are **instance methods on the object returned by `createRemoteCoreProxy()`**. References elsewhere in this document of the form `RemoteCoreProxy.<method>` mean "invoked on a `RemoteCoreProxy` instance", not "a static on the class". These methods divide into two surfaces with different normative status:
+
+- **Call methods** (`set`, `setWithAck`, `setWithAckOptions`, `invoke`, `invokeWithOptions`) — defined in § Methods. All are mandatory.
+- **Lifecycle methods** (`dispose`, `reconnect`) — defined separately in § Lifecycle methods. `dispose` is mandatory; `reconnect` is OPTIONAL and MUST be omitted entirely when unsupported (rather than exposed as a stub that throws).
+
+Third-party implementations of Extension 1 MAY use any factory name as long as the returned object exposes the mandatory call methods in § Methods and the lifecycle surface in § Lifecycle methods; only the *method* names are normative to the call-site interop (consistent with the discovery-helper naming rule in [SPEC.md § Conformance Levels](SPEC.md#conformance-levels)).
 
 ### Methods
 
@@ -112,14 +117,28 @@ When `setWithAck` or `invoke` fails on the remote side, the consumer-side proxy 
 
 #### Canonical mapping for non-Error throws
 
-JavaScript allows throwing any value (`throw "oops"`, `throw null`, `throw { code: 42 }`, …), not only `Error` instances. The producer-side proxy MUST canonicalize whatever was thrown into the `{ name, message, stack? }` envelope shape according to the following rules:
+JavaScript allows throwing any value (`throw "oops"`, `throw null`, `throw { code: 42 }`, …), not only `Error` instances. The producer-side proxy MUST canonicalize whatever was thrown into the `{ name, message, stack?, cause? }` envelope shape according to the following rules:
 
 | Thrown value | `name` | `message` | `stack` |
 |---|---|---|---|
-| An `Error` instance (or subclass) | `error.name \|\| "Error"` | `String(error.message)` (empty string is permitted) | `error.stack` if present and the producer's trust-boundary policy permits transmission (see security note above) |
-| Any other value (string / number / boolean / null / plain object / etc.) | `"NonErrorThrow"` | `String(thrownValue)` — invokes the value's default coercion (`String(null)` → `"null"`, `String({a:1})` → `"[object Object]"`, etc.) | Omitted (no stack exists for a non-Error throw) |
+| An `Error` instance (or subclass) | `error.name \|\| "Error"` | safely stringified `error.message` (empty string is permitted; see safe-stringification rule below) | `error.stack` if present and the producer's trust-boundary policy permits transmission (see security note above) |
+| Any other value (string / number / boolean / null / plain object / etc.) | `"NonErrorThrow"` | safely stringified `thrownValue` — typically the value's default coercion (`String(null)` → `"null"`, `String({a:1})` → `"[object Object]"`, etc.) (see safe-stringification rule below) | Omitted (no stack exists for a non-Error throw) |
 
-The literal string `"NonErrorThrow"` is normative: consumers MAY pattern-match on it to distinguish thrown-non-Error from thrown-Error at the surface. Producers MAY additionally attach the original thrown value as `cause` on the wire if it survives `JsonValue` validation (see § Design invariants invariant 3); non-JsonValue thrown values MUST be omitted from `cause` (the `name` + `message` pair is the canonical fallback).
+**Safe-stringification rule.** Naive `String(v)` can itself throw — `String(Object.create(null))` raises because the null-prototype object has no `toString`, and hostile objects with throwing `toString` / `valueOf` / `Symbol.toPrimitive` traps can throw arbitrarily. The producer MUST shield the canonicalization step:
+
+```javascript
+// Reference safe-stringification used by both rows of the table above.
+function safeString(v) {
+  try { return String(v); }
+  catch { return "<unstringifiable thrown value>"; }
+}
+```
+
+The fallback string `"<unstringifiable thrown value>"` is RECOMMENDED but not normative — implementations MAY choose a different sentinel as long as it is non-empty and clearly identifies the safe-stringification fallback. The same rule applies to `error.name` in the `Error` row (a subclass with a hostile `name` getter); the `|| "Error"` fallback then catches both an empty string and a thrown access.
+
+The literal string `"NonErrorThrow"` is normative: consumers MAY pattern-match on it to distinguish thrown-non-Error from thrown-Error at the surface.
+
+**`cause` field on the wire.** Producers MAY additionally attach the original thrown value as `cause` in the throw envelope's `error` object (see wire schema in § Message types — server → client) if it survives `JsonValue` validation (§ Design invariants invariant 3); non-JsonValue thrown values MUST be omitted from `cause` (the `name` + `message` pair is the canonical fallback). The validation runs *before* serialization, so a producer that violates JsonValue cannot leak silently. Consumers MAY surface a successfully-transmitted `cause` via JavaScript `Error.cause` on the proxy-side Error instance; the wire `cause` is OPTIONAL on both sides and consumers MUST cope with its absence.
 
 Consumers MUST surface the wire envelope as a JavaScript `Error` instance regardless of the thrown shape on the producer side — the `Error` boundary at the proxy preserves `try { await invoke() } catch (e) { ... }` ergonomics without leaking the producer-side throw oddity into the consumer's catch.
 
@@ -276,7 +295,7 @@ This section is the **normative** wire-format specification for any implementati
 // meanings depending on which client message the `id` came from — see the
 // "Return envelope value field" subsection below.
 { "type": "return", "id": string, "value"?: JsonValue }
-{ "type": "throw",  "id": string, "error": { "name": string, "message": string, "stack"?: string } }
+{ "type": "throw",  "id": string, "error": { "name": string, "message": string, "stack"?: string, "cause"?: JsonValue } }
 ```
 
 - `update` is dispatched for every change event the producer-side shell observes, after applying the producer-side `getter`. The `name` SHOULD be one declared in the producer's `properties` (see § Undeclared-name update handling below for the consumer-side behavior when it is not).
@@ -517,7 +536,7 @@ A minimal conformant Extension 2 implementation should implement the following i
 9. **Preserve FIFO** on the single logical channel between proxy and shell (§ Transport adapter contract invariant 1).
 10. **Maintain an `id → pending` table** for `setWithAck` and `invoke`. Match incoming `return` / `throw` envelopes by `id`; drop late envelopes after timeout or abort settles the caller's promise (§ AckOptions).
 11. **Honor `capabilities.setAck: true`** as a producer; reject `setWithAck` calls cleanly against legacy producers that omit or set `false` (§ sync response capabilities). For current Extension 2 producer conformance, advertise `setAck: true` and implement `setWithAck` end-to-end.
-12. **Make `dispose()` idempotent**, and treat `onClose` as at-most-once (§ Transport adapter contract invariants 3 + 4). Reconnect by attaching a fresh transport via `reconnect()` on the proxy instance (see § Naming: factory vs class).
+12. **Make `dispose()` idempotent**, and treat `onClose` as at-most-once (§ Transport adapter contract invariants 3 + 4). If the implementation supports reconnect (it is OPTIONAL per § Lifecycle methods), reconnect by attaching a fresh transport via `reconnect()` on the proxy instance (see § Naming: factory vs class); otherwise consumers `dispose()` the proxy and construct a new one as the equivalent operation.
 
 A producer-side implementation has a symmetric checklist: validate inbound payloads, dispatch declared property events to the connected shell, advertise the capabilities it supports, apply incoming `set` synchronously before acking, route command return values / throws through the wire envelope, and emit the declaration fingerprint on every sync response.
 

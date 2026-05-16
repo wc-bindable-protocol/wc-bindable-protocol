@@ -275,7 +275,10 @@ Level 1 has two facets. An implementation claiming Level 1 MUST specify which:
 
 An implementation MAY claim 1P alone (typical: a non-JS server-side component implementation), 1O alone (typical: a JS-only inspector / devtools harness that binds to existing components but never authors them), or both (typical: `@wc-bindable/core`, which exposes both `bind()` for consumers and the declaration-discovery surface every producer needs).
 
-A higher-level claim (`Level 2`, `Level 3`) usually implies both 1P + 1O — the JS reference implementation and the remote wire shape both touch both facets. A non-JS Level 3 implementation may be 1P-only on the producer side and not implement 1O at all (its sidecar role is to emit, not to observe), which is the common case.
+**Facet implication for higher levels.** Level 2 and Level 3 each pin a specific facet rather than mandating both. The rules are:
+
+- **Level 2 implies Level 1O.** The three normatively-named exports (`bind`, `getWcBindableDeclaration`, `isWcBindable`) are observer-side surfaces, so a Level 2 claim MUST satisfy 1O. If the same implementation also provides producer targets or producer helpers (component base classes, declaration generators, etc.), that producer surface MUST additionally satisfy 1P; an observer-only library (e.g. a third-party `bind()` reimplementation that ships no component authoring helpers) is Level 2 conformant on 1O alone.
+- **Level 3 splits by role.** A consumer-side remote proxy claiming Level 3 MUST satisfy 1O for its local bind-target surface (the proxy is observed via `bind()` on the consumer). A producer-side remote shell claiming Level 3 MUST satisfy 1P for the target it exposes (it dispatches change events for the wrapped Core). An implementation that ships both sides (the common case for `@wc-bindable/remote` and its eventual peers) MUST satisfy both 1O and 1P for the respective sides; an implementation that ships only one side (a non-JS sidecar that is producer-only, or a thin observer-only client) is Level 3 conformant on the matching facet alone.
 
 ---
 
