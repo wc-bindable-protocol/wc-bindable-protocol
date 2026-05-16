@@ -171,6 +171,40 @@ describe("getWcBindableDeclaration", () => {
     });
     expect(getWcBindableDeclaration(el)).not.toBeUndefined();
   });
+
+  it("accepts properties: [] (commands-only headless target is bindable)", () => {
+    class CommandsOnly extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+        commands: [{ name: "ping" }],
+      };
+    }
+    const t = new CommandsOnly();
+    expect(getWcBindableDeclaration(t)).not.toBeUndefined();
+    expect(isWcBindable(t)).toBe(true);
+    // bind() should successfully no-op-but-not-error: no listeners, no
+    // initial sync, returns a real cleanup function.
+    const unbind = bind(t, () => { throw new Error("no event possible"); });
+    expect(typeof unbind).toBe("function");
+    unbind();
+  });
+
+  it("does not throw for pathological targets (null-prototype constructor reference)", () => {
+    // EventTarget with constructor swapped out — Object.create(null) would not
+    // satisfy the EventTarget signature, so simulate the "no ctor" case via a
+    // proxy that returns undefined for .constructor access.
+    const t = new Proxy(new EventTarget(), {
+      get(target, prop, receiver) {
+        if (prop === "constructor") return undefined;
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    expect(() => getWcBindableDeclaration(t)).not.toThrow();
+    expect(getWcBindableDeclaration(t)).toBeUndefined();
+    expect(isWcBindable(t)).toBe(false);
+  });
 });
 
 describe("bind", () => {

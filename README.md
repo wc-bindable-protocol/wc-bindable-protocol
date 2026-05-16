@@ -382,8 +382,16 @@ const result = await proxy.invoke("fetch");
 //   await proxy.setWithAck("url", "/api/users");
 //   const result = await proxy.invoke("fetch");
 //
-// See SPEC-extensions.md § Call-order preservation and § Transport
-// lifecycle vocabulary for the exact contract.
+// Further nuance: `setWithAck` resolves once the JS-level assignment
+// `core.url = "/api/users"` has run on the trusted side. It does NOT
+// wait for any asynchronous side effects the setter may schedule
+// (database write, network round-trip, validation pipeline, …). If the
+// downstream command depends on that async work being complete, model
+// the work as its own command and `await invoke(...)` it — `set` /
+// `setWithAck` only guarantee the synchronous slice. See
+// SPEC-extensions.md § Call-order preservation, § Transport lifecycle
+// vocabulary, and the `setWithAck` row of the Methods table for the
+// exact contracts.
 ```
 
 ## Examples

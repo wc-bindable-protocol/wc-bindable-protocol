@@ -148,7 +148,7 @@ This section is the **normative** wire-format specification for any implementati
 
 - `update` is dispatched for every change event the producer-side shell observes, after applying the producer-side `getter`. The `name` MUST be one declared in `properties`.
 - `return` / `throw` MUST reference an `id` issued by a prior client message. The producer MAY emit only ONE of `return` or `throw` for any given `id`. Implementations SHOULD reject unknown `id`s with a logger warning rather than throwing — late replies after an abort are normal.
-- `capabilities.setAck === true` advertises that the producer honors `setWithAck`. Consumers that issued `setWithAck` calls before the `sync` response MUST reject all of them with a clear error if `setAck` is absent or `false`.
+- `capabilities.setAck === true` advertises that the producer honors `setWithAck`. Consumers that issued `setWithAck` calls before the `sync` response MUST reject all of them with a clear error if `setAck` is absent or `false`. **Fire-and-forget `set` (the `id`-less variant) is unaffected by this capability bit** — it is part of the baseline wire contract and every producer MUST handle it regardless of `setAck` support. A producer that signals `setAck: false` is opting out only of the acknowledged path.
 
 #### Return envelope value field
 
@@ -173,6 +173,8 @@ This rule mirrors core's `in`-operator initial-sync semantics across the wire. T
 Producers MAY omit the `undefinedProperties` field entirely when no declared property is currently `undefined`. Consumers MUST treat a missing field as an empty list.
 
 Legacy compatibility: a producer that predates the `undefinedProperties` field will simply omit it. Consumers SHOULD treat a re-sync that omits a previously-cached property as a revert-to-`undefined` event, even without the explicit list, so that long-running connections do not drift.
+
+> **Known lossy interaction (legacy producers only).** A legacy producer that sends neither `undefinedProperties` nor `getterFailures` cannot let the consumer distinguish "the value is now `undefined`" from "the producer-side read threw and was skipped". Both cases reach the wire as "the property is omitted from `values`". The consumer-side revert-to-`undefined` heuristic above will therefore **misclassify a getter failure on a legacy producer as a value reset to `undefined`**, dispatching a spurious `undefined` event and replacing the cached value with `undefined` in the consumer's state. This is a known irrecoverable gap of the legacy wire shape — it cannot be fixed on the consumer side because the information is not on the wire. Producers SHOULD send `getterFailures` (and `undefinedProperties` when applicable) to opt out of this lossy classification. Consumers MAY surface a "legacy producer detected" warning in their logger to make the limitation visible.
 
 #### `getterFailures` semantics
 

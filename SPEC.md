@@ -118,6 +118,8 @@ When `inputs` or `commands` is absent (`undefined`), consumers **MUST** treat it
 
 Within a single `properties` array, every `name` MUST be unique. A declaration that violates this rule is **invalid**: adapters MUST treat such a target as non-bindable (`bind()` returns its no-op cleanup, `isWcBindable()` MAY return `false` if the adapter checks; at minimum, no event listeners are installed). Adapters MAY warn or throw in development mode. Multiple property descriptors MAY share the same `event` name — adapters dispatch each one independently. The same `name` MAY appear in both `properties` (as an observable output) and `inputs` (as a settable input); this is a common pattern for two-way-bindable values (e.g. `value`).
 
+An empty `properties: []` is **valid**: it describes a target that exposes no observable outputs (e.g. a command-only headless service whose surface is entirely in `commands`). `bind()` on such a target installs no listeners, performs no initial sync, and returns a no-op cleanup — this is a successful bind, not a non-bindable rejection.
+
 Adapters **MUST** ignore unknown fields on a property descriptor.
 
 ### Input Descriptor
@@ -164,6 +166,8 @@ Implementations **MUST** expose two discovery primitives whose contracts are obs
 **Discovery is bindability.** Because `getWcBindableDeclaration()` performs the complete schema validation (including the duplicate-name rule that invalidates a declaration per § Property Descriptor / § Input Descriptor / § Command Descriptor), no declaration that survives this filter can silently no-op inside `bind()`. The earlier draft where `isWcBindable()` could return `true` for an invalid declaration while `bind()` returned a no-op cleanup is fixed: the two helpers now agree by construction. Consumers can therefore use `isWcBindable()` as the single decision point for "will `bind()` install listeners?".
 
 The two functions are kept paired so that callers who need the declaration object (tooling, codegen, devtools, test inspection) read it once instead of probing for existence and then re-reading. Adapters that perform their own discovery MUST surface the same `boolean`-vs-declaration pair to be considered conforming. Naming is normative — third-party implementations of these helpers MUST use the same identifiers so consumers can swap implementations.
+
+> **Why identifier naming is normative.** This protocol's pitch is "zero dependencies, just `static` fields + `CustomEvent`", and mandating helper names is admittedly more API surface than that pitch implies. The justification: the data shape on `target.constructor.wcBindable` alone is not enough to make an `@wc-bindable/core` consumer and a third-party reimplementation (Deno port, web-component-devtools-style runtime inspector, a forked monorepo) drop-in compatible. If one names the helper `getDeclaration()` and another `readWcBindable()`, every adapter and tool downstream has to dual-import or rename. Pinning the two function names — and *only* the two function names — keeps the runtime contract honest (still just static field + events) while letting consumers swap implementations at the import boundary. The constraint is intentionally narrow: no other identifier in this spec is normatively named.
 
 ---
 
@@ -237,7 +241,7 @@ Third-party adapters that re-export `bind()` MUST preserve this signature. Highe
 
 ```javascript
 const DEFAULT_GETTER = (e) => e.detail;
-const SUPPORTED_VERSION = 1;
+const MIN_COMPATIBLE_VERSION = 1;
 
 // DOM globals are referenced through these locals so that the reference
 // implementation runs unmodified in headless runtimes (Node, Deno,
@@ -250,10 +254,50 @@ const documentRef = typeof document !== "undefined" ? document : undefined;
 const MutationObserverCtor =
   typeof MutationObserver !== "undefined" ? MutationObserver : undefined;
 
+// Discovery — full schema validation, including descriptor shape and
+// name-uniqueness within properties / inputs / commands. MUST NOT throw
+// (target without a constructor, target with a non-object constructor,
+// any other edge — return undefined). This is the single source of truth
+// for "is this target safe to bind to" (see § Discovery API).
+function getWcBindableDeclaration(target) {
+  const ctor = target?.constructor;
+  const decl = ctor && typeof ctor === "object" ? ctor.wcBindable : undefined;
+  if (decl?.protocol !== "wc-bindable") return undefined;
+  if (!Number.isInteger(decl.version) || decl.version < MIN_COMPATIBLE_VERSION) return undefined;
+  if (!isValidNamedList(decl.properties, isValidPropertyDescriptor)) return undefined;
+  if (decl.inputs !== undefined && !isValidNamedList(decl.inputs, isValidInputDescriptor)) return undefined;
+  if (decl.commands !== undefined && !isValidNamedList(decl.commands, isValidCommandDescriptor)) return undefined;
+  return decl;
+}
+
+function isWcBindable(target) {
+  return getWcBindableDeclaration(target) !== undefined;
+}
+
+function isValidNamedList(list, isValidEntry) {
+  if (!Array.isArray(list)) return false;
+  const seen = new Set();
+  for (const entry of list) {
+    if (!isValidEntry(entry) || seen.has(entry.name)) return false;
+    seen.add(entry.name);
+  }
+  return true;
+}
+function isValidPropertyDescriptor(p) {
+  return p && typeof p === "object"
+    && typeof p.name === "string" && p.name.length > 0
+    && typeof p.event === "string" && p.event.length > 0
+    && (p.getter === undefined || typeof p.getter === "function");
+}
+function isValidInputDescriptor(p)   { return p && typeof p === "object" && typeof p.name === "string" && p.name.length > 0; }
+function isValidCommandDescriptor(p) { return p && typeof p === "object" && typeof p.name === "string" && p.name.length > 0; }
+
 function bind(target, onUpdate, options) {
-  const decl = target.constructor.wcBindable;
-  if (decl?.protocol !== "wc-bindable") return () => {};
-  if (!Number.isInteger(decl.version) || decl.version < SUPPORTED_VERSION) return () => {};
+  // Discovery == bindability: a declaration that survives this check is
+  // safe to bind. The version check above is permissive (every integer
+  // >= 1) per § Versioning; no adapter-specific upper bound exists.
+  const decl = getWcBindableDeclaration(target);
+  if (decl === undefined) return () => {};
 
   const cleanups = [];
   for (const prop of decl.properties) {
@@ -315,7 +359,7 @@ Component authors **should** ensure that every `name` in the declaration corresp
 
 The relative ordering of the initial-sync delivery and the first subsequent `onUpdate` triggered by an event depends on `syncOn`:
 
-- With `syncOn: "call"` (the default), the adapter **MUST** deliver the initial-sync values **before any subsequent change events fire on the same target**. Since `bind()` performs the synchronous initial-sync inside the same call that attaches event listeners, this ordering follows naturally as long as the host does not dispatch on the target re-entrantly inside `onUpdate`.
+- With `syncOn: "call"` (the default), the adapter **MUST** attach event listeners and perform the initial-sync read within the same synchronous frame of `bind()`. As a consequence, no event the adapter itself observes can fire on the target *between* the listener attach and the initial-sync delivery — the in-frame ordering is the adapter's enforceable guarantee. Once the initial sync has been delivered and `bind()` has returned, subsequent events follow normal listener-delivery order. The only way an event can interleave the initial sync at all is if `onUpdate` synchronously re-enters the target via `dispatchEvent` while the initial-sync loop is running; the adapter cannot prevent this re-entry, and component / consumer authors SHOULD NOT do it. The event-payload-authoritative rule (see [§ Event detail vs Property Read](#event-detail-vs-property-read)) covers any resulting ordering anomaly.
 - With `syncOn: "connect"`, the initial-sync read is intentionally deferred until the target becomes connected. **Any change event that fires between `bind()` return and the deferred initial-sync MUST be delivered to `onUpdate` in the order it arrives** — that is, an event arriving before the deferred sync is delivered first, and the deferred initial-sync runs afterwards with `target[prop.name]` read at sync time. The consumer therefore sees the most recent value last, regardless of the path it arrived on. This is the only sound interpretation when the read site is deferred; the `"before any events fire"` guarantee from `syncOn: "call"` is **not** in effect under `syncOn: "connect"`.
 
 In both modes, the **event payload is authoritative** in case the initial-sync read and a subsequent event disagree on the value — see [§ Event detail vs Property Read](#event-detail-vs-property-read).
@@ -334,6 +378,8 @@ bind(target, onUpdate, { syncOn: "connect" })
 The returned unbind function tears down the `MutationObserver` as well, so cancelling a deferred bind is safe.
 
 > **Shadow DOM limitation.** A `MutationObserver` attached to `document` with `subtree: true` does **not** traverse shadow roots, so a target that is appended into another element's shadow tree will have `target.isConnected === true` without firing the observer — the deferred initial sync never runs. This is a structural limitation of `MutationObserver`, not a bug. Adapters that **own** the element (i.e. hold a ref to it via a framework lifecycle hook such as React `useEffect`, Vue `onMounted`, Stencil `componentDidLoad`, or a custom element's own `connectedCallback`) **SHOULD** call `bind(target, onUpdate)` (with the default `syncOn: "call"`) from inside that hook rather than relying on `syncOn: "connect"`. The deferred path is intended for callers who construct elements imperatively and append them into the light DOM in a separate step (e.g. the VanJS / MobX / RxJS / Signals binder pattern). Adapters that deferred-bind a large number of elements simultaneously should also be aware that each deferred bind installs one document-wide observer.
+>
+> **Connect-then-disconnect race.** `MutationObserver` callbacks are delivered as microtasks, not synchronously. If the host appends the target and then synchronously detaches it again within the same task — for example, a transient mount inside a virtual-DOM diff — the observer callback runs after both mutations and observes `target.isConnected === false`. The reference implementation rechecks `isConnected` inside the callback, so it does NOT fire the initial sync in this case and the observer remains armed; a later re-attach will re-fire the observer and complete the sync. If the target is never re-attached, the observer is held alive until `unbind()` is called and never delivers the initial sync. This is an intentional consequence of "deferred until first real connection" — adapters that need a tighter binding to host lifecycle MUST use `syncOn: "call"` from their own lifecycle hook instead.
 
 ### Repeated Events for the Same Property
 

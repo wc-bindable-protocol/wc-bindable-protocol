@@ -93,7 +93,16 @@ const DEFAULT_GETTER = (e: Event): unknown => (e as CustomEvent).detail;
 export function getWcBindableDeclaration(
   target: EventTarget,
 ): WcBindableDeclaration | undefined {
-  const decl = (target.constructor as { wcBindable?: WcBindableDeclaration }).wcBindable;
+  // Guard against pathological targets (e.g. `Object.create(null)` — no
+  // constructor at all; a constructor that throws on `wcBindable` access).
+  // The contract is "MUST NOT throw", so any error path returns undefined.
+  let decl: WcBindableDeclaration | undefined;
+  try {
+    const ctor = (target as { constructor?: { wcBindable?: WcBindableDeclaration } }).constructor;
+    decl = ctor?.wcBindable;
+  } catch {
+    return undefined;
+  }
   if (decl?.protocol !== "wc-bindable") return undefined;
   if (typeof decl.version !== "number" || !Number.isInteger(decl.version)) return undefined;
   if (decl.version < MIN_COMPATIBLE_VERSION) return undefined;
