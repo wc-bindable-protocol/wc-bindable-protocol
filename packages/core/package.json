@@ -1,6 +1,6 @@
 {
   "name": "@wc-bindable/core",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Core protocol definitions and bind utility for wc-bindable",
   "type": "module",
   "main": "dist/index.js",
