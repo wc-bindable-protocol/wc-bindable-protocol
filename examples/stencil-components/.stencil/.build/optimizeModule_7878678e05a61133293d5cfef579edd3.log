@@ -1,0 +1,1 @@
+import{S as o,d as s}from"./p-D486-E-R.js";const t=o;const p=s;export{t as StencilFetchApp,p as defineCustomElement};
