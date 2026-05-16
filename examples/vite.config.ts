@@ -3,6 +3,7 @@ import vue from "@vitejs/plugin-vue";
 import react from "@vitejs/plugin-react";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 import solid from "vite-plugin-solid";
+import { qwikVite } from "@builder.io/qwik/optimizer";
 import path from "path";
 
 export default defineConfig({
@@ -25,6 +26,26 @@ export default defineConfig({
     solid({
       include: /solid-.*\.tsx?$/,
     }),
+    qwikVite({
+      csr: true,
+      srcDir: path.resolve(__dirname, "qwik"),
+      // Match examples/qwik/ source files AND the segment chunks qwikVite
+      // generates from them. The filter must NOT match packages/qwik/ — the
+      // adapter source there already uses the lower-level inlinedQrl API, so
+      // a second optimizer pass tries to hoist its `task` variable and breaks
+      // it with "task is not defined" at runtime.
+      fileFilter: (id) =>
+        /[\\/]examples[\\/]qwik[\\/]/.test(id) ||
+        /\.tsx?_[^/\\]+\.js$/.test(id),
+    }),
+    {
+      // qwikVite's config() hook sets `esbuild: false` in serve mode, which
+      // breaks JSX transforms for the other framework examples that lean on
+      // Vite's default esbuild step (plugin-react adds the Refresh wrapper
+      // but defers JSX transform to esbuild). Restore it after qwikVite.
+      name: "restore-esbuild-for-non-qwik-examples",
+      config: () => ({ esbuild: { jsx: "automatic" } }),
+    },
   ],
   resolve: {
     alias: {
@@ -64,6 +85,9 @@ export default defineConfig({
         angularLitTodo: path.resolve(__dirname, "angular-lit-todo/index.html"),
         alpineLitTodo: path.resolve(__dirname, "alpine-lit-todo/index.html"),
         litLitTodo: path.resolve(__dirname, "lit-lit-todo/index.html"),
+        qwikCounter: path.resolve(__dirname, "qwik/counter/index.html"),
+        qwikFetch: path.resolve(__dirname, "qwik/fetch/index.html"),
+        qwikLitTodo: path.resolve(__dirname, "qwik/lit-todo/index.html"),
       },
     },
   },
