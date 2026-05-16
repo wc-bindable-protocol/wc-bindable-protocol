@@ -670,7 +670,7 @@ Transport-specific concerns *outside* the normative contract — back-pressure c
 
 A wire-format implementation conforms to this extension when:
 
-> Half of these rules have runnable starter vectors in [CONFORMANCE.md](CONFORMANCE.md) — specifically the `has`-trap pre-sync rule, the `update`-with-no-`value` undefined preservation, `JsonValue` validation, `setWithAck` ordering, and the legacy-`setAck` rejection path. Pass that file before claiming Extension 2 conformance; it is necessary, not sufficient.
+> Half of these rules have runnable starter vectors in [CONFORMANCE.md](CONFORMANCE.md). At minimum, an Extension 2 implementation should pass vectors **5, 6, 7, 9, and 10** (the `has`-trap pre-sync rule, the `update`-with-no-`value` undefined preservation, `JsonValue` validation, `setWithAck` ordering, and the legacy-`setAck` rejection path), plus any core vectors that apply to the local bind surface it exposes — see CONFORMANCE.md's "Applies to" column for the per-vector scoping. Pass the applicable subset before claiming Extension 2 conformance; the file is necessary, not sufficient.
 
 1. Every client message and server message matches one of the shapes above.
 2. The five design invariants (property-centric, getter-on-producer, JSON shape, FIFO, single-shell) hold.
