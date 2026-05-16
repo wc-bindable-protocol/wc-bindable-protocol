@@ -141,7 +141,7 @@ This section is the **normative** wire-format specification for any implementati
    - `Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null`. Plain objects only. Class instances, `Date`, `Map`, `Set`, `RegExp`, etc. carry custom prototypes and are out of contract — without this check they pass through as `{}` (no own enumerable keys) and the wire silently strips their semantics.
    - For every own enumerable string key, `Object.getOwnPropertyDescriptor(value, key)` MUST be a data descriptor (`"value" in desc`, neither `"get"` nor `"set"` in `desc`). Accessor properties are rejected outright. Beyond shape correctness, this also avoids invoking the getter during validation — a getter on an untrusted-source value could have side effects (information leak, state mutation) at exactly the trust boundary where the wire is meant to be defensive.
    - Symbol-keyed properties on an object are silently invisible to JSON and to `JSON.stringify`. The default normative rule is: if `Object.getOwnPropertySymbols(value).length > 0`, the value is non-conformant and MUST be rejected. This is the security-leaning choice — silently transmitting an object whose author meant to attach metadata via a symbol key would lose information across the wire without warning. Implementations MAY opt out of strict rejection for ecosystem compatibility (e.g. React adds `Symbol(react.element)` to JSX nodes; some immutable libraries tag values with private symbols), in which case they MUST: (a) document the opt-out explicitly in their public API surface, (b) ignore the symbol keys at serialization time without throwing, and (c) document that those keys are NEVER transmitted to the consumer. The reference implementation in `@wc-bindable/remote` chooses strict rejection.
-   - Arrays: every element MUST itself satisfy `isJsonValue`; sparse holes (where `i in arr === false`) MUST be either rejected or treated as the explicit value `null`, with the choice documented by the implementation.
+   - Arrays: every element MUST itself satisfy `isJsonValue`. Sparse holes (positions where `i in arr === false`) MUST be **rejected**; the earlier "treat as `null`" alternative is removed because it introduces silent shape change between transports and defeats the validate-before-serialize principle. Callers that need to transmit "this index is unset" MUST encode it explicitly (`null`, or a sentinel they define).
    - Cyclic references: traversal MUST detect a cycle (typically via a `WeakSet` of seen objects) and reject the value; otherwise the validator stack-overflows on adversarial input.
 
    **Handling of non-`JsonValue` values is normative — on both sides of the wire:**
@@ -392,6 +392,14 @@ A wire-format implementation conforms to this extension when:
 3. `setWithAck` resolves only after the JS-level assignment has executed on the producer side (Extension 1).
 4. The undefined-enumeration rule mirrors core's `in`-operator semantics.
 5. Reserved names are rejected at proxy construction.
+
+#### Implementation-defined behavior (interop variability flag)
+
+The wire format is *almost* fully prescriptive, but a small number of validation behaviors are left to the implementation by design. Each is documented here so cross-implementation testing can target the spot where two conformant implementations might still differ:
+
+- **Symbol-keyed property handling on `JsonValue` validation.** Default normative rule is "reject any object with own symbol keys" (see § Design invariants invariant 3). Implementations MAY opt out for ecosystem compatibility (React's `Symbol(react.element)`, tagged-immutable libraries) by ignoring symbol keys and documenting that they are never transmitted. Two conformant implementations MAY therefore disagree on whether a particular input is `JsonValue`-valid when symbol keys are present; cross-impl consumers SHOULD avoid relying on symbol-keyed values surviving across the wire under any implementation.
+
+All other validation rules — finite-number gate, plain-object prototype check, accessor rejection, sparse-hole rejection, cycle detection — are fully prescriptive and admit no implementation-defined variation. A `JsonValue` predicate that rejects on one of them in implementation A but accepts in implementation B is non-conformant.
 
 `@wc-bindable/remote` 0.7.x is the reference implementation; [packages/remote/README.md](packages/remote/README.md) documents its operational specifics (back-pressure caps, logger injection, transport adapter contract for `BroadcastChannel` / `MessagePort` / `Worker`).
 

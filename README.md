@@ -26,17 +26,22 @@ class MyInput extends HTMLElement {
 }
 customElements.define("my-input", MyInput);
 
-// 2. Consumer side — call bind() and react.
+// 2. Consumer side — instantiate, attach, bind.
 import { bind } from "@wc-bindable/core";
 
-const el = document.querySelector("my-input");
+const el = new MyInput();
+el.value = "hello";              // optional initial state
+document.body.appendChild(el);   // attach so the consumer can find it
+
 const unbind = bind(el, (name, value) => {
   console.log(`${name} =`, value); // fires for the initial value and every change
 });
+
+el.value = "world"; // triggers a second log line: `value = world`
 // later: unbind();
 ```
 
-> **One thing that surprises first-time readers:** `bind()` performs an initial-value read immediately, before any event has fired. In the snippet above the `value` getter is exposed on the prototype (so `"value" in el` is `true`) but no one has assigned to it yet, so the first line that lands in the console is `value = undefined`. That is correct behavior — the protocol delivers "the current value, even if it is `undefined`" — and it goes away as soon as the component is given a starting value (via `el.value = ...`, attribute reflection, or in the constructor). Reading the [SPEC.md § Initial Value Synchronization](SPEC.md#initial-value-synchronization) makes the rule explicit.
+The console output is two lines: `value = hello` (the initial-sync read) followed by `value = world` (the change event). If you remove the `el.value = "hello"` line you will see `value = undefined` first — `"value" in el` is `true` because the getter is on the prototype, and the protocol delivers "the current value, even if it is `undefined`". This is by design; see [SPEC.md § Initial Value Synchronization](SPEC.md#initial-value-synchronization).
 
 That's it. The framework adapters below (`@wc-bindable/react`, `@wc-bindable/vue`, ...) are typically small wrappers that pipe the same `(name, value)` callbacks into their framework's reactivity primitive — they add no new protocol concepts.
 
@@ -70,11 +75,11 @@ class MyInput extends HTMLElement {
 
 Any framework adapter can then automatically bind to those properties — no manual wiring needed. The optional `inputs` and `commands` fields declare the component's input interface for tooling, documentation, and remote proxying — they do not create automatic two-way synchronization. The *behavioral* semantics of those fields (`set`, `invoke`, the `attribute` and `async` hints) are defined in [SPEC-extensions.md](SPEC-extensions.md) — the core protocol itself is read-only on `properties`.
 
-When the adapter binds to an element, it reads the current value of each declared property (using `name in target` so an explicitly-`undefined` value is still delivered) and then listens for subsequent change events. `bind()` returns an unbind function that removes every listener it registered; adapters re-expose this so consumers can tear down cleanly. For DOM elements that have not yet been connected when `bind()` is called, pass `{ syncOn: "connect" }` to defer the initial read until `connectedCallback` has run. Framework adapters that bind from a mounted-element lifecycle hook (React `useEffect`, Vue `onMounted`, Angular `AfterViewInit`, etc.) use the default `syncOn: "call"` because the host already guarantees the element is attached; the imperative binders this repository ships for VanJS / MobX / RxJS / Signals currently pass `syncOn: "connect"` internally so callers do not have to sequence `appendChild()` and `binder.bind(el)` manually. This is a guideline ([SPEC-extensions.md § Extension 3](SPEC-extensions.md) is informational, not normative); third-party adapters are free to make a different choice as long as it matches their binder shape.
+When the adapter binds to an element, it reads the current value of each declared property (using `name in target` so an explicitly-`undefined` value is still delivered) and then listens for subsequent change events. `bind()` returns an unbind function that removes every listener it registered; adapters re-expose this so consumers can tear down cleanly.
 
-> **Prefer `syncOn: "call"` whenever the adapter can observe a mounted lifecycle.** `syncOn: "connect"` is a fallback for imperative light-DOM insertion only — it does NOT replace a proper lifecycle hook. It installs a document-wide `MutationObserver`, it does NOT traverse shadow roots (a target appended into a shadow tree never fires the deferred sync), and a large number of simultaneous deferred binds means a corresponding number of document observers. Treat the option as "I have no lifecycle hook on this path"; if you do have one, bind from inside it with the default and skip the deferred path entirely.
+For DOM elements that have not yet been connected when `bind()` is called, pass `{ syncOn: "connect" }` to defer the initial read until `connectedCallback` has run. Framework adapters that bind from a mounted-element lifecycle hook (React `useEffect`, Vue `onMounted`, Angular `AfterViewInit`, etc.) use the default `syncOn: "call"` because the host already guarantees the element is attached. The imperative binders this repository ships for VanJS / MobX / RxJS / Signals pass `syncOn: "connect"` internally so callers do not have to sequence `appendChild()` and `binder.bind(el)` manually; this is a guideline rather than a spec MUST.
 
-> **Note — Shadow DOM caveat for `syncOn: "connect"`.** The deferred path is observed via a `MutationObserver` attached to the top-level `document`, which does NOT traverse shadow roots. A target appended into another element's shadow tree becomes `isConnected === true` without firing the observer, and the deferred initial sync never runs. `syncOn: "connect"` is intended for light-DOM imperative insertion. If your adapter owns the element lifecycle (any of the framework hooks listed above), bind from the mounted hook with the default `syncOn: "call"` instead. See [SPEC.md § Deferring the Initial Sync Until Connection](SPEC.md#deferring-the-initial-sync-until-connection) for the full caveat list.
+> **Prefer `syncOn: "call"` whenever the adapter can observe a mounted lifecycle.** `syncOn: "connect"` is a fallback for imperative light-DOM insertion only — it does NOT replace a proper lifecycle hook. The deferred path installs a document-wide `MutationObserver` which does NOT traverse shadow roots (so a target appended into a shadow tree never fires the deferred sync), and N simultaneous deferred binds installs N document observers. If your adapter owns the element lifecycle, bind from inside that hook with the default `syncOn: "call"` and skip the deferred path entirely. See [SPEC.md § Deferring the Initial Sync Until Connection](SPEC.md#deferring-the-initial-sync-until-connection) for the full caveat list.
 
 ## Security model
 
@@ -173,9 +178,9 @@ Every other adapter follows the same pattern (`useWcBindable` / `createWcBindabl
 | [@wc-bindable/lit](packages/lit/README.md) | `WcBindableController` (Lit ReactiveController) |
 | [@wc-bindable/stencil](packages/stencil/README.md) | `WcBindableController` (Stencil controller) |
 | [@wc-bindable/alpine](packages/alpine/README.md) | `x-wc-bindable` directive (Alpine plugin) |
-| [@wc-bindable/marko](packages/marko/README.md) | `wcBindable()` helper (Marko 5 & 6) |
+| [@wc-bindable/marko](packages/marko/README.md) | `wcBindable()` helper (Marko 5 + 6) |
 | [@wc-bindable/mithril](packages/mithril/README.md) | `createWcBindable()` with `oncreate` / `onremove` |
-| [@wc-bindable/qwik](packages/qwik/README.md) | `useWcBindable()` (Qwik 1.x; Qwik 2.x via `/v2`) |
+| [@wc-bindable/qwik](packages/qwik/README.md) | `useWcBindable()` (Qwik 1.x; Qwik 2.x via `/v2`, experimental) |
 | [@wc-bindable/riot](packages/riot/README.md) | `createWcBindable()` with `{ update }` callback |
 | [@wc-bindable/vanjs](packages/vanjs/README.md) | `createWcBindable()` exposing `binder.states.<name>` |
 | [@wc-bindable/mobx](packages/mobx/README.md) | `createWcBindable()` exposing `binder.state.<name>` (one observable) |
@@ -243,18 +248,16 @@ bind(proxy, (name, value) => {
   console.log(name, value); // works exactly as if Core were local
 });
 
-proxy.set("url", "/api/users");
+// `setWithAck` is the safe default whenever a later `invoke` depends on
+// a prior `set` — it waits for the assignment `core.url = "/api/users"`
+// to actually execute on the trusted side before resolving.
+await proxy.setWithAck("url", "/api/users");
 const result = await proxy.invoke("fetch");
 ```
 
-> **Delivery vs. ordering.** `set` is fire-and-forget (at-most-once). The WebSocket transport preserves message *order*, so on a healthy connection `fetch` always observes `url = "/api/users"`. But order ≠ delivery — during a transient outage the `set` can be silently dropped while the later `invoke` still lands, causing `fetch` to run against a stale `url` with no error returned. When `fetch` semantically depends on `url` having been applied, use the acknowledged path:
+> **When to use the fire-and-forget `proxy.set()` instead.** `set` is a faster, non-acknowledged write — at-most-once delivery, no round-trip wait. The WebSocket transport preserves message *order*, so on a healthy connection `fetch` after `set` always observes the new value. But order ≠ delivery — during a transient outage the `set` can be silently dropped while the later `invoke` still lands, causing `fetch` to run against a stale `url` with no error returned. Reach for `set` only when the downstream call does NOT depend on this assignment having been applied (e.g. an update-only-side-effect input, or a write that is naturally re-driven by a later event). When in doubt, prefer `setWithAck`.
 >
-> ```typescript
-> await proxy.setWithAck("url", "/api/users");
-> const result = await proxy.invoke("fetch");
-> ```
->
-> Further nuance: `setWithAck` resolves once the JS-level assignment `core.url = "/api/users"` has executed on the trusted side. It does **not** wait for any asynchronous side effects the setter may schedule (database write, network round-trip, validation pipeline, …). If the downstream command depends on that async work completing, model the work as its own command and `await invoke(...)` it.
+> **Further nuance.** `setWithAck` resolves once the JS-level assignment has executed on the trusted side. It does **not** wait for any asynchronous side effects the setter may schedule (database write, network round-trip, validation pipeline, …). If the downstream command depends on that async work completing, model the work as its own command and `await invoke(...)` it.
 
 For the full wire format, error envelope, back-pressure controls, transport adapter contract, and security model, see [SPEC-extensions.md](SPEC-extensions.md) and [packages/remote/README.md](packages/remote/README.md).
 
