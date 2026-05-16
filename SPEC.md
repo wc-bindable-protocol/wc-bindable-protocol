@@ -156,7 +156,8 @@ Any object an adapter is asked to bind against MUST therefore expose a `construc
 - A **wrapper or proxy** that stands in for a real `EventTarget` (for example, a `Proxy`-wrapped object whose `get`/`set` traps route to a remote Core, or a test double) MUST expose an `equivalent` `constructor.wcBindable` declaration — where "equivalent" means **observation-equivalent at the wrapper**, NOT byte-equal to the wrapped target's declaration. Specifically:
 
   - The declaration the consumer reads via `target.constructor.wcBindable` MUST describe what the wrapper **actually** dispatches and exposes, not what the wrapped target dispatches and exposes. In particular, wrappers MAY (and often MUST) rewrite `event` names internally — the `@wc-bindable/remote` `RemoteCoreProxy` uses synthetic per-property event names like `@wc-bindable/remote:value` to disambiguate properties that shared a Core-side event. The wire layer translates between the two name spaces; the consumer sees only the wrapper's space.
-  - Required equivalences: same `protocol`; same `version` integer as the wrapped target (the [Versioning](#versioning) policy guarantees every adapter accepts every `version >= 1`, so wrappers do not need a version-matching step); same set of `name`s in `properties`; observable `getter` semantics at the wrapper that yield the same values a local consumer would have observed (in the remote case the wrapper omits `getter` entirely — see [SPEC-extensions.md § Extension 2](SPEC-extensions.md)); and — when [SPEC-extensions.md § Extension 1](SPEC-extensions.md) is in use — the same `inputs` and `commands` membership as the wrapped target.
+  - Required equivalences: same `protocol`; same set of `name`s in `properties`; observable `getter` semantics at the wrapper that yield the same values a local consumer would have observed (in the remote case the wrapper omits `getter` entirely — see [SPEC-extensions.md § Extension 2](SPEC-extensions.md)); and — when [SPEC-extensions.md § Extension 1](SPEC-extensions.md) is in use — the same `inputs` and `commands` membership as the wrapped target.
+  - **Version reporting.** The wrapper MUST report the same `version` integer that the wrapped target's declaration carries. The wrapper does NOT need to verify or "match" the version against anything before reporting it — the [Versioning](#versioning) policy guarantees every adapter on either side accepts every integer `>= 1`, so wrappers simply propagate the value faithfully. (Reporting fidelity is required; a separate matching/checking step is not.)
 - Implementations that wrap one declaration per instance (i.e. multiple wrapped targets coexisting on the same page) MUST give each instance an **isolated** `constructor.wcBindable` — sharing a single constructor across instances with different declarations would break `isWcBindable()` and `bind()` for every instance after the first declaration write. The typical pattern is to synthesize a unique subclass per wrapped target.
 
 Adapters MUST NOT cache the declaration across binds — re-read `target.constructor.wcBindable` on each `bind()` call so that proxies whose declaration changes on reconnect are observed correctly.
@@ -235,6 +236,8 @@ A reactivity system that supports this protocol should:
    a. Attach an event listener for subsequent changes
    b. Perform the initial-value synchronization (see below)
 4. Return a function that removes every listener registered above (the **teardown contract**, see below)
+
+> **This 4-step list is a simplification.** The full, normative validation that `bind()` MUST perform — descriptor-shape checks (non-empty string `name` / `event`, function-or-undefined `getter`), name-uniqueness within `properties` / `inputs` / `commands`, the EventTarget-capability check on `target` itself, and the MUST-NOT-throw guard for pathological constructors — is specified in [§ Discovery API](#discovery-api). The reference implementation that follows this guide routes the validation through `getWcBindableDeclaration()`, which performs all of the above; if you re-implement `bind()` from scratch following only the 4 steps above, you will reproduce the "isWcBindable returns true but bind silently no-ops" footgun that the discovery-is-bindability rule exists to prevent. Always consult § Discovery API for the complete check set.
 
 The `target` parameter accepts any `EventTarget` — this includes `HTMLElement` instances as well as headless `EventTarget` subclasses.
 
@@ -513,7 +516,7 @@ The protocol version is an integer. Within a single `protocol` identifier (e.g. 
 - New optional fields (on the root, on property/input/command descriptors, or new root-level keys entirely) may be added in later versions. Adapters **MUST** ignore fields they do not recognize. The `version` field then becomes informational at the wire / discovery level — its primary role within a given `protocol` identifier is to flag the presence of newer optional fields, not to gate acceptance.
 - Breaking changes to the `properties` binding contract (the shape of property descriptors, the meaning of `event` / `getter`, the initial-sync rule, the teardown contract) require a new `protocol` identifier (e.g. `"wc-bindable-2"`), **not** a version bump. This guarantees both directions: a v1 adapter never silently misinterprets a future declaration **and** a future-version adapter never silently rejects a v1 declaration.
 
-In `@wc-bindable/core`, the exported constant `MIN_COMPATIBLE_VERSION` is pinned to `1` and serves only as a sanity check that the `version` field exists, is a number, is an integer, and is `>= 1`. It is **not** an adapter-version dial and MUST NOT be raised in future releases.
+The normative rule above ("integer `>= 1`") is the version contract every implementation MUST enforce. The reference implementation `@wc-bindable/core` materializes this minimum as an exported constant `MIN_COMPATIBLE_VERSION = 1` for convenience; the constant's *name* is NOT normatively required (only `getWcBindableDeclaration` and `isWcBindable` are normatively named — see [§ Discovery API](#discovery-api)). Other implementations MAY use any identifier or inline the literal `1`; what they MUST NOT do is raise the threshold above `1` for the `"wc-bindable"` protocol identifier, because that would silently reject valid older declarations.
 
 | Version | Status  | Notes            |
 |---------|---------|------------------|
@@ -633,6 +636,15 @@ Doing so would require the core to take a position on call semantics (synchronou
 **Is this a W3C standard?**
 No. This is a community protocol. Any EventTarget-based class or framework can adopt it independently.
 
+**Why is `version` required if breaking changes use a new `protocol` identifier?**
+Three reasons, in decreasing order of weight:
+
+1. **Well-formedness gate.** The `version` field gives every adapter a cheap, uniform sanity check: a declaration without an integer `version >= 1` is unambiguously not a wc-bindable declaration, regardless of which `protocol` string it carries. Adapters and tooling that probe arbitrary targets (devtools, codegen, test inspection) use the field's presence as the second discriminator after `protocol === "wc-bindable"`, instead of having to validate the rest of the schema before deciding the target is "ours" at all.
+2. **Future-affordance for additive metadata.** The forward-compatibility policy says breaking changes get a new `protocol` identifier — but additive changes (a new optional descriptor field, a new top-level optional key) DO bump `version`. An adapter that wants to opt into a new feature can branch on `decl.version >= N` without affecting backward compatibility, because it MUST still bind successfully against lower-version declarations.
+3. **Wire-format echoing.** Remote and similar bridging extensions transmit `version` faithfully (see [SPEC-extensions.md § Extension 2](SPEC-extensions.md)). Tooling on the other side that inspects a sync snapshot can ask "what feature surface is this producer at?" without separately reading the producer's source. A literal `1` everywhere today still costs nothing; the slot exists so the question can be answered in v1.1 / v1.2 / … without renegotiating the wire shape.
+
+So the field is informational *for the binding contract* (every adapter accepts every version `>= 1`), but informational does not mean useless — it is the single integer that makes the declaration well-formed, future-extensible, and inspectable end-to-end.
+
 ---
 
 ## Appendix: Design rationale notes
@@ -648,8 +660,8 @@ A pre-v0.7.0 draft used `if (target[prop.name] !== undefined)` as the initial-sy
 **Why the reference pseudocode uses optional chaining (not a `typeof` gate) on `target.constructor`.**
 A class declaration in JavaScript is a function (`typeof MyClass === "function"`), not an object. A pre-v0.7.1 draft of the pseudocode gated on `typeof ctor === "object"` and silently failed to discover any class-based component — the single most common shape in the wild. Optional chaining inside a `try / catch` accepts both function-typed (class) and object-typed constructors and satisfies the "MUST NOT throw" rule even when `target` is a null-prototype-like object.
 
-**Why `MIN_COMPATIBLE_VERSION` is pinned to `1` (and adapter-specific bounds are forbidden).**
-The forward-compatibility policy — "breaking changes get a new `protocol` identifier, not a version bump" — implies symmetric compatibility within a given `protocol` identifier. A future v2 adapter that gated on `decl.version >= 2` would silently no-op against valid v1 declarations, producing exactly the regression the policy was meant to prevent. Pinning the constant to `1` and naming it `MIN_COMPATIBLE_VERSION` (a minimum, not a maximum) reflects this and makes the bound obviously protocol-wide rather than adapter-specific.
+**Why the minimum version is pinned to `1` (and adapter-specific bounds are forbidden).**
+The forward-compatibility policy — "breaking changes get a new `protocol` identifier, not a version bump" — implies symmetric compatibility within a given `protocol` identifier. A future v2 adapter that gated on `decl.version >= 2` would silently no-op against valid v1 declarations, producing exactly the regression the policy was meant to prevent. The reference implementation materializes this minimum as the constant `MIN_COMPATIBLE_VERSION = 1` (the *name* is implementation-local, not part of the normative API — only the discovery helper names are pinned per § Discovery API), and the constant's value MUST NOT be raised in future releases under the `"wc-bindable"` identifier.
 
 ---
 

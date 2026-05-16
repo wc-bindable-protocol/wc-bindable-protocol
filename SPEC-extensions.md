@@ -42,10 +42,11 @@ interface AckOptions {
    * with the signal's `reason` (or a synthetic AbortError). Abort is a
    * **local** cancellation — the proxy removes the pending entry and
    * rejects the caller's promise; the wire message MAY have already left
-   * the proxy, and any subsequent `return` / `throw` envelope from the
-   * producer for the same `id` MUST be silently ignored by the consumer
-   * (logged at warn level). The protocol does NOT send a wire-level
-   * cancellation.
+   * the proxy. Any subsequent `return` / `throw` envelope from the
+   * producer for the same `id` MUST NOT re-settle the (already-rejected)
+   * promise and MUST be dropped by the consumer; the consumer SHOULD log
+   * the drop at warn level so the unexpected late envelope is visible to
+   * diagnostics. The protocol does NOT send a wire-level cancellation.
    */
   signal?: AbortSignal;
 }
@@ -56,7 +57,7 @@ Implementations MUST honor:
 - A default timeout. The reference implementation uses `30_000` ms. Other implementations MAY choose a different default but MUST document it. `timeoutMs: 0` disables the timeout; `timeoutMs: undefined` (or `options` omitted) applies the default.
 - Invalid `timeoutMs` (negative, non-finite, non-numeric) MUST cause the returned promise to reject synchronously with a `RangeError`-shaped error rather than be silently ignored.
 - Pre-aborted signals (`signal.aborted === true` at call time) MUST cause the returned promise to reject immediately without sending any wire message.
-- After timeout or abort settles the caller's promise, the proxy MUST NOT also re-settle it if a late `return` / `throw` arrives for the same `id`; the late envelope is logged at warn level and dropped (see § Transport lifecycle vocabulary for the disposal/terminal vocabulary that interacts with this).
+- After timeout or abort settles the caller's promise, the proxy MUST NOT re-settle it if a late `return` / `throw` envelope arrives for the same `id`. The late envelope MUST be dropped, and the proxy SHOULD log the drop at warn level so the unexpected delivery is visible to diagnostics. (See § Transport lifecycle vocabulary for the terminal-vs-transient terminology that interacts with this.)
 
 #### Call-order preservation
 
