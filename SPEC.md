@@ -576,8 +576,16 @@ function bind(target, onUpdate, options) {
   const decl = getWcBindableDeclaration(target);
   if (decl === undefined) return () => {};
   // After the discovery guard, `target` is known to expose
-  // addEventListener / removeEventListener (the helper's EventTarget
-  // capability check), so the cast below is safe.
+  // addEventListener / removeEventListener (the helper's consumer-side
+  // capability check — see WcBindableTarget in § Normative TypeScript
+  // surface). The cast below narrows to that two-method subset, NOT to
+  // the full EventTarget interface — bind() never calls dispatchEvent
+  // on the target, which is what lets relay proxies that only re-emit
+  // through their own internal channel still be valid bind targets
+  // (the WcBindableTarget design intent). The `EventTarget` type tag
+  // here is a JSDoc convenience for environments where importing the
+  // structural WcBindableTarget type is awkward; at runtime, only the
+  // add/removeEventListener methods are invoked, never dispatchEvent.
   const et = /** @type {EventTarget} */ (target);
 
   const cleanups = [];

@@ -33,7 +33,7 @@ import { bind } from "@wc-bindable/core";
 
 const el = new MyInput();
 el.value = "hello";              // optional initial state
-document.body.appendChild(el);   // attach (optional with default syncOn: "call" — bind() works on detached elements too; useful here so any connectedCallback runs before bind() reads initial state)
+document.body.appendChild(el);   // optional in this snippet — MyInput has no connectedCallback. Default syncOn: "call" works on detached elements. Kept here only because real Web Components typically use connectedCallback to set up state that initial sync should observe.
 
 const unbind = bind(el, (name, value) => {
   console.log(`${name} =`, value); // fires for the initial value and every change

@@ -168,6 +168,8 @@ A naive JS-`Proxy`-based implementation that lets `has` fall through to the unde
 
 ### 6. Remote undefined — absent `update.value` delivers `undefined`, not `null`
 
+> **⚠ Known divergence in the reference implementation.** `@wc-bindable/remote` 0.7.x does NOT pass this vector as written — its `update`-handling path dispatches `new CustomEvent(eventName, { detail: undefined })`, which WebIDL coerces to `detail: null`, so `bind()` callbacks observe `null` while `proxy.value` correctly reads `undefined`. This is the **only** vector among the ten that the reference implementation does not satisfy today. The divergence is also documented at [SPEC-extensions.md § CustomEvent `detail` and undefined preservation → "Reference implementation status (informative)"](SPEC-extensions.md#customevent-detail-and-undefined-preservation), [SPEC-extensions.md § Implementation-defined behavior](SPEC-extensions.md#implementation-defined-behavior-interop-variability-flag) (the "current implementation, not a complete conformance oracle" paragraph), and the README's remote-path callouts. Third-party implementers writing against the spec contract should treat the spec rule as authoritative and expect a future `@wc-bindable/remote` release to close the gap; consumers running 0.7.x today can read the cached `proxy.<name>` as the producer-intended-`undefined` recovery.
+
 **Setup.** Establish a remote proxy + producer pair through Step 5; let `sync` complete with `value: 1` for `"value"`. Then have the producer send a post-sync transition into `undefined`:
 
 ```javascript
@@ -213,7 +215,7 @@ const NEEDS_REJECT = [
   (() => {                                                   // non-enumerable own string key
     return Object.defineProperty({}, "hidden", { value: 1, enumerable: false });
   })(),
-  Object.create({ inherited: 1 }),                           // non-plain prototype
+  Object.create({ inherited: 1 }),                           // prototype is neither Object.prototype nor null (the object itself is plain; the prototype object is too — what disqualifies it from JsonValue is that Object.getPrototypeOf(value) is not in { Object.prototype, null })
   new Map([["k", "v"]]),                                     // class instance
   new Set([1, 2]),                                           // class instance
   Symbol("x"),                                               // symbol primitive used as a value
@@ -365,12 +367,14 @@ const sync = {
 
 These ten vectors are deliberately narrow — they target rules that are easy to violate in ways that pass naive smoke tests. They are **not** a complete conformance suite. Additional areas worth covering in a richer test corpus:
 
+- **Non-function `onUpdate` synchronous `TypeError`** at `bind()` entry (Level 2 MUST; Level 1O SHOULD). The hazard is exactly the "compiles, passes smoke tests, only bites on the empty-`properties` target where deferred detection never fires" pattern that motivates the rest of this file — strong candidate for vectorization in the next round. See [SPEC.md § onUpdate validity](SPEC.md#onupdate-validity).
+- **Hostile-accessor `getWcBindableDeclaration()` MUST NOT throw.** Vectors 1 / 2 cover *duplicate-name* and *malformed-attribute* declarations but not the case where reading the descriptor itself throws (a Proxy `wcBindable` whose `protocol` getter raises; a `name` getter that throws on access; a null-prototype `constructor`). The discovery helper's "MUST NOT throw — return `undefined` on any access failure" is the rule that keeps `isWcBindable` safe to call on stray inputs, and it is not currently exercised. Strong candidate for vectorization. See [SPEC.md § Discovery API](SPEC.md#discovery-api).
 - **`syncOn: "connect"` deferred-sync ordering** (events that arrive between bind and connection)
 - **Shadow-DOM attach** under `syncOn: "connect"` (the documented "observer doesn't traverse shadow roots" limitation)
 - **Re-entrant `dispatchEvent` from a property getter** during initial sync (the producer-side MUST NOT rule)
 - **`AbortSignal` pre-aborted at `setWithAckOptions` / `invokeWithOptions` call time** (rejects immediately without sending)
 - **Late `return` / `throw` envelope after timeout / abort** (consumer MUST drop, MUST NOT re-settle)
-- **Reserved-name declarations** at proxy construction (MUST throw)
+- **Reserved-name declarations** at proxy construction (MUST throw — and per § Reserved names "Normative minimum", the `@wc-bindable/` prefix specifically is reservable across implementations, so this vector is portable without per-impl branching)
 - **Declaration fingerprint mismatch** on `sync` (MUST log warn, MUST continue accepting)
 - **`getterFailures` semantics** — MUST log, MUST NOT touch cache, MUST NOT dispatch
 - **Cleanup-callback that itself throws** during the consumer-invoked unbind (other cleanups MUST still run)
