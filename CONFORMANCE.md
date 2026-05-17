@@ -522,16 +522,21 @@ document.body.appendChild(target);
 // some JSDOM versions) can need more than one turn. A macrotask wait is
 // strictly later than any pending microtask queue and avoids the
 // timing-sensitive flake that a microtask-only wait can produce on some
-// environments. Equivalent two-microtask form: `await Promise.resolve();
-// await Promise.resolve();`.
+// environments.
+//
+// Often-sufficient two-microtask form: `await Promise.resolve();
+// await Promise.resolve();`. This is not strictly equivalent — a polyfill
+// or test runner that re-queues microtasks during the callback can still
+// need more than two turns — but in practice it covers the common cases
+// and has the advantage of working unchanged under fake timers.
 //
 // If the harness uses fake timers (Vitest `vi.useFakeTimers()`, Jest
 // `jest.useFakeTimers()`, Sinon `useFakeTimers`), this `setTimeout` will
 // not fire on its own — advance the clock by one macrotask after the
 // `appendChild` (e.g. `await vi.advanceTimersByTimeAsync(0)` /
 // `jest.advanceTimersByTime(0)`) or temporarily exit fake-timer mode
-// for this wait. The two-microtask form above does not have this
-// caveat and is the simpler choice under fake timers.
+// for this wait. The two-microtask form above is a fake-timer-friendly
+// alternative in many harnesses, with the strictness caveat noted there.
 await new Promise((resolve) => setTimeout(resolve, 0));
 ```
 
