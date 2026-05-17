@@ -139,12 +139,20 @@ bind(proxy, (name, value) => {
   console.log(name, value);
 });
 
-// Set input properties
-proxy.set("url", "/api/users");
+// Set input properties — `setWithAck` is the safe default whenever a later
+// `invoke` (or any other call) depends on the assignment having actually
+// landed on the server. It resolves only after the JS-level
+// `core.url = "/api/users"` has executed on the trusted side. Plain
+// `set()` is fire-and-forget (at-most-once, can be silently dropped on
+// transient outages) and is the right choice only when you do NOT want
+// to await acknowledgement — see "Error handling" below.
+await proxy.setWithAck("url", "/api/users");
 
 // Invoke commands
 const result = await proxy.invoke("fetch");
 ```
+
+> **`set()` vs `setWithAck()` — pick `setWithAck()` first.** The fire-and-forget `set()` is a low-latency optimization for cases where you genuinely do not care whether the write reaches the server (e.g. high-rate telemetry, last-write-wins UI hints) — it MUST NOT be used when a subsequent `invoke()` or read depends on the assignment having landed. The proxy's call queue is FIFO but **not transactional**: a later `invoke()` does not auto-cancel if an earlier queued `set()` was silently dropped. For the full semantics see [SPEC-extensions.md § Methods](../../SPEC-extensions.md#methods) and the "Error handling" section below.
 
 ### With a framework adapter
 

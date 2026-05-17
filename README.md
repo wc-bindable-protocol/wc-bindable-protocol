@@ -47,7 +47,9 @@ The console output is two lines: `value = hello` (the initial-sync read) followe
 
 That's it. The framework adapters below (`@wc-bindable/react`, `@wc-bindable/vue`, ...) are typically small wrappers that pipe the same `(name, value)` callbacks into their framework's reactivity primitive — they add no new protocol concepts.
 
-> **Building your own implementation? Start at [CONFORMANCE.md](CONFORMANCE.md).** Ten reproducible test vectors covering the easy-to-violate corners of [SPEC.md](SPEC.md) and [SPEC-extensions.md](SPEC-extensions.md) — duplicate names, empty-properties cleanup, `undefined` preservation across `CustomEvent.detail`, pre-sync `has`-trap behavior, `setWithAck` legacy interop, and more. Passing it is necessary but not sufficient for full conformance; failing any of them indicates a concrete bug the rest of this README and the spec call out in prose.
+> **Building your own implementation? Start at [CONFORMANCE.md](CONFORMANCE.md).** Reproducible test vectors covering the easy-to-violate corners of [SPEC.md](SPEC.md) and [SPEC-extensions.md](SPEC-extensions.md) — duplicate names, empty-properties cleanup, `undefined` preservation across `CustomEvent.detail`, pre-sync `has`-trap behavior, `setWithAck` legacy interop, and more. Passing it is necessary but not sufficient for full conformance; failing any of them indicates a concrete bug the rest of this README and the spec call out in prose.
+>
+> **Note for third-party implementers.** The reference implementation `@wc-bindable/remote` 0.7.x has **one** known divergence from the current conformance vectors — remote `undefined` update delivery is observed as `null` by `bind()` callbacks because `CustomEvent.detail` is WebIDL-coerced. The spec is authoritative; the implementation is expected to close this gap in a future release. See [CONFORMANCE.md vector 6](CONFORMANCE.md#6-remote-undefined--absent-updatevalue-delivers-undefined-not-null) for the full callout. No other vector is currently divergent.
 
 > **The "one snippet" framing is a Layer-1 conceptual demo, not a Level 2 conformance bar.** A drop-in replacement for `@wc-bindable/core` is a few hundred lines (full schema validation, name-uniqueness, MUST-NOT-throw guards, exception-safe teardown), not tens — see [SPEC.md § Discovery API](SPEC.md#discovery-api) and [§ Teardown Contract](SPEC.md#teardown-contract) for the normative rules and [SPEC.md § Conformance Levels](SPEC.md#conformance-levels) for the level boundaries.
 
@@ -102,6 +104,14 @@ When the adapter binds to an element, it reads the current value of each declare
 For DOM elements that have not yet been connected when `bind()` is called, pass `{ syncOn: "connect" }` to defer the initial read until `connectedCallback` has run. Framework adapters that bind from a mounted-element lifecycle hook (React `useEffect`, Vue `onMounted`, Angular `AfterViewInit`, etc.) use the default `syncOn: "call"` because the host already guarantees the element is attached. The imperative binders this repository ships for VanJS / MobX / RxJS / Signals pass `syncOn: "connect"` internally so callers do not have to sequence `appendChild()` and `binder.bind(el)` manually; this is a guideline rather than a spec MUST.
 
 > **Prefer `syncOn: "call"` whenever the adapter can observe a mounted lifecycle.** `syncOn: "connect"` is a fallback for imperative light-DOM insertion only — it does NOT replace a proper lifecycle hook. Among other constraints, the deferred path uses a document-wide `MutationObserver` (shadow-root non-traversal, one observer per deferred bind) — full caveat list lives in [SPEC.md § Deferring the Initial Sync Until Connection](SPEC.md#deferring-the-initial-sync-until-connection).
+
+| Situation | Recommended `syncOn` |
+|---|---|
+| React / Vue / Lit / Stencil / Angular — adapter binds from a lifecycle hook | `"call"` |
+| Imperative construction followed by `appendChild()` into light DOM | `"connect"` |
+| Element may be appended into a shadow root | `"call"` from the host's own `connectedCallback` (document-level `MutationObserver` does not traverse shadow roots) |
+| Bulk-binding many deferred elements at once | Audit first — each deferred bind installs its own document-wide `MutationObserver` |
+| Headless `EventTarget` / remote proxy / test double | `"call"` (the deferred-path gate silently falls back to `"call"` here anyway) |
 
 ### Runtime note
 

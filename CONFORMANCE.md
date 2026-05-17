@@ -28,6 +28,11 @@ The "Applies to" column uses the facet shorthand from [SPEC.md § Conformance Le
 | 8 | Teardown | `{1O, 2}` (and any other 1O implementation that hands a cleanup function back to the caller) | If `addEventListener` throws on the Nth listener install, the previous N-1 listeners MUST be removed before the throw propagates | [SPEC.md § Teardown Contract](SPEC.md#teardown-contract) |
 | 9 | setWithAck | `{3-both}` end-to-end; producer-side semantics tested on `{3-producer}`, consumer-side semantics tested on `{3-consumer}` | The returned `Promise` MUST NOT resolve before the JS-level assignment `target[name] = value` has executed on the producer side | [SPEC-extensions.md § Methods](SPEC-extensions.md#methods) (the `setWithAck` row) + [§ setWithAck end-to-end](SPEC-extensions.md#setwithack-end-to-end) |
 | 10 | setWithAck legacy | `{3-consumer}` and `{3-both}` (the consumer-side rejection rule is what is tested; producer side participates only as a stub that omits `setAck`) | If the producer's `sync` response omits / sets-false `capabilities.setAck`, `setWithAck` MUST return an already-rejected `Promise` and MUST NOT send an id-bearing `set` on the wire | [SPEC-extensions.md § Message types — server → client](SPEC-extensions.md#message-types--server--client) (setAck capability bullets) + [§ Pre-sync call state machine](SPEC-extensions.md#pre-sync-call-state-machine) |
+| 11 | onUpdate validity | **`{2}` MUST**; `{1O without 2}` SHOULD (MAY defer to first invocation — see body) | **`{2}` (binding pass/fail):** `bind(target, "not-a-function")` (and other non-function `onUpdate` values) MUST throw a synchronous `TypeError` at `bind()` entry, **including** on an empty-`properties` target where deferred detection would never fire. **`{1O without 2}` (informational):** SHOULD throw synchronously; an implementation that defers MUST still surface the `TypeError` at the first attempted `onUpdate` invocation, so a non-empty-`properties` target produces the throw at initial-sync delivery time | [SPEC.md § onUpdate validity](SPEC.md#onupdate-validity) |
+| 12 | Hostile discovery | `{1O, 2}` (any implementation exposing `getWcBindableDeclaration` / `isWcBindable`) | A target whose `constructor.wcBindable` access throws (Proxy `get` trap that raises, throwing accessor on a Schema field, null-prototype constructor) MUST result in `getWcBindableDeclaration() === undefined`, `isWcBindable() === false`, and `bind()` returning a non-bindable no-op cleanup — no error escapes the helpers | [SPEC.md § Discovery API](SPEC.md#discovery-api) (MUST NOT throw) |
+| 13 | Deferred sync ordering | `{1O}` (any 1O-claiming implementation that supports `syncOn: "connect"` — implementations whose deferred path silently falls back to `"call"` per the unknown-value rule are exempt; record the choice and skip) | Under `syncOn: "connect"`, a change event dispatched on the still-unconnected target BEFORE `connectedCallback` fires MUST be delivered to `onUpdate` first; the deferred initial sync runs afterward and delivers `target[prop.name]` as read at connection time | [SPEC.md § Initial Value Synchronization → Ordering vs subsequent events](SPEC.md#ordering-vs-subsequent-events) |
+| 14 | Cleanup-throw containment | `{1O, 2}` (and any 1O implementation that hands a cleanup function back to the caller) | If the first listener removal in the cleanup chain throws (hostile `removeEventListener`), the remaining listeners and `MutationObserver`s registered by the same `bind()` call MUST still be torn down; the secondary cleanup-time error is swallowed | [SPEC.md § Teardown Contract](SPEC.md#teardown-contract) (the "MUST continue running the remaining cleanup callbacks" paragraph) |
+| 15 | Reserved names | `{3-consumer}` and `{3-producer}` (and `{3-both}`) | A declaration containing a `properties` / `inputs` / `commands` `name` that begins with `@wc-bindable/` MUST cause the consumer-side proxy constructor and the producer-side shell constructor to throw synchronously with a clear error; no wire traffic MUST be sent for such a name even if validation is bypassed | [SPEC-extensions.md § Reserved names](SPEC-extensions.md#reserved-names) (Normative minimum) |
 
 ---
 
@@ -168,7 +173,7 @@ A naive JS-`Proxy`-based implementation that lets `has` fall through to the unde
 
 ### 6. Remote undefined — absent `update.value` delivers `undefined`, not `null`
 
-> **⚠ Known divergence in the reference implementation.** `@wc-bindable/remote` 0.7.x does NOT pass this vector as written — its `update`-handling path dispatches `new CustomEvent(eventName, { detail: undefined })`, which WebIDL coerces to `detail: null`, so `bind()` callbacks observe `null` while `proxy.value` correctly reads `undefined`. This is the **only** vector among the ten that the reference implementation does not satisfy today. The divergence is also documented at [SPEC-extensions.md § CustomEvent `detail` and undefined preservation → "Reference implementation status (informative)"](SPEC-extensions.md#customevent-detail-and-undefined-preservation), [SPEC-extensions.md § Implementation-defined behavior](SPEC-extensions.md#implementation-defined-behavior-interop-variability-flag) (the "current implementation, not a complete conformance oracle" paragraph), and the README's remote-path callouts. Third-party implementers writing against the spec contract should treat the spec rule as authoritative and expect a future `@wc-bindable/remote` release to close the gap; consumers running 0.7.x today can read the cached `proxy.<name>` as the producer-intended-`undefined` recovery.
+> **⚠ Known divergence in the reference implementation.** `@wc-bindable/remote` 0.7.x does NOT pass this vector as written — its `update`-handling path dispatches `new CustomEvent(eventName, { detail: undefined })`, which WebIDL coerces to `detail: null`, so `bind()` callbacks observe `null` while `proxy.value` correctly reads `undefined`. This is the **only** vector among the fifteen that the reference implementation does not satisfy today. The divergence is also documented at [SPEC-extensions.md § CustomEvent `detail` and undefined preservation → "Reference implementation status (informative)"](SPEC-extensions.md#customevent-detail-and-undefined-preservation), [SPEC-extensions.md § Implementation-defined behavior](SPEC-extensions.md#implementation-defined-behavior-interop-variability-flag) (the "current implementation, not a complete conformance oracle" paragraph), and the README's remote-path callouts. Third-party implementers writing against the spec contract should treat the spec rule as authoritative and expect a future `@wc-bindable/remote` release to close the gap; consumers running 0.7.x today can read the cached `proxy.<name>` as the producer-intended-`undefined` recovery.
 
 **Setup.** Establish a remote proxy + producer pair through Step 5; let `sync` complete with `value: 1` for `"value"`. Then have the producer send a post-sync transition into `undefined`:
 
@@ -363,21 +368,252 @@ const sync = {
 
 ---
 
+### 11. onUpdate validity — non-function `onUpdate` throws `TypeError` synchronously
+
+> **Pass/fail bar — Level 2 only.** This vector is a hard pass/fail gate for `{2}` (the drop-in `@wc-bindable/core` JS API). A `{1O}` implementation that does not also claim `{2}` SHOULD pass it as written but MAY satisfy the underlying rule with a deferred-detection path that throws on the first `onUpdate` invocation instead — see the "Expected (Level 1O without a Level 2 claim)" section below for what that variant must still guarantee. Failing the Level 2 form against an implementation that claims `{2}` is a concrete conformance bug; the Level 1O-only form is informational and tracked separately.
+
+**Setup.** A perfectly valid bindable target and an `onUpdate` value that is not a function:
+
+```javascript
+class T extends EventTarget {
+  static wcBindable = {
+    protocol: "wc-bindable",
+    version: 1,
+    properties: [{ name: "value", event: "t:value-changed" }],
+  };
+}
+const target = new T();
+
+// A second target that is also valid but exposes the empty-properties shape —
+// this is the one where a deferred "fail at first dispatch" implementation
+// would never trip, and is what makes synchronous detection MUST at Level 2.
+class CommandOnly extends EventTarget {
+  static wcBindable = {
+    protocol: "wc-bindable",
+    version: 1,
+    properties: [],
+    commands:   [{ name: "doThing" }],
+  };
+}
+const commandOnly = new CommandOnly();
+```
+
+**Action.** For each of the targets above, call `bind(target, onUpdate)` with each of these `onUpdate` values:
+
+```javascript
+const BAD_ON_UPDATES = [undefined, null, "not a function", 42, {}, []];
+```
+
+**Expected (Level 2).** Every combination of `(target, onUpdate)` above MUST throw a synchronous `TypeError` at the `bind()` call site, **before any discovery, listener installation, or initial-sync read happens**. The recommended internal shape is a top-of-function `if (typeof onUpdate !== "function") throw new TypeError(...)`.
+
+- The throw MUST happen even for `commandOnly` (the empty-`properties` target) — that is the whole point of the synchronous-throw rule, since a deferred "fail on first dispatch" implementation would silently accept this case forever.
+- The throw MUST be observable on the `bind()` call frame (i.e. a `try { bind(...) } catch (e) { ... }` around the call MUST catch it).
+- No listener may be left attached on `target` after the throw, and the caller MUST NOT receive a cleanup function.
+
+**Expected (Level 1O without a Level 2 claim).** SHOULD throw synchronously; MAY defer to the first attempted invocation. An implementation that defers MUST still detect the bug at the first `onUpdate` invocation site (so that on a non-empty `properties` target, the initial-sync delivery surfaces the `TypeError`). Implementations that target the Level 2 drop-in API (every JS implementation that exposes itself as `@wc-bindable/core`) MUST use the synchronous form. See [SPEC.md § onUpdate validity](SPEC.md#onupdate-validity).
+
+The hazard is structural: an empty-`properties` target is the only call shape where a deferred-detection implementation can ship for years without ever throwing, so the vector exercises both shapes together.
+
+---
+
+### 12. Hostile discovery — accessors that throw return `undefined`, never propagate
+
+**Setup.** Three targets whose `constructor.wcBindable` walk fails in different places. Each is a separate sub-vector:
+
+```javascript
+// Sub-vector A — accessing `constructor.wcBindable` itself throws.
+const ctorThatThrows = new Proxy(class {}, {
+  get(target, prop) {
+    if (prop === "wcBindable") throw new Error("hostile constructor");
+    return Reflect.get(target, prop);
+  },
+});
+const targetA = Object.assign(Object.create(EventTarget.prototype), {
+  constructor: ctorThatThrows,
+  addEventListener() {}, removeEventListener() {},
+});
+
+// Sub-vector B — `wcBindable` exists but reading its `protocol` field throws.
+class HostileSchema extends EventTarget {
+  static wcBindable = Object.defineProperty({
+    version: 1,
+    properties: [{ name: "v", event: "t:v" }],
+  }, "protocol", { get() { throw new Error("hostile getter"); }, enumerable: true });
+}
+const targetB = new HostileSchema();
+
+// Sub-vector C — null-prototype constructor (no `wcBindable` lookup possible).
+const targetC = Object.assign(Object.create(null), {
+  addEventListener() {}, removeEventListener() {},
+});
+```
+
+**Action.** For each `target` in `[targetA, targetB, targetC]`, call `getWcBindableDeclaration(target)`, `isWcBindable(target)`, and `bind(target, () => {})`.
+
+**Expected.** For every sub-vector:
+- `getWcBindableDeclaration(target) === undefined` (no exception propagates)
+- `isWcBindable(target) === false`
+- `bind(target, () => {})` returns the non-bindable `() => {}` no-op cleanup; no listeners are installed (the hostile target never sees `addEventListener` called by the adapter)
+- No error reaches the test harness from any of the three calls — the helpers internalize every throw
+
+The discovery helper MUST wrap its entire validation body in a single `try / catch` (or equivalent guard) so that any access failure funnels to `return undefined`. Conformant implementations also snapshot each Schema-typed field into a local on first read within a validator function so the uniqueness gate cannot fall out of step with the type checks that share it — see [SPEC.md § Trust Boundaries](SPEC.md#trust-boundaries) → "Discovery itself touches the target." for the rationale and the explicit non-extension of that snapshotting across the validator → `bind()` pipeline.
+
+---
+
+### 13. Deferred initial sync — pre-connection events deliver before the deferred sync
+
+**Setup.** A bindable custom element that has been constructed but **not** yet appended to a document. Use `syncOn: "connect"`.
+
+> **Applicability of this vector.** A `{1O}` implementation MAY skip this vector **only** when the deferred path is not applicable under one of the spec-defined fallback conditions in [SPEC.md § Deferring the Initial Sync Until Connection](SPEC.md#deferring-the-initial-sync-until-connection):
+> - The runtime is non-browser and `HTMLElement` / `document` / `MutationObserver` are undefined (the deferred path's `typeof` guard short-circuits to `"call"`).
+> - The implementation profile does not claim `syncOn: "connect"` support and rejects or ignores it — this MUST be documented in the implementation's public API surface.
+> - The vector harness targets the non-`HTMLElement` short-circuit specifically (a headless `EventTarget` subclass, a synthetic proxy, an already-connected element).
+>
+> The unknown-`syncOn` fallback (an unrecognized string value collapsing to `"call"`) is **not** a valid skip reason — the caller here is passing the literal `"connect"`. A browser-runtime `{1O}` implementation that supports `syncOn: "connect"` against `HTMLElement` targets MUST pass this vector.
+
+```javascript
+class T extends HTMLElement {
+  static wcBindable = {
+    protocol: "wc-bindable",
+    version: 1,
+    properties: [{ name: "value", event: "t:value-changed" }],
+  };
+  set value(v) {
+    this._value = v;
+    this.dispatchEvent(new CustomEvent("t:value-changed", { detail: v }));
+  }
+  get value() { return this._value; }
+}
+customElements.define("t-deferred-sync", T);
+
+const target = new T();
+target.value = "initial";  // setter records _value, but no listener is attached yet
+
+const calls = [];
+const unbind = bind(target, (name, value) => { calls.push([name, value]); }, { syncOn: "connect" });
+```
+
+**Action.** Mutate the property via its setter on the still-unconnected target (which both updates `_value` *and* dispatches the change event in the same call), then append it to the document, then let the `MutationObserver` microtask run:
+
+```javascript
+target.value = "between-bind-and-connect";
+document.body.appendChild(target);
+// Wait one microtask turn for the deferred-sync observer callback to fire.
+await Promise.resolve();
+```
+
+**Expected.**
+- `calls.length === 2`
+- `calls[0]` corresponds to the pre-connection event the setter dispatched: `["value", "between-bind-and-connect"]`
+- `calls[1]` corresponds to the deferred initial sync, which reads `target.value` **at sync time**: `["value", "between-bind-and-connect"]` as well — the setter ran before connection, so the getter sees the post-mutation value when the deferred sync finally reads it
+- The deferred initial sync runs **after** the pre-connection event, not before — implementations that fire the initial sync first violate the ordering rule
+
+> **Why a property-setter mutation, not a bare `dispatchEvent`.** A bare `target.dispatchEvent(new CustomEvent("t:value-changed", { detail: X }))` would deliver `X` to `calls[0]` *but leave `_value` untouched*, so the deferred-sync read at `calls[1]` would observe the pre-bind `"initial"` instead of `X`. The vector exercises the spec's intended scenario where a producer-side state change is what raced ahead of connection, and the routing rule is "the event is delivered first; the deferred sync's later property-read wins for `calls[1]`". If you want to test the bare-`dispatchEvent` case explicitly, the expected `calls[1]` is `["value", "initial"]`, not `["value", X]` — the divergence between the event payload and the deferred read is precisely the inverse of `syncOn: "call"`'s "event payload is authoritative" rule.
+
+The deferred-sync read winning over a (hypothetical) divergent pre-connection event payload is the **opposite** of the call-mode "event payload is authoritative" rule, and is intentional — see [SPEC.md § Initial Value Synchronization → Ordering vs subsequent events](SPEC.md#ordering-vs-subsequent-events). Producers that need event-payload-wins semantics on an unconnected target MUST use `syncOn: "call"` from a host lifecycle hook.
+
+---
+
+### 14. Teardown — a cleanup callback that throws does NOT abort the remaining cleanups
+
+**Setup.** A bindable target with at least three declared properties; instrument `removeEventListener` so the **first** invocation throws but the rest succeed:
+
+```javascript
+class T extends EventTarget {
+  static wcBindable = {
+    protocol: "wc-bindable",
+    version: 1,
+    properties: [
+      { name: "a", event: "t:a" },
+      { name: "b", event: "t:b" },
+      { name: "c", event: "t:c" },
+    ],
+  };
+}
+const target = new T();
+
+// Track every successful removal.
+let removedCount = 0;
+const removedEventNames = [];
+const realRemove = target.removeEventListener.bind(target);
+let firstRemoveSeen = false;
+target.removeEventListener = (type, ...rest) => {
+  if (!firstRemoveSeen) {
+    firstRemoveSeen = true;
+    throw new Error("simulated cleanup failure on the first listener removed");
+  }
+  removedCount++;
+  removedEventNames.push(type);
+  realRemove(type, ...rest);
+};
+
+const unbind = bind(target, () => {});
+```
+
+**Action.** Call `unbind()` and observe both the thrown error (if any) and the removal tally.
+
+**Expected.**
+- `removedCount === 2` (the two listeners after the first one were all torn down despite the first removal throwing)
+- The set `removedEventNames` covers the two events for which removal succeeded; the order matches the registration order minus the failing one
+- The `unbind()` call MUST NOT propagate the cleanup-time error to the caller — secondary errors are swallowed per the "more confusing than useful" rule in [SPEC.md § Teardown Contract](SPEC.md#teardown-contract)
+- A second `unbind()` call MUST be a safe no-op (the closure-level `disposed` re-entry guard is set on first invocation regardless of which individual cleanups threw)
+
+The same shape applies to a throwing `MutationObserver.disconnect()` under `syncOn: "connect"` — the adapter MUST still tear down its event listeners.
+
+---
+
+### 15. Reserved names — `@wc-bindable/` prefix rejects at proxy / shell construction
+
+**Setup.** Three declarations, each placing the reserved prefix on a different facet:
+
+```javascript
+const RESERVED_PROPERTIES = {
+  protocol: "wc-bindable",
+  version: 1,
+  properties: [{ name: "@wc-bindable/value", event: "t:value-changed" }],
+};
+
+const RESERVED_INPUTS = {
+  protocol: "wc-bindable",
+  version: 1,
+  properties: [{ name: "value", event: "t:value-changed" }],
+  inputs:     [{ name: "@wc-bindable/url" }],
+};
+
+const RESERVED_COMMANDS = {
+  protocol: "wc-bindable",
+  version: 1,
+  properties: [{ name: "value", event: "t:value-changed" }],
+  commands:   [{ name: "@wc-bindable/dispose" }],
+};
+```
+
+**Action.** For each declaration, attempt both ends of the wire:
+- **Consumer side.** Construct the implementation's consumer-side remote proxy with the declaration and a recording transport (a stub that records every outbound send).
+- **Producer side.** Construct the implementation's producer-side remote shell with a core that exposes the declaration as `constructor.wcBindable` and the same kind of recording transport.
+
+> The protocol pins the wire-level method names (`set`, `setWithAck`, `invoke`, the message `type` discriminator) as normative but does **not** pin the JavaScript factory names third-party implementations must use to construct the proxy / shell — see [SPEC-extensions.md § Extension 2](SPEC-extensions.md#extension-2--wire-format-remote-proxying). Third-party implementers should target the abstract construction step above; only the *behavior* (synchronous throw, zero outbound messages) is normative. For the reference implementation, these are `createRemoteCoreProxy(declaration, transport)` on the consumer side and `new RemoteShellProxy(coreWithDecl, transport)` on the producer side.
+
+**Expected.** For every declaration and every side:
+- Construction MUST throw synchronously with an error that names the reserved prefix (or otherwise clearly identifies the rejection reason); the call site sees the throw on its own frame
+- No reference to the constructed proxy / shell is returned to the caller — the failure is total
+- The transport stub MUST observe **zero** outbound messages — rejection happens at construction, before any `sync` request is sent
+- If the consumer-side proxy somehow advances past construction (non-conformant), the producer's per-message reserved-name gate MUST still reject any wire frame whose `name` is reserved; this is the defense-in-depth check called out in [SPEC-extensions.md § Reserved names](SPEC-extensions.md#reserved-names) and the producer-side dispatcher footnote
+
+The reserved-name rule pins **only** the `@wc-bindable/` prefix as cross-implementation; implementations MAY reserve additional names (e.g. `__proto__`, vendor prefixes) and MUST document those additions in their public API. Cross-implementation vectors that target the implementation-specific extras MUST branch on the implementation's documented list — only the `@wc-bindable/` prefix is portable.
+
+---
+
 ## What this list does NOT cover
 
-These ten vectors are deliberately narrow — they target rules that are easy to violate in ways that pass naive smoke tests. They are **not** a complete conformance suite. Additional areas worth covering in a richer test corpus:
+These vectors are deliberately narrow — they target rules that are easy to violate in ways that pass naive smoke tests. They are **not** a complete conformance suite. Additional areas worth covering in a richer test corpus:
 
-- **Non-function `onUpdate` synchronous `TypeError`** at `bind()` entry (Level 2 MUST; Level 1O SHOULD). The hazard is exactly the "compiles, passes smoke tests, only bites on the empty-`properties` target where deferred detection never fires" pattern that motivates the rest of this file — strong candidate for vectorization in the next round. See [SPEC.md § onUpdate validity](SPEC.md#onupdate-validity).
-- **Hostile-accessor `getWcBindableDeclaration()` MUST NOT throw.** Vectors 1 / 2 cover *duplicate-name* and *malformed-attribute* declarations but not the case where reading the descriptor itself throws (a Proxy `wcBindable` whose `protocol` getter raises; a `name` getter that throws on access; a null-prototype `constructor`). The discovery helper's "MUST NOT throw — return `undefined` on any access failure" is the rule that keeps `isWcBindable` safe to call on stray inputs, and it is not currently exercised. Strong candidate for vectorization. See [SPEC.md § Discovery API](SPEC.md#discovery-api).
-- **`syncOn: "connect"` deferred-sync ordering** (events that arrive between bind and connection)
 - **Shadow-DOM attach** under `syncOn: "connect"` (the documented "observer doesn't traverse shadow roots" limitation)
 - **Re-entrant `dispatchEvent` from a property getter** during initial sync (the producer-side MUST NOT rule)
 - **`AbortSignal` pre-aborted at `setWithAckOptions` / `invokeWithOptions` call time** (rejects immediately without sending)
 - **Late `return` / `throw` envelope after timeout / abort** (consumer MUST drop, MUST NOT re-settle)
-- **Reserved-name declarations** at proxy construction (MUST throw — and per § Reserved names "Normative minimum", the `@wc-bindable/` prefix specifically is reservable across implementations, so this vector is portable without per-impl branching)
 - **Declaration fingerprint mismatch** on `sync` (MUST log warn, MUST continue accepting)
 - **`getterFailures` semantics** — MUST log, MUST NOT touch cache, MUST NOT dispatch
-- **Cleanup-callback that itself throws** during the consumer-invoked unbind (other cleanups MUST still run)
 - **`MutationObserver` callback after host detach** under `syncOn: "connect"` (observer rechecks `isConnected`, stays armed)
 
 Implementations targeting full conformance should grow their own test suite to cover at minimum the items above; the in-tree tests under `packages/core/tests/` and `packages/remote/tests/` cover much of this space and can be used as a starting reference.
