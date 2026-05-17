@@ -686,15 +686,20 @@ transport.emitInbound({
   capabilities: { setAck: false },
 });
 
-// Flush a microtask turn so the proxy's sync-response handler completes
-// and drains the queue (emitting the `cmd` envelope for invoke("fetch"))
-// before we inspect the outbound list. Without this, the `find()` below
-// can race the proxy's microtask scheduler in some harnesses and observe
-// the outbound list before the cmd has been pushed. The vector's
-// settleOrder expectation likewise depends on the setWithAck rejection
-// settling before we inject the return — this await pins both orderings
-// to the post-sync-handler frame.
-await Promise.resolve();
+// Flush queued microtasks AND one macrotask turn so the proxy's
+// sync-response handler completes, drains the queue (emitting the `cmd`
+// envelope for invoke("fetch")), and settles the queued setWithAck's
+// already-rejected Promise — in that order — before we inspect outbound
+// state and inject the return below. A single `await Promise.resolve()`
+// is enough for the common "one microtask hop" implementation, but a
+// proxy that uses two microtask hops internally (e.g. queue drain
+// scheduled as a microtask that itself schedules per-call microtasks)
+// could observe the outbound list before the cmd has been pushed AND
+// settle setWithAck after the return injection — both flip the
+// settleOrder expectation. The setTimeout(0) form below pins both
+// orderings to the post-handler frame across any reasonable scheduler
+// (matches the same defensive pattern used in vector 13).
+await new Promise((resolve) => setTimeout(resolve, 0));
 
 // After the sync response is processed, the proxy must respond to the
 // pending `cmd` envelope it sent for `invoke("fetch")`.
@@ -812,8 +817,13 @@ await new Promise((resolve) => setTimeout(resolve, 0));
 // A subsequent normal call MUST still work — the late drop is per-id,
 // not a connection-level failure. Inject the matching return explicitly
 // so the vector is executable end-to-end against a recording transport.
+// Capture the outbound count BEFORE issuing the follow-up so we match
+// the follow-up's `cmd` rather than any pre-existing cmd("fetch") that
+// a longer test scenario might have left in the recording transport.
+const outboundBefore = transport.outboundMessages().length;
 const followUpPromise = proxy.invoke("fetch");
 const outboundCmd = transport.outboundMessages()
+  .slice(outboundBefore)
   .find((m) => m.type === "cmd" && m.name === "fetch");
 transport.emitInbound({ type: "return", id: outboundCmd.id, value: null });
 const followUp = await followUpPromise;
