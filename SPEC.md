@@ -853,7 +853,7 @@ Adapters **SHOULD NOT** wrap getter calls in try/catch unless they re-throw the 
 
 ### `bind()` state machine summary
 
-The rules in §§ [Discovery API](#discovery-api), [Teardown Contract](#teardown-contract), [Initial Value Synchronization](#initial-value-synchronization), and [onUpdate validity](#onupdate-validity) combine into a small state machine on each `bind()` call. This table is **non-normative** — the linked sections are authoritative — but it gives third-party implementers a single place to verify "which state is my `bind()` invocation in and which transitions are legal." The state names here are descriptive, not normatively pinned, so an implementation that uses different internal names is still conformant as long as the observable transitions match.
+The observable transition rules in §§ [Discovery API](#discovery-api), [Teardown Contract](#teardown-contract), [Initial Value Synchronization](#initial-value-synchronization), and [onUpdate validity](#onupdate-validity) are **normative** — those linked sections are authoritative for what each `bind()` invocation must obey. The table below is a **non-normative index** of those rules, collected as a small state machine so third-party implementers have a single place to verify "which state is my `bind()` invocation in and which transitions are legal." The state names here are descriptive only, not normatively pinned, so an implementation that uses different internal names is still conformant as long as the observable transitions match.
 
 | State | Entry condition | Behavior in state | Permitted exits |
 |---|---|---|---|
