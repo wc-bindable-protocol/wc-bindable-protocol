@@ -44,6 +44,10 @@ Compound shorthand: `{1O, 2}` means "Level 1 observer facet + Level 2"; `{3-cons
 | 13 | Deferred sync ordering | `{1O}` for general-purpose browser JS implementations targeting `HTMLElement` with `syncOn: "connect"`. MAY be skipped **only** under the spec-defined fallback conditions: non-browser runtime without DOM globals, non-`HTMLElement` / synthetic / already-connected target, or an explicitly scoped profile that documents non-support of browser DOM deferred-sync. A `{1O}` implementation **SHOULD NOT** skip this vector merely by ignoring `syncOn: "connect"` — see body | Under `syncOn: "connect"`, a setter-driven property mutation on the still-unconnected target (which dispatches the change event as a side effect) MUST surface the event to `onUpdate` first; the deferred initial sync runs afterward and delivers `target[prop.name]` as read at connection time | [SPEC.md § Initial Value Synchronization → Ordering vs subsequent events](SPEC.md#ordering-vs-subsequent-events) |
 | 14 | Cleanup-throw containment | `{1O, 2}` (and any 1O implementation that hands a cleanup function back to the caller) | If the first listener removal in the cleanup chain throws (hostile `removeEventListener`), the remaining listeners and `MutationObserver`s registered by the same `bind()` call MUST still be torn down; the secondary cleanup-time error is swallowed | [SPEC.md § Teardown Contract](SPEC.md#teardown-contract) (the "MUST continue running the remaining cleanup callbacks" paragraph) |
 | 15 | Reserved names | `{3-consumer}` and `{3-producer}` (and `{3-both}`) | A declaration containing a `properties` / `inputs` / `commands` `name` that begins with `@wc-bindable/` MUST cause the consumer-side proxy constructor and the producer-side shell constructor to throw synchronously with a clear error; no wire traffic MUST be sent for such a name even if validation is bypassed | [SPEC-extensions.md § Reserved names](SPEC-extensions.md#reserved-names) (Normative minimum) |
+| 16 | Queue not transactional | `{3-consumer}` and `{3-both}` | A queued `setWithAck` whose settlement rejects does NOT cancel a queued `invoke` issued after it; FIFO replay preserves order, not dependency | [SPEC-extensions.md § Pre-sync call state machine](SPEC-extensions.md#pre-sync-call-state-machine) ("Queue ordering is not transactional") |
+| 17 | `set` pre-sync queue | `{3-consumer}` and `{3-both}` | Pre-sync fire-and-forget `set` SHOULD queue with id-bearing calls so caller order is preserved across mixed traffic (default profile). A low-latency-profile implementation MAY send `set` immediately and MUST document the choice in its public API surface. Both profiles MUST throw synchronously from `set()` on declared-name / JsonValue validation failure | [SPEC-extensions.md § Pre-sync call state machine](SPEC-extensions.md#pre-sync-call-state-machine) (`set` row) |
+| 18 | Late envelope drop | `{3-consumer}` and `{3-both}` | A `return` / `throw` envelope arriving for an `id` whose pending entry has already timed out or been aborted MUST be silently dropped (with SHOULD warn-log); the consumer `Promise` MUST NOT re-settle | [SPEC-extensions.md § AckOptions](SPEC-extensions.md#ackoptions) |
+| 19 | Re-entrant getter dispatch | `{1O}` (any 1O-claiming bind implementation observing a non-conformant producer) | A producer-side property getter that synchronously dispatches its declared change event during initial sync produces a double `onUpdate` (dispatch-first, sync-second). The adapter MUST faithfully deliver both calls in that order; deduplication / detection / repair is NOT the adapter's job — the producer MUST NOT cause the re-entry | [SPEC.md § Event detail vs Property Read](SPEC.md#event-detail-vs-property-read) (producer-side rule) + [§ Producer Obligations](SPEC.md#producer-obligations) |
 
 ---
 
@@ -655,17 +659,205 @@ The reserved-name rule pins **only** the `@wc-bindable/` prefix as cross-impleme
 
 ---
 
+### 16. Pre-sync queue is FIFO but not transactional
+
+**Setup.** A remote proxy in PreSync (before its initial `sync` response arrives) with a recording client transport and a producer-stub that will respond to `sync` with `capabilities.setAck: false` — the legacy-producer path is the most reliable way to force a queued `setWithAck` to reject without needing a co-operating producer that throws on a specific setter:
+
+```javascript
+const transport = new RecordingTransport();
+const proxy = createRemoteCoreProxy(declaration, transport);
+// proxy is now in PreSync; no setWithAck / invoke wire traffic has been
+// sent yet (only the initial { type: "sync" } request).
+
+const settleOrder = [];
+const setPromise = proxy.setWithAck("url", "/api/users")
+  .then(() => settleOrder.push("setWithAck:resolved"))
+  .catch(() => settleOrder.push("setWithAck:rejected"));
+const invokePromise = proxy.invoke("fetch")
+  .then(() => settleOrder.push("invoke:resolved"))
+  .catch(() => settleOrder.push("invoke:rejected"));
+
+// Producer responds with legacy semantics (no setAck capability).
+transport.emitInbound({
+  type: "sync",
+  values: {},
+  capabilities: { setAck: false },
+});
+
+// After the sync response is processed, the proxy must respond to the
+// pending `cmd` envelope it sent for `invoke("fetch")`.
+const outboundCmd = transport.outboundMessages().find((m) => m.type === "cmd");
+transport.emitInbound({ type: "return", id: outboundCmd.id, value: null });
+
+await Promise.allSettled([setPromise, invokePromise]);
+```
+
+**Action.** Inspect `settleOrder` and the recorded outbound message list.
+
+**Expected.**
+- `settleOrder[0] === "setWithAck:rejected"` — the queued `setWithAck` rejects on sync arrival because the producer did not advertise `setAck` (per the legacy-rejection rule in § Pre-sync call state machine)
+- `settleOrder[1] === "invoke:resolved"` — the queued `invoke` is **NOT** auto-cancelled by the preceding rejection; it is sent on the wire after sync-response processing and resolves on the matching `return` envelope
+- The recorded outbound list contains exactly ONE `cmd` envelope for `"fetch"` and ZERO id-bearing `set` envelopes (the proxy MUST NOT send a `setWithAck` it knows the producer will not handle)
+
+**Variant — post-sync, producer-side assignment throws.** With a producer that advertises `setAck: true`, issue `await proxy.setWithAck("badInput", v)` (where the producer's setter throws on receipt) immediately followed by `proxy.invoke("fetch")` *without* awaiting the first. The `setWithAck` rejects via a `throw` envelope; the `invoke` STILL sends on the wire and STILL completes per its own rules. The same FIFO-without-dependency rule applies post-sync — the pre-sync case is just the most visible place the distinction matters.
+
+**Spec reference.** [SPEC-extensions.md § Pre-sync call state machine](SPEC-extensions.md#pre-sync-call-state-machine) → "Queue ordering is not transactional" paragraph (with the same `setWithAck("url"); invoke("fetch")` example) plus the section's final paragraph extending the rule symmetrically to the steady-state post-sync case.
+
+---
+
+### 17. Fire-and-forget `set` pre-sync queuing (default vs low-latency profile)
+
+**Setup.** A remote proxy in PreSync with a recording client transport, plus a known-input / known-command declaration:
+
+```javascript
+const transport = new RecordingTransport();
+const proxy = createRemoteCoreProxy(declaration, transport);
+
+proxy.setWithAck("url", "/api/users"); // call 1: id-bearing, queued
+proxy.set("method", "GET");             // call 2: fire-and-forget
+proxy.invoke("fetch");                   // call 3: id-bearing, queued
+
+// Inspect outbound state BEFORE sync (the default vs low-latency choice
+// is observable right here — see Expected below).
+const preSyncOutbound = transport.outboundMessages()
+  .filter((m) => m.type !== "sync");
+
+// Trigger sync to let the queue drain.
+transport.emitInbound({
+  type: "sync",
+  values: {},
+  capabilities: { setAck: true },
+});
+await new Promise((resolve) => setTimeout(resolve, 0));
+
+const postSyncOutbound = transport.outboundMessages()
+  .filter((m) => m.type !== "sync");
+```
+
+**Action.** Compare `preSyncOutbound` (what left the proxy before sync arrival) and `postSyncOutbound` (the full ordered outbound after queue drain).
+
+**Expected (default profile — SHOULD-queue, what the reference implementation does).**
+- `preSyncOutbound.length === 0` — all three calls (including the fire-and-forget `set`) are queued; nothing leaves the proxy until sync-response processing completes
+- `postSyncOutbound` is exactly three messages in caller order: `[set("url", id: X), set("method", no id), cmd("fetch", id: Y)]`
+- The relative order between `setWithAck("url")` and the fire-and-forget `set("method")` is preserved — the producer observes the inputs in exactly the order the consumer issued them
+
+**Expected (low-latency profile — MAY-immediate, a documented alternative).**
+- `preSyncOutbound` MAY contain the fire-and-forget `set("method", "GET")` — the implementation chose to send `set` immediately rather than queue. The id-bearing `setWithAck("url")` and `invoke("fetch")` MUST still queue (the immediate-send option is `set`-only).
+- `postSyncOutbound` then contains `[set("method", no id), set("url", id: X), cmd("fetch", id: Y)]` — note the reordering: the fire-and-forget `set` lands first because it bypassed the queue.
+- A low-latency-profile implementation MUST document this choice in its public API surface so consumers can audit before relying on caller-order-preserves-wire-order.
+
+**Cross-profile invariant (BOTH profiles MUST satisfy).** Validation throws in `set()` are call-site synchronous regardless of profile. A `set("not-a-declared-input", X)` (undeclared name) and a `set("validInput", { date: new Date() })` (non-`JsonValue` value) MUST both throw synchronously from the `set()` call itself; no message is queued, no message is sent, and the consumer learns about the bug at the call site rather than via a silent drop.
+
+**Spec reference.** [SPEC-extensions.md § Pre-sync call state machine](SPEC-extensions.md#pre-sync-call-state-machine) (`set` row in the per-call-site table) and the cross-profile validation-throw paragraph in the same table cell.
+
+---
+
+### 18. Late `return` after timeout MUST be dropped
+
+**Setup.** A `setWithAckOptions` with a short timeout against a proxy that has already finished sync handshake (so the message goes on the wire directly), plus the ability to inject a late inbound `return` envelope after the timeout fires:
+
+```javascript
+const transport = new RecordingTransport();
+const proxy = createRemoteCoreProxy(declaration, transport);
+
+// Bring the proxy to Active.
+transport.emitInbound({
+  type: "sync",
+  values: {},
+  capabilities: { setAck: true },
+});
+await new Promise((resolve) => setTimeout(resolve, 0));
+
+const settleSequence = [];
+const callPromise = proxy
+  .setWithAckOptions("url", "/api/users", { timeoutMs: 50 })
+  .then(() => settleSequence.push("resolved"))
+  .catch((err) => settleSequence.push(["rejected", err?.name]));
+
+// Capture the id the proxy assigned to this setWithAck on the wire.
+const outboundSet = transport.outboundMessages()
+  .find((m) => m.type === "set" && m.id !== undefined);
+const id = outboundSet.id;
+
+// Wait past the timeout — the proxy fires its local TimeoutError.
+await new Promise((resolve) => setTimeout(resolve, 100));
+// At this point settleSequence === [["rejected", "TimeoutError"]]
+
+// Inject the LATE `return` envelope referencing the same id.
+transport.emitInbound({ type: "return", id, value: null });
+await new Promise((resolve) => setTimeout(resolve, 0));
+
+// A subsequent normal call MUST still work — the late drop is per-id,
+// not a connection-level failure.
+const followUp = await proxy.invoke("fetch").catch((err) => err);
+// (assuming a co-operating producer that emits a matching return)
+```
+
+**Action.** Inspect `settleSequence`, any warn-level logger output, and the follow-up call's outcome.
+
+**Expected.**
+- `settleSequence.length === 1` and `settleSequence[0] === ["rejected", "TimeoutError"]` — the late `return` MUST NOT re-settle the already-rejected `Promise`
+- The proxy SHOULD log a warn-level message for the dropped late envelope so the unexpected late delivery is visible to diagnostics; the consumer's `Promise` MUST NOT throw or transition on the late delivery
+- The transport MUST NOT be closed by the late drop — subsequent `setWithAck` / `invoke` calls on the same proxy continue to work normally
+
+**Variant — `AbortSignal`-initiated cancellation.** The same shape applies when the caller's `AbortSignal` fires before the producer answers. The aborted call's pending entry is removed locally; a subsequent matching `return` / `throw` envelope MUST be silently dropped without re-settling the `Promise`. The cancellation is local-only — no wire-level cancellation is sent, so the producer keeps running the work and eventually emits an envelope that the late-drop rule then ignores.
+
+**Spec reference.** [SPEC-extensions.md § AckOptions](SPEC-extensions.md#ackoptions) → "After timeout or abort settles the caller's promise, the proxy MUST NOT re-settle it if a late `return` / `throw` envelope arrives for the same `id`" and the surrounding paragraph on warn-logging.
+
+---
+
+### 19. Producer re-entrant getter dispatch is a producer violation
+
+**Setup.** A producer whose declared-property getter synchronously dispatches the corresponding wc-bindable change event during the property read — exactly the case the producer MUST NOT cause per [SPEC.md § Event detail vs Property Read](SPEC.md#event-detail-vs-property-read) (producer-side rule blockquote) and the second-to-last bullet in [SPEC.md § Producer Obligations](SPEC.md#producer-obligations):
+
+```javascript
+class HostileProducer extends EventTarget {
+  static wcBindable = {
+    protocol: "wc-bindable",
+    version: 1,
+    properties: [{ name: "value", event: "h:value-changed" }],
+  };
+
+  // PRODUCER VIOLATION: synchronous re-entrant dispatch from the getter.
+  get value() {
+    this.dispatchEvent(
+      new CustomEvent("h:value-changed", { detail: "from-getter" }),
+    );
+    return "from-read";
+  }
+}
+const target = new HostileProducer();
+
+const calls = [];
+const unbind = bind(target, (name, value) => calls.push([name, value]));
+unbind();
+```
+
+**Action.** Inspect `calls` (the consumer's observed `onUpdate` delivery sequence).
+
+**Expected.**
+- `calls.length === 2` — the consumer observes BOTH the re-entrant dispatch AND the initial-sync read. The adapter MUST faithfully deliver both; deduplication / detection / repair is **NOT** the adapter's job (the producer is responsible for not causing the re-entry).
+- `calls[0]` is the listener-delivered event from the synchronous `dispatchEvent` inside the getter: `["value", "from-getter"]`.
+- `calls[1]` is the initial-sync read's `onUpdate` call observing the property's return: `["value", "from-read"]`.
+- The order is **dispatch-first, sync-second** because adapters MUST attach listeners *before* performing the initial-sync read (the registration-before-read rule, so no event is missed during the read), so the re-entrant dispatch fires the registered listener first and the initial-sync `onUpdate` runs after.
+
+**Conformance interpretation.** This is a **negative test on the producer**, not on the adapter. An adapter that suppresses the duplicate `onUpdate`, reorders the two calls, or otherwise "repairs" the double delivery is non-conformant — it is masking a producer bug that the spec deliberately makes observable so producer authors can detect it during testing. The conformant adapter behavior is the literal sequence above; the conformant producer behavior is to NOT define such a getter (and, if a side effect like a sensor materialization is unavoidable, to perform it on construction / in a dedicated initializer instead of inside the getter — see the § Producer Obligations "side-effect-free with respect to wc-bindable change events" bullet).
+
+**Spec reference.** [SPEC.md § Event detail vs Property Read](SPEC.md#event-detail-vs-property-read) (producer-side rule blockquote) + [SPEC.md § Producer Obligations](SPEC.md#producer-obligations) ("avoid synchronously dispatching" and "side-effect-free" bullets).
+
+---
+
 ## What this list does NOT cover
 
 These vectors are deliberately narrow — they target rules that are easy to violate in ways that pass naive smoke tests. They are **not** a complete conformance suite. Additional areas worth covering in a richer test corpus:
 
 - **Shadow-DOM attach** under `syncOn: "connect"` (the documented "observer doesn't traverse shadow roots" limitation)
-- **Re-entrant `dispatchEvent` from a property getter** during initial sync (the producer-side MUST NOT rule)
-- **`AbortSignal` pre-aborted at `setWithAckOptions` / `invokeWithOptions` call time** (rejects immediately without sending)
-- **Late `return` / `throw` envelope after timeout / abort** (consumer MUST drop, MUST NOT re-settle)
+- **`AbortSignal` pre-aborted at `setWithAckOptions` / `invokeWithOptions` call time** (rejects immediately without sending — distinct from vector 18's "aborted/timed-out after send" case, which IS covered)
 - **Declaration fingerprint mismatch** on `sync` (MUST log warn, MUST continue accepting)
 - **`getterFailures` semantics** — MUST log, MUST NOT touch cache, MUST NOT dispatch
 - **`MutationObserver` callback after host detach** under `syncOn: "connect"` (observer rechecks `isConnected`, stays armed)
+- **Reconnect after TerminalFailure** — `reconnect(transport)` MUST send a fresh `sync` and MUST throw if the proxy is already disposed or the existing transport is still active (implementations that omit `reconnect()` entirely are conformant; vector applies only to those that ship it)
+- **`set` synchronously throws on terminal transport** but MUST NOT throw on a transient outage — the exact line between the two is transport-implementation-defined and best tested per-transport
 
 Implementations targeting full conformance should grow their own test suite to cover at minimum the items above; the in-tree tests under `packages/core/tests/` and `packages/remote/tests/` cover much of this space and can be used as a starting reference.
 
