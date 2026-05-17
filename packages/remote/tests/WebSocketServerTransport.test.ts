@@ -462,4 +462,90 @@ describe("WebSocketServerTransport", () => {
 
     expect(onClose).toHaveBeenCalledTimes(1);
   });
+
+  describe("maxFrameBytes (SPEC-extensions.md § Wire framing and encoding rule 3 MUST)", () => {
+    it("drops inbound frames exceeding the configured limit before JSON.parse", () => {
+      const ws = new MockBrowserWebSocket(WebSocket.OPEN);
+      const warnCalls: unknown[][] = [];
+      const transport = new WebSocketServerTransport(
+        ws as unknown as Parameters<typeof WebSocketServerTransport>[0],
+        {
+          maxFrameBytes: 64,
+          logger: {
+            warn: (...args: unknown[]) => warnCalls.push(args),
+            error: () => {},
+          },
+        },
+      );
+      const onMessage = vi.fn();
+      transport.onMessage(onMessage);
+
+      // 128-byte payload exceeds the 64-byte limit; must drop + warn-log,
+      // never reach onMessage.
+      const oversizedPayload = JSON.stringify({ type: "set", name: "url", value: "x".repeat(120) });
+      expect(oversizedPayload.length).toBeGreaterThan(64);
+      ws.emit("message", { data: oversizedPayload });
+
+      expect(onMessage).not.toHaveBeenCalled();
+      expect(warnCalls.length).toBe(1);
+      expect(warnCalls[0]?.[0]).toMatch(/exceeds maxFrameBytes=64/);
+    });
+
+    it("accepts frames at or below the configured limit and stays open after drops", () => {
+      const ws = new MockBrowserWebSocket(WebSocket.OPEN);
+      const transport = new WebSocketServerTransport(
+        ws as unknown as Parameters<typeof WebSocketServerTransport>[0],
+        {
+          maxFrameBytes: 256,
+          logger: { warn: () => {}, error: () => {} },
+        },
+      );
+      const onMessage = vi.fn();
+      transport.onMessage(onMessage);
+
+      // Oversized: dropped.
+      ws.emit("message", {
+        data: JSON.stringify({ type: "set", name: "url", value: "x".repeat(500) }),
+      });
+      // Well within limit: processed normally.
+      const okMsg = { type: "sync" };
+      ws.emit("message", { data: JSON.stringify(okMsg) });
+
+      expect(onMessage).toHaveBeenCalledTimes(1);
+      expect(onMessage).toHaveBeenCalledWith(okMsg);
+    });
+
+    it("defaults to 1 MiB when maxFrameBytes is omitted (spec-pinned baseline)", () => {
+      const ws = new MockBrowserWebSocket(WebSocket.OPEN);
+      const transport = new WebSocketServerTransport(
+        ws as unknown as Parameters<typeof WebSocketServerTransport>[0],
+        { logger: { warn: () => {}, error: () => {} } },
+      );
+      const onMessage = vi.fn();
+      transport.onMessage(onMessage);
+
+      // 2 MiB payload exceeds the 1 MiB spec default; must be dropped even
+      // with no explicit maxFrameBytes option set.
+      ws.emit("message", {
+        data: JSON.stringify({ type: "set", name: "url", value: "x".repeat(2 * 1024 * 1024) }),
+      });
+      expect(onMessage).not.toHaveBeenCalled();
+    });
+
+    it("rejects construction when maxFrameBytes is invalid", () => {
+      const ws = new MockBrowserWebSocket(WebSocket.OPEN);
+      expect(
+        () => new WebSocketServerTransport(
+          ws as unknown as Parameters<typeof WebSocketServerTransport>[0],
+          { maxFrameBytes: -1 },
+        ),
+      ).toThrow(/maxFrameBytes must be a positive integer/);
+      expect(
+        () => new WebSocketServerTransport(
+          ws as unknown as Parameters<typeof WebSocketServerTransport>[0],
+          { maxFrameBytes: 1.5 },
+        ),
+      ).toThrow(/maxFrameBytes must be a positive integer/);
+    });
+  });
 });

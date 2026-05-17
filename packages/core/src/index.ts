@@ -38,21 +38,47 @@ export type WcBindableConstructor = (new (...args: unknown[]) => EventTarget) & 
   wcBindable: WcBindableDeclaration;
 };
 
-export interface WcBindableElement extends EventTarget {
-  constructor: WcBindableConstructor;
+/**
+ * Structural type narrowed by `isWcBindable()`. Requires only the
+ * consumer-side EventTarget surface (`addEventListener` /
+ * `removeEventListener`) plus a `constructor.wcBindable` declaration —
+ * `dispatchEvent` is intentionally NOT required so a relay-only proxy that
+ * re-emits events through its own internal channel can still be a valid
+ * bind target. See SPEC.md § Overview for the consumer-vs-producer split.
+ */
+export interface WcBindableElement {
+  addEventListener(
+    type: string,
+    listener: EventListenerOrEventListenerObject | null,
+    options?: boolean | AddEventListenerOptions,
+  ): void;
+  removeEventListener(
+    type: string,
+    listener: EventListenerOrEventListenerObject | null,
+    options?: boolean | EventListenerOptions,
+  ): void;
+  readonly constructor: WcBindableConstructor;
 }
 
 /**
- * Lowest protocol version this adapter is compatible with. The check is
- * `decl.version >= MIN_COMPATIBLE_VERSION`, so this is a minimum, not a
- * maximum — see SPEC.md § Versioning for the forward-compatibility policy.
+ * Lowest protocol version any declaration may carry. Fixed at `1` for the
+ * `"wc-bindable"` protocol identifier and **NOT** adapter-specific —
+ * within a given `protocol` identifier, breaking changes require a new
+ * identifier rather than a version bump, so any version `>= 1` must be
+ * accepted by every adapter regardless of when the adapter was built.
+ * See SPEC.md § Versioning for the forward-compatibility policy.
  */
 export const MIN_COMPATIBLE_VERSION = 1;
 
 /**
  * @deprecated v0.7.0 alias kept for source compatibility. Use
- * {@link MIN_COMPATIBLE_VERSION} — the name reflects the actual semantics
- * (`decl.version >= MIN_COMPATIBLE_VERSION`). Scheduled for removal in v1.0.
+ * {@link MIN_COMPATIBLE_VERSION}. Scheduled for removal in v1.0.
+ *
+ * Historical note: this constant was originally intended to gate "the
+ * highest protocol version this adapter understands", which the
+ * forward-compatibility policy explicitly disallows. The check has always
+ * been `decl.version >= MIN_COMPATIBLE_VERSION`, and `MIN_COMPATIBLE_VERSION`
+ * is now pinned to the protocol-wide minimum (`1`).
  */
 export const SUPPORTED_PROTOCOL_VERSION = MIN_COMPATIBLE_VERSION;
 
@@ -61,8 +87,26 @@ const DEFAULT_GETTER = (e: Event): unknown => (e as CustomEvent).detail;
 /**
  * Read the wc-bindable declaration off `target` via the protocol's sole
  * discovery path (`target.constructor.wcBindable`). Returns the declaration
- * if it is shaped like a valid wc-bindable contract, or `undefined`
- * otherwise.
+ * if it is a fully valid wc-bindable contract, or `undefined` otherwise.
+ *
+ * Validation performed:
+ *   - `protocol === "wc-bindable"`
+ *   - `version` is an integer `>= MIN_COMPATIBLE_VERSION`
+ *   - `properties` is an array; every entry has a string `name` and string
+ *     `event`; `getter` (if present) is a function
+ *   - `inputs` / `commands` (if present) are arrays of objects with string `name`s
+ *   - `name`s are unique within `properties`, within `inputs`, and within `commands`
+ *
+ * Because the validation is *complete*, the helper doubles as the single
+ * source of truth for "is this target protocol-valid / bindable" —
+ * `isWcBindable()` is exactly `getWcBindableDeclaration(target) !== undefined`,
+ * and no declaration that survives this filter will silently no-op inside
+ * `bind()`. "Protocol-valid / bindable" is NOT a security predicate: a
+ * declaration that passes this check can still carry a `getter` that runs
+ * in the consumer's JS context, and discovery itself performs JS property
+ * access on the target (Proxy traps / accessor side effects fire). See
+ * SPEC.md § Trust Boundaries and § Protocol Model and Assumptions →
+ * Trust model for the threat-model statement.
  *
  * Prefer this helper over reading `target.constructor.wcBindable`
  * directly. The helper centralizes the discovery rule so future protocol
@@ -71,17 +115,95 @@ const DEFAULT_GETTER = (e: Event): unknown => (e as CustomEvent).detail;
  * package, `isWcBindable()` and `bind()` both go through this helper.
  */
 export function getWcBindableDeclaration(
-  target: EventTarget,
+  target: unknown,
 ): WcBindableDeclaration | undefined {
-  const decl = (target.constructor as { wcBindable?: WcBindableDeclaration }).wcBindable;
-  if (decl?.protocol !== "wc-bindable") return undefined;
-  if (typeof decl.version !== "number" || !Number.isInteger(decl.version)) return undefined;
-  if (decl.version < MIN_COMPATIBLE_VERSION) return undefined;
-  if (!Array.isArray(decl.properties)) return undefined;
-  return decl;
+  // SPEC.md § Discovery API contract: the parameter is `unknown` precisely
+  // so callers can probe arbitrary inputs (a stray null, a plain object,
+  // a Map, …) without first having to coerce to EventTarget. This helper
+  // MUST NOT throw on ANY input shape — not only hostile Proxy targets
+  // whose `get` traps throw on `target` property access, but also hostile
+  // declaration / descriptor objects whose getters throw (e.g. a Proxy
+  // `wcBindable` whose `protocol` getter raises, a Proxy property
+  // descriptor whose `name` getter raises). The whole body therefore
+  // lives inside a single try/catch — any thrown access during
+  // validation funnels to the same `return undefined`.
+  try {
+    if (target === null || (typeof target !== "object" && typeof target !== "function")) {
+      return undefined;
+    }
+    const addListener = (target as { addEventListener?: unknown }).addEventListener;
+    const removeListener = (target as { removeEventListener?: unknown }).removeEventListener;
+    const ctor = (target as { constructor?: { wcBindable?: WcBindableDeclaration } }).constructor;
+    const decl = ctor?.wcBindable;
+
+    // SPEC.md § Overview pins EventTarget as the minimum consumer-side
+    // capability. Reject targets that satisfy the declaration schema but
+    // cannot actually be bound to — without this, `bind()` would throw
+    // on `addEventListener` later, defeating the "discovery == bindability"
+    // contract.
+    if (typeof addListener !== "function" || typeof removeListener !== "function") return undefined;
+    if (decl?.protocol !== "wc-bindable") return undefined;
+    if (typeof decl.version !== "number" || !Number.isInteger(decl.version)) return undefined;
+    if (decl.version < MIN_COMPATIBLE_VERSION) return undefined;
+    if (!Array.isArray(decl.properties)) return undefined;
+    if (!isValidNamedList(decl.properties, isValidPropertyDescriptor)) return undefined;
+    if (decl.inputs !== undefined && !isValidNamedList(decl.inputs, isValidInputDescriptor)) return undefined;
+    if (decl.commands !== undefined && !isValidNamedList(decl.commands, isValidCommandDescriptor)) return undefined;
+
+    return decl;
+  } catch {
+    return undefined;
+  }
 }
 
-export function isWcBindable(target: EventTarget): target is WcBindableElement {
+function isValidPropertyDescriptor(p: unknown): p is WcBindableProperty {
+  if (!p || typeof p !== "object") return false;
+  const pp = p as Partial<WcBindableProperty>;
+  if (typeof pp.name !== "string" || pp.name.length === 0) return false;
+  if (typeof pp.event !== "string" || pp.event.length === 0) return false;
+  if (pp.getter !== undefined && typeof pp.getter !== "function") return false;
+  return true;
+}
+
+function isValidInputDescriptor(p: unknown): p is WcBindableInput {
+  if (!p || typeof p !== "object") return false;
+  const pp = p as Partial<WcBindableInput>;
+  if (typeof pp.name !== "string" || pp.name.length === 0) return false;
+  // `attribute` is a Schema-defined optional field of type `string`. Core
+  // never interprets it (see SPEC-extensions.md), but its declared type
+  // is still part of the wcBindable schema — a non-string value here is
+  // an invalid declaration even though core would otherwise ignore the
+  // field. Validating it keeps "isWcBindable === true ⇒ schema is well-
+  // formed" honest.
+  if (pp.attribute !== undefined && typeof pp.attribute !== "string") return false;
+  return true;
+}
+
+function isValidCommandDescriptor(p: unknown): p is WcBindableCommand {
+  if (!p || typeof p !== "object") return false;
+  const pp = p as Partial<WcBindableCommand>;
+  if (typeof pp.name !== "string" || pp.name.length === 0) return false;
+  // Same rationale as `attribute` above: `async` is a Schema-typed
+  // optional boolean. Type-validate it even though core never reads it.
+  if (pp.async !== undefined && typeof pp.async !== "boolean") return false;
+  return true;
+}
+
+function isValidNamedList<T extends { name: string }>(
+  list: unknown,
+  isValidEntry: (entry: unknown) => entry is T,
+): list is T[] {
+  if (!Array.isArray(list)) return false;
+  const seen = new Set<string>();
+  for (const entry of list) {
+    if (!isValidEntry(entry)) return false;
+    if (seen.has(entry.name)) return false; // duplicate name within the list
+    seen.add(entry.name);
+  }
+  return true;
+}
+
+export function isWcBindable(target: unknown): target is WcBindableElement {
   return getWcBindableDeclaration(target) !== undefined;
 }
 
@@ -98,9 +220,19 @@ export interface BindOptions {
    *   connected to a document, defer the initial-value read until the
    *   element becomes connected (i.e. after `connectedCallback` has run).
    *   For headless `EventTarget`s and already-connected elements, behaves
-   *   like `"call"`. Useful when `bind()` is called before
-   *   `appendChild()` / `customElement.upgrade()` so the read sees the
-   *   post-connection state.
+   *   like `"call"`.
+   *
+   *   **Read this as `"light-dom-connect"`.** The option is narrowly
+   *   scoped — it observes via a `MutationObserver` on the top-level
+   *   `document`, which (a) does NOT traverse shadow roots, so a target
+   *   appended into a shadow tree never fires the deferred sync, and
+   *   (b) installs one document-wide observer per deferred bind. It is
+   *   the right tool for one specific use case: a caller that has an
+   *   `el` reference it will hand to a host (`document.body.appendChild`,
+   *   `van.add`, MobX root mount) at a later point and does not want to
+   *   sequence "append before bind" manually. It is NOT a general-purpose
+   *   lifecycle abstraction; prefer the default `"call"` from inside a
+   *   framework's mounted lifecycle hook whenever you have one.
    *
    *   Implementation detail: connection is detected via a `MutationObserver`
    *   on the top-level `document`. `MutationObserver` does NOT traverse
@@ -130,52 +262,99 @@ const MutationObserverCtor: typeof MutationObserver | undefined =
   typeof MutationObserver !== "undefined" ? MutationObserver : undefined;
 
 export function bind(
-  target: EventTarget,
+  target: unknown,
   onUpdate: (name: string, value: unknown) => void,
   options?: BindOptions,
 ): UnbindFn {
+  // Programmer error: a non-function onUpdate cannot be reached for an
+  // empty-properties target (no event would ever fire it), so defer-and-let-
+  // it-throw would silently accept the bug. Reject it synchronously here.
+  // See SPEC.md § onUpdate validity.
+  if (typeof onUpdate !== "function") {
+    throw new TypeError("bind: onUpdate must be a function");
+  }
+  // Discovery performs the full schema validation (descriptor shapes,
+  // name-uniqueness within properties/inputs/commands). A declaration that
+  // survives this check is protocol-valid and accepted by bind() without
+  // further validation here — there is no path where isWcBindable() returns
+  // true but bind() silently no-ops on the same target. "Protocol-valid"
+  // is not a security predicate (see SPEC.md § Trust Boundaries).
   const decl = getWcBindableDeclaration(target);
   if (decl === undefined) return () => {};
-  // Reject declarations with duplicate property names rather than producing
-  // double dispatch. SPEC.md classifies this as an invalid declaration; the
-  // adapter MAY treat the target as non-bindable. See SPEC.md § Property
-  // Descriptor.
-  const seen = new Set<string>();
-  for (const prop of decl.properties) {
-    if (seen.has(prop.name)) return () => {};
-    seen.add(prop.name);
-  }
+  // After the discovery guard, `target` is known to expose
+  // addEventListener / removeEventListener (the helper's EventTarget
+  // capability check), so the assertion below is safe — narrowing
+  // `unknown` to EventTarget without re-checking.
+  const et = target as EventTarget;
 
   const { properties } = decl;
   const cleanups: (() => void)[] = [];
   let disposed = false;
 
-  for (const prop of properties) {
-    const getter = prop.getter ?? DEFAULT_GETTER;
-    const handler = (event: Event) => onUpdate(prop.name, getter(event));
-    target.addEventListener(prop.event, handler);
-    cleanups.push(() => target.removeEventListener(prop.event, handler));
-  }
+  // Run an arbitrary function and, if it throws, tear down every cleanup
+  // installed so far before rethrowing. Used to wrap BOTH the listener
+  // registration loop (a `Proxy`-wrapped addEventListener can throw via
+  // a `get` trap on the registry method — see SPEC.md § Overview, which
+  // permits relay / Proxy wrappers as valid bind targets) AND the
+  // synchronous initial-sync pass (a property's `in` trap, a getter, or
+  // the consumer's `onUpdate` callback can throw). Without this wrapper,
+  // a throw at registration leaves N-1 listeners attached without ever
+  // returning the unbind function to the caller — a permanent leak.
+  const runOrCleanup = (fn: () => void) => {
+    try {
+      fn();
+    } catch (err) {
+      disposed = true;
+      cleanups.forEach((c) => {
+        try { c(); } catch { /* swallow secondary errors during cleanup */ }
+      });
+      throw err;
+    }
+  };
 
+  runOrCleanup(() => {
+    for (const prop of properties) {
+      const getter = prop.getter ?? DEFAULT_GETTER;
+      const handler = (event: Event) => onUpdate(prop.name, getter(event));
+      et.addEventListener(prop.event, handler);
+      cleanups.push(() => et.removeEventListener(prop.event, handler));
+    }
+  });
+
+  // initialSync may throw if:
+  //   - a property's `name in target` trap (e.g. on a Proxy) throws,
+  //   - reading `target[prop.name]` invokes a getter that throws, or
+  //   - the consumer's `onUpdate` callback throws.
+  // Wrapped in the same runOrCleanup as the registration loop above so
+  // listeners and any deferred-sync observer are torn down before the
+  // error reaches the caller.
   const initialSync = () => {
     if (disposed) return;
     for (const prop of properties) {
       // Use `in` so that a property whose current value is `undefined` is
       // still observable on first sync — distinguishing "value is undefined"
       // from "property is not exposed on the target".
-      if (prop.name in (target as object)) {
-        const current = (target as unknown as Record<string, unknown>)[prop.name];
+      if (prop.name in et) {
+        const current = (et as unknown as Record<string, unknown>)[prop.name];
         onUpdate(prop.name, current);
       }
     }
   };
 
   const syncOn = options?.syncOn ?? "call";
+  // A declaration with empty `properties` has nothing to initial-sync, so
+  // there is no work the deferred path could meaningfully do — short-
+  // circuiting here keeps the "empty properties returns a real no-op
+  // cleanup" promise from § Property Descriptor even under syncOn:"connect".
+  // Without this, we would install a document-wide MutationObserver whose
+  // callback only ever runs an empty loop, and the returned cleanup would
+  // include the observer.disconnect() — i.e. NOT a no-op.
   const canDefer =
     syncOn === "connect" &&
+    properties.length > 0 &&
     HTMLElementCtor !== undefined &&
-    target instanceof HTMLElementCtor &&
-    !target.isConnected &&
+    et instanceof HTMLElementCtor &&
+    !et.isConnected &&
     documentRef !== undefined &&
     MutationObserverCtor !== undefined;
 
@@ -184,20 +363,65 @@ export function bind(
     // run the initial sync once. The observer is also torn down by unbind().
     // NOTE: MutationObserver does not traverse shadow roots; see
     // BindOptions.syncOn JSDoc.
-    const observer = new MutationObserverCtor(() => {
-      if ((target as HTMLElement).isConnected) {
-        observer.disconnect();
-        initialSync();
-      }
+    // Deferred initialSync errors are routed through runOrCleanup so the
+    // listener set installed by bind() is torn down before the error
+    // surfaces — same contract as the synchronous path. The observer
+    // *setup* (constructor + observe()) is ALSO wrapped in runOrCleanup
+    // because § Teardown Contract explicitly names "the deferred-sync
+    // observer's setup" as an install-time throw the cleanup MUST cover;
+    // a hostile MutationObserverCtor / observe() that throws would
+    // otherwise leak the listeners attached by the registration loop.
+    const htmlTarget = et as HTMLElement;
+    // Single-path observer disposal: the callback's success path and the
+    // unbind cleanup path both go through `disposeObserver`, which guards
+    // against double-disconnect via its own `observerDisposed` flag. This
+    // matters for a hostile / counting `observer.disconnect()` override —
+    // SPEC.md § Teardown Contract names that exact threat as in-scope.
+    // `observer` is declared as a `let` so disposeObserver can be pushed
+    // to `cleanups` BEFORE the (possibly-throwing) constructor+observe
+    // pair; the optional chain on `observer?.disconnect()` makes the
+    // helper a safe no-op in the "pushed but not yet assigned" window.
+    let observer: MutationObserver | undefined;
+    let observerDisposed = false;
+    const disposeObserver = () => {
+      if (observerDisposed) return;
+      observerDisposed = true;
+      observer?.disconnect();
+    };
+    cleanups.push(disposeObserver);
+    runOrCleanup(() => {
+      observer = new MutationObserverCtor(() => {
+        if (htmlTarget.isConnected) {
+          disposeObserver();
+          runOrCleanup(initialSync);
+        }
+      });
+      observer.observe(documentRef, { childList: true, subtree: true });
     });
-    observer.observe(documentRef, { childList: true, subtree: true });
-    cleanups.push(() => observer.disconnect());
   } else {
-    initialSync();
+    runOrCleanup(initialSync);
   }
 
   return () => {
+    // Idempotent teardown: the second and later invocations are an
+    // unconditional no-op, satisfying SPEC.md § Teardown Contract's
+    // "MUST be a safe no-op on subsequent calls" rule without depending
+    // on the constituent cleanups themselves being idempotent. This is
+    // symmetric with the registration-side defensive posture (we wrap
+    // the addEventListener loop in runOrCleanup precisely because a
+    // hostile Proxy can throw mid-loop — by the same logic, a hostile
+    // Proxy whose removeEventListener is non-idempotent must not be
+    // called twice).
+    if (disposed) return;
     disposed = true;
-    cleanups.forEach((fn) => fn());
+    // Exception-safe teardown: every cleanup runs, even if an earlier one
+    // throws. Secondary errors are swallowed — this is best-effort
+    // teardown, not error reporting; surfacing a cleanup-time secondary
+    // error in place of the caller's expected silent unbind is more
+    // confusing than useful. Same shape as the runOrCleanup fallback
+    // above.
+    for (const fn of cleanups) {
+      try { fn(); } catch { /* swallow per teardown-contract semantics */ }
+    }
   };
 }

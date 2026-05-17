@@ -18,4 +18,10 @@ export type {
   RemoteSerializedError,
   RemoteRequestOptions,
   RemoteInvokeOptions,
+  RemoteCapabilities,
+  DeclarationFingerprint,
 } from "./types.js";
+export {
+  buildDeclarationFingerprint,
+  declarationFingerprintsEqual,
+} from "./declarationFingerprint.js";

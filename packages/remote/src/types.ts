@@ -8,6 +8,49 @@ export type ClientMessage =
 
 export interface RemoteCapabilities {
   setAck?: boolean;
+  /**
+   * Set by producers that understand the `undefinedProperties` field on
+   * sync responses. Consumers SHOULD use this flag (not the mere
+   * presence of the field) to decide whether to apply the
+   * revert-to-undefined legacy heuristic: a modern producer with
+   * `undefinedProperties: true` and an empty list means "no undefined
+   * values, do not revert"; a legacy producer that omits both this
+   * capability and the field is the only case where the heuristic
+   * should fire.
+   */
+  undefinedProperties?: boolean;
+  /**
+   * Set by producers that understand the `getterFailures` field on
+   * sync responses. Same disambiguation rationale as above —
+   * separates "modern producer, no failures" from "legacy producer,
+   * concept does not exist".
+   */
+  getterFailures?: boolean;
+}
+
+/**
+ * Canonical structural fingerprint of a wcBindable declaration. Carries the
+ * version integer and the sorted-and-deduplicated name lists from
+ * `properties`, `inputs`, and `commands` — everything that determines whether
+ * two declarations describe the same surface to a remote consumer. Event
+ * names are intentionally NOT included: the consumer-side proxy rewrites them
+ * to synthetic per-property names, so equality there would be spurious.
+ */
+export interface DeclarationFingerprint {
+  /**
+   * The protocol identifier (e.g. "wc-bindable"). Optional for backward
+   * compatibility with legacy producers that emit a fingerprint without
+   * this field; the consumer-side comparison falls through to non-`protocol`
+   * mismatch handling when either side omits it (per SPEC-extensions.md
+   * § Declaration fingerprint → "Legacy fingerprint shape (no protocol)").
+   * When both sides emit it and the values differ, the comparison drives
+   * the proxy into TerminalFailure regardless of strict-mode opt-in.
+   */
+  protocol?: string;
+  version: number;
+  properties: string[];
+  inputs: string[];
+  commands: string[];
 }
 
 /**
@@ -37,8 +80,21 @@ export type ServerMessage =
        * `undefined` on re-sync.
        */
       undefinedProperties?: string[];
+      /**
+       * Canonical fingerprint of the server-side `wcBindable` declaration —
+       * the set of names the producer actually exposes in `properties`,
+       * `inputs`, and `commands`, plus the `version`. Servers SHOULD include
+       * this so clients can detect a stale or mismatched declaration cached
+       * on their side (different package version, partial deploy, etc.)
+       * before the mismatch surfaces as a per-message rejection. Clients
+       * SHOULD compute the same fingerprint from their local declaration
+       * and SHOULD log a warning if the two differ. The wire is purely
+       * additive: legacy servers omit the field and clients treat absence
+       * as "no fingerprint comparison available".
+       */
+      declarationFingerprint?: DeclarationFingerprint;
     }
-  | { type: "update"; name: string; value: unknown }
+  | { type: "update"; name: string; value?: unknown }
   | { type: "return"; id: string; value: unknown }
   | { type: "throw"; id: string; error: unknown };
 

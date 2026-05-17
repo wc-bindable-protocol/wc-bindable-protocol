@@ -7,6 +7,14 @@ const WS_OPEN = 1;
 const WS_CLOSING = 2;
 const WS_CLOSED = 3;
 
+/**
+ * MUST-level default per SPEC-extensions.md § Wire framing and encoding rule 3
+ * — the consumer-side proxy / shell MUST enforce a maximum decoded envelope
+ * byte length at the transport-frame layer before JSON parsing. 1 MiB is the
+ * spec-pinned baseline; configurable via the `maxFrameBytes` option.
+ */
+const DEFAULT_MAX_FRAME_BYTES = 1_048_576;
+
 function normalizeLimit(value: number | undefined, label: string): number {
   if (value === undefined) return Number.POSITIVE_INFINITY;
   if (!Number.isFinite(value) || value < 1 || !Number.isInteger(value)) {
@@ -15,6 +23,38 @@ function normalizeLimit(value: number | undefined, label: string): number {
     );
   }
   return value;
+}
+
+function normalizeFrameBytesLimit(value: number | undefined): number {
+  if (value === undefined) return DEFAULT_MAX_FRAME_BYTES;
+  if (!Number.isFinite(value) || value < 1 || !Number.isInteger(value)) {
+    throw new Error(
+      "WebSocketClientTransport: maxFrameBytes must be a positive integer or omitted",
+    );
+  }
+  return value;
+}
+
+function frameByteLength(data: unknown): number {
+  if (typeof data === "string") {
+    if (typeof Buffer !== "undefined") {
+      return Buffer.byteLength(data, "utf8");
+    }
+    if (typeof TextEncoder !== "undefined") {
+      return new TextEncoder().encode(data).byteLength;
+    }
+    /* v8 ignore next 2 */
+    return data.length;
+  }
+  if (typeof Buffer !== "undefined" && Buffer.isBuffer(data)) {
+    return data.byteLength;
+  }
+  if (typeof ArrayBuffer !== "undefined") {
+    if (data instanceof ArrayBuffer) return data.byteLength;
+    if (ArrayBuffer.isView(data)) return data.byteLength;
+  }
+  /* v8 ignore next */
+  return 0;
 }
 
 function isBinaryMessagePayload(data: unknown): boolean {
@@ -36,13 +76,34 @@ function isBinaryMessagePayload(data: unknown): boolean {
   return typeof Buffer !== "undefined" && Buffer.isBuffer(data);
 }
 
-function parseServerMessage(data: unknown, logger: Logger): ServerMessage | null {
+function parseServerMessage(
+  data: unknown,
+  logger: Logger,
+  maxFrameBytes: number,
+): ServerMessage | null {
   if (typeof Blob !== "undefined" && data instanceof Blob) {
     logger.warn(
       "WebSocketClientTransport: ignoring invalid server message",
       new Error("Blob payloads are not supported; expected a text JSON frame"),
     );
     return null;
+  }
+
+  // Enforce maxFrameBytes BEFORE JSON.parse so the parser itself is bounded
+  // (per SPEC-extensions.md § Wire framing and encoding rule 3 MUST). Oversized
+  // inbound frames are dropped with a warn-log; the transport stays open so
+  // a single oversized frame does NOT escalate to channel teardown.
+  if (Number.isFinite(maxFrameBytes)) {
+    const byteLength = frameByteLength(data);
+    if (byteLength > maxFrameBytes) {
+      logger.warn(
+        `WebSocketClientTransport: dropping inbound frame of ${byteLength} bytes; ` +
+          `exceeds maxFrameBytes=${maxFrameBytes} (configurable via constructor options). ` +
+          "Per SPEC-extensions.md § Wire framing and encoding (rule 3 MUST), oversized " +
+          "frames are dropped at the transport-frame layer before JSON parsing.",
+      );
+      return null;
+    }
   }
 
   try {
@@ -82,9 +143,20 @@ export interface WebSocketClientTransportOptions {
    */
   maxPreOpenQueue?: number;
   /**
+   * Maximum decoded inbound frame byte length. Frames whose size exceeds
+   * the limit are dropped at the transport layer **before** invoking
+   * `JSON.parse`, with a warn-log naming the offending size; the transport
+   * stays open. Per [SPEC-extensions.md § Wire framing and encoding rule 3
+   * MUST]; spec-pinned default is **1 MiB (1 048 576 bytes)**. Raise
+   * explicitly for legitimate large-payload applications; lower for
+   * tighter untrusted-peer hardening. MUST be a positive integer if
+   * provided.
+   */
+  maxFrameBytes?: number;
+  /**
    * Logger used for diagnostic output (invalid server frames, unexpected
-   * binary payloads). Defaults to `console.warn`. Inject a structured
-   * logger in production.
+   * binary payloads, oversized inbound frames). Defaults to `console.warn`.
+   * Inject a structured logger in production.
    */
   logger?: Logger;
 }
@@ -102,6 +174,7 @@ export class WebSocketClientTransport implements ClientTransport {
   private _disposed = false;
   private _warnedBinaryPayload = false;
   private _maxPreOpenQueue: number;
+  private _maxFrameBytes: number;
   private _logger: Logger;
   private _openListener: (() => void) | null = null;
   private _failListener: (() => void) | null = null;
@@ -112,6 +185,7 @@ export class WebSocketClientTransport implements ClientTransport {
   constructor(ws: WebSocket, options: WebSocketClientTransportOptions = {}) {
     this._ws = ws;
     this._maxPreOpenQueue = normalizeLimit(options.maxPreOpenQueue, "maxPreOpenQueue");
+    this._maxFrameBytes = normalizeFrameBytesLimit(options.maxFrameBytes);
     this._logger = resolveLogger(options.logger);
 
     if (ws.readyState === WS_CLOSING || ws.readyState === WS_CLOSED) {
@@ -181,7 +255,7 @@ export class WebSocketClientTransport implements ClientTransport {
           "WebSocketClientTransport: received a binary message payload; this transport expects text JSON frames from the server. Check the server framing or browser binaryType.",
         );
       }
-      const msg = parseServerMessage(event.data, this._logger);
+      const msg = parseServerMessage(event.data, this._logger, this._maxFrameBytes);
       /* v8 ignore next -- invalid frames are dropped after parseServerMessage logs a warning */
       if (!msg) return;
       handler(msg);

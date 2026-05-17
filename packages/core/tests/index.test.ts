@@ -56,7 +56,14 @@ describe("isWcBindable", () => {
     expect(SUPPORTED_PROTOCOL_VERSION).toBe(MIN_COMPATIBLE_VERSION);
   });
 
-  it("rejects versions below the adapter's supported version", () => {
+  it("pins MIN_COMPATIBLE_VERSION to 1 (the protocol-wide minimum, NOT adapter-specific)", () => {
+    // SPEC.md § Versioning forbids raising this constant within the
+    // "wc-bindable" protocol identifier — adapters MUST accept every
+    // version >= 1 regardless of when they were built.
+    expect(MIN_COMPATIBLE_VERSION).toBe(1);
+  });
+
+  it("rejects versions below the protocol-wide minimum (< 1)", () => {
     const el = createBindableElement({
       ...validDeclaration,
       version: 0,
@@ -104,6 +111,435 @@ describe("getWcBindableDeclaration", () => {
       properties: "nope" as unknown as never,
     });
     expect(getWcBindableDeclaration(el)).toBeUndefined();
+  });
+
+  it("returns undefined when a property descriptor is missing name", () => {
+    const el = createBindableElement({
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [{ event: "test:e" } as unknown as { name: string; event: string }],
+    });
+    expect(getWcBindableDeclaration(el)).toBeUndefined();
+  });
+
+  it("returns undefined when a property descriptor's getter is not a function", () => {
+    const el = createBindableElement({
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [{ name: "value", event: "test:e", getter: 42 as unknown as () => unknown }],
+    });
+    expect(getWcBindableDeclaration(el)).toBeUndefined();
+  });
+
+  it("returns undefined when properties contain duplicate names", () => {
+    const el = createBindableElement({
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [
+        { name: "value", event: "test:a" },
+        { name: "value", event: "test:b" },
+      ],
+    });
+    expect(getWcBindableDeclaration(el)).toBeUndefined();
+  });
+
+  it("returns undefined when inputs contain duplicate names", () => {
+    const el = createBindableElement({
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [{ name: "value", event: "test:e" }],
+      inputs: [{ name: "url" }, { name: "url" }],
+    });
+    expect(getWcBindableDeclaration(el)).toBeUndefined();
+  });
+
+  it("returns undefined when commands contain duplicate names", () => {
+    const el = createBindableElement({
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [{ name: "value", event: "test:e" }],
+      commands: [{ name: "fetch" }, { name: "fetch" }],
+    });
+    expect(getWcBindableDeclaration(el)).toBeUndefined();
+  });
+
+  it("returns undefined when an input descriptor's attribute is not a string", () => {
+    const el = createBindableElement({
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [{ name: "value", event: "test:e" }],
+      inputs: [{ name: "value", attribute: 123 as unknown as string }],
+    });
+    expect(getWcBindableDeclaration(el)).toBeUndefined();
+  });
+
+  it("returns undefined when a command descriptor's async is not a boolean", () => {
+    const el = createBindableElement({
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [{ name: "value", event: "test:e" }],
+      commands: [{ name: "fetch", async: "yes" as unknown as boolean }],
+    });
+    expect(getWcBindableDeclaration(el)).toBeUndefined();
+  });
+
+  it("accepts declarations whose inputs/commands are absent (treated as empty)", () => {
+    const el = createBindableElement({
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [{ name: "value", event: "test:e" }],
+    });
+    expect(getWcBindableDeclaration(el)).not.toBeUndefined();
+  });
+
+  it("does NOT install a MutationObserver under syncOn:connect when properties is empty", () => {
+    // Regression: a previous draft would install a document-wide observer
+    // for an empty-properties / unconnected / syncOn:connect bind, breaking
+    // the "empty properties returns a no-op cleanup" promise. The fix
+    // short-circuits the deferred path when properties.length === 0.
+    class EmptyCore extends HTMLElement {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+        commands: [{ name: "ping" }],
+      };
+    }
+    const tag = `empty-${Math.random().toString(36).slice(2, 8)}`;
+    customElements.define(tag, EmptyCore);
+    const el = document.createElement(tag);
+    // Intentionally NOT connected.
+    const observeSpy = vi.spyOn(MutationObserver.prototype, "observe");
+    try {
+      const unbind = bind(el, () => {}, { syncOn: "connect" });
+      expect(observeSpy).not.toHaveBeenCalled();
+      unbind();
+    } finally {
+      observeSpy.mockRestore();
+    }
+  });
+
+  it("cleans up already-registered listeners when a later addEventListener throws (no leak)", () => {
+    // Regression for the registration-loop leak: if addEventListener throws
+    // on the Nth property (e.g. a Proxy-wrapped relay target whose `get`
+    // trap throws), the first N-1 listeners must be torn down before the
+    // error reaches the caller. Without the fix, those listeners stayed
+    // attached and bind() never returned an unbind function.
+    const declarations: WcBindableDeclaration = {
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [
+        { name: "a", event: "test:a" },
+        { name: "b", event: "test:b" },
+      ],
+    };
+
+    class HostileCore extends EventTarget {
+      static wcBindable = declarations;
+      _callCount = 0;
+      addEventListener(type: string, listener: EventListenerOrEventListenerObject): void {
+        this._callCount++;
+        if (this._callCount === 2) throw new Error("simulated trap throw");
+        super.addEventListener(type, listener);
+      }
+    }
+
+    const core = new HostileCore();
+    const realRemove = core.removeEventListener.bind(core);
+    const removeSpy = vi.fn((type: string, listener: EventListenerOrEventListenerObject) => {
+      realRemove(type, listener);
+    });
+    core.removeEventListener = removeSpy;
+
+    const onUpdate = vi.fn();
+    expect(() => bind(core, onUpdate)).toThrow("simulated trap throw");
+
+    // The first listener (for "a") was registered before the throw, and the
+    // cleanup-on-throw wrapper must have removed it before propagating.
+    expect(removeSpy).toHaveBeenCalledTimes(1);
+    expect(removeSpy).toHaveBeenCalledWith("test:a", expect.any(Function));
+
+    // Dispatching the leaked event should NOT reach onUpdate.
+    core.dispatchEvent(new CustomEvent("test:a", { detail: 1 }));
+    expect(onUpdate).not.toHaveBeenCalled();
+  });
+
+  it("throws synchronously when onUpdate is not a function", () => {
+    // Empty-properties target: a deferred error would never fire because
+    // there are no events to deliver. SPEC § onUpdate validity SHOULD-throws
+    // up front so the bug is visible at bind-time.
+    class EmptyCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+      };
+    }
+    expect(() => bind(new EmptyCore(), null as unknown as () => void)).toThrow(TypeError);
+    expect(() => bind(new EmptyCore(), 42 as unknown as () => void)).toThrow(TypeError);
+    expect(() => bind(new EmptyCore(), "nope" as unknown as () => void)).toThrow(TypeError);
+  });
+
+  it("does not leak listeners when MutationObserver.observe() throws during deferred-sync setup", () => {
+    // Regression for Issue C: when the deferred-sync observer setup
+    // throws (a hostile MutationObserverCtor or observe() that raises),
+    // the registration loop's already-installed listeners must be torn
+    // down before the error reaches the caller. Previously the canDefer
+    // block sat OUTSIDE runOrCleanup, so an observe() throw escaped
+    // unprotected and the listeners leaked.
+    const el = createBindableElement(validDeclaration);
+    const realRemove = el.removeEventListener.bind(el);
+    const removeSpy = vi.fn(realRemove);
+    el.removeEventListener = removeSpy as typeof el.removeEventListener;
+
+    // Sabotage MutationObserver.observe so the deferred-sync setup
+    // throws synchronously.
+    const realObserve = MutationObserver.prototype.observe;
+    const observeSpy = vi.spyOn(MutationObserver.prototype, "observe")
+      .mockImplementation(() => { throw new Error("observe trap"); });
+    try {
+      const onUpdate = vi.fn();
+      expect(() => bind(el, onUpdate, { syncOn: "connect" })).toThrow("observe trap");
+      // The registration loop already attached one listener for "value".
+      // The cleanup-on-throw path must have removed it before the throw
+      // propagated, so the spy records exactly one removeEventListener call.
+      expect(removeSpy).toHaveBeenCalledTimes(1);
+      expect(removeSpy).toHaveBeenCalledWith("test:value-changed", expect.any(Function));
+
+      // Confirm there really is no listener left by dispatching the event.
+      el.dispatchEvent(new CustomEvent("test:value-changed", { detail: "leaked?" }));
+      expect(onUpdate).not.toHaveBeenCalled();
+    } finally {
+      observeSpy.mockRestore();
+      MutationObserver.prototype.observe = realObserve;
+    }
+  });
+
+  it("disposes the deferred-sync observer exactly once across both the success callback and unbind", async () => {
+    // Regression: the previous shape called observer.disconnect() twice
+    // on the success-then-throw path (once manually in the callback's
+    // success branch, then again via cleanups iteration). Standard
+    // MutationObserver is idempotent so the bug was invisible, but
+    // SPEC.md § Teardown Contract names "overridden observer.disconnect()"
+    // as in-scope of the hostile-target threat model. The single-path
+    // disposeObserver helper guarantees one call total, regardless of
+    // path (success-then-unbind, success-then-throw, etc.).
+    const el = createBindableElement(validDeclaration);
+    const disconnectSpy = vi.spyOn(MutationObserver.prototype, "disconnect");
+    try {
+      const unbind = bind(el, () => {}, { syncOn: "connect" });
+      document.body.appendChild(el);
+      // MutationObserver microtask: callback fires → disposeObserver()
+      // → disconnect() #1 → initialSync runs successfully.
+      await new Promise((r) => setTimeout(r, 0));
+      expect(disconnectSpy).toHaveBeenCalledTimes(1);
+      // unbind path: cleanups include disposeObserver, which is already
+      // disposed → MUST NOT call disconnect() a second time.
+      unbind();
+      expect(disconnectSpy).toHaveBeenCalledTimes(1);
+      // Idempotent unbind: calling again still keeps disconnect at 1.
+      unbind();
+      expect(disconnectSpy).toHaveBeenCalledTimes(1);
+      document.body.removeChild(el);
+    } finally {
+      disconnectSpy.mockRestore();
+    }
+  });
+
+  it("unbind() is unconditionally idempotent — second call does not re-invoke cleanups", () => {
+    // Regression for the idempotency MUST in § Teardown Contract: the
+    // returned closure SHOULD guard re-entry with a `disposed` flag so a
+    // hostile (non-idempotent) removeEventListener / disconnect is not
+    // called twice. This test wraps removeEventListener with a spy to
+    // detect a second call.
+    class TwoEventCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [
+          { name: "a", event: "test:a" },
+          { name: "b", event: "test:b" },
+        ],
+      };
+    }
+    const core = new TwoEventCore();
+    const realRemove = core.removeEventListener.bind(core);
+    const removeSpy = vi.fn(realRemove);
+    core.removeEventListener = removeSpy;
+
+    const unbind = bind(core, () => {});
+
+    unbind();
+    expect(removeSpy).toHaveBeenCalledTimes(2); // one per property
+
+    unbind(); // second call MUST be a no-op
+    expect(removeSpy).toHaveBeenCalledTimes(2); // still 2, not 4
+  });
+
+  it("cleans up all listeners even when an earlier cleanup throws (exception-safe unbind)", () => {
+    // Regression: unbind previously aborted on the first throwing cleanup,
+    // leaving later listeners attached. Now wraps each cleanup in try/catch.
+    class TwoEventCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [
+          { name: "a", event: "test:a" },
+          { name: "b", event: "test:b" },
+        ],
+      };
+    }
+    const core = new TwoEventCore();
+    // Sabotage the first removeEventListener call so it throws once.
+    const real = core.removeEventListener.bind(core);
+    let sabotaged = false;
+    core.removeEventListener = vi.fn((type: string, listener: EventListenerOrEventListenerObject) => {
+      if (!sabotaged) {
+        sabotaged = true;
+        // Still actually remove the listener so the next dispatch test reflects
+        // teardown intent. The throw is the contract violation we want to
+        // recover from.
+        real(type, listener);
+        throw new Error("remove threw");
+      }
+      real(type, listener);
+    });
+
+    const onUpdate = vi.fn();
+    const unbind = bind(core, onUpdate);
+    expect(() => unbind()).not.toThrow();
+
+    // After unbind, neither event should reach onUpdate.
+    onUpdate.mockClear();
+    core.dispatchEvent(new CustomEvent("test:a", { detail: 1 }));
+    core.dispatchEvent(new CustomEvent("test:b", { detail: 2 }));
+    expect(onUpdate).not.toHaveBeenCalled();
+  });
+
+  it("accepts properties: [] (commands-only headless target is bindable)", () => {
+    class CommandsOnly extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [],
+        commands: [{ name: "ping" }],
+      };
+    }
+    const t = new CommandsOnly();
+    expect(getWcBindableDeclaration(t)).not.toBeUndefined();
+    expect(isWcBindable(t)).toBe(true);
+    // bind() should successfully no-op-but-not-error: no listeners, no
+    // initial sync, returns a real cleanup function.
+    const unbind = bind(t, () => { throw new Error("no event possible"); });
+    expect(typeof unbind).toBe("function");
+    unbind();
+  });
+
+  it("does not throw for pathological targets (null-prototype constructor reference)", () => {
+    // EventTarget with constructor swapped out — Object.create(null) would not
+    // satisfy the EventTarget signature, so simulate the "no ctor" case via a
+    // proxy that returns undefined for .constructor access.
+    const t = new Proxy(new EventTarget(), {
+      get(target, prop, receiver) {
+        if (prop === "constructor") return undefined;
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    expect(() => getWcBindableDeclaration(t)).not.toThrow();
+    expect(getWcBindableDeclaration(t)).toBeUndefined();
+    expect(isWcBindable(t)).toBe(false);
+  });
+
+  it("accepts arbitrary unknown inputs without throwing (null / primitives / plain objects)", () => {
+    // SPEC.md § Normative TypeScript surface: parameter type is `unknown`
+    // precisely so callers can probe any input.
+    for (const probe of [null, undefined, 0, "string", true, Symbol("x"), {}, [], new Map()]) {
+      expect(() => getWcBindableDeclaration(probe as unknown as EventTarget)).not.toThrow();
+      expect(getWcBindableDeclaration(probe as unknown as EventTarget)).toBeUndefined();
+      expect(isWcBindable(probe as unknown as EventTarget)).toBe(false);
+    }
+  });
+
+  it("returns undefined when a hostile wcBindable declaration's getter throws on schema fields", () => {
+    // SPEC.md § Discovery API MUST NOT throw covers hostile declarations
+    // too, not only hostile targets. A Proxy `wcBindable` whose `protocol`
+    // or `version` getter raises must funnel to `undefined` rather than
+    // crash the discovery helper.
+    const hostileDecl = new Proxy({} as Partial<WcBindableDeclaration>, {
+      get(_t, prop) {
+        if (prop === "protocol" || prop === "version" || prop === "properties") {
+          throw new Error(`decl trap rejected ${String(prop)}`);
+        }
+        return undefined;
+      },
+    });
+    class HostileDeclCore extends EventTarget {
+      static get wcBindable(): WcBindableDeclaration { return hostileDecl as WcBindableDeclaration; }
+    }
+    const target = new HostileDeclCore();
+    expect(() => getWcBindableDeclaration(target)).not.toThrow();
+    expect(getWcBindableDeclaration(target)).toBeUndefined();
+    expect(() => bind(target, () => {})).not.toThrow();
+  });
+
+  it("returns undefined when a hostile property descriptor's getter throws on `name`", () => {
+    // Same MUST NOT throw coverage, one level deeper: a Proxy descriptor
+    // inside `properties` whose `name` getter raises during isValidNamedList
+    // iteration must also funnel to `undefined`.
+    const hostileDescriptor = new Proxy({}, {
+      get(_t, prop) {
+        if (prop === "name") throw new Error("descriptor trap rejected name");
+        return undefined;
+      },
+    });
+    class HostileDescCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [hostileDescriptor as unknown as { name: string; event: string }],
+      };
+    }
+    const target = new HostileDescCore();
+    expect(() => getWcBindableDeclaration(target)).not.toThrow();
+    expect(getWcBindableDeclaration(target)).toBeUndefined();
+    expect(() => bind(target, () => {})).not.toThrow();
+  });
+
+  it("returns undefined (does not throw) when a hostile Proxy throws on capability access", () => {
+    // SPEC.md § Discovery API: getWcBindableDeclaration MUST NOT throw on
+    // any input shape, including hostile Proxy targets whose `get` trap
+    // throws on access to addEventListener / removeEventListener /
+    // constructor. The capability check must therefore live inside the
+    // try/catch alongside the constructor read.
+    const hostile = new Proxy({}, {
+      get(_t, prop) {
+        if (prop === "addEventListener" || prop === "removeEventListener" || prop === "constructor") {
+          throw new Error(`proxy trap rejected access to ${String(prop)}`);
+        }
+        return undefined;
+      },
+    });
+    expect(() => getWcBindableDeclaration(hostile)).not.toThrow();
+    expect(getWcBindableDeclaration(hostile)).toBeUndefined();
+    expect(() => isWcBindable(hostile)).not.toThrow();
+    expect(isWcBindable(hostile)).toBe(false);
+    expect(() => bind(hostile, () => {})).not.toThrow();
+  });
+
+  it("rejects targets that have a valid declaration but lack EventTarget capability", () => {
+    // A plain object with the static-fields shape would pass the schema
+    // check but bind() would throw on addEventListener. The capability
+    // check up front rejects it so isWcBindable() and bind() agree.
+    class NotAnEventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [{ name: "value", event: "test:e" }],
+      };
+    }
+    const fake = new NotAnEventTarget() as unknown as EventTarget;
+    expect(getWcBindableDeclaration(fake)).toBeUndefined();
+    expect(isWcBindable(fake)).toBe(false);
   });
 });
 
@@ -192,7 +628,42 @@ describe("bind", () => {
     expect(onUpdate).not.toHaveBeenCalled();
   });
 
-  it("treats a declaration with duplicate property names as invalid (no-op bind)", () => {
+  it("accepts arbitrary unknown inputs (null, primitives, plain objects) and returns a no-op cleanup", () => {
+    // bind() signature is `target: unknown` precisely to absorb the common
+    // `document.querySelector(...)` returning null case without a separate
+    // null check at the call site.
+    for (const probe of [null, undefined, 0, "string", true, Symbol("x"), {}, [], new Map()]) {
+      const onUpdate = vi.fn();
+      let unbind: (() => void) | undefined;
+      expect(() => {
+        unbind = bind(probe, onUpdate);
+      }).not.toThrow();
+      expect(typeof unbind).toBe("function");
+      unbind!();
+      expect(onUpdate).not.toHaveBeenCalled();
+    }
+  });
+
+  it("cleans up listeners when initial-sync throws (no leak)", () => {
+    const el = createBindableElement(validDeclaration);
+    (el as unknown as Record<string, unknown>).value = "initial";
+
+    // onUpdate throws during the synchronous initial sync. bind() MUST
+    // tear down the listener it just installed and rethrow.
+    const onUpdate = vi.fn(() => {
+      throw new Error("consumer blew up");
+    });
+
+    expect(() => bind(el, onUpdate)).toThrow("consumer blew up");
+
+    // If the listener leaked, this dispatch would call onUpdate again.
+    const onUpdateAfter = vi.fn();
+    onUpdate.mockImplementation(onUpdateAfter);
+    el.dispatchEvent(new CustomEvent("test:value-changed", { detail: "post-leak-check" }));
+    expect(onUpdateAfter).not.toHaveBeenCalled();
+  });
+
+  it("treats a declaration with duplicate property names as invalid — both isWcBindable and bind agree", () => {
     const el = createBindableElement({
       protocol: "wc-bindable",
       version: 1,
@@ -203,6 +674,10 @@ describe("bind", () => {
     });
     (el as unknown as Record<string, unknown>).value = "x";
     const onUpdate = vi.fn();
+
+    // SPEC.md § Discovery API requires isWcBindable() to return false here,
+    // not the older "true + bind no-ops" split.
+    expect(isWcBindable(el)).toBe(false);
 
     const unbind = bind(el, onUpdate);
     el.dispatchEvent(new CustomEvent("test:value-changed", { detail: "y" }));

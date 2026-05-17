@@ -23,7 +23,7 @@
     "test:watch": "vitest tests"
   },
   "dependencies": {
-    "@wc-bindable/core": "^0.6.0"
+    "@wc-bindable/core": "^0.7.0"
   },
   "peerDependencies": {
     "riot": ">=9"

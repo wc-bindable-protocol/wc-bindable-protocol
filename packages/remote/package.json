@@ -24,7 +24,7 @@
     "test:integration": "playwright test"
   },
   "dependencies": {
-    "@wc-bindable/core": "^0.6.0"
+    "@wc-bindable/core": "^0.7.0"
   },
   "repository": {
     "type": "git",

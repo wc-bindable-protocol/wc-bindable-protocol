@@ -8,9 +8,17 @@ import type {
 } from "./types.js";
 import { isReservedRemoteName } from "./transport/messageValidation.js";
 import { type Logger, resolveLogger } from "./logger.js";
+import { buildDeclarationFingerprint } from "./declarationFingerprint.js";
 
 const REMOTE_CAPABILITIES: RemoteCapabilities = {
   setAck: true,
+  // Advertised so consumers can distinguish a modern producer that has
+  // no undefined / failed-getter properties at the moment ("field
+  // present, list empty") from a legacy producer that does not know
+  // about these fields at all ("field absent"). See SPEC-extensions.md
+  // § sync response capabilities.
+  undefinedProperties: true,
+  getterFailures: true,
 };
 
 const DEFAULT_GETTER = (event: Event): unknown => (event as CustomEvent).detail;
@@ -254,7 +262,14 @@ export class RemoteShellProxy {
       const handler = (event: Event) => {
         try {
           const value = getter(event);
-          const message: ServerMessage = { type: "update", name: prop.name, value };
+          // Omit the `value` key entirely when the property transitions
+          // to `undefined`. JSON cannot represent undefined and absent
+          // key is the normative encoding per SPEC-extensions § Update
+          // envelope value field. The consumer treats absent as
+          // undefined on receipt.
+          const message: ServerMessage = value === undefined
+            ? { type: "update", name: prop.name }
+            : { type: "update", name: prop.name, value };
           if (this._isBuildingSyncSnapshot) {
             this._queuedSyncUpdates.push({
               message,
@@ -309,6 +324,12 @@ export class RemoteShellProxy {
         type: "sync",
         values,
         capabilities: REMOTE_CAPABILITIES,
+        // Always include the fingerprint — it lets the client detect a stale
+        // or mismatched declaration cached on its side (different package
+        // version, partial deploy, etc.) before the mismatch surfaces as a
+        // per-message rejection. See SPEC-extensions.md § Declaration
+        // fingerprint.
+        declarationFingerprint: buildDeclarationFingerprint(this._declaration),
         ...(getterFailures.length > 0 ? { getterFailures } : {}),
         ...(undefinedProperties.length > 0 ? { undefinedProperties } : {}),
       }, "sync response");
