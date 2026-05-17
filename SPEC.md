@@ -285,6 +285,8 @@ The identifier names `bind`, `getWcBindableDeclaration`, and `isWcBindable` are 
 
 ## Event Naming Convention
 
+> **This section is a non-normative naming convention.** Event-name shape is not a conformance requirement at any level — interop is keyed off the `properties[i].event` string a producer declares and a consumer listens for, not off any pattern that string follows. The lowercase "should follow" / "recommended" wording below is advisory in the natural-English sense per [§ Requirements language](#requirements-language); it does not become a normative requirement unless another section explicitly references it as one. Producers that adopt a different naming style (or use existing native events like `input` / `change` directly) remain fully conformant.
+
 Event names should follow the `namespace:property-changed` pattern.
 
 ```
@@ -796,14 +798,14 @@ The relative ordering of the initial-sync delivery and the first subsequent `onU
 
 In `syncOn: "call"` the **event payload is authoritative** in case the initial-sync read and a subsequent event disagree on the value — see [§ Event detail vs Property Read](#event-detail-vs-property-read). **In `syncOn: "connect"` this rule is overridden by the ordering rule above**: the deferred initial-sync runs *after* any events that fired pre-connection, reads `target[prop.name]` at sync time, and that read is what the consumer's state holds last. The deferred-sync read therefore wins over a pre-connection event payload, which is the opposite of the call-mode authority direction. This is a deliberate compromise — in the deferred case, the producer is expected to NOT dispatch wc-bindable change events on an unconnected element (no real consumer is observing changes yet), and if it does, the sync-time property read is the better source of truth at the moment the consumer first becomes attentive. Producers that genuinely need event-payload-wins semantics on an unconnected target MUST use `syncOn: "call"` from a host lifecycle hook instead.
 
-**Quick comparison (non-normative; the two bullets above are authoritative).** The two `syncOn` modes differ on three observable axes that consumers and reviewers most often confuse:
+**Quick comparison (non-normative; the two bullets above are authoritative).** The two `syncOn` modes differ on three observable axes that consumers and reviewers most often confuse. RFC 2119 keywords are intentionally lowercased in this summary so the table cannot be misread as creating independent requirements — the normative wording lives in the two bullets above.
 
 | Mode | Initial-sync timing | Pre-sync event delivery | Disagreement winner (event payload vs property read) |
 |---|---|---|---|
 | `syncOn: "call"` (default) | Inside the same synchronous `bind()` frame | Impossible by construction (listeners + sync delivered in-frame; the only window is consumer-initiated `dispatchEvent` re-entry during the initial-sync loop) | **Event payload** is authoritative (`getter(event)` value is what the consumer holds last) |
-| `syncOn: "connect"` (DOM-deferred) | After the first `MutationObserver`-observed connection | MUST be delivered to `onUpdate` in arrival order | **Deferred property read** is authoritative (the post-event deferred sync reads `target[prop.name]` and that read wins last) |
+| `syncOn: "connect"` (DOM-deferred) | After the first `MutationObserver`-observed connection | delivered to `onUpdate` in arrival order | **Deferred property read** is authoritative (the post-event deferred sync reads `target[prop.name]` and that read wins last) |
 
-The inversion of the "disagreement winner" axis between the two modes is the most-asked design question; see the paragraph above for the rationale (producers SHOULD NOT dispatch on unconnected elements, but when they do the sync-time property read is the better source-of-truth at the moment the consumer first becomes attentive). Consumers who want event-payload-wins semantics on an unconnected target MUST use `syncOn: "call"` from inside their own lifecycle hook.
+The inversion of the "disagreement winner" axis between the two modes is the most-asked design question; see the paragraph above for the rationale (producers should not dispatch on unconnected elements, but when they do the sync-time property read is the better source-of-truth at the moment the consumer first becomes attentive). Consumers who want event-payload-wins semantics on an unconnected target should use `syncOn: "call"` from inside their own lifecycle hook (the normative form of this rule lives in the bullets above).
 
 #### Deferring the Initial Sync Until Connection
 
