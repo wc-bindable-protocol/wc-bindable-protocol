@@ -417,25 +417,25 @@ interface WcBindableDeclaration {
   protocol: "wc-bindable";
   /** Integer >= 1. See SPEC.md § Versioning. */
   version: number;
-  properties: WcBindablePropertyDescriptor[];
-  inputs?: WcBindableInputDescriptor[];
-  commands?: WcBindableCommandDescriptor[];
+  properties: WcBindableProperty[];
+  inputs?: WcBindableInput[];
+  commands?: WcBindableCommand[];
 }
 
-interface WcBindablePropertyDescriptor {
+interface WcBindableProperty {
   name: string;
   event: string;
   /** Defaults to `(e) => (e as CustomEvent).detail` when omitted. */
   getter?: (event: Event) => unknown;
 }
 
-interface WcBindableInputDescriptor {
+interface WcBindableInput {
   name: string;
   /** Hint consumed by extensions (see SPEC-extensions.md); not interpreted by core. */
   attribute?: string;
 }
 
-interface WcBindableCommandDescriptor {
+interface WcBindableCommand {
   name: string;
   /** Hint consumed by extensions (see SPEC-extensions.md); not interpreted by core. */
   async?: boolean;
@@ -449,7 +449,7 @@ interface WcBindableCommandDescriptor {
  *  through its own internal channel is a valid bind target. Including
  *  `EventTarget` in the intersection would let a `isWcBindable()` narrowing
  *  falsely promise `dispatchEvent` on such proxies. */
-type WcBindableTarget = {
+interface WcBindableElement {
   addEventListener(
     type: string,
     listener: EventListenerOrEventListenerObject | null,
@@ -460,7 +460,15 @@ type WcBindableTarget = {
     listener: EventListenerOrEventListenerObject | null,
     options?: boolean | EventListenerOptions,
   ): void;
-  readonly constructor: { readonly wcBindable: WcBindableDeclaration };
+  readonly constructor: WcBindableConstructor;
+}
+
+/** Companion type on `WcBindableElement.constructor`: a constructor whose
+ *  produced instances are `EventTarget`s carrying a valid declaration on
+ *  the `wcBindable` static field. Exposed so type-narrowing helpers and
+ *  framework adapters can reference the constructor side directly. */
+type WcBindableConstructor = (new (...args: unknown[]) => EventTarget) & {
+  wcBindable: WcBindableDeclaration;
 };
 
 // ── bind() and discovery ──
@@ -477,7 +485,7 @@ interface BindOptions {
  *  (not `EventTarget`) precisely because the helper handles non-EventTarget
  *  inputs (returning `undefined`) as part of its validation surface. */
 function getWcBindableDeclaration(target: unknown): WcBindableDeclaration | undefined;
-function isWcBindable(target: unknown): target is WcBindableTarget;
+function isWcBindable(target: unknown): target is WcBindableElement;
 
 /** Binding. `target` is typed `unknown` for the same reason the discovery
  *  helpers are: bind() MUST NOT throw **merely because** the target is
@@ -648,14 +656,14 @@ function bind(target, onUpdate, options) {
   if (decl === undefined) return () => {};
   // After the discovery guard, `target` is known to expose
   // addEventListener / removeEventListener (the helper's consumer-side
-  // capability check — see WcBindableTarget in § Normative TypeScript
+  // capability check — see WcBindableElement in § Normative TypeScript
   // surface). The cast below narrows to that two-method subset, NOT to
   // the full EventTarget interface — bind() never calls dispatchEvent
   // on the target, which is what lets relay proxies that only re-emit
   // through their own internal channel still be valid bind targets
-  // (the WcBindableTarget design intent). The `EventTarget` type tag
+  // (the WcBindableElement design intent). The `EventTarget` type tag
   // here is a JSDoc convenience for environments where importing the
-  // structural WcBindableTarget type is awkward; at runtime, only the
+  // structural WcBindableElement type is awkward; at runtime, only the
   // add/removeEventListener methods are invoked, never dispatchEvent.
   const et = /** @type {EventTarget} */ (target);
 
@@ -1026,6 +1034,8 @@ The type declarations are **recommendations**, not requirements. Components with
 ---
 
 ## Trust Boundaries
+
+> **wc-bindable is a protocol layer, not a security boundary.** Conformance with this specification guarantees observation / declaration mechanics (and, for Extensions 1 + 2, wire-format mechanics) — it does **not** provide authentication, authorization, rate limiting, application-level payload validation, confidentiality, or integrity. A conformant implementation deployed across a trust boundary without those guardrails is unsafe by construction. The protocol layer's responsibilities and the deployment / application layer's responsibilities are split in [SPEC-extensions.md § Threat model](SPEC-extensions.md#threat-model-shared-by-extensions-1-and-2) and the [§ Remote Security Profile for untrusted networks](SPEC-extensions.md#remote-security-profile-for-untrusted-networks) immediately below it; the [Remote Security Profile](SPEC-extensions.md#remote-security-profile-for-untrusted-networks) is the deployment-layer SHOULD-list that goes with the protocol-layer MUST-list here.
 
 The protocol assumes the `target` is trusted by the consumer: `getter` is an arbitrary function executed in the consumer's JavaScript context every time an event fires. Components should not declare a `getter` that performs anything other than pure extraction of the new value from the event.
 

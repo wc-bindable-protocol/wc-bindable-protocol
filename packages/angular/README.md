@@ -55,6 +55,10 @@ This directive uses `@Output()` with `EventEmitter` rather than the newer `outpu
 - **Testability** — `@Output()` does not require an injection context, so the directive can be instantiated directly in unit tests.
 - **Stability** — `EventEmitter` is a long-established, stable Angular API with no deprecation planned.
 
+## Specification
+
+The protocol contract this adapter implements lives in [SPEC.md](../../SPEC.md); the optional input/command invocation surface and the remote wire format live in [SPEC-extensions.md](../../SPEC-extensions.md). Runnable conformance vectors are in [CONFORMANCE.md](../../CONFORMANCE.md).
+
 ## License
 
 MIT

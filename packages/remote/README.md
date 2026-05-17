@@ -79,19 +79,31 @@ Before exposing `RemoteShellProxy` to untrusted peers:
 
 ### Starting-point values for `JsonValue` resource limits
 
-[SPEC-extensions.md § Design invariants](../../SPEC-extensions.md#design-invariants) invariant 3 specifies *which* limits SHOULD be enforced on inbound `JsonValue`s at an untrusted boundary; it does not normatively pin values. The numbers below are **non-normative starting points** for operators wiring this up the first time — pick the smallest values that still admit every legitimate payload your application sends, and tighten from there.
+[SPEC-extensions.md § Wire framing and encoding](../../SPEC-extensions.md#wire-framing-and-encoding) rule 3 pins `maxFrameBytes` at a **MUST-level 1 MiB default** (configurable per implementation). The other `JsonValue`-shape limits below remain SHOULD-level per [SPEC-extensions.md § Design invariants](../../SPEC-extensions.md#design-invariants) invariant 3 — their right values depend on application payload shape more than on protocol shape; the numbers below are **non-normative starting points** for operators wiring this up the first time.
 
-| Limit | Starting point | Notes |
-|---|---|---|
-| `maxFrameBytes` | **1 MiB** | Enforced at the WebSocket / transport frame layer, before JSON parsing. Lower if your largest legitimate payload is smaller. |
-| `maxDepth` | **32** | Nesting depth of objects / arrays. Most application payloads are well under 10; 32 leaves headroom for legitimate nested data. |
-| `maxArrayLength` | **10 000** | Per single array node. Size to your largest legitimate array (paginated lists, batch operations). |
-| `maxObjectProperties` | **1 000** | Per single object node. Generous default for property bags; lower for tightly schema'd payloads. |
-| `maxTotalNodes` | **50 000** | Across the whole value. Guards against wide-but-shallow shapes that pass each per-node limit individually. |
+| Limit | Starting point | Status in reference impl | Notes |
+|---|---|---|---|
+| `maxFrameBytes` | **1 MiB** | **Enforced by default** in both `WebSocketClientTransport` and `WebSocketServerTransport` (configurable via constructor option `maxFrameBytes`). Inbound frames exceeding the limit are dropped with a warn-log before `JSON.parse`; the transport stays open. | Per SPEC-extensions.md rule 3 MUST. Raise explicitly for legitimate large-payload deployments; lower for tighter untrusted-peer hardening. |
+| `maxDepth` | **32** | Not enforced by the reference transports — wire at the application layer. | Nesting depth of objects / arrays. Most application payloads are well under 10; 32 leaves headroom for legitimate nested data. |
+| `maxArrayLength` | **10 000** | Not enforced by the reference transports — wire at the application layer. | Per single array node. Size to your largest legitimate array (paginated lists, batch operations). |
+| `maxObjectProperties` | **1 000** | Not enforced by the reference transports — wire at the application layer. | Per single object node. Generous default for property bags; lower for tightly schema'd payloads. |
+| `maxTotalNodes` | **50 000** | Not enforced by the reference transports — wire at the application layer. | Across the whole value. Guards against wide-but-shallow shapes that pass each per-node limit individually. |
 
 These compose: a payload that satisfies every per-node limit can still fail `maxTotalNodes`, and a payload that satisfies `maxTotalNodes` can still fail `maxFrameBytes` if it is mostly long strings. Enforce all of them; do not pick one and skip the others.
 
-The reference implementation in this package does NOT enforce these by default (backward compatibility with existing local-binding use). They are expected to be wired at the transport adapter layer — either by extending `WebSocketServerTransport` or by writing a custom `ServerTransport` that runs `isJsonValue`-with-limits inline before forwarding the message to the shell.
+The reference `WebSocketClientTransport` and `WebSocketServerTransport` enforce **only the `maxFrameBytes` limit** (because the spec promotes that one to MUST). The remaining `JsonValue`-shape limits stay opt-in at the application layer — either by extending `WebSocketServerTransport` or by writing a custom `ServerTransport` that runs `isJsonValue`-with-limits inline before forwarding the message to the shell. The reference proxies do NOT enforce the per-node `JsonValue` limits because their right values depend on the application's legitimate payload shape, which the protocol layer cannot know.
+
+## Known conformance divergences
+
+The reference `@wc-bindable/remote` 0.7.x implementation has the following documented divergences from [SPEC-extensions.md](../../SPEC-extensions.md). Each is preserved for backward compatibility with the pre-0.7 line; the divergences are scheduled to be closed in future releases as documented per item.
+
+| Divergence | Spec rule | 0.7.x behavior | Workaround / opt-in | Planned fix |
+|---|---|---|---|---|
+| **Pre-sync `setWithAck` / `invoke` queueing** | [§ Pre-sync call state machine](../../SPEC-extensions.md#pre-sync-call-state-machine) MUST queue setWithAck / invoke before the first `sync` response | Default `preSyncBehavior: "eager"` dispatches immediately (0.6.x optimistic-send behavior). A `setWithAck` against a producer that ends up advertising `setAck: false` rejects with `WC_BINDABLE_SET_ACK_UNSUPPORTED` when the sync response arrives. | Pass `preSyncBehavior: "queue"` to `createRemoteCoreProxy()` to get the spec-conformant queueing + drain semantics today. `maxPreSyncQueue` (default 1 024) bounds the queue. | **Default flips to `"queue"` in 0.8.0**; the option will be removed in 1.0. New code SHOULD opt into `"queue"` now. |
+| **CustomEvent `detail: undefined` → `null`** | [CONFORMANCE.md vector 6](../../CONFORMANCE.md#6-remote-undefined--absent-updatevalue-delivers-undefined-not-null) — `update` envelope with no `value` key delivers `undefined`, not `null` | `bind()` callbacks observe `null` because WebIDL coerces `CustomEvent.detail = undefined` to `null` during dispatch. The proxy's per-property cache is correct (`undefined`); only the event delivery is coerced. | Read `proxy.<name>` instead of relying on the `bind()` callback for the `undefined` case, OR use the synthetic per-property event listener directly with a sentinel-unwrapping check. | Pending resolution at the event-dispatch layer; tracked against a future release. |
+| **Locally-synthesized `error.code` coverage** | [§ Error envelope → Code-emission rule](../../SPEC-extensions.md#error-envelope) MUST that every locally-synthesized error carries `code` | The new terminal-failure paths (protocol mismatch, dispose, transport close, pre-sync queue full) carry `code` per the registry. Older code paths (some legacy `setWithAck`-on-legacy-server rejections, `Transport closed` from `_requireTransport`) may still surface as bare `Error` instances without `code`. | Pattern-match defensively: `err.code === "..." || /substring/.test(err.message)` for the legacy paths. | Full coverage planned for 0.8.0 alongside the `preSyncBehavior` default flip. |
+
+CONFORMANCE.md remains the authoritative source-of-truth for the full vector list and which vectors the reference implementation passes. This README documents the divergences a 0.7.x user is most likely to encounter; for the complete set, run the vector suite against your build.
 
 ## Connection lifecycle
 
@@ -269,11 +281,11 @@ The `Logger` contract is intentionally minimal (`{ warn(message, ...extras): voi
 
 | Export | Description |
 |---|---|
-| `createRemoteCoreProxy(declaration, transport, options?)` | Create a client-side proxy. Returns an EventTarget compatible with `bind()`. `options` accepts `maxPendingInvocations` (see Back-pressure) and `logger` (see Logging). |
+| `createRemoteCoreProxy(declaration, transport, options?)` | Create a client-side proxy. Returns an EventTarget compatible with `bind()`. `options` accepts `preSyncBehavior` (`"eager"` default; `"queue"` opts into the spec-conformant pre-sync queue — see Known conformance divergences and Back-pressure), `maxPreSyncQueue` (default 1 024; active under `preSyncBehavior: "queue"`), `maxPendingInvocations` (default `Infinity`; see Back-pressure), and `logger` (see Logging). |
 | `RemoteCoreProxy` | The underlying proxy class (use `createRemoteCoreProxy` for property access support). |
 | `RemoteShellProxy` | Server-side proxy that connects a real Core to the transport. Constructor accepts an options bag with `maxSyncUpdateBuffer` and `logger`. |
-| `WebSocketClientTransport` | `ClientTransport` implementation using the standard `WebSocket` API. Constructor accepts an options bag with `maxPreOpenQueue` and `logger`. |
-| `WebSocketServerTransport` | `ServerTransport` implementation using any `WebSocketLike` object. Constructor accepts an options bag with `logger`. |
+| `WebSocketClientTransport` | `ClientTransport` implementation using the standard `WebSocket` API. Constructor accepts an options bag with `maxFrameBytes` (default 1 MiB; SPEC-extensions.md § Wire framing and encoding rule 3 MUST — enforced on inbound frames before `JSON.parse`), `maxPreOpenQueue` (default `Infinity`), and `logger`. |
+| `WebSocketServerTransport` | `ServerTransport` implementation using any `WebSocketLike` object. Constructor accepts an options bag with `maxFrameBytes` (default 1 MiB; SPEC-extensions.md § Wire framing and encoding rule 3 MUST — enforced on inbound frames before `JSON.parse`) and `logger`. |
 | `Logger`, `consoleLogger` | Logger contract (`{ warn, error }`) and the default implementation that forwards to `console`. See Logging. |
 
 ### RemoteCoreProxy
@@ -290,18 +302,70 @@ The `Logger` contract is intentionally minimal (`{ warn(message, ...extras): voi
 
 #### Error handling
 
-- **`invoke()`** errors on the server are serialized and delivered as `throw` messages, which reject the returned Promise. When the server throws an `Error`, the payload preserves at least `name` and `message`, and includes `stack` when available. If the thrown value itself is not JSON-serializable, `RemoteShellProxy` falls back to a serializable `RemoteShellProxyError` payload instead of leaving the client request pending.
-- **`setWithAckOptions()`** supports `AbortSignal` and `timeoutMs`. Aborting rejects the client-side Promise and forgets the pending response; it does not send a cancellation message to the server. Timeouts reject with `TimeoutError` and also clear the pending entry. `setWithAck()` uses the same behavior with a default 30s timeout.
-- **`invokeWithOptions()`** supports `AbortSignal` and `timeoutMs`. **Use the explicit form `invokeWithOptions(name, args, options)`.** Aborting rejects the client-side Promise and forgets the pending response; it does not send a cancellation message to the server. Timeouts reject with `TimeoutError` and also clear the pending entry. `invoke()` uses the same behavior with a default 30s timeout.
+**Pattern-match on `error.code` where it is set, with `error.message` as a fallback for the legacy paths called out in [Known conformance divergences](#known-conformance-divergences).** The spec-conformance target is that every protocol-level failure rejection from `RemoteCoreProxy` carries a stable `error.code` drawn from the [SPEC-extensions.md § Error envelope](../../SPEC-extensions.md#error-envelope) registry (vector 30). The 0.7.x reference implementation reaches that target on **the new terminal-failure paths** added in this release (protocol mismatch, dispose, transport close, pre-sync queue full, opt-in `preSyncBehavior: "queue"` rejections); the older legacy paths still surface as bare `Error` instances without `code` and are tracked under Known conformance divergences for a 0.8.0 fix. Until that flip, consumer recovery branches should prefer `err.code === "..."` with a `/substring/.test(err.message)` fallback for the legacy paths. `code` (when present) is the load-bearing classifier; `name` / `message` are diagnostic.
+
+The `code` values you will encounter:
+
+| `error.code` | When it fires |
+|---|---|
+| `WC_BINDABLE_UNDECLARED_INPUT` | `set()` / `setWithAck()` called with a `name` not in the consumer-side declaration's `inputs`. The proxy validates membership before send. |
+| `WC_BINDABLE_UNDECLARED_COMMAND` | `invoke()` called with a `name` not in `commands`. |
+| `WC_BINDABLE_INVALID_JSON_VALUE` | `set.value` / `cmd.args[i]` failed consumer-side `JsonValue` deep validation (`Date`, `Map`, `NaN`, accessor properties, cycles, etc.). No wire message is sent. |
+| `WC_BINDABLE_INVALID_ACK_OPTIONS` | `setWithAckOptions` / `invokeWithOptions` received a malformed `timeoutMs` (negative, non-finite, non-numeric) or other `AckOptions` validation failure. The returned `Promise` is **synchronously already-rejected** with a `RangeError`-shaped error carrying this code. |
+| `WC_BINDABLE_TIMEOUT` | `AckOptions.timeoutMs` elapsed before the server's `return` / `throw` arrived. The default is 30 s for `invoke()` / `setWithAck()` — pass `timeoutMs: 0` to disable. **No wire cancellation is sent**; the server keeps running and a late envelope is silently dropped. |
+| `WC_BINDABLE_ABORTED` | `AckOptions.signal` fired (caller-initiated abort). Same posture as `WC_BINDABLE_TIMEOUT` — local-only, no wire cancellation. |
+| `WC_BINDABLE_SET_ACK_UNSUPPORTED` | `setWithAck()` issued against a legacy server whose `sync` response omits / sets-false `capabilities.setAck`. The proxy rejects locally without sending wire traffic. Branch on this code to fall back to fire-and-forget `set()` if your application can tolerate at-most-once. |
+| `WC_BINDABLE_TERMINAL_FAILURE` | The transport reached terminal state (`onClose` fired, `send` synchronously threw). Every pending entry drains in caller order with this code; subsequent `set()` throws synchronously and `setWithAck` / `invoke` return already-rejected with the same code. Distinct from `WC_BINDABLE_DISPOSED` so adapters that auto-reconnect on terminal failure do NOT auto-reconnect on a disposed proxy. |
+| `WC_BINDABLE_DISPOSED` | `dispose()` was called. All pending entries reject with this code; subsequent `set()` throws synchronously and `setWithAck` / `invoke` return already-rejected. A disposed proxy is, by contract, never reusable — `reconnect()` MUST throw. |
+| `WC_BINDABLE_PRE_SYNC_QUEUE_FULL` | The proxy's pre-sync queue (the buffer holding calls issued before the `sync` response arrives) is at its `maxPreSyncQueue` bound (default 1 024). The new call is rejected; in-queue entries are NOT evicted. Bound the producer-controlled latency surface. |
+| `WC_BINDABLE_PROTOCOL_ERROR` | A wire-protocol bug or `sync`-response timeout (default 30 s). The proxy transitions to TerminalFailure as part of the rejection. Distinct from `WC_BINDABLE_TERMINAL_FAILURE` (this code is the *trigger* for the terminal transition; the `TERMINAL_FAILURE` code is for *subsequent* calls against an already-terminal proxy — see [SPEC-extensions.md § Error envelope](../../SPEC-extensions.md#error-envelope) for the three-way split). |
+| `WC_BINDABLE_RESERVED_NAME` | `createRemoteCoreProxy()` / `new RemoteShellProxy()` rejected a declaration whose `properties` / `inputs` / `commands` `name` matches a reserved-namespace rule (`@wc-bindable/` prefix, `__proto__`, `constructor`, `prototype`). Thrown synchronously at construction. |
+| `WC_BINDABLE_REMOTE_THROW` | Default code for an application-level error thrown from a producer-side `target[command]()` implementation that did not set its own `error.code`. Application throws MAY carry an application-namespaced `code` instead — the protocol layer does not enforce the `WC_BINDABLE_REMOTE_THROW` fallback when the producer already supplied a code. |
+
+**Conformant pattern.** Prefer switching on `code` and treat `code === undefined` as the legacy-path fallback documented under Known conformance divergences (do NOT silently swallow it — branch to a default that surfaces the error or matches on `message` as a last resort, then file a tracking issue for the missing-code path so it can be closed in the next release):
+
+```ts
+try {
+  await proxy.setWithAck("url", "/api/users");
+} catch (err) {
+  switch (err.code) {
+    case "WC_BINDABLE_SET_ACK_UNSUPPORTED":
+      // Legacy server. Fall back to fire-and-forget if at-most-once is acceptable.
+      proxy.set("url", "/api/users");
+      break;
+    case "WC_BINDABLE_TIMEOUT":
+    case "WC_BINDABLE_ABORTED":
+      // Local timeout / abort. Producer may still apply; treat as "outcome unknown".
+      break;
+    case "WC_BINDABLE_TERMINAL_FAILURE":
+      // Transport gone. reconnect() if implemented, else construct a new proxy.
+      break;
+    case "WC_BINDABLE_DISPOSED":
+      // We tore the proxy down. Do not retry; build a new one.
+      break;
+    default:
+      throw err;  // unexpected — re-throw for upstream handling
+  }
+}
+```
+
+**Notes on specific surfaces:**
+
+- **`invoke()`** errors on the server are serialized and delivered as `throw` messages, which reject the returned Promise. When the server throws an `Error`, the payload preserves at least `name` and `message`, and includes `stack` when available. Application throws default to `code: "WC_BINDABLE_REMOTE_THROW"`; producers MAY carry an application-namespaced code instead (e.g. `"APP_FORBIDDEN"`). If the thrown value itself is not JSON-serializable, `RemoteShellProxy` falls back to a serializable `RemoteShellProxyError` payload instead of leaving the client request pending.
+- **`setWithAckOptions()`** / **`invokeWithOptions()`** support `AbortSignal` and `timeoutMs`. Aborting rejects with `WC_BINDABLE_ABORTED` (or the signal's `reason` when present); timing out rejects with `WC_BINDABLE_TIMEOUT`. Both clear the pending entry locally and do NOT send wire-level cancellation — the server runs to completion and the late `return` / `throw` envelope is silently dropped.
 - **Deprecation — legacy `invokeWithOptions(name, options, ...args)` overload.** The historical `(name, options, ...args)` form is **deprecated and scheduled for removal in v1.0**. It is still accepted in the 0.x line so existing callers do not break, and the TypeScript signature carries a `@deprecated` tag so IDEs and linters surface it. The runtime branches on `Array.isArray(optionsOrArgs)`, which means a command whose first or only wire argument is itself an array (`invokeWithOptions("save", [1, 2, 3])`) is always interpreted as `args = [1, 2, 3]`, never as `options = [1, 2, 3]` — that ambiguity is why the legacy overload must go. Migrate those call sites now: wrap the wire arguments in a single array and move options to the last position, for example `invokeWithOptions("save", [[1, 2, 3]], { timeoutMs: 0 })`.
-- **Timeout configuration**: pass `timeoutMs` to override the default 30s deadline, or `timeoutMs: 0` to disable the built-in timeout for an individual call. Invalid timeout values (negative or non-finite) are surfaced as `RangeError` rejections from the returned Promise rather than synchronous throws. If the initial `sync` response does not advertise `capabilities.setAck`, `setWithAck()` and `setWithAckOptions()` reject instead of waiting forever against a legacy server.
-- **Back-pressure** is opt-in, not automatic. The three in-memory queues in this package — pending `setWithAck`/`invoke` requests on `RemoteCoreProxy`, pre-open send buffer on `WebSocketClientTransport`, and `sync`-time queued `update` messages on `RemoteShellProxy` — default to unbounded. Opt-in soft limits are available via constructor options: `createRemoteCoreProxy(decl, transport, { maxPendingInvocations: N })` rejects further `setWithAck`/`invoke` calls with `Error("RemoteCoreProxy: pending invocations exceeded maxPendingInvocations=N")` once the pending map is at capacity; `new WebSocketClientTransport(ws, { maxPreOpenQueue: N })` throws `Error("WebSocketClientTransport: pre-open queue exceeded maxPreOpenQueue=N")` when a send() would grow the pre-open buffer past N; `new RemoteShellProxy(core, transport, { maxSyncUpdateBuffer: N })` logs a single `console.warn` per sync cycle when a getter side-effect pushes the queued-updates buffer past N (buffering continues so wire-level ordering is preserved). Each accepts positive integers only; defaults are `Infinity` for backward compatibility. These are soft operational guardrails — set them alongside admission control, connection quotas, reverse-proxy limits, or per-client rate limiting if untrusted or slow peers are possible.
-- **Transport close** rejects all pending `invoke()` calls with `Transport closed` and leaves the proxy disconnected until you call `reconnect()` with a new transport.
-- **`dispose()`** is terminal: it rejects all pending requests with `RemoteCoreProxy disposed` and causes subsequent `set()`, `invoke()`, and `reconnect()` calls to fail immediately.
-- **`set()`** validates the input name on the client before sending, so undeclared names fail immediately. It also throws synchronously if the proxy is already disconnected or if the transport send fails while trying to enqueue the message. For declared inputs on a healthy transport, it remains fire-and-forget: there is no response id and no server-side success/error is delivered back to the client. If a buggy or stale client still sends an undeclared input, `RemoteShellProxy` drops it and logs via the injected logger. **Delivery is at-most-once**: a `set()` whose frame is still in-flight when the transport drops is not retried on `reconnect()`, and the client cannot tell whether the server received it. Eventual state convergence is achieved by the `sync` fired during `reconnect()` (the server's authoritative value is restored on the client). Prefer `setWithAck()` when the input is not idempotent — see "`set()` is at-most-once" under Design decisions.
-- **`setWithAck()`** sends the same mutation with a request id and waits for a `return`/`throw` response. Use it when the caller needs server-side validation feedback such as type mismatches, read-only assignments, or conversion failures. It requires the server to advertise `capabilities.setAck` in the initial `sync` response; legacy servers that omit that capability are rejected once detected. Use `setWithAckOptions()` when you also need client-side cancellation.
-- **Fire-and-forget setter failures** on plain `set()` are still caught and logged via `console.error` on the server so they do not escape the transport's message handler or terminate the connection.
-- **Server send failures** while forwarding `sync`, `update`, `return`, or `throw` messages are caught and logged via `console.error`. The failing message is dropped; the connection is not closed automatically.
+- **Back-pressure controls.** Two of the back-pressure / framing limits are MUST-level per spec and **enforced by default in the reference implementation**:
+  - `maxFrameBytes` (`WebSocketClientTransport` and `WebSocketServerTransport` constructor option) — inbound frame byte-length bound, **default 1 MiB**. Frames exceeding the limit are dropped before `JSON.parse` with a warn-log; the transport stays open. Per [SPEC-extensions.md § Wire framing and encoding](../../SPEC-extensions.md#wire-framing-and-encoding) rule 3.
+  - `maxPreSyncQueue` (`createRemoteCoreProxy` option) — bound on the pre-sync queue depth, **default 1 024 entries**. Calls exceeding the bound reject with `error.code === "WC_BINDABLE_PRE_SYNC_QUEUE_FULL"`. **Only active when `preSyncBehavior: "queue"` is set** — the 0.7.x default `preSyncBehavior: "eager"` skips queueing entirely (see Known conformance divergences below). Per [SPEC-extensions.md § Pre-sync call state machine](../../SPEC-extensions.md#pre-sync-call-state-machine).
+  - The remaining limits stay opt-in (`Infinity` default) for backward compatibility with existing local-binding use:
+    - `createRemoteCoreProxy(decl, transport, { maxPendingInvocations: N })` rejects further `setWithAck` / `invoke` calls once the pending map is at capacity.
+    - `new WebSocketClientTransport(ws, { maxPreOpenQueue: N })` throws when a `send()` would grow the pre-open buffer past N.
+    - `new RemoteShellProxy(core, transport, { maxSyncUpdateBuffer: N })` logs a `console.warn` per sync cycle when a getter side-effect pushes the queued-updates buffer past N (buffering continues so wire-level ordering is preserved).
+  - Each accepts positive integers only.
+- **`set()` validation.** Undeclared names throw synchronously with `WC_BINDABLE_UNDECLARED_INPUT`. `JsonValue`-invalid values throw synchronously with `WC_BINDABLE_INVALID_JSON_VALUE`. The proxy disposed / transport terminal throws are covered by `WC_BINDABLE_DISPOSED` / `WC_BINDABLE_TERMINAL_FAILURE` above. For declared inputs on a healthy transport, `set()` remains fire-and-forget — **at-most-once delivery**, can be silently dropped on transient transport outages. Prefer `setWithAck()` when the input is not idempotent or a later call depends on the assignment having landed; see the security callout near the top of this README.
+- **`setWithAck()` and legacy servers.** Servers that omit `capabilities.setAck` from the initial `sync` response cause `setWithAck()` to reject with `WC_BINDABLE_SET_ACK_UNSUPPORTED` instead of hanging.
+- **Fire-and-forget setter failures** on plain `set()` are caught and logged via the injected `Logger` on the server so they do not escape the transport's message handler or terminate the connection.
+- **Server send failures** while forwarding `sync`, `update`, `return`, or `throw` messages are caught and logged via the injected `Logger`. The failing message is dropped; the connection is not closed automatically.
 - **Server transport teardown**: if the `ServerTransport` implements `onClose()`, `RemoteShellProxy` disposes itself automatically. If the transport also implements `dispose()`, `RemoteShellProxy.dispose()` calls it so message/close listeners can be released. `WebSocketServerTransport` does both for standard WebSocket and Node `ws` close events.
 
 ### RemoteShellProxy

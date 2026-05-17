@@ -18,6 +18,7 @@ describe("declarationFingerprint", () => {
       commands: [{ name: "fetch" }, { name: "abort" }],
     };
     expect(buildDeclarationFingerprint(decl)).toEqual({
+      protocol: "wc-bindable",
       version: 1,
       properties: ["loading", "value"],
       inputs: ["method", "url"],

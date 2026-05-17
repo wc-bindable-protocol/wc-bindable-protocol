@@ -54,12 +54,21 @@ if (isWcBindable(element)) {
 
 | Export | Description |
 |---|---|
-| `bind(element, onUpdate)` | Attaches listeners for all bindable properties. Returns an unbind function. |
-| `isWcBindable(element)` | Type guard that checks if an element implements the protocol. |
+| `bind(target, onUpdate, options?)` | Attaches listeners for every declared property and reads each property's current value. Returns an `UnbindFn` that removes every listener it installed. `options.syncOn` is `"call"` (default) or `"connect"` (defer the initial-value read until `connectedCallback` for unmounted `HTMLElement`s). |
+| `getWcBindableDeclaration(target)` | Returns the validated declaration or `undefined`. MUST NOT throw, even on hostile targets — see [SPEC.md § Discovery API](../../SPEC.md#discovery-api). |
+| `isWcBindable(target)` | Type guard wrapping `getWcBindableDeclaration() !== undefined`. Narrows `target` to `WcBindableElement`. |
 | `WcBindableDeclaration` | Type for the `static wcBindable` field. |
-| `WcBindableProperty` | Type for a single property descriptor. |
-| `WcBindableElement` | Type for a protocol-compliant element. |
-| `UnbindFn` | Type alias for the cleanup function returned by `bind()`. |
+| `WcBindableProperty` | Type for a single property descriptor (`{ name, event, getter? }`). |
+| `WcBindableInput` | Type for a single input descriptor (`{ name, attribute? }`). |
+| `WcBindableCommand` | Type for a single command descriptor (`{ name, async? }`). |
+| `WcBindableElement` | Structural type for a protocol-compliant target (`add/removeEventListener` + `constructor.wcBindable`). Does NOT require `dispatchEvent` so relay-only proxies fit. |
+| `WcBindableConstructor` | The constructor side of `WcBindableElement`. |
+| `UnbindFn` | `() => void` — the cleanup function returned by `bind()`. |
+| `BindOptions` | Options object for `bind()`. |
+| `MIN_COMPATIBLE_VERSION` | Lowest protocol version any declaration may carry (fixed at `1`). See [SPEC.md § Versioning](../../SPEC.md#versioning). |
+| `SUPPORTED_PROTOCOL_VERSION` | Deprecated alias for `MIN_COMPATIBLE_VERSION`. Removed in v1.0. |
+
+The normative TypeScript surface lives in [SPEC.md § Normative TypeScript surface](../../SPEC.md#typescript-support). The exports above match it 1:1; the names here are authoritative when reading the implementation.
 
 ## License
 

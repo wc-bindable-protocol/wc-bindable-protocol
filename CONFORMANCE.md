@@ -901,6 +901,270 @@ unbind();
 
 ---
 
+### 20. Reserved prototype-pollution names — `__proto__` / `constructor` / `prototype` reject at proxy / shell construction
+
+**Setup.** Three declarations, one per reserved name, used to construct a consumer-side proxy and a producer-side shell. The reserved-name check MUST fire at construction time for both sides regardless of which descriptor list (`properties` / `inputs` / `commands`) the name lives in:
+
+```javascript
+const declProto = {
+  protocol: "wc-bindable",
+  version: 1,
+  properties: [{ name: "__proto__", event: "x:p-changed" }],
+};
+
+const declConstructor = {
+  protocol: "wc-bindable",
+  version: 1,
+  properties: [{ name: "v", event: "x:v-changed" }],
+  inputs: [{ name: "constructor" }],
+};
+
+const declPrototype = {
+  protocol: "wc-bindable",
+  version: 1,
+  properties: [{ name: "v", event: "x:v-changed" }],
+  commands: [{ name: "prototype" }],
+};
+
+class Producer extends EventTarget {}
+Producer.wcBindable = declProto;  // (and the same shape for the other two)
+```
+
+**Action.** For each of the three declarations:
+1. `createRemoteCoreProxy(decl, transport)` on the consumer side.
+2. `new RemoteShellProxy(new Producer(), transport)` on the producer side.
+
+Use a recording transport that asserts nothing was sent on the wire.
+
+**Expected.**
+- Both calls MUST throw synchronously with an `Error` whose `error.code === "WC_BINDABLE_RESERVED_NAME"`.
+- Neither the consumer-side proxy nor the producer-side shell MUST emit any wire envelope (no `sync`, no `set`, no `cmd`) for the offending name — the check is at the construction-time gate, not at message-send time.
+- The thrown Error's `message` SHOULD identify which name was rejected (so callers do not have to re-walk the declaration to find the culprit), but `error.code` is the load-bearing classifier.
+- The same expectation holds whether the reserved name appears in `properties`, `inputs`, or `commands`; the gate is descriptor-list-agnostic.
+
+**Implementation note.** This is the same rule as the `@wc-bindable/` prefix vector (#15), applied to the second normative reserved-name rule. Implementations that materialize per-property caches via plain `{}` (e.g. `cache[name] = value`) without this check would pollute the host object's prototype chain on a `__proto__` / `constructor` / `prototype` declaration — the construction-time rejection is the cross-implementation single-checkpoint mitigation. Implementations MAY *additionally* use null-prototype containers internally; the reservation is the simpler defense that this vector verifies.
+
+**Spec reference.** [SPEC-extensions.md § Reserved names](SPEC-extensions.md#reserved-names) (rule 2) + [§ Error envelope](SPEC-extensions.md#error-envelope) (`WC_BINDABLE_RESERVED_NAME` row).
+
+---
+
+### 21. Duplicate pending `id` rejection (producer side)
+
+**Setup.** A producer-side shell in Active state. The consumer (or a test harness simulating one) sends two `cmd` envelopes carrying the **same `id`** before the first one has been settled (no `return` / `throw` emitted yet). The producer's command implementation is asynchronous so the first call is still pending when the second arrives:
+
+```javascript
+class SlowProducer extends EventTarget {
+  static wcBindable = {
+    protocol: "wc-bindable",
+    version: 1,
+    properties: [],
+    commands: [{ name: "slow", async: true }],
+  };
+  async slow() {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    return "first-done";
+  }
+}
+
+const transport = new RecordingTransport();
+const shell = new RemoteShellProxy(new SlowProducer(), transport);
+
+transport.emitInbound({ type: "cmd", name: "slow", id: "dup-1", args: [] });
+transport.emitInbound({ type: "cmd", name: "slow", id: "dup-1", args: [] });
+```
+
+**Action.** Wait long enough for both the original `slow()` to complete and any duplicate-handling settlement to fire. Inspect `transport.sentMessages`.
+
+**Expected.** Two conformant producer responses are defined; an implementation MUST follow exactly one of them:
+
+**Path (a) — Log + drop (default; SHOULD prefer this for accidental-duplicate resilience):**
+- The producer logs a warning naming the duplicate `id`.
+- The duplicate (second) message MUST NOT execute — no second invocation of `target.slow()`.
+- The original pending entry MUST NOT be canceled, rejected, or otherwise settled by the duplicate-handling code path — it continues to its natural settlement (`target.slow()` still runs and emits its `return`).
+- Exactly one `{ type: "return", id: "dup-1", value: "first-done" }` envelope is sent on the wire (the original's natural reply).
+- **No `return` or `throw` envelope is ever sent that carries the duplicate `id` as the response to the later message** — the response `id` would be ambiguous from the consumer's perspective (a conformant consumer would settle the *original* against it).
+
+**Path (b) — TerminalFailure (MAY, for strict deployments treating duplicate-`id` as a protocol violation):**
+- The producer transitions the channel to TerminalFailure with a synthetic `WC_BINDABLE_DUPLICATE_ID`-coded reason.
+- The transport is signaled to dispose; `onClose` fires.
+- As part of standard channel teardown the producer MAY reject every outstanding pending entry — including the original `slow()` whose `id` was duplicated — typically by surfacing a local synthetic error to producer-side observers; this is part of teardown, not a per-duplicate response.
+- The producer SHOULD NOT emit a final wire `throw` envelope carrying the duplicate `id` (or the original `id`) merely to surface the duplicate-detection reason — local synthetic rejection plus the transport `onClose` is the cleaner channel-failure signal.
+
+**Both paths.** No double execution of `target.slow()`. No wire `return` / `throw` carrying the duplicate `id` as the later message's reply.
+
+**Spec reference.** [SPEC-extensions.md § Message types — client → server](SPEC-extensions.md#message-types--client--server) (id-constraints bullet → "On the producer side, if an inbound `cmd` or id-bearing `set` carries an `id` that matches an entry the producer has not yet settled").
+
+---
+
+### 22. Empty-string `id` rejection (producer side)
+
+**Setup.** A producer-side shell in Active state. The harness emits malformed inbound messages whose `id` is `""` (or otherwise not a non-empty string):
+
+```javascript
+const transport = new RecordingTransport();
+const shell = new RemoteShellProxy(new Producer(), transport);
+
+transport.emitInbound({ type: "cmd", name: "doThing", id: "", args: [] });
+transport.emitInbound({ type: "set", name: "x", value: 1, id: "" });
+transport.emitInbound({ type: "cmd", name: "doThing", id: 42, args: [] });  // non-string
+```
+
+**Action.** Inspect `transport.sentMessages` and any logger output.
+
+**Expected.**
+- The producer MUST treat each as malformed and **log + drop**.
+- **No `throw` reply is emitted** — a wire `throw` whose `id: ""` is unreachable for any conformant consumer (the consumer never allocates `""` to await on), so echoing it back has no recipient.
+- The producer MUST NOT touch the Core: no `doThing()` invocation, no `target.x = 1` setter call.
+- The transport MUST stay open — the malformed message does NOT escalate to TerminalFailure on its own (it is treated as a malformed-inbound message, not a wire-protocol disagreement).
+
+**Conformance interpretation.** This is the carve-out from the "id-bearing malformed inbound" rule that drives vector 21 / the spec's "if any well-formed `id`-bearing message is reachable the producer MUST `throw`" requirement. Empty-string `id` does NOT count as "well-formed `id`-bearing" because the consumer cannot disambiguate the echoed reply, so the conformant action is silent drop with diagnostic logging — distinct from the `throw`-with-`WC_BINDABLE_PROTOCOL_ERROR` path that applies to malformed-but-id-bearing messages.
+
+**Spec reference.** [SPEC-extensions.md § Message types — client → server](SPEC-extensions.md#message-types--client--server) (id-constraints bullet, first sub-bullet → "id MUST be a non-empty string ... An empty-string id does not count as 'well-formed id-bearing'").
+
+---
+
+### 23. Malformed `sync` ⇒ TerminalFailure (consumer side)
+
+**Setup.** A consumer-side proxy with several queued pre-sync pending entries (one `setWithAck`, one `invoke`, plus a fire-and-forget `set`). A recording transport that delivers a malformed `sync` response (missing the required `values` field, or with `values` typed as a non-object):
+
+```javascript
+const transport = new RecordingTransport();
+const proxy = createRemoteCoreProxy(declaration, transport);
+
+const p1 = proxy.setWithAck("url", "/api/a");
+const p2 = proxy.invoke("fetch");
+proxy.set("flag", true);  // fire-and-forget
+
+// Producer responds with a malformed sync — no `values` field.
+transport.emitInbound({ type: "sync" });  // missing `values`
+```
+
+**Action.** Inspect the settlement of `p1` and `p2`, the proxy's lifecycle state, and whether the transport was disposed.
+
+**Expected.**
+- Both `p1` and `p2` MUST reject **in caller order** (`p1` before `p2`).
+- Each rejection's `error.code === "WC_BINDABLE_PROTOCOL_ERROR"`.
+- The proxy MUST transition to TerminalFailure.
+- The transport's `dispose()` MUST be called (the proxy signals teardown).
+- Any subsequent `set()` MUST throw synchronously with `error.code === "WC_BINDABLE_TERMINAL_FAILURE"` (NOT `WC_BINDABLE_PROTOCOL_ERROR` — the trigger code is distinct from the post-terminal-call code per vector 34's terminal-path rule).
+- Any subsequent `setWithAck` / `invoke` MUST return an already-rejected `Promise` with `error.code === "WC_BINDABLE_TERMINAL_FAILURE"`.
+- The same vector holds for any other malformed-`sync` shape: `values` present but a non-object (e.g. an array or string), `capabilities` present but non-object, `getterFailures` present but not an array of strings, `undefinedProperties` present but not an array of strings — any wire-shape rule violation on the `sync` envelope follows this path.
+
+**Conformance interpretation.** Malformed `sync` is the **one consumer-side path** where a single malformed envelope escalates to TerminalFailure — distinct from malformed `update` (vector 32) which degrades gracefully, and distinct from malformed `return` / `throw` (vector 24) which is per-entry-recoverable. The asymmetry is deliberate: `sync` is the handshake, and continuing past a malformed handshake means the consumer cannot prove its envelope shapes will be understood by the peer (the same reasoning behind the protocol-mismatch terminal posture in vector 35).
+
+**Spec reference.** [SPEC-extensions.md § Consumer-side malformed message handling](SPEC-extensions.md#consumer-side-malformed-message-handling) (malformed `sync` row).
+
+---
+
+### 24. Malformed `return` / `throw` ⇒ drop or per-entry reject (consumer side)
+
+**Setup.** A consumer-side proxy in Active state with one outstanding `setWithAck` pending entry. The harness delivers two malformed envelopes back-to-back: (a) one with a well-formed `id` matching the pending entry but a malformed body; (b) one whose `id` is non-string / missing (no pending entry could match):
+
+```javascript
+const transport = new RecordingTransport();
+const proxy = createRemoteCoreProxy(declaration, transport);
+// (bring to Active via a valid sync response — omitted here for brevity)
+
+const pending = proxy.setWithAck("name", "value");
+const id = transport.lastSentId();  // the `id` the proxy allocated
+
+// (a) malformed envelope whose id matches the pending entry
+transport.emitInbound({ type: "return", id, value: { /* non-JsonValue */ NaN: true } });
+
+// (b) malformed envelope with no usable id
+transport.emitInbound({ type: "throw", id: 42, error: { code: "X" } });
+```
+
+**Action.** Inspect the settlement of `pending`, the proxy's lifecycle state, and any subsequent traffic.
+
+**Expected.**
+- The transport MUST NOT be closed by either malformed envelope — the proxy stays Active.
+- **(a) id-matches path:** the proxy MUST reject the pending entry with `error.code === "WC_BINDABLE_PROTOCOL_ERROR"`. The rejection MUST be a **locally-synthesized synthetic error built by the consumer-side proxy** — the proxy MUST NOT pass-through the malformed `error` object (it has no protocol-defined shape).
+- **(b) no-matching-id path:** the proxy MUST **drop the envelope + warn-log**. No pending entry is affected. The consumer `Promise` for any previously-issued call MUST NOT re-settle.
+- A subsequent `setWithAck` / `invoke` issued after both malformed envelopes MUST behave normally (the channel stays usable; malformed `return` / `throw` is per-entry-recoverable, not channel-fatal).
+
+**Conformance interpretation.** This is the asymmetry from vector 23 (malformed `sync` ⇒ terminal) and vector 32 (malformed `update` ⇒ drop). Malformed `return` / `throw` is **per-entry**: if the consumer can locate the pending entry via a well-formed `id`, it can synthesize a meaningful rejection (giving the caller a deterministic error.code) without escalating; if it cannot, dropping is the only safe action.
+
+**Spec reference.** [SPEC-extensions.md § Consumer-side malformed message handling](SPEC-extensions.md#consumer-side-malformed-message-handling) (malformed `return` / `throw` row).
+
+---
+
+### 25. `update.value` absence via key-presence check (consumer side)
+
+**Setup.** A consumer-side proxy in Active state. Three `update` envelopes for the same property, hand-rolled to exercise the `value`-key-presence distinction:
+
+```javascript
+const observed = [];
+const unbind = bind(proxy, (name, value) => observed.push([name, value]));
+
+// 1. `value` key present, holds a defined value.
+transport.emitInbound({ type: "update", name: "v", value: 42 });
+
+// 2. `value` key present, holds `undefined`.
+//    (Reachable in-process — JSON.parse would strip this. The spec
+//    contract is key-presence, not value comparison.)
+transport.emitInbound({ type: "update", name: "v", value: undefined });
+
+// 3. `value` key entirely absent.
+transport.emitInbound({ type: "update", name: "v" });
+```
+
+**Action.** Inspect `observed`.
+
+**Expected.**
+- After envelope 1: `observed` ends with `["v", 42]`; `proxy.v === 42`.
+- After envelope 2: `observed` ends with `["v", undefined]` (or `["v", null]` on the documented `CustomEvent.detail` divergence — see vector 6); the proxy's `value`-key-present envelope is treated as carrying the value, even when that value is `undefined`. The cache reflects `undefined`.
+- After envelope 3: `observed` ends with `["v", undefined]` (or `["v", null]` per vector 6's divergence); the proxy's missing-`value`-key envelope is treated as the "current value is `undefined`" wire signal per the out-of-band-undefined rule. The cache reflects `undefined`.
+- The conformant detection MUST use `Object.hasOwn(msg, "value")` (or an equivalent own-key check) — **not** `msg.value === undefined`. Implementations that conflate the two are non-conformant against any non-`JSON.parse` boundary (in-process test harnesses, hand-rolled envelopes, structured-clone-capable transports that bypass JSON serialization).
+
+**Conformance interpretation.** Post-`JSON.parse` the two cases (`value: undefined` and no `value` key) are equivalent — JSON drops own-properties whose value is `undefined` during stringify. But the spec contract is key-presence, not value comparison, because the proxy's deserializer MAY not be `JSON.parse` (a transport adapter could `JSON.parse` once and forward the parsed object, or a test could hand the proxy a synthesized envelope directly). Using `=== undefined` on the consumer side makes the proxy non-conformant on those boundaries even though it would pass against a pure WebSocket+JSON setup.
+
+**Spec reference.** [SPEC-extensions.md § Update envelope value field](SPEC-extensions.md#update-envelope-value-field) (the `Object.hasOwn` rule).
+
+---
+
+### 26. Transport at-most-once delivery (transport adapter)
+
+**Setup.** Two test modes for the transport adapter under test. The adapter wraps some underlying medium (WebSocket, MessagePort, custom pub/sub, …). The vector applies to **any** transport adapter packaged with a `{3-consumer}` / `{3-producer}` / `{3-both}` implementation:
+
+**Mode A — duplicate-injectable medium.** The adapter's underlying medium can be coerced into duplicating frames (a controllable mock, an adapter wrapping a pub/sub bus, a transport whose retry layer can replay an accepted send):
+
+```javascript
+const peer = createRecordingPeer();
+const adapter = new MyTransport(peer.underlying);
+adapter.send({ type: "set", name: "x", value: 1 });
+
+// Inject a duplicate at the underlying medium.
+peer.duplicateLastFrame();
+```
+
+**Mode B — non-duplicating medium.** The adapter's underlying medium cannot duplicate frames under test (strict in-process mock, WebSocket-over-TCP with no proxy in front of it, single-`MessagePort` peer-to-peer). The duplicate-injection setup is unreachable.
+
+**Action.**
+
+- **Mode A:** record every `onMessage` invocation on the peer. Inject one duplicate at the underlying medium.
+- **Mode B:** inspect the adapter's `send` and `onMessage` code paths.
+
+**Expected.**
+
+**Mode A — at-most-once via runtime defense.** The adapter MUST satisfy ONE of:
+- **(i) De-duplication at the adapter boundary.** The peer's `onMessage` fires **exactly once** for the original frame; the duplicate is silently filtered before invoking `onMessage`. The adapter's de-duplication metadata (sequence number, nonce, etc.) MUST live outside the wc-bindable protocol envelope (typically on the adapter's own framing layer) and MUST be stripped before `onMessage` invocation — see the spec's "De-duplication metadata is transport-private" rule.
+- **(ii) Terminal-failure on observed duplication.** The adapter detects the duplicate and treats it as a non-resumable transport failure: `onClose` fires, subsequent traffic is dropped, no further `onMessage` invocations occur.
+
+Silent double-delivery (peer's `onMessage` fires twice for one accepted `send()`) is **non-conformant** under Mode A.
+
+**Mode B — at-most-once by construction.** The adapter satisfies the vector by inspection:
+- The adapter's `send` and `onMessage` paths contain no retry / replay code that can call `onMessage` twice for one accepted `send()`.
+- The at-most-once property holds by construction (the underlying medium delivers each accepted frame exactly once and the adapter is a thin pass-through).
+
+Implementations SHOULD document which of the two satisfaction modes their adapter uses, so reviewers can locate the right test surface.
+
+**Conformance interpretation.** Silent duplicate delivery is the most dangerous mode the spec defends against: fire-and-forget `set` (no `id`, at-most-once by design) has **no application-layer deduplication mechanism**, so a duplicated `set("count", n+1)` against a non-idempotent setter applies twice with no detectable signal at either end. Id-bearing call methods (`setWithAck` / `invoke`) tolerate adapter-level duplication only when the proxy's `id → pending` table happens to settle the duplicate as a late-envelope drop (vector 18) — that is incidental, not a design guarantee, and the adapter MUST NOT rely on it.
+
+**Spec reference.** [SPEC-extensions.md § Transport adapter contract](SPEC-extensions.md#transport-adapter-contract) invariant 7 (At-most-once delivery) + the "De-duplication metadata is transport-private" paragraph immediately below it.
+
+---
+
 ### 27. `dispose()` — pending entries reject in caller order; late envelopes dropped
 
 **Setup.** A remote proxy in Active state with three outstanding pending entries issued in caller order (`setWithAck`, `invoke`, `setWithAck`), plus a recording transport that can inject late inbound envelopes after `dispose()`:

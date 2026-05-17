@@ -62,6 +62,46 @@ export function flush(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+/**
+ * Drive a proxy out of PreSync into Active by synthesizing a minimal
+ * `sync` response and feeding it through the supplied `handler`. After
+ * this returns, the proxy's pre-sync queue is drained and subsequent
+ * `setWithAck` / `invoke` calls take the steady-state path (immediate
+ * wire send) — which is what most tests want when they are not
+ * exercising the pre-sync queue behavior itself.
+ *
+ * Defaults to advertising `setAck: true` so `setWithAck` works; pass
+ * `setAck: false` to simulate a legacy server. Pass `values` /
+ * `undefinedProperties` / `getterFailures` / `declarationFingerprint`
+ * to override individual fields for tests that need them.
+ */
+export function deliverSync(
+  handler: ((msg: ServerMessage) => void) | null | undefined,
+  opts: {
+    setAck?: boolean;
+    values?: Record<string, unknown>;
+    undefinedProperties?: string[];
+    getterFailures?: string[];
+    capabilities?: { setAck?: boolean; undefinedProperties?: boolean; getterFailures?: boolean };
+    declarationFingerprint?: import("../src/types.js").DeclarationFingerprint;
+  } = {},
+): void {
+  if (!handler) {
+    throw new Error("deliverSync: handler is not registered yet; call after createRemoteCoreProxy()");
+  }
+  const setAck = opts.setAck ?? true;
+  const capabilities = opts.capabilities ?? { setAck };
+  const msg: ServerMessage = {
+    type: "sync",
+    values: opts.values ?? {},
+    ...(capabilities ? { capabilities } : {}),
+    ...(opts.undefinedProperties ? { undefinedProperties: opts.undefinedProperties } : {}),
+    ...(opts.getterFailures ? { getterFailures: opts.getterFailures } : {}),
+    ...(opts.declarationFingerprint ? { declarationFingerprint: opts.declarationFingerprint } : {}),
+  };
+  handler(msg);
+}
+
 /** A simple test Core with wcBindable declaration. */
 export class TestCore extends EventTarget {
   static wcBindable: WcBindableDeclaration = {

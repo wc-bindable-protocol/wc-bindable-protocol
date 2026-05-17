@@ -55,6 +55,10 @@ Default export. Pass to `Alpine.plugin()` to register the `x-wc-bindable` direct
 - Binds on directive setup and cleans up automatically via Alpine's `cleanup` hook.
 - If the element does not implement `wc-bindable`, the directive is a no-op.
 
+## Specification
+
+The protocol contract this adapter implements lives in [SPEC.md](../../SPEC.md); the optional input/command invocation surface and the remote wire format live in [SPEC-extensions.md](../../SPEC-extensions.md). Runnable conformance vectors are in [CONFORMANCE.md](../../CONFORMANCE.md).
+
 ## License
 
 MIT

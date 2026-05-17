@@ -43,6 +43,10 @@ const { ref, values } = useWcBindable<HTMLElement>({ value: "" });
 - Binds on `onMounted` and cleans up on `onUnmounted`.
 - If the element does not implement `wc-bindable`, the composable is a no-op.
 
+## Specification
+
+The protocol contract this adapter implements lives in [SPEC.md](../../SPEC.md); the optional input/command invocation surface and the remote wire format live in [SPEC-extensions.md](../../SPEC-extensions.md). Runnable conformance vectors are in [CONFORMANCE.md](../../CONFORMANCE.md).
+
 ## License
 
 MIT

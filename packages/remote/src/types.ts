@@ -37,6 +37,16 @@ export interface RemoteCapabilities {
  * to synthetic per-property names, so equality there would be spurious.
  */
 export interface DeclarationFingerprint {
+  /**
+   * The protocol identifier (e.g. "wc-bindable"). Optional for backward
+   * compatibility with legacy producers that emit a fingerprint without
+   * this field; the consumer-side comparison falls through to non-`protocol`
+   * mismatch handling when either side omits it (per SPEC-extensions.md
+   * § Declaration fingerprint → "Legacy fingerprint shape (no protocol)").
+   * When both sides emit it and the values differ, the comparison drives
+   * the proxy into TerminalFailure regardless of strict-mode opt-in.
+   */
+  protocol?: string;
   version: number;
   properties: string[];
   inputs: string[];

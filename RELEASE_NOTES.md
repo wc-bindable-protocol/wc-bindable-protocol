@@ -3,8 +3,9 @@
 Substantial pre-1.0 minor release. Tightens the core protocol contract on
 five long-standing gaps identified during review (initial-sync semantics,
 teardown contract, version forward-compatibility, `set` / `invoke`
-ordering, name-collision behavior) and adds an `@wc-bindable/extension`
-spec layer for the input/command surface. All 19 packages stay lockstep
+ordering, name-collision behavior) and adds a new `SPEC-extensions.md`
+spec document for the input/command invocation surface and the remote
+wire format (Extensions 1 and 2). All 19 packages stay lockstep
 on `0.7.0`.
 
 ## Behavior changes (pre-1.0 minor — review before upgrading)

@@ -16,7 +16,7 @@ import type {
   ClientMessage,
   RemoteSerializedError,
 } from "../src/types.js";
-import { createSyncTransportPair, TestCore } from "./_helpers.js";
+import { createSyncTransportPair, deliverSync, TestCore } from "./_helpers.js";
 
 describe("RemoteCoreProxy", () => {
   it("exports the public API from the package barrels", () => {
@@ -168,6 +168,9 @@ describe("RemoteCoreProxy", () => {
     };
 
     const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+    // Drive the proxy out of PreSync so `setWithAck` takes the steady-state
+    // path (immediate wire send) rather than queueing for the first sync.
+    deliverSync(handler);
     const pending = proxy.setWithAck("url", "/api/ack");
 
     expect(send).toHaveBeenLastCalledWith({
@@ -227,6 +230,7 @@ describe("RemoteCoreProxy", () => {
     };
 
     const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+    deliverSync(handler);
     const pending = proxy.setWithAck("url", 123);
     const requestId = send.mock.calls.at(-1)?.[0]?.id as string;
 
@@ -263,13 +267,15 @@ describe("RemoteCoreProxy", () => {
 
   it("rejects setWithAckOptions() when aborted in flight and clears pending state", async () => {
     const send = vi.fn();
+    let handler: ((msg: ServerMessage) => void) | null = null;
     const client: ClientTransport = {
       send,
-      onMessage: () => {},
+      onMessage: (h) => { handler = h; },
     };
     const controller = new AbortController();
 
     const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+    deliverSync(handler);
     const pendingSet = proxy.setWithAckOptions("url", "/api/ack", { signal: controller.signal });
 
     controller.abort();
@@ -285,12 +291,14 @@ describe("RemoteCoreProxy", () => {
     vi.useFakeTimers();
     try {
       const send = vi.fn();
+      let handler: ((msg: ServerMessage) => void) | null = null;
       const client: ClientTransport = {
         send,
-        onMessage: () => {},
+        onMessage: (h) => { handler = h; },
       };
 
       const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+      deliverSync(handler);
       const pendingSet = expect(proxy.setWithAck("url", "/api/ack")).rejects.toMatchObject({
         name: "TimeoutError",
         message: 'RemoteCoreProxy: setWithAck("url") timed out after 30000ms',
@@ -406,12 +414,14 @@ describe("RemoteCoreProxy", () => {
 
   it("forwards direct assignment for declared inputs as a set message", () => {
     const send = vi.fn();
+    let handler: ((msg: ServerMessage) => void) | null = null;
     const client: ClientTransport = {
       send,
-      onMessage: () => {},
+      onMessage: (h) => { handler = h; },
     };
 
     const proxy = createRemoteCoreProxy(TestCore.wcBindable, client) as RemoteCoreProxy & { url: string };
+    deliverSync(handler);
     proxy.url = "/api/direct";
 
     expect(send).toHaveBeenCalledWith({ type: "set", name: "url", value: "/api/direct" });
@@ -464,6 +474,7 @@ describe("RemoteCoreProxy", () => {
     };
 
     const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+    deliverSync(handler);
     const result = await proxy.invoke("doFetch");
     expect(result).toBe("result");
     expect(send).toHaveBeenCalledWith(
@@ -487,6 +498,7 @@ describe("RemoteCoreProxy", () => {
     const randomUuidSpy = vi.spyOn(globalThis.crypto, "randomUUID").mockReturnValue("cmd-uuid");
 
     const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+    deliverSync(handler);
 
     await expect(proxy.invoke("doFetch")).resolves.toBe("uuid-result");
     expect(send).toHaveBeenCalledWith({ type: "cmd", name: "doFetch", id: "cmd-uuid", args: [] });
@@ -515,6 +527,7 @@ describe("RemoteCoreProxy", () => {
 
     try {
       const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+      deliverSync(handler);
       await expect(proxy.invoke("doFetch")).resolves.toBe("fallback-id");
       expect(send).toHaveBeenCalledWith({ type: "cmd", name: "doFetch", id: "1", args: [] });
     } finally {
@@ -537,6 +550,7 @@ describe("RemoteCoreProxy", () => {
     };
 
     const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+    deliverSync(handler);
     await expect(proxy.invoke("doFetch")).rejects.toBe("boom");
   });
 
@@ -558,6 +572,7 @@ describe("RemoteCoreProxy", () => {
     };
 
     const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+    deliverSync(handler);
     const error = await proxy.invoke("doFetch").catch((err) => err);
 
     expect(error).toBeInstanceOf(Error);
@@ -584,6 +599,7 @@ describe("RemoteCoreProxy", () => {
 
     try {
       const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+      deliverSync(handler);
       const error = await proxy.invoke("doFetch").catch((err) => err);
 
       expect(error).toBeInstanceOf(Error);
@@ -762,6 +778,7 @@ describe("RemoteCoreProxy", () => {
     };
 
     const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+    deliverSync(handler);
     await proxy.invoke("doFetch", "arg1", 2);
     expect(send).toHaveBeenCalledWith(
       expect.objectContaining({ type: "cmd", name: "doFetch", args: ["arg1", 2] }),
@@ -794,6 +811,7 @@ describe("RemoteCoreProxy", () => {
     };
 
     const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+    deliverSync(handler);
     const pending = proxy.invokeWithOptions("doFetch", ["arg1", 2], { timeoutMs: 25 });
 
     expect(send).toHaveBeenLastCalledWith(
@@ -808,13 +826,15 @@ describe("RemoteCoreProxy", () => {
 
   it("rejects invokeWithOptions() when aborted in flight and clears pending state", async () => {
     const send = vi.fn();
+    let handler: ((msg: ServerMessage) => void) | null = null;
     const client: ClientTransport = {
       send,
-      onMessage: () => {},
+      onMessage: (h) => { handler = h; },
     };
     const controller = new AbortController();
 
     const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+    deliverSync(handler);
     const pendingInvoke = proxy.invokeWithOptions("doFetch", { signal: controller.signal });
 
     controller.abort();
@@ -830,12 +850,14 @@ describe("RemoteCoreProxy", () => {
     vi.useFakeTimers();
     try {
       const send = vi.fn();
+      let handler: ((msg: ServerMessage) => void) | null = null;
       const client: ClientTransport = {
         send,
-        onMessage: () => {},
+        onMessage: (h) => { handler = h; },
       };
 
       const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+      deliverSync(handler);
       const pendingInvoke = expect(proxy.invokeWithOptions("doFetch", { timeoutMs: 25 })).rejects.toMatchObject({
         name: "TimeoutError",
         message: 'RemoteCoreProxy: invoke("doFetch") timed out after 25ms',
@@ -853,12 +875,14 @@ describe("RemoteCoreProxy", () => {
   });
 
   it("rejects (not throws) when timeoutMs is invalid", async () => {
+    let handler: ((msg: ServerMessage) => void) | null = null;
     const client: ClientTransport = {
       send: vi.fn(),
-      onMessage: () => {},
+      onMessage: (h) => { handler = h; },
     };
 
     const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+    deliverSync(handler);
 
     // invokeWithOptions and setWithAckOptions must surface invalid timeoutMs
     // as an async rejection — callers chain .catch() on the returned Promise
@@ -885,6 +909,7 @@ describe("RemoteCoreProxy", () => {
     };
 
     const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+    deliverSync(handler);
 
     const badPending = proxy.setWithAck("url", 1n);
     await expect(badPending).rejects.toBeInstanceOf(TypeError);
@@ -901,37 +926,51 @@ describe("RemoteCoreProxy", () => {
   });
 
   it("rejects pending setWithAck() with a default transport-closed error when the transport disappears without a connection error", async () => {
-    const { client } = createSyncTransportPair();
+    const { client, server } = createSyncTransportPair();
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    server.onMessage(() => {});
+    const origOnMessage = client.onMessage.bind(client);
+    client.onMessage = (h) => { handler = h; origOnMessage(h); };
     const proxy = createRemoteCoreProxy(TestCore.wcBindable, client) as RemoteCoreProxy;
+    deliverSync(handler);
 
     Object.defineProperty(proxy, "_transport", { value: null, writable: true });
     Object.defineProperty(proxy, "_connectionError", { value: null, writable: true });
+    Object.defineProperty(proxy, "_isPreSync", { value: false, writable: true });
 
     await expect(proxy.setWithAck("url", "/api")).rejects.toThrow("Transport closed");
   });
 
   it("rejects invoke() with a default transport-closed error when the transport disappears without a connection error", async () => {
-    const { client } = createSyncTransportPair();
+    const { client, server } = createSyncTransportPair();
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    server.onMessage(() => {});
+    const origOnMessage = client.onMessage.bind(client);
+    client.onMessage = (h) => { handler = h; origOnMessage(h); };
     const proxy = createRemoteCoreProxy(TestCore.wcBindable, client) as RemoteCoreProxy;
+    deliverSync(handler);
 
     Object.defineProperty(proxy, "_transport", { value: null, writable: true });
     Object.defineProperty(proxy, "_connectionError", { value: null, writable: true });
+    Object.defineProperty(proxy, "_isPreSync", { value: false, writable: true });
 
     await expect(proxy.invoke("doFetch")).rejects.toThrow("Transport closed");
   });
 
   it("disconnects and rejects setWithAck() when sending a serializable payload throws", async () => {
     const dispose = vi.fn();
+    let handler: ((msg: ServerMessage) => void) | null = null;
     const client: ClientTransport = {
       send: (msg) => {
         if (msg.type === "sync") return;
         throw new Error("socket blew up");
       },
-      onMessage: () => {},
+      onMessage: (h) => { handler = h; },
       dispose,
     };
 
     const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+    deliverSync(handler);
 
     await expect(proxy.setWithAck("url", "/api")).rejects.toThrow("socket blew up");
     expect(dispose).toHaveBeenCalledTimes(1);
@@ -940,16 +979,18 @@ describe("RemoteCoreProxy", () => {
 
   it("throws from set() when sending a serializable payload fails", () => {
     const dispose = vi.fn();
+    let handler: ((msg: ServerMessage) => void) | null = null;
     const client: ClientTransport = {
       send: (msg) => {
         if (msg.type === "sync") return;
         throw new Error("set send failed");
       },
-      onMessage: () => {},
+      onMessage: (h) => { handler = h; },
       dispose,
     };
 
     const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+    deliverSync(handler);
 
     expect(() => proxy.set("url", "/api")).toThrow("set send failed");
     expect(dispose).toHaveBeenCalledTimes(1);
@@ -1953,6 +1994,316 @@ describe("RemoteCoreProxy", () => {
       } finally {
         console.warn = originalWarn;
       }
+    });
+  });
+
+  describe("declaration fingerprint protocol mismatch", () => {
+    // High #2: SPEC-extensions.md § Declaration fingerprint ("protocol differs")
+    // + CONFORMANCE.md vector 35: a producer-side `declarationFingerprint`
+    // whose `protocol` field disagrees with the consumer's local one MUST
+    // drive the proxy into TerminalFailure regardless of strict-mode opt-in.
+    it("terminates the proxy when the producer's sync advertises a different protocol identifier", async () => {
+      const send = vi.fn();
+      let handler: ((msg: ServerMessage) => void) | null = null;
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const client: ClientTransport = {
+        send,
+        onMessage: (h) => { handler = h; },
+      };
+
+      try {
+        const proxy = createRemoteCoreProxy(TestCore.wcBindable, client, {
+          preSyncBehavior: "queue",
+        });
+        const pending = proxy.setWithAck("url", "/api");
+
+        // Server advertises a different `protocol` identifier — breaking
+        // compatibility per SPEC.md § Versioning. Vector 35 requires this
+        // to drive TerminalFailure regardless of strict-mode opt-in.
+        handler!({
+          type: "sync",
+          values: {},
+          capabilities: { setAck: true },
+          declarationFingerprint: {
+            protocol: "wc-bindable-2",
+            version: 1,
+            properties: ["value", "loading"],
+            inputs: ["url"],
+            commands: ["abort", "doFetch"],
+          },
+        });
+
+        // Pending entry rejects with the TRIGGER code (WC_BINDABLE_PROTOCOL_ERROR).
+        const triggerError = await pending.catch((e) => e);
+        expect(triggerError).toBeInstanceOf(Error);
+        expect((triggerError as { code?: string }).code).toBe("WC_BINDABLE_PROTOCOL_ERROR");
+        expect((triggerError as Error).message).toMatch(/protocol identifier mismatch/);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("post-mismatch calls reject with WC_BINDABLE_TERMINAL_FAILURE (distinct from the trigger code)", async () => {
+      let handler: ((msg: ServerMessage) => void) | null = null;
+      const dispose = vi.fn();
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const client: ClientTransport = {
+        send: () => {},
+        onMessage: (h) => { handler = h; },
+        dispose,
+      };
+
+      try {
+        const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+        handler!({
+          type: "sync",
+          values: {},
+          capabilities: { setAck: true },
+          declarationFingerprint: {
+            protocol: "wc-bindable-99",
+            version: 1,
+            properties: ["value", "loading"],
+            inputs: ["url"],
+            commands: ["abort", "doFetch"],
+          },
+        });
+
+        // Transport disposed as part of TerminalFailure.
+        expect(dispose).toHaveBeenCalledTimes(1);
+
+        // Subsequent set() throws synchronously with the POST-TERMINAL code,
+        // distinct from the TRIGGER code that drained pending entries.
+        let setError: unknown;
+        try {
+          proxy.set("url", "/api");
+        } catch (err) {
+          setError = err;
+        }
+        expect(setError).toBeInstanceOf(Error);
+        expect((setError as { code?: string }).code).toBe("WC_BINDABLE_TERMINAL_FAILURE");
+
+        // setWithAck / invoke return already-rejected with the same terminal code.
+        const setAckErr = await proxy.setWithAck("url", "/api").catch((e) => e);
+        expect((setAckErr as { code?: string }).code).toBe("WC_BINDABLE_TERMINAL_FAILURE");
+        const invokeErr = await proxy.invoke("doFetch").catch((e) => e);
+        expect((invokeErr as { code?: string }).code).toBe("WC_BINDABLE_TERMINAL_FAILURE");
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("default 'eager' path: pre-sync setWithAck rejects with the trigger PROTOCOL_ERROR (not SET_ACK_UNSUPPORTED) when sync carries a protocol mismatch AND setAck: false", async () => {
+      // Regression for the spec-conformance gap where the sync handler
+      // ran `_rejectUnsupportedSetAckPending` before
+      // `_compareDeclarationFingerprint`, so a pre-sync `setWithAck` (in
+      // `_pending` under the legacy eager path) would reject with
+      // `WC_BINDABLE_SET_ACK_UNSUPPORTED` and the wire-protocol
+      // disagreement that should have driven `WC_BINDABLE_PROTOCOL_ERROR`
+      // never reached the caller. CONFORMANCE.md vector 35 requires the
+      // trigger code regardless of the setAck capability — protocol
+      // mismatch is the load-bearing terminal condition.
+      const send = vi.fn();
+      let handler: ((msg: ServerMessage) => void) | null = null;
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const client: ClientTransport = {
+        send,
+        onMessage: (h) => { handler = h; },
+      };
+
+      try {
+        // Default `preSyncBehavior: "eager"` — setWithAck lands in `_pending` immediately.
+        const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
+        const pending = proxy.setWithAck("url", "/api");
+
+        // Producer disagrees on `protocol` AND omits `setAck`. Without the
+        // fix, the pending entry rejects with WC_BINDABLE_SET_ACK_UNSUPPORTED
+        // because `_rejectUnsupportedSetAckPending` runs first. With the fix,
+        // the protocol mismatch takes precedence and the pending entry
+        // rejects with the trigger code WC_BINDABLE_PROTOCOL_ERROR.
+        handler!({
+          type: "sync",
+          values: {},
+          // setAck deliberately absent — legacy server posture.
+          declarationFingerprint: {
+            protocol: "wc-bindable-2",
+            version: 1,
+            properties: ["value", "loading"],
+            inputs: ["url"],
+            commands: ["abort", "doFetch"],
+          },
+        });
+
+        const err = await pending.catch((e) => e);
+        expect((err as { code?: string }).code).toBe("WC_BINDABLE_PROTOCOL_ERROR");
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("matching protocol with non-protocol drift only warns (default mode)", async () => {
+      let handler: ((msg: ServerMessage) => void) | null = null;
+      const warnCalls: unknown[][] = [];
+      const logger = {
+        warn: (...args: unknown[]) => warnCalls.push(args),
+        error: () => {},
+      };
+      const client: ClientTransport = {
+        send: () => {},
+        onMessage: (h) => { handler = h; },
+      };
+
+      const proxy = createRemoteCoreProxy(TestCore.wcBindable, client, { logger });
+
+      handler!({
+        type: "sync",
+        values: {},
+        capabilities: { setAck: true },
+        declarationFingerprint: {
+          protocol: "wc-bindable",
+          version: 2, // version differs — non-protocol axis
+          properties: ["value", "loading"],
+          inputs: ["url"],
+          commands: ["abort", "doFetch"],
+        },
+      });
+
+      // Warn-log fires; proxy does NOT terminate. set() still works.
+      expect(warnCalls.length).toBeGreaterThanOrEqual(1);
+      expect(() => proxy.set("url", "/non-terminal")).not.toThrow();
+    });
+  });
+
+  describe("pre-sync queue (preSyncBehavior: 'queue')", () => {
+    // High #1: SPEC-extensions.md § Pre-sync call state machine + CONFORMANCE.md
+    // vector 16. When opted into the conformant `"queue"` behavior, pre-sync
+    // setWithAck / invoke MUST queue and replay in caller order after the
+    // first sync response.
+    it("queues setWithAck before sync arrives and dispatches after drain (setAck supported)", async () => {
+      const send = vi.fn();
+      let handler: ((msg: ServerMessage) => void) | null = null;
+      const client: ClientTransport = {
+        send,
+        onMessage: (h) => { handler = h; },
+      };
+
+      const proxy = createRemoteCoreProxy(TestCore.wcBindable, client, {
+        preSyncBehavior: "queue",
+      });
+      const pending = proxy.setWithAck("url", "/queued");
+
+      // Only the initial sync should have been sent — the setWithAck is queued.
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(send).toHaveBeenLastCalledWith({ type: "sync" });
+
+      // Deliver the sync response; queue drains and the setWithAck is dispatched.
+      handler!({ type: "sync", values: {}, capabilities: { setAck: true } });
+      expect(send).toHaveBeenCalledTimes(2);
+      const second = send.mock.calls[1]?.[0];
+      expect(second).toMatchObject({ type: "set", name: "url", value: "/queued" });
+      const requestId = (second as { id: string }).id;
+
+      handler!({ type: "return", id: requestId, value: undefined });
+      await expect(pending).resolves.toBeUndefined();
+    });
+
+    it("queued setWithAck rejects with WC_BINDABLE_SET_ACK_UNSUPPORTED when producer omits the capability", async () => {
+      let handler: ((msg: ServerMessage) => void) | null = null;
+      const send = vi.fn();
+      const client: ClientTransport = {
+        send,
+        onMessage: (h) => { handler = h; },
+      };
+
+      const proxy = createRemoteCoreProxy(TestCore.wcBindable, client, {
+        preSyncBehavior: "queue",
+      });
+      const pending = proxy.setWithAck("url", "/queued-on-legacy");
+
+      handler!({ type: "sync", values: {}, capabilities: {} });
+
+      const err = await pending.catch((e) => e);
+      expect((err as { code?: string }).code).toBe("WC_BINDABLE_SET_ACK_UNSUPPORTED");
+      // No wire `set` was sent — only the initial sync.
+      expect(send).toHaveBeenCalledTimes(1);
+    });
+
+    it("queues invoke alongside setWithAck and preserves caller-order FIFO on drain", async () => {
+      const sentMessages: ClientMessage[] = [];
+      let handler: ((msg: ServerMessage) => void) | null = null;
+      const client: ClientTransport = {
+        send: (msg) => { sentMessages.push(msg); },
+        onMessage: (h) => { handler = h; },
+      };
+
+      const proxy = createRemoteCoreProxy(TestCore.wcBindable, client, {
+        preSyncBehavior: "queue",
+      });
+      const setPending = proxy.setWithAck("url", "/first");
+      const invokePending = proxy.invoke("doFetch");
+
+      // Only sync was sent.
+      expect(sentMessages).toEqual([{ type: "sync" }]);
+
+      handler!({ type: "sync", values: {}, capabilities: { setAck: true } });
+
+      // Drain order matches caller order: setWithAck before invoke.
+      const post = sentMessages.slice(1);
+      expect(post[0]).toMatchObject({ type: "set", name: "url", value: "/first" });
+      expect(post[1]).toMatchObject({ type: "cmd", name: "doFetch", args: [] });
+
+      const setId = (post[0] as { id: string }).id;
+      const cmdId = (post[1] as { id: string }).id;
+      handler!({ type: "return", id: setId, value: undefined });
+      handler!({ type: "return", id: cmdId, value: "ok" });
+
+      await expect(setPending).resolves.toBeUndefined();
+      await expect(invokePending).resolves.toBe("ok");
+    });
+
+    it("rejects with WC_BINDABLE_PRE_SYNC_QUEUE_FULL when the bound is exceeded", async () => {
+      const send = vi.fn();
+      const client: ClientTransport = {
+        send,
+        onMessage: () => {},
+      };
+
+      const proxy = createRemoteCoreProxy(TestCore.wcBindable, client, {
+        preSyncBehavior: "queue",
+        maxPreSyncQueue: 2,
+      });
+      const p1 = proxy.setWithAck("url", "a");
+      const p2 = proxy.setWithAck("url", "b");
+      const p3 = proxy.setWithAck("url", "c"); // exceeds maxPreSyncQueue=2
+
+      const err = await p3.catch((e) => e);
+      expect((err as { code?: string }).code).toBe("WC_BINDABLE_PRE_SYNC_QUEUE_FULL");
+      // The in-queue entries (p1, p2) are NOT evicted — they continue to wait.
+      // Clean up to avoid leaking pending promises into other tests.
+      proxy.dispose();
+      await expect(p1).rejects.toBeDefined();
+      await expect(p2).rejects.toBeDefined();
+    });
+
+    it("drains the queue with terminal-failure error on transport close before sync", async () => {
+      let closeHandler: (() => void) | null = null;
+      const client: ClientTransport = {
+        send: () => {},
+        onMessage: () => {},
+        onClose: (h) => { closeHandler = h; },
+      };
+
+      const proxy = createRemoteCoreProxy(TestCore.wcBindable, client, {
+        preSyncBehavior: "queue",
+      });
+      const p1 = proxy.setWithAck("url", "/queued");
+      const p2 = proxy.invoke("doFetch");
+
+      closeHandler!();
+
+      const e1 = await p1.catch((e) => e);
+      const e2 = await p2.catch((e) => e);
+      expect((e1 as { code?: string }).code).toBe("WC_BINDABLE_TERMINAL_FAILURE");
+      expect((e2 as { code?: string }).code).toBe("WC_BINDABLE_TERMINAL_FAILURE");
     });
   });
 });

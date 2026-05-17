@@ -16,6 +16,14 @@ import {
 
 const DEFAULT_PENDING_TIMEOUT_MS = 30_000;
 
+/**
+ * MUST-level default per SPEC-extensions.md § Pre-sync call state machine
+ * → "Pre-sync queue depth bound (MUST)". Bounds the producer-controlled
+ * latency surface: an unresponsive producer that never sends `sync` cannot
+ * grow this queue without limit. Configurable via `maxPreSyncQueue`.
+ */
+const DEFAULT_MAX_PRE_SYNC_QUEUE = 1_024;
+
 export interface RemoteCoreProxyOptions {
   /**
    * Soft cap on pending acknowledged requests (`setWithAck` + `invoke`).
@@ -26,6 +34,41 @@ export interface RemoteCoreProxyOptions {
    * peers.
    */
   maxPendingInvocations?: number;
+  /**
+   * Upper bound on the pre-sync queue depth — the count of `setWithAck` /
+   * `setWithAckOptions` / `invoke` / `invokeWithOptions` calls waiting for
+   * the first `sync` response (see SPEC-extensions.md § Pre-sync call state
+   * machine). When a new call would push the queue past this count, it
+   * rejects with an `error.code === "WC_BINDABLE_PRE_SYNC_QUEUE_FULL"`
+   * error and the in-queue entries are NOT evicted. Defaults to
+   * `DEFAULT_MAX_PRE_SYNC_QUEUE` (1 024). MUST be a positive integer if
+   * provided. Only used when `preSyncBehavior` is `"queue"` (default).
+   */
+  maxPreSyncQueue?: number;
+  /**
+   * **Conformance switch — pre-sync `setWithAck` / `invoke` behavior.**
+   *
+   * - `"eager"` (default in 0.7.x for backward compatibility; **NON-conformant**
+   *   per SPEC-extensions.md § Pre-sync call state machine MUST): calls
+   *   are dispatched immediately, before the `setAck` capability is known.
+   *   A `setWithAck` against a producer that ends up advertising
+   *   `setAck: false` rejects with `WC_BINDABLE_SET_ACK_UNSUPPORTED` when
+   *   the sync response arrives (`_rejectUnsupportedSetAckPending`).
+   *   This is the legacy 0.6.x behavior — it is documented as a known
+   *   conformance divergence (see [packages/remote/README.md § Known
+   *   conformance divergences] and [CONFORMANCE.md vector 17 / vector 38]).
+   * - `"queue"` (opt-in conformant behavior; **planned default in 0.8.0**):
+   *   the same calls are queued onto `_preSyncQueue` and replayed in
+   *   caller order after the first `sync` response arrives. `setWithAck`
+   *   against a `setAck: false` producer rejects locally without ever
+   *   reaching the wire. Recommended for new code that wants the spec
+   *   contract today.
+   *
+   * The default flips to `"queue"` in 0.8.0; this option will be removed
+   * in 1.0. Document the choice in any public API surface that wraps
+   * `createRemoteCoreProxy`.
+   */
+  preSyncBehavior?: "queue" | "eager";
   /**
    * Logger used for diagnostic output (ignored-sync-value warnings,
    * unknown-response warnings, etc.). Defaults to `console.warn` /
@@ -39,6 +82,16 @@ function normalizePendingLimit(value: number | undefined): number {
   if (!Number.isFinite(value) || value < 1 || !Number.isInteger(value)) {
     throw new Error(
       "RemoteCoreProxy: maxPendingInvocations must be a positive integer or omitted",
+    );
+  }
+  return value;
+}
+
+function normalizePreSyncQueueLimit(value: number | undefined): number {
+  if (value === undefined) return DEFAULT_MAX_PRE_SYNC_QUEUE;
+  if (!Number.isFinite(value) || value < 1 || !Number.isInteger(value)) {
+    throw new Error(
+      "RemoteCoreProxy: maxPreSyncQueue must be a positive integer or omitted",
     );
   }
   return value;
@@ -59,6 +112,17 @@ function createAbortError(signal: AbortSignal): unknown {
 function createTimeoutError(operation: string, timeoutMs: number): Error {
   const error = new Error(`RemoteCoreProxy: ${operation} timed out after ${timeoutMs}ms`);
   error.name = "TimeoutError";
+  return error;
+}
+
+/**
+ * Build an Error with a machine-readable `code` field set to one of the
+ * normatively-registered values in SPEC-extensions.md § Error envelope.
+ * Consumer recovery branches MUST pattern-match on `code`, not on `message`.
+ */
+function createCodedError(code: string, message: string): Error {
+  const error = new Error(message) as Error & { code?: string };
+  error.code = code;
   return error;
 }
 
@@ -107,6 +171,31 @@ function isRemoteSerializedError(value: unknown): value is RemoteSerializedError
     (candidate.stack === undefined || typeof candidate.stack === "string")
   );
 }
+
+/**
+ * One queued pre-sync call. The proxy uses this between transport attach
+ * and the first received `sync` response so that `setWithAck` / `invoke`
+ * never reach the wire before the `setAck` capability is known and the
+ * fingerprint has been compared. See SPEC-extensions.md § Pre-sync call
+ * state machine.
+ */
+type PreSyncQueueEntry = {
+  kind: "set-ack" | "invoke";
+  name: string;
+  /** Present for `set-ack` entries. */
+  value?: unknown;
+  /** Present for `invoke` entries. */
+  args?: unknown[];
+  options: RemoteRequestOptions | undefined;
+  timeoutContext: string;
+  /** Forwards the post-drain dispatch (or pre-drain rejection) to the
+   *  caller's awaited Promise. */
+  resolve: (v: unknown) => void;
+  reject: (e: unknown) => void;
+  /** Tears down per-entry abort / timeout listeners and removes the entry
+   *  from `_preSyncQueue` if still present. Idempotent. */
+  cleanup: () => void;
+};
 
 function reviveThrownError(value: unknown): unknown {
   if (!isRemoteSerializedError(value)) {
@@ -162,7 +251,30 @@ export class RemoteCoreProxy extends EventTarget {
   private _transportGeneration = 0;
   private _setAckSupported: boolean | null = null;
   private _maxPendingInvocations: number;
+  private _maxPreSyncQueue: number;
+  /**
+   * When `"eager"`, pre-sync `setWithAck` / `invoke` skip the queue and
+   * dispatch immediately (0.6.x legacy behavior). When `"queue"` (default),
+   * they queue per SPEC-extensions.md § Pre-sync call state machine MUST.
+   */
+  private _preSyncBehavior: "queue" | "eager";
   private _logger: Logger;
+  /**
+   * True between transport attach and the first received `sync` response on
+   * that transport. Reset to true on every reconnect. While true,
+   * `setWithAck` / `setWithAckOptions` / `invoke` / `invokeWithOptions`
+   * queue onto `_preSyncQueue` instead of issuing wire traffic
+   * immediately, per the MUST in SPEC-extensions.md § Pre-sync call state
+   * machine.
+   */
+  private _isPreSync = false;
+  /**
+   * FIFO queue of pre-sync `setWithAck` / `invoke` calls waiting for the
+   * first `sync` response. Drained in caller order when the response
+   * arrives (and replayed with the appropriate disposition per setAck
+   * capability). Drained-and-rejected on terminal failure before sync.
+   */
+  private _preSyncQueue: PreSyncQueueEntry[] = [];
   /** Local fingerprint, computed once at construction and compared against
    *  the server's fingerprint on every `sync` response. See
    *  SPEC-extensions.md § Declaration fingerprint. */
@@ -181,6 +293,12 @@ export class RemoteCoreProxy extends EventTarget {
     this._inputs = new Set((declaration.inputs ?? []).map((input) => input.name));
     this._commands = new Set((declaration.commands ?? []).map((command) => command.name));
     this._maxPendingInvocations = normalizePendingLimit(options.maxPendingInvocations);
+    this._maxPreSyncQueue = normalizePreSyncQueueLimit(options.maxPreSyncQueue);
+    // Default is "eager" in 0.7.x for backward compatibility with the 0.6.x
+    // optimistic-send behavior; the planned 0.8.0 release flips this to
+    // "queue" to match the SPEC-extensions.md § Pre-sync call state machine MUST.
+    // Document this choice explicitly in any wrapper API.
+    this._preSyncBehavior = options.preSyncBehavior ?? "eager";
     this._logger = resolveLogger(options.logger);
     this._localFingerprint = buildDeclarationFingerprint(declaration);
 
@@ -210,16 +328,26 @@ export class RemoteCoreProxy extends EventTarget {
     } catch (err) {
       return Promise.reject(err);
     }
-    if (this._setAckSupported === false) {
-      return Promise.reject(
-        new Error("RemoteCoreProxy: remote server does not support setWithAck(); use set() or upgrade the server"),
-      );
-    }
-
-    const transport = this._transport;
     if (this._disposedError) {
       return Promise.reject(this._disposedError);
     }
+    // setAck capability is known only after the first `sync` response.
+    // Per SPEC-extensions.md § Pre-sync call state machine MUST, pre-sync
+    // `setWithAck` MUST queue instead of fast-rejecting on a capability we
+    // have not learned yet — the conformant behavior is gated behind
+    // `preSyncBehavior: "queue"` (the planned 0.8.0 default). The 0.7.x
+    // default `"eager"` preserves the legacy optimistic-send behavior.
+    if (this._isPreSync && this._preSyncBehavior === "queue") {
+      return this._enqueuePreSync<void>("set-ack", name, value, undefined, options, `setWithAck("${name}")`);
+    }
+    if (this._setAckSupported === false) {
+      return Promise.reject(createCodedError(
+        "WC_BINDABLE_SET_ACK_UNSUPPORTED",
+        "RemoteCoreProxy: remote server does not support setWithAck(); use set() or upgrade the server",
+      ));
+    }
+
+    const transport = this._transport;
     if (!transport) {
       /* v8 ignore next -- reaching transport=null without a recorded connection error requires mutating private state */
       return Promise.reject(this._connectionError ?? new Error("Transport closed"));
@@ -292,10 +420,17 @@ export class RemoteCoreProxy extends EventTarget {
         new Error(`RemoteCoreProxy: command "${name}" is not declared in wcBindable.commands`),
       );
     }
-    const transport = this._transport;
     if (this._disposedError) {
       return Promise.reject(this._disposedError);
     }
+    // Per SPEC-extensions.md § Pre-sync call state machine MUST, pre-sync
+    // `invoke` MUST queue alongside `setWithAck` so caller-order FIFO is
+    // preserved across mixed traffic. Gated behind `preSyncBehavior: "queue"`
+    // (planned 0.8.0 default); 0.7.x defaults to `"eager"` legacy behavior.
+    if (this._isPreSync && this._preSyncBehavior === "queue") {
+      return this._enqueuePreSync<unknown>("invoke", name, undefined, args, options, `invoke("${name}")`);
+    }
+    const transport = this._transport;
     if (!transport) {
       return Promise.reject(this._connectionError ?? new Error("Transport closed"));
     }
@@ -397,6 +532,194 @@ export class RemoteCoreProxy extends EventTarget {
     });
   }
 
+  /**
+   * Queue a pre-sync `setWithAck` / `invoke` call. The promise stays
+   * pending until the first `sync` response arrives and `_drainPreSyncQueue`
+   * either dispatches the wire message or rejects with
+   * `WC_BINDABLE_SET_ACK_UNSUPPORTED`. Per-entry abort / timeout listeners
+   * are installed while queued so the call settles even if `sync` never
+   * arrives.
+   *
+   * Bounded by `_maxPreSyncQueue`: when the queue is at capacity, the new
+   * call rejects with `WC_BINDABLE_PRE_SYNC_QUEUE_FULL` (the in-queue
+   * entries MUST NOT be evicted, per SPEC-extensions.md § Pre-sync call
+   * state machine → "Pre-sync queue depth bound (MUST)").
+   */
+  private _enqueuePreSync<T>(
+    kind: "set-ack" | "invoke",
+    name: string,
+    value: unknown | undefined,
+    args: unknown[] | undefined,
+    options: RemoteRequestOptions | undefined,
+    timeoutContext: string,
+  ): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      if (this._preSyncQueue.length >= this._maxPreSyncQueue) {
+        reject(createCodedError(
+          "WC_BINDABLE_PRE_SYNC_QUEUE_FULL",
+          `RemoteCoreProxy: pre-sync queue exceeded maxPreSyncQueue=${this._maxPreSyncQueue}; ` +
+            "the in-queue entries are preserved per SPEC-extensions.md MUST. " +
+            "Either wait for the sync response to drain the queue, raise maxPreSyncQueue " +
+            "on createRemoteCoreProxy(), or stop optimistic-bursting before the handshake.",
+        ));
+        return;
+      }
+      // Validate timeoutMs at the call site so an invalid value surfaces as
+      // an async rejection rather than being silently held until drain.
+      let timeoutMs: number | null;
+      try {
+        timeoutMs = normalizeTimeoutMs(options);
+      } catch (err) {
+        reject(err);
+        return;
+      }
+      const signal = options?.signal;
+      if (signal?.aborted) {
+        reject(createAbortError(signal));
+        return;
+      }
+
+      let entry: PreSyncQueueEntry;
+      let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+
+      const cleanup = () => {
+        if (signal) {
+          signal.removeEventListener("abort", onAbort);
+        }
+        if (timeoutHandle !== null) {
+          clearTimeout(timeoutHandle);
+          timeoutHandle = null;
+        }
+        const idx = this._preSyncQueue.indexOf(entry);
+        if (idx >= 0) this._preSyncQueue.splice(idx, 1);
+      };
+      const onAbort = () => {
+        cleanup();
+        /* v8 ignore next -- abort handler only fires while still queued; signal is non-null on this code path */
+        reject(createAbortError(signal!));
+      };
+      const onTimeout = () => {
+        cleanup();
+        reject(createTimeoutError(timeoutContext, timeoutMs!));
+      };
+
+      entry = {
+        kind,
+        name,
+        value,
+        args,
+        options,
+        timeoutContext,
+        resolve: resolve as (v: unknown) => void,
+        reject,
+        cleanup,
+      };
+
+      if (signal) {
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
+      if (timeoutMs !== null) {
+        timeoutHandle = setTimeout(onTimeout, timeoutMs);
+      }
+
+      this._preSyncQueue.push(entry);
+    });
+  }
+
+  /**
+   * Replay the pre-sync queue in caller order once the first `sync`
+   * response has been received and processed. For each entry:
+   *
+   * - `set-ack` against a producer that did NOT advertise `capabilities.setAck`
+   *   rejects with `WC_BINDABLE_SET_ACK_UNSUPPORTED`; no wire message is sent.
+   * - `set-ack` against a `setAck: true` producer is dispatched as an
+   *   id-bearing `set` and the entry's promise resolves on the matching
+   *   `return` / rejects on `throw`, timeout, abort, or transport
+   *   terminal — same lifecycle as a post-sync `setWithAck`.
+   * - `invoke` is dispatched as a `cmd` regardless of `setAck` (its
+   *   semantics do not depend on the capability).
+   *
+   * Per-caller FIFO is preserved across mixed `set-ack` + `invoke` traffic.
+   * After this method returns the proxy is in steady-state and new calls
+   * skip the queue path entirely.
+   */
+  private _drainPreSyncQueue(): void {
+    const queue = this._preSyncQueue;
+    this._preSyncQueue = [];
+    this._isPreSync = false;
+    const setAckSupported = this._setAckSupported === true;
+    for (const entry of queue) {
+      // Tear down the pre-sync abort / timeout listeners — `_createPendingRequest`
+      // will install its own for the post-drain pending entry.
+      entry.cleanup();
+      if (entry.kind === "set-ack" && !setAckSupported) {
+        entry.reject(createCodedError(
+          "WC_BINDABLE_SET_ACK_UNSUPPORTED",
+          "RemoteCoreProxy: remote server does not support setWithAck(); use set() or upgrade the server",
+        ));
+        continue;
+      }
+      this._dispatchDrainedEntry(entry);
+    }
+  }
+
+  /**
+   * Allocate a pending-table id for a queue entry that has cleared the
+   * sync-time admission rules, send the wire message, and forward its
+   * settlement to the entry's original `resolve` / `reject`.
+   */
+  private _dispatchDrainedEntry(entry: PreSyncQueueEntry): void {
+    const transport = this._transport;
+    if (!transport) {
+      // Transport torn down between sync arrival and drain — defensive
+      // fallback. The standard terminal paths drain the queue with the
+      // terminal error before this branch can fire under normal flow.
+      /* v8 ignore next 2 */
+      entry.reject(this._connectionError ?? this._disposedError ?? new Error("Transport closed"));
+      return;
+    }
+    const dispatcher = (id: string) => {
+      const message: ClientMessage = entry.kind === "set-ack"
+        ? { type: "set", name: entry.name, value: entry.value, id }
+        : { type: "cmd", name: entry.name, id, args: entry.args ?? [] };
+      try {
+        transport.send(message);
+      } catch (err) {
+        if (!canSerializeClientMessage(message)) {
+          this._rejectPendingRequest(id, err);
+          return;
+        }
+        this._handleSendFailure(transport, err);
+      }
+    };
+    const pending = this._createPendingRequest<unknown>(
+      entry.kind,
+      entry.options,
+      entry.timeoutContext,
+      dispatcher,
+    );
+    pending.then(entry.resolve, entry.reject);
+  }
+
+  /**
+   * Drain the pre-sync queue with a terminal error — called from every
+   * terminal / close path so a queued `setWithAck` / `invoke` whose drain
+   * will never run does not leak its caller's awaited Promise.
+   */
+  private _rejectPreSyncQueue(error: Error): void {
+    if (this._preSyncQueue.length === 0) {
+      this._isPreSync = false;
+      return;
+    }
+    const queue = this._preSyncQueue;
+    this._preSyncQueue = [];
+    this._isPreSync = false;
+    for (const entry of queue) {
+      entry.cleanup();
+      entry.reject(error);
+    }
+  }
+
   /** Attach a new transport after the previous one closed. Existing subscribers remain active. */
   reconnect(transport: ClientTransport): void {
     if (this._disposedError) {
@@ -412,13 +735,17 @@ export class RemoteCoreProxy extends EventTarget {
   /** Reject pending work and stop processing future transport events. */
   dispose(): void {
     if (this._disposedError) return;
-    const error = new Error("RemoteCoreProxy disposed");
+    const error = createCodedError("WC_BINDABLE_DISPOSED", "RemoteCoreProxy disposed");
     const transport = this._transport;
     this._disposedError = error;
     this._connectionError = error;
     this._transport = null;
     this._transportGeneration++;
     this._rejectPending(error);
+    // Drain any pre-sync queue with the same coded error so callers
+    // awaiting a queued setWithAck/invoke get a deterministic rejection
+    // instead of a hung Promise.
+    this._rejectPreSyncQueue(error);
     this._disposeTransport(transport);
   }
 
@@ -426,10 +753,14 @@ export class RemoteCoreProxy extends EventTarget {
     /* v8 ignore next -- late close callbacks after dispose are intentionally ignored */
     if (this._disposedError) return;
     const transport = this._transport;
-    this._connectionError = new Error("Transport closed");
+    this._connectionError = createCodedError(
+      "WC_BINDABLE_TERMINAL_FAILURE",
+      "Transport closed",
+    );
     this._transport = null;
     this._transportGeneration++;
     this._rejectPending(this._connectionError);
+    this._rejectPreSyncQueue(this._connectionError);
     this._disposeTransport(transport);
   }
 
@@ -457,6 +788,7 @@ export class RemoteCoreProxy extends EventTarget {
     this._transport = null;
     this._transportGeneration++;
     this._rejectPending(error);
+    this._rejectPreSyncQueue(error);
     this._disposeTransport(transport);
     return error;
   }
@@ -506,18 +838,44 @@ export class RemoteCoreProxy extends EventTarget {
   }
 
   /**
-   * Compare the producer's declaration fingerprint to the local one and
-   * emit a warning on the first observed mismatch. The wire field is
-   * optional (legacy producers omit it); absence means "no comparison
-   * available" and is silently accepted. See SPEC-extensions.md §
-   * Declaration fingerprint.
+   * Compare the producer's declaration fingerprint to the local one.
+   *
+   * Returns `true` when the consumer MUST treat the sync response as
+   * terminal and stop processing it (the `protocol` axis differs — see
+   * SPEC-extensions.md § Declaration fingerprint, "protocol differs"
+   * bullet, and vector 35 in CONFORMANCE.md). Returns `false` for the
+   * other cases: equal fingerprints, legacy fingerprint absent, legacy
+   * fingerprint missing the `protocol` field, and non-`protocol`
+   * mismatches (warn-and-continue per the same section).
    */
   private _compareDeclarationFingerprint(
     remote: DeclarationFingerprint | undefined,
-  ): void {
-    if (remote === undefined) return;
-    if (this._fingerprintMismatchWarned) return;
-    if (declarationFingerprintsEqual(remote, this._localFingerprint)) return;
+  ): boolean {
+    if (remote === undefined) return false;
+    if (declarationFingerprintsEqual(remote, this._localFingerprint)) return false;
+    const localProtocol = this._localFingerprint.protocol;
+    const remoteProtocol = remote.protocol;
+    if (
+      typeof localProtocol === "string" &&
+      typeof remoteProtocol === "string" &&
+      localProtocol !== remoteProtocol
+    ) {
+      // `protocol` axis disagrees. This is a breaking-compatibility
+      // boundary per SPEC.md § Versioning — continuing past it would let
+      // a v1 consumer process v2-shaped envelopes (the silent-corruption
+      // scenario SPEC-extensions.md § Wire format versioning item 4
+      // exists to prevent). MUST terminal regardless of strict-mode opt-in.
+      const triggerError = createCodedError(
+        "WC_BINDABLE_PROTOCOL_ERROR",
+        "RemoteCoreProxy: declaration protocol identifier mismatch between client and server " +
+          `(local="${localProtocol}", remote="${remoteProtocol}"). Continuing past this would let ` +
+          "the consumer silently process envelopes of a different wire-protocol version. " +
+          "Update one side so both declarations advertise the same `protocol` identifier.",
+      );
+      this._terminate(triggerError);
+      return true;
+    }
+    if (this._fingerprintMismatchWarned) return false;
     this._fingerprintMismatchWarned = true;
     this._logger.warn(
       "RemoteCoreProxy: declaration fingerprint mismatch between client and server. " +
@@ -525,6 +883,41 @@ export class RemoteCoreProxy extends EventTarget {
         "server-side wcBindable. Check that both sides are on the same package version. " +
         `Local=${JSON.stringify(this._localFingerprint)} Remote=${JSON.stringify(remote)}`,
     );
+    return false;
+  }
+
+  /**
+   * Tear the proxy down because a wire-protocol-level condition forces
+   * TerminalFailure (currently: fingerprint `protocol` mismatch). Pending
+   * entries reject in caller order with the supplied `triggerError`
+   * (carrying the trigger code per SPEC-extensions.md § Error envelope —
+   * e.g. `WC_BINDABLE_PROTOCOL_ERROR`); subsequent `set` / `setWithAck` /
+   * `invoke` calls reject with a `WC_BINDABLE_TERMINAL_FAILURE`-coded
+   * error, matching vector 34's terminal-path rule and vector 35's
+   * three-way code split.
+   *
+   * Distinct from `dispose()` (which is consumer-initiated and emits
+   * `WC_BINDABLE_DISPOSED`) and from `_handleSendFailure` (which is
+   * transport-send-induced and currently leaves room for `reconnect()`
+   * to recover). `reconnect()` MAY still recover from this terminal
+   * state if the user attaches a transport whose producer advertises the
+   * matching `protocol` identifier; the spec's TerminalFailure → PreSync
+   * transition is preserved.
+   */
+  private _terminate(triggerError: Error): void {
+    /* v8 ignore next -- dispose() has already torn everything down; nothing more to do */
+    if (this._disposedError) return;
+    const transport = this._transport;
+    const terminalError = createCodedError(
+      "WC_BINDABLE_TERMINAL_FAILURE",
+      "RemoteCoreProxy: transport in terminal state",
+    );
+    this._connectionError = terminalError;
+    this._transport = null;
+    this._transportGeneration++;
+    this._rejectPending(triggerError);
+    this._rejectPreSyncQueue(triggerError);
+    this._disposeTransport(transport);
   }
 
   private _rejectUnsupportedSetAckPending(): void {
@@ -546,6 +939,11 @@ export class RemoteCoreProxy extends EventTarget {
     this._connectionError = null;
     this._setAckSupported = null;
     this._fingerprintMismatchWarned = false;
+    // Fresh transport → fresh PreSync window. Any setWithAck / invoke
+    // called between now and the first received `sync` response on this
+    // transport will be queued onto `_preSyncQueue` (or rejected with
+    // WC_BINDABLE_PRE_SYNC_QUEUE_FULL when the bound is reached).
+    this._isPreSync = true;
 
     transport.onMessage((msg) => {
       /* v8 ignore next -- stale transport callbacks after reconnect are ignored defensively */
@@ -570,11 +968,26 @@ export class RemoteCoreProxy extends EventTarget {
     if (this._disposedError) return;
     switch (msg.type) {
       case "sync": {
+        // Compare the declaration fingerprint **before** any other sync
+        // processing. A `protocol` axis disagreement is a breaking-
+        // compatibility boundary (SPEC.md § Versioning) and the spec
+        // requires pending entries to drain with the TRIGGER code
+        // `WC_BINDABLE_PROTOCOL_ERROR` (CONFORMANCE.md vector 35). If we
+        // ran the setAck-capability check first, pre-sync `setWithAck`
+        // entries that landed in `_pending` under the legacy `"eager"`
+        // path would already have rejected with
+        // `WC_BINDABLE_SET_ACK_UNSUPPORTED` by the time `_terminate`
+        // tried to drain them, masking the wire-protocol disagreement
+        // with a capability-mismatch error. Protocol mismatch takes
+        // precedence — capability and value processing are skipped
+        // entirely on termination.
+        if (this._compareDeclarationFingerprint(msg.declarationFingerprint)) {
+          return;
+        }
         this._setAckSupported = msg.capabilities?.setAck === true;
         if (!this._setAckSupported) {
           this._rejectUnsupportedSetAckPending();
         }
-        this._compareDeclarationFingerprint(msg.declarationFingerprint);
         const getterFailures = new Set(msg.getterFailures ?? []);
         const undefinedProperties = new Set(msg.undefinedProperties ?? []);
         // Populate cache and dispatch events for each initial value.
@@ -628,6 +1041,12 @@ export class RemoteCoreProxy extends EventTarget {
             this.dispatchEvent(new CustomEvent(eventName, { detail: undefined }));
           }
         }
+        // Replay any pre-sync queued setWithAck / invoke in caller order
+        // AFTER initial-sync events have dispatched. Doing this here (as
+        // opposed to before value processing) preserves the spec's
+        // ordering invariant: callers see initial-sync `onUpdate`
+        // callbacks before any post-handshake `set` / `invoke` settles.
+        this._drainPreSyncQueue();
         break;
       }
       case "update": {

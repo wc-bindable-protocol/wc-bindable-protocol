@@ -16,6 +16,7 @@ export function buildDeclarationFingerprint(
   decl: WcBindableDeclaration,
 ): DeclarationFingerprint {
   return {
+    protocol: decl.protocol,
     version: decl.version,
     properties: sortedUniqueNames(decl.properties),
     inputs: sortedUniqueNames(decl.inputs),
@@ -27,11 +28,23 @@ export function buildDeclarationFingerprint(
  * Structural equality on two fingerprints. Returns true iff version matches
  * and every name list is the same set (order- and duplicate-insensitive,
  * though `buildDeclarationFingerprint` already normalizes both).
+ *
+ * The `protocol` field participates only when **both** sides emit it.
+ * Legacy fingerprint shapes that omit `protocol` fall through to the
+ * comparison-unavailable case per SPEC-extensions.md § Declaration
+ * fingerprint → "Legacy fingerprint shape (no protocol)".
  */
 export function declarationFingerprintsEqual(
   a: DeclarationFingerprint,
   b: DeclarationFingerprint,
 ): boolean {
+  if (
+    typeof a.protocol === "string" &&
+    typeof b.protocol === "string" &&
+    a.protocol !== b.protocol
+  ) {
+    return false;
+  }
   if (a.version !== b.version) return false;
   if (!arraysEqual(a.properties, b.properties)) return false;
   if (!arraysEqual(a.inputs, b.inputs)) return false;
