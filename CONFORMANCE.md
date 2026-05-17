@@ -489,9 +489,18 @@ class T extends HTMLElement {
 
 // Use a unique tag name per harness invocation. `customElements.define`
 // is process-global and throws on a duplicate definition, so a watch-mode
-// or repeated-run harness MUST NOT reuse a static tag literal. Replace
-// crypto.randomUUID() with the harness's preferred unique-id source if
-// the runtime lacks it.
+// or repeated-run harness MUST NOT reuse a static tag literal.
+//
+// `crypto.randomUUID()` is the cleanest unique-id source on modern
+// browsers and Node 19+, but is not universally available — JSDOM
+// before v22, Node before 19, and some older browser versions lack it.
+// A fallback that works everywhere with no dependencies:
+//
+//   const tag = `t-deferred-sync-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+//
+// or use the harness's preferred unique-id source. The protocol does
+// not care which one you pick — the only requirement is that the tag
+// is unique within the lifetime of the test process.
 const tag = `t-deferred-sync-${crypto.randomUUID()}`;
 customElements.define(tag, T);
 const target = document.createElement(tag);
@@ -506,8 +515,16 @@ const unbind = bind(target, (name, value) => { calls.push([name, value]); }, { s
 ```javascript
 target.value = "between-bind-and-connect";
 document.body.appendChild(target);
-// Wait one microtask turn for the deferred-sync observer callback to fire.
-await Promise.resolve();
+// Wait until the next macrotask so the MutationObserver callback has
+// definitely fired. `MutationObserver` callbacks are microtasks, so a
+// single `await Promise.resolve()` suffices in theory — but harnesses
+// that re-queue microtasks during the callback (test runners, polyfills,
+// some JSDOM versions) can need more than one turn. A macrotask wait is
+// strictly later than any pending microtask queue and avoids the
+// timing-sensitive flake that a microtask-only wait can produce on some
+// environments. Equivalent two-microtask form: `await Promise.resolve();
+// await Promise.resolve();`.
+await new Promise((resolve) => setTimeout(resolve, 0));
 ```
 
 **Expected.**
