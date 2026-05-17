@@ -22,7 +22,7 @@ The "Applies to" column uses the facet shorthand from [SPEC.md § Conformance Le
 | 2 | Discovery | `{1O, 2}` (and `{3-consumer}` / `{3-both}` for the proxy's local bindable declaration exposed to core `bind()` — i.e. the wrapper's own `constructor.wcBindable`, per [SPEC.md § Discovery Contract](SPEC.md#discovery-contract)) | Malformed `inputs[].attribute` (non-string) invalidates the declaration | [SPEC.md § Input Descriptor](SPEC.md#input-descriptor) |
 | 3 | Empty properties | `{1O, 2}` (and any 1O-claiming bind implementation) | `properties: []` → `bind()` succeeds, installs no listeners, returns a valid no-op cleanup | [SPEC.md § Property Descriptor](SPEC.md#property-descriptor) (empty-array case) |
 | 4 | Initial sync | `{1O}` (any 1O-claiming bind implementation, including `{1O, 2}` and `{3-consumer}` proxies that expose `bind()`-equivalent semantics to local consumers) | A property whose current value is `undefined` is still delivered as `onUpdate(name, undefined)` on initial sync | [SPEC.md § Initial Value Synchronization](SPEC.md#initial-value-synchronization) |
-| 5 | Remote sync | `{3-consumer}` and `{3-both}` | Before the `sync` response, `name in proxy === false` for declared names | [SPEC-extensions.md § Consumer-side proxy `has` trap contract](SPEC-extensions.md#consumer-side-proxy-has-trap-contract) |
+| 5 | Remote sync | `{3-consumer}` and `{3-both}` | Before the `sync` response, `name in proxy === false` for declared `properties` names (the rule is properties-only; `inputs` / `commands` `in` behavior is implementation-defined — see the detail section) | [SPEC-extensions.md § Consumer-side proxy `has` trap contract](SPEC-extensions.md#consumer-side-proxy-has-trap-contract) |
 | 6 | Remote undefined | `{3-consumer}` and `{3-both}` | An `update` envelope with no `value` key produces `onUpdate(name, undefined)` — **not** `null` | [SPEC-extensions.md § Update envelope value field](SPEC-extensions.md#update-envelope-value-field) + [§ CustomEvent `detail` and undefined preservation](SPEC-extensions.md#customevent-detail-and-undefined-preservation) |
 | 7 | JsonValue | `{3-consumer}` and `{3-producer}` (and `{3-both}`) — every side that serializes payloads to the wire | Non-finite numbers, non-plain-prototype objects, sparse-hole arrays, accessor-property objects, non-enumerable / symbol-keyed objects, functions, and cyclic references are rejected by `JsonValue` validation | [SPEC-extensions.md § Design invariants → invariant 3](SPEC-extensions.md#extension-2--wire-format-remote-proxying) |
 | 8 | Teardown | `{1O, 2}` (and any other 1O implementation that hands a cleanup function back to the caller) | If `addEventListener` throws on the Nth listener install, the previous N-1 listeners MUST be removed before the throw propagates | [SPEC.md § Teardown Contract](SPEC.md#teardown-contract) |
@@ -197,9 +197,10 @@ The same vector applies to the initial-sync path via `undefinedProperties` — a
 
 ### 7. JsonValue — non-finite numbers, non-plain objects, sparse arrays, accessors, non-enumerable / symbol keys, functions, and cycles are rejected
 
-**Setup.** For each of the inputs below, call the producer's `isJsonValue(v)` predicate (or the equivalent the implementation exposes) **and** call `proxy.setWithAck("name", v)` against any declared input named `"name"`:
+**Setup.** Two buckets — `NEEDS_REJECT` is unconditional (every conformant implementation MUST reject these); `IMPLEMENTATION_DEFINED` is the symbol-keyed-object opt-out per [SPEC-extensions.md § Implementation-defined behavior](SPEC-extensions.md#implementation-defined-behavior-interop-variability-flag). Test each value with the producer's `isJsonValue(v)` predicate (or the equivalent the implementation exposes) and with `proxy.setWithAck("name", v)` against any declared input named `"name"`:
 
 ```javascript
+// Bucket 1 — always rejected, regardless of implementation choice.
 const NEEDS_REJECT = [
   new Date(),                                                // Date carries a custom prototype
   NaN,                                                       // non-finite number
@@ -215,24 +216,39 @@ const NEEDS_REJECT = [
   Object.create({ inherited: 1 }),                           // non-plain prototype
   new Map([["k", "v"]]),                                     // class instance
   new Set([1, 2]),                                           // class instance
-  Symbol("x"),                                               // symbol
+  Symbol("x"),                                               // symbol primitive used as a value
   () => {},                                                  // function
   (() => { const o = {}; o.self = o; return o; })(),         // cyclic
 ];
+
+// Bucket 2 — symbol-keyed object: a plain object whose OWN keys include a symbol.
+// Distinct from `Symbol("x")` above — that is a symbol PRIMITIVE used as a value.
+// This case is the documented opt-out point.
+const IMPLEMENTATION_DEFINED = [
+  (() => {
+    const meta = Symbol("meta");
+    return { [meta]: "x", visible: true };                   // own symbol key + visible string key
+  })(),
+];
 ```
 
-**Action.** For each value `v`:
+**Action.** For each value `v` in either bucket:
 - `isJsonValue(v)` (or equivalent) is called
 - `proxy.setWithAck("name", v)` is called (assuming `"name"` is in the declaration's `inputs`)
 
-**Expected.** Every entry:
+**Expected — `NEEDS_REJECT`.** Every entry:
 - `isJsonValue(v) === false`
 - `proxy.setWithAck("name", v)` returns an already-rejected `Promise` (per [SPEC-extensions.md § Design invariants invariant 3](SPEC-extensions.md#extension-2--wire-format-remote-proxying)); no wire message is sent
 - `proxy.set("name", v)` (fire-and-forget) MUST throw synchronously **at the `set()` call site** (no silent drop, and crucially: even if the implementation is queueing fire-and-forget `set` calls before `sync` per [SPEC-extensions.md § Pre-sync call state machine](SPEC-extensions.md#pre-sync-call-state-machine), validation MUST happen at the call site, not at send time — `set()` returns `void` and deferring validation past the call site removes the caller's only signal that anything went wrong)
 
-A `try { JSON.stringify(v) }` based predicate fails this vector against `NaN`, `Infinity`, and any value containing them — `JSON.stringify` silently coerces them to `null` rather than throwing. See the "JSON.stringify is NOT sufficient validation" paragraph in invariant 3.
+**Expected — `IMPLEMENTATION_DEFINED`.** For each entry, the **default normative behavior is rejection** (the implementation behaves identically to a `NEEDS_REJECT` entry). An implementation MAY accept the value, but only if **all** of the following hold:
+- The opt-out is **documented in the implementation's public API surface** (per [SPEC-extensions.md § Implementation-defined behavior](SPEC-extensions.md#implementation-defined-behavior-interop-variability-flag))
+- The symbol keys are **silently ignored at serialization** — the wire frame for this entry MUST be observationally identical to one carrying just `{ visible: true }` (the symbol key contributes no wire bytes)
+- The consumer-side proxy on the other end never observes the symbol key under any circumstance
 
-Symbol-keyed objects are the **one** vector here with a documented opt-out (see [SPEC-extensions.md § Implementation-defined behavior](SPEC-extensions.md#implementation-defined-behavior-interop-variability-flag)); a conformant implementation may either reject them (default normative behavior) or silently ignore the symbol keys, but MUST document its choice. Cross-impl test vectors targeting symbol-key handling should branch on the implementation's documented stance.
+Cross-implementation tests targeting symbol-key handling MUST therefore branch on the implementation's documented stance: a strict-rejecting implementation (the default and the reference implementation's choice) treats `IMPLEMENTATION_DEFINED` exactly like `NEEDS_REJECT`; an opt-out implementation accepts the call but verifies the symbol key did not cross the wire.
+
+A `try { JSON.stringify(v) }` based predicate fails this vector against `NaN`, `Infinity`, and any value containing them — `JSON.stringify` silently coerces them to `null` rather than throwing. See the "JSON.stringify is NOT sufficient validation" paragraph in invariant 3.
 
 ---
 
