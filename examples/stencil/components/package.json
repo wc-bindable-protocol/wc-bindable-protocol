@@ -8,8 +8,8 @@
     "dev": "stencil build --watch --dev"
   },
   "dependencies": {
-    "@wc-bindable/core": "^0.6.0",
-    "@wc-bindable/stencil": "^0.6.0"
+    "@wc-bindable/core": "^0.7.1",
+    "@wc-bindable/stencil": "^0.7.1"
   },
   "devDependencies": {
     "@stencil/core": "^4.43.4"

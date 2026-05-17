@@ -1,3 +1,94 @@
+# v0.7.1
+
+Patch release. Closes the long tail of review items raised against the
+v0.7.0 PR, tightens the spec across every layer, and ships
+[CONFORMANCE.md](CONFORMANCE.md) — a new test-vector document for
+third-party implementers. All public surfaces from v0.7.0 remain
+backward-compatible; additions are strictly additive.
+
+## Spec & conformance
+
+- **`CONFORMANCE.md` (new)** — first organized set of test vectors covering
+  discovery, initial-sync, teardown, error codes, deferred-sync observer
+  cleanup, remote dispose / reconnect / cache lifecycle, getter failures,
+  malformed updates, set terminal/transient, and fingerprint mismatch
+  handling.
+- **SPEC.md** — clarifications across protocol model, roles, producer
+  obligations, `bind()` state machine, layer-3 value model and `undefined`
+  handling, JsonValue validation, `has`-trap contract scope, declaration
+  fingerprint comparison rules, version-bump classification, minimum
+  version policy, and normative naming for runtime entry points.
+- **SPEC-extensions.md** — tightened on call-order preservation,
+  microtask/macrotask semantics, duplicate pending-id rejection,
+  at-most-once delivery wording for transport adapters, snapshotting
+  during validation, safe-stringification, security notes around
+  `setWithAck` / `invoke` and sensitive inputs, and Level 2 conformance
+  for the "one snippet" demo.
+- **Error code registry** — split code-emission rule by emission site;
+  `WC_BINDABLE_DISPOSED` tightened to MUST; `set()` terminal throws
+  pinned to `WC_BINDABLE_TERMINAL_FAILURE`; new
+  `WC_BINDABLE_INVALID_ACK_OPTIONS` added; UNDECLARED registry broadened
+  to cover consumer-side detection (RangeError-shaped).
+
+## Added (additive only)
+
+- **`@wc-bindable/core`** — new exports:
+  - `getWcBindableDeclaration(target)` — sole discovery entry point that
+    proxies / wrappers can implement isolated from `EventTarget`.
+  - `MIN_COMPATIBLE_VERSION` (alias of `SUPPORTED_PROTOCOL_VERSION`) for
+    forward-compat readers.
+  - `isWcBindable()` parameter type broadened from `EventTarget` to
+    `unknown` so it accepts proxies/non-EventTargets safely. Strictly
+    broader, so existing call sites are unaffected.
+- **`@wc-bindable/remote`** — new module and exports:
+  - `buildDeclarationFingerprint`, `declarationFingerprintsEqual`, and the
+    `DeclarationFingerprint` type for explicit producer/consumer
+    declaration matching.
+  - `DeclarationFingerprint` gains a `protocol` field so legacy producers
+    that omit it continue to interoperate cleanly.
+
+## Fixes
+
+- **Core** — deferred-sync observer setup throw no longer leaks listeners
+  (Issue C). The cleanup path now runs whether the observer setup throws
+  before or after listener attachment.
+- **Remote** — assorted internal-contradiction and gap fixes from the
+  0.7.0 review queue (≥80 review items closed across spec / core /
+  remote / docs).
+
+## Tooling
+
+- **`examples/stencil/components`** dep range bumped from `^0.6.0` to
+  `^0.7.1` so the example resolves to the in-tree workspace instead of
+  pulling a stale `0.6.1` from the registry. Example workspace only;
+  not published.
+
+## Packages
+
+| Package | Version |
+|---------|---------|
+| `@wc-bindable/core` | 0.7.1 |
+| `@wc-bindable/react` | 0.7.1 |
+| `@wc-bindable/vue` | 0.7.1 |
+| `@wc-bindable/angular` | 0.7.1 |
+| `@wc-bindable/svelte` | 0.7.1 |
+| `@wc-bindable/alpine` | 0.7.1 |
+| `@wc-bindable/lit` | 0.7.1 |
+| `@wc-bindable/marko` | 0.7.1 |
+| `@wc-bindable/mithril` | 0.7.1 |
+| `@wc-bindable/preact` | 0.7.1 |
+| `@wc-bindable/qwik` | 0.7.1 |
+| `@wc-bindable/riot` | 0.7.1 |
+| `@wc-bindable/solid` | 0.7.1 |
+| `@wc-bindable/stencil` | 0.7.1 |
+| `@wc-bindable/vanjs` | 0.7.1 |
+| `@wc-bindable/mobx` | 0.7.1 |
+| `@wc-bindable/rxjs` | 0.7.1 |
+| `@wc-bindable/signals` | 0.7.1 |
+| `@wc-bindable/remote` | 0.7.1 |
+
+---
+
 # v0.7.0
 
 Substantial pre-1.0 minor release. Tightens the core protocol contract on
