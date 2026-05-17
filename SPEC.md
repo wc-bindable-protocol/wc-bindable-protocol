@@ -526,7 +526,10 @@ const MutationObserverCtor =
 // (target without a constructor, target with a constructor whose
 // `wcBindable` getter throws, target that is `null`-prototype-like —
 // return undefined). This is the single source of truth for "is this
-// target safe to bind to" (see § Discovery API).
+// target protocol-valid / bindable" (see § Discovery API). It is NOT a
+// security predicate — a passing target may still carry a `getter` that
+// runs in the consumer's JS context, and discovery itself performs JS
+// property access against the target. See § Trust Boundaries.
 //
 // Implementation note: optional chaining (not a `typeof` gate) accepts
 // both function-typed class constructors and object-typed constructors.
@@ -635,8 +638,10 @@ function bind(target, onUpdate, options) {
     throw new TypeError("bind: onUpdate must be a function");
   }
   // Discovery == bindability: a declaration that survives this check is
-  // safe to bind. The version check above is permissive (every integer
-  // >= 1) per § Versioning; no adapter-specific upper bound exists.
+  // protocol-valid and accepted by bind(). The version check above is
+  // permissive (every integer >= 1) per § Versioning; no adapter-specific
+  // upper bound exists. "Protocol-valid" is not a security predicate
+  // (see § Trust Boundaries).
   const decl = getWcBindableDeclaration(target);
   if (decl === undefined) return () => {};
   // After the discovery guard, `target` is known to expose

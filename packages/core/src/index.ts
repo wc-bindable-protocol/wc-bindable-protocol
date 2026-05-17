@@ -98,9 +98,15 @@ const DEFAULT_GETTER = (e: Event): unknown => (e as CustomEvent).detail;
  *   - `name`s are unique within `properties`, within `inputs`, and within `commands`
  *
  * Because the validation is *complete*, the helper doubles as the single
- * source of truth for "is this target safe to bind to" — `isWcBindable()`
- * is exactly `getWcBindableDeclaration(target) !== undefined`, and no
- * declaration that survives this filter will silently no-op inside `bind()`.
+ * source of truth for "is this target protocol-valid / bindable" —
+ * `isWcBindable()` is exactly `getWcBindableDeclaration(target) !== undefined`,
+ * and no declaration that survives this filter will silently no-op inside
+ * `bind()`. "Protocol-valid / bindable" is NOT a security predicate: a
+ * declaration that passes this check can still carry a `getter` that runs
+ * in the consumer's JS context, and discovery itself performs JS property
+ * access on the target (Proxy traps / accessor side effects fire). See
+ * SPEC.md § Trust Boundaries and § Protocol Model and Assumptions →
+ * Trust model for the threat-model statement.
  *
  * Prefer this helper over reading `target.constructor.wcBindable`
  * directly. The helper centralizes the discovery rule so future protocol
@@ -269,9 +275,10 @@ export function bind(
   }
   // Discovery performs the full schema validation (descriptor shapes,
   // name-uniqueness within properties/inputs/commands). A declaration that
-  // survives this check is safe to bind without further validation here —
-  // there is no path where isWcBindable() returns true but bind() silently
-  // no-ops on the same target.
+  // survives this check is protocol-valid and accepted by bind() without
+  // further validation here — there is no path where isWcBindable() returns
+  // true but bind() silently no-ops on the same target. "Protocol-valid"
+  // is not a security predicate (see SPEC.md § Trust Boundaries).
   const decl = getWcBindableDeclaration(target);
   if (decl === undefined) return () => {};
   // After the discovery guard, `target` is known to expose

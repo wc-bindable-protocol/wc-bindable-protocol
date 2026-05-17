@@ -153,6 +153,16 @@ const result = await proxy.invoke("fetch");
 ```
 
 > **`set()` vs `setWithAck()` — pick `setWithAck()` first.** The fire-and-forget `set()` is a low-latency optimization for cases where you genuinely do not care whether the write reaches the server (e.g. high-rate telemetry, last-write-wins UI hints) — it MUST NOT be used when a subsequent `invoke()` or read depends on the assignment having landed. The proxy's call queue is FIFO but **not transactional**: a later `invoke()` does not auto-cancel if an earlier queued `set()` was silently dropped. For the full semantics see [SPEC-extensions.md § Methods](../../SPEC-extensions.md#methods) and the "Error handling" section below.
+>
+> **⚠ Security-sensitive inputs: never `set()` before a dependent `invoke()`.** Use `await setWithAck()` for any input that gates authorization, target URL, HTTP method, identity / role, feature flag, or anything token-like before invoking a command that depends on it. Plain `set()` is at-most-once: under a transient transport outage the frame is silently dropped, the FIFO queue does NOT auto-cancel the subsequent `invoke()`, and the command runs against whatever value the producer last saw — typically a *previous* user's URL, a stale auth context, or the producer-side default. The failure mode is silent on both sides. The conformant pattern is:
+>
+> ```ts
+> await proxy.setWithAck("authToken", token);        // wait for the assignment
+> await proxy.setWithAck("targetUrl", "/api/secure"); // (or chain only the security-relevant set)
+> const result = await proxy.invoke("savePayment");   // now safe to depend on the above
+> ```
+>
+> If you find yourself reaching for `set()` ahead of `invoke()`, treat that as a code-review red flag — model the operation as a single `command` whose arguments carry the gating values, or `await setWithAck()` first.
 
 ### With a framework adapter
 
