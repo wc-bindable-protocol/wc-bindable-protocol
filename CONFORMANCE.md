@@ -173,7 +173,7 @@ A naive JS-`Proxy`-based implementation that lets `has` fall through to the unde
 
 ### 6. Remote undefined — absent `update.value` delivers `undefined`, not `null`
 
-> **⚠ Known divergence in the reference implementation.** `@wc-bindable/remote` 0.7.x does NOT pass this vector as written — its `update`-handling path dispatches `new CustomEvent(eventName, { detail: undefined })`, which WebIDL coerces to `detail: null`, so `bind()` callbacks observe `null` while `proxy.value` correctly reads `undefined`. This is the **only** vector among the fifteen that the reference implementation does not satisfy today. The divergence is also documented at [SPEC-extensions.md § CustomEvent `detail` and undefined preservation → "Reference implementation status (informative)"](SPEC-extensions.md#customevent-detail-and-undefined-preservation), [SPEC-extensions.md § Implementation-defined behavior](SPEC-extensions.md#implementation-defined-behavior-interop-variability-flag) (the "current implementation, not a complete conformance oracle" paragraph), and the README's remote-path callouts. Third-party implementers writing against the spec contract should treat the spec rule as authoritative and expect a future `@wc-bindable/remote` release to close the gap; consumers running 0.7.x today can read the cached `proxy.<name>` as the producer-intended-`undefined` recovery.
+> **⚠ Known divergence in the reference implementation.** `@wc-bindable/remote` 0.7.x does NOT pass this vector as written — its `update`-handling path dispatches `new CustomEvent(eventName, { detail: undefined })`, which WebIDL coerces to `detail: null`, so `bind()` callbacks observe `null` while `proxy.value` correctly reads `undefined`. This is the **only documented divergence** in this CONFORMANCE.md revision — every other vector in the file is satisfied by the reference implementation as of `@wc-bindable/remote` 0.7.x. The divergence is also documented at [SPEC-extensions.md § CustomEvent `detail` and undefined preservation → "Reference implementation status (informative)"](SPEC-extensions.md#customevent-detail-and-undefined-preservation), [SPEC-extensions.md § Implementation-defined behavior](SPEC-extensions.md#implementation-defined-behavior-interop-variability-flag) (the "current implementation, not a complete conformance oracle" paragraph), and the README's remote-path callouts. Third-party implementers writing against the spec contract should treat the spec rule as authoritative and expect a future `@wc-bindable/remote` release to close the gap; consumers running 0.7.x today can read the cached `proxy.<name>` as the producer-intended-`undefined` recovery.
 
 **Setup.** Establish a remote proxy + producer pair through Step 5; let `sync` complete with `value: 1` for `"value"`. Then have the producer send a post-sync transition into `undefined`:
 
@@ -524,6 +524,14 @@ document.body.appendChild(target);
 // timing-sensitive flake that a microtask-only wait can produce on some
 // environments. Equivalent two-microtask form: `await Promise.resolve();
 // await Promise.resolve();`.
+//
+// If the harness uses fake timers (Vitest `vi.useFakeTimers()`, Jest
+// `jest.useFakeTimers()`, Sinon `useFakeTimers`), this `setTimeout` will
+// not fire on its own — advance the clock by one macrotask after the
+// `appendChild` (e.g. `await vi.advanceTimersByTimeAsync(0)` /
+// `jest.advanceTimersByTime(0)`) or temporarily exit fake-timer mode
+// for this wait. The two-microtask form above does not have this
+// caveat and is the simpler choice under fake timers.
 await new Promise((resolve) => setTimeout(resolve, 0));
 ```
 
@@ -582,6 +590,8 @@ const unbind = bind(target, () => {});
 - The set `removedEventNames` covers the two events for which removal succeeded; the order matches the registration order minus the failing one
 - The `unbind()` call MUST NOT propagate the cleanup-time error to the caller — secondary errors are swallowed per the "more confusing than useful" rule in [SPEC.md § Teardown Contract](SPEC.md#teardown-contract)
 - A second `unbind()` call MUST be a safe no-op (the closure-level `disposed` re-entry guard is set on first invocation regardless of which individual cleanups threw)
+
+> **The listener whose `removeEventListener` threw may remain attached on `target` after `unbind()` returns** — the adapter cannot force a hostile removal to succeed, and the spec does not require it to. The conformance requirement this vector tests is that **the failure does not abort the remaining cleanup callbacks** and does not propagate from `unbind()`; a leaked listener whose removal threw is acceptable collateral damage, not a vector failure. Test harnesses that assert "every listener is removed" against a hostile target are testing a stricter rule than the spec; the assertion to make instead is on `removedCount` for the *non-failing* removals plus the absence of a propagated throw.
 
 The same shape applies to a throwing `MutationObserver.disconnect()` under `syncOn: "connect"` — the adapter MUST still tear down its event listeners.
 
