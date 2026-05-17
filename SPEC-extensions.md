@@ -765,8 +765,13 @@ function processSync(msg, prev, capabilities, logger) {
   // fication is the "Known lossy interaction" called out above.)
 
   // 4) Compare the producer's declarationFingerprint with the local
-  //    fingerprint and log a warning on mismatch. Continue processing
-  //    regardless — fingerprint is diagnostic, not gating.
+  //    fingerprint per § Declaration fingerprint:
+  //    - protocol mismatch     -> MUST TerminalFailure (always)
+  //    - non-protocol mismatch -> warn-then-continue by default,
+  //                               TerminalFailure under strict mode
+  //    - protocol absent       -> legacy fingerprint shape; fall through
+  //                               to non-protocol comparison
+  //    - all equal / absent    -> no-op
   compareFingerprint(msg.declarationFingerprint, localFingerprint, logger);
 }
 ```
@@ -787,14 +792,18 @@ The optional `declarationFingerprint` field on a sync response carries a canonic
 
 Producers SHOULD include the field on every sync response. The cost is `O(N)` in declaration size and a few hundred bytes of wire payload; the benefit is structural-mismatch detection before the first `set` / `invoke` reaches the producer.
 
-Consumers SHOULD compute the same fingerprint from their **local** declaration (the one passed to `createRemoteCoreProxy` or its equivalent) at construction time, and on every received `sync` response SHOULD compare the local fingerprint to the remote one:
+Consumers SHOULD compute the same fingerprint from their **local** declaration (the one passed to `createRemoteCoreProxy` or its equivalent) at construction time, and on every received `sync` response SHOULD compare the local fingerprint to the remote one. The comparison rule **splits by which field disagrees**, because `protocol` and the other fingerprint fields carry different compatibility weights: `protocol` is the breaking-compatibility boundary defined in [SPEC.md § Versioning](SPEC.md#versioning), so a peer that advertises a different identifier is by definition not speaking the same wire contract; `version` / `properties` / `inputs` / `commands` differences indicate operational drift on the same wire contract and degrade gracefully under the per-message rules.
 
-- If they are equal (or the producer omits the field — see legacy fallback below), do nothing.
-- If they differ, the consumer MUST log a warning identifying the mismatch and SHOULD continue accepting the sync. Subsequent per-message rejections (an undeclared input name, an undeclared command name) will still fire normally; the fingerprint warning surfaces the root cause at handshake time so operators do not have to chase those rejections back to a version drift.
+- **All fields equal (or the entire `declarationFingerprint` is absent — see Legacy fallback below)** → do nothing.
+- **`protocol` differs** (both sides emit `protocol` and the values are not string-equal) → the consumer MUST treat this as a **terminal protocol mismatch**: transition the proxy to TerminalFailure (per § Remote proxy lifecycle) with a locally-constructed `WC_BINDABLE_PROTOCOL_ERROR`-coded error, reject every pending entry with that error (in caller order, per the TerminalFailure-drain rules in [§ Pre-sync call state machine](#pre-sync-call-state-machine)), and signal the transport to dispose. **No wire message is emitted** (the new `protocol` identifier means the consumer can no longer prove its envelope shapes would be understood). Continuing past a `protocol` mismatch is non-conformant — silently doing so would let a v1 consumer process v2-shaped envelopes, which is the exact silent-corruption scenario that [§ Wire format versioning](#wire-format-versioning) item 4 exists to prevent. **This rule applies regardless of strict-mode opt-in.**
+- **`protocol` is absent on the wire** (legacy fingerprint emitter — see Legacy fingerprint shape below) → treat the protocol axis as **comparison-unavailable** and fall through to the non-`protocol` comparison below. Do NOT escalate to terminal; the missing-field case is governed by the legacy bridge, not by the mismatch rule.
+- **Non-`protocol` mismatch** (`version` / `properties` / `inputs` / `commands` differ while `protocol` is equal-or-unavailable) → the consumer MUST log a warning identifying which fields differ and SHOULD continue accepting the sync. Subsequent per-message rejections (an undeclared input name, an undeclared command name) will still fire normally; the fingerprint warning surfaces the root cause at handshake time so operators do not have to chase those rejections back to a version drift.
 
-Consumers MAY suppress the warning after the first mismatch on a given transport to avoid log spam on re-sync; the warning state SHOULD reset on reconnect so a real fingerprint change after reconnect is reported again.
+Consumers MAY suppress the warning after the first non-`protocol` mismatch on a given transport to avoid log spam on re-sync; the warning state SHOULD reset on reconnect so a real fingerprint change after reconnect is reported again.
 
-**Strict-mode opt-in.** Implementations MAY offer a strict fingerprint mode (typical surface: a `strictFingerprint: true` option on `createRemoteCoreProxy`) that escalates a mismatch from warn-log into a **terminal protocol error** — the proxy transitions to TerminalFailure (per § Remote proxy lifecycle), every pending entry rejects with a `WC_BINDABLE_PROTOCOL_ERROR`-coded throw envelope shape (locally constructed; no wire message is emitted), and subsequent `set` / `setWithAck` / `invoke` calls fail per the TerminalFailure rules. This is appropriate for deployments where consumer and producer ship from the same versioned package and any drift is a deployment bug rather than expected partial-deploy state. The default behavior remains warn-then-continue; strict mode is opt-in, MUST be documented in the implementation's public API surface, and MUST NOT be the default — a default-strict implementation would refuse to interoperate with legacy producers that omit the field, violating the existing "treat absence as no fingerprint comparison available" legacy fallback.
+**Strict-mode opt-in.** Implementations MAY offer a strict fingerprint mode (typical surface: a `strictFingerprint: true` option on `createRemoteCoreProxy`) that **escalates non-`protocol` mismatches** (`version` / `properties` / `inputs` / `commands` differing while `protocol` is equal-or-unavailable) from warn-log into the same terminal-protocol-mismatch posture defined for `protocol` mismatch above: TerminalFailure transition, `WC_BINDABLE_PROTOCOL_ERROR`-coded local rejection of every pending entry (no wire message emitted), and transport dispose. This is appropriate for deployments where consumer and producer ship from the same versioned package and any non-`protocol` drift is a deployment bug rather than expected partial-deploy state. Strict mode MUST be documented in the implementation's public API surface and MUST NOT be the default for non-`protocol` mismatches — a default-strict implementation would refuse to interoperate with legacy producers that omit the field, violating the existing "treat absence as no fingerprint comparison available" legacy fallback.
+
+> **Strict mode does NOT govern `protocol` mismatch.** The terminal posture for `protocol` mismatch above is a MUST, not an opt-in — strict mode only changes the *default* path for the lighter-weight non-`protocol` mismatches. A `protocol` mismatch is always terminal; a non-`protocol` mismatch is warn-then-continue by default and terminal under strict mode.
 
 **Legacy fallback.** Producers from a release that predates the field omit it; consumers MUST treat absence as "no fingerprint comparison available" and proceed silently. This keeps the field purely additive on the wire.
 
