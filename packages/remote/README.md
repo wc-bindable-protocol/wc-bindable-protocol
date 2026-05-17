@@ -60,6 +60,39 @@ Recommended practices when a peer is untrusted or semi-trusted:
 
 If these guarantees are not acceptable, the Core should sit behind an additional service that owns the trust boundary.
 
+### Deployment checklist for untrusted peers
+
+This is a **deployment checklist, not a conformance test**. None of the items below are required for [SPEC-extensions.md Extension 2](../../SPEC-extensions.md#extension-2--wire-format-remote-proxying) wire-format conformance — a conformant `RemoteShellProxy` will run without any of them. They are the operator-facing companion to [SPEC-extensions.md § Remote Security Profile for untrusted networks](../../SPEC-extensions.md), and they MUST be satisfied (by something — this package, your transport, your reverse proxy, or your application) before exposing `RemoteShellProxy` to a peer that is not part of the same trust domain.
+
+Before exposing `RemoteShellProxy` to untrusted peers:
+
+- [ ] **Authentication before protocol-message handling.** No peer-supplied envelope reaches the shell's message handler before the peer's identity has been established (handshake-time `verifyClient`, authenticating reverse proxy, or a `ServerTransport` wrapper that buffers messages until handshake completes).
+- [ ] **Per-input / per-command authorization.** Each inbound `{ type: "set", name }` / `{ type: "cmd", name }` is checked against the peer's identity / role *before* it is forwarded to the shell. Deny-by-default with an explicit per-role allow-list.
+- [ ] **Rate limiting per peer.** Configurable separately for `sync` (expensive — full snapshot) and `set` / `cmd` (cheap). Enforced at the transport or upstream proxy.
+- [ ] **Frame byte-length limit.** Reject oversized inbound frames at the WebSocket / transport layer before JSON parsing. The Node `ws` default (~100 MiB) is too permissive for almost every deployment — set it to your application's largest legitimate payload.
+- [ ] **`JsonValue` depth / node / array / property-count limits.** Enforce the resource limits enumerated in [SPEC-extensions.md § Design invariants](../../SPEC-extensions.md#design-invariants) invariant 3 on every inbound `set.value` / `cmd.args[i]`. See "Starting-point values" below.
+- [ ] **Pending-call cap.** Bound the producer-side pending-`id` table per connection (symmetric with the consumer-side `maxPendingInvocations` option).
+- [ ] **Producer-side `invoke` / `setWithAck` timeout.** A wall-clock deadline per acknowledged call so a hung command implementation cannot keep pending entries alive indefinitely.
+- [ ] **Structured audit logger.** Inject a `Logger` (per [§ Logging](#logging)) that records connection-open / -close events with established peer identity, every rejected `set` / `cmd` with the reason, and every emitted `throw` envelope with its `error.code`. The default `console.warn` / `console.error` logger is for development.
+- [ ] **`stack` redaction policy.** On untrusted boundaries, omit `stack` from `throw` envelopes by default; require explicit opt-in to include it. See [SPEC-extensions.md § Security note on `stack` and `cause`](../../SPEC-extensions.md).
+- [ ] **`cause` redaction policy.** Passing `isJsonValue` does NOT make `cause` safe to transmit — it only guarantees the wire shape is serializable. On untrusted boundaries, drop `cause` by default or replace it with a sanitized JsonValue (e.g. a producer-side error code plus a constant string). Pass-through SHOULD require explicit opt-in per command / per shell, and the redaction policy SHOULD live in the producer-side error mapper (not inline in each command implementation) so it is auditable in one place.
+
+### Starting-point values for `JsonValue` resource limits
+
+[SPEC-extensions.md § Design invariants](../../SPEC-extensions.md#design-invariants) invariant 3 specifies *which* limits SHOULD be enforced on inbound `JsonValue`s at an untrusted boundary; it does not normatively pin values. The numbers below are **non-normative starting points** for operators wiring this up the first time — pick the smallest values that still admit every legitimate payload your application sends, and tighten from there.
+
+| Limit | Starting point | Notes |
+|---|---|---|
+| `maxFrameBytes` | **1 MiB** | Enforced at the WebSocket / transport frame layer, before JSON parsing. Lower if your largest legitimate payload is smaller. |
+| `maxDepth` | **32** | Nesting depth of objects / arrays. Most application payloads are well under 10; 32 leaves headroom for legitimate nested data. |
+| `maxArrayLength` | **10 000** | Per single array node. Size to your largest legitimate array (paginated lists, batch operations). |
+| `maxObjectProperties` | **1 000** | Per single object node. Generous default for property bags; lower for tightly schema'd payloads. |
+| `maxTotalNodes` | **50 000** | Across the whole value. Guards against wide-but-shallow shapes that pass each per-node limit individually. |
+
+These compose: a payload that satisfies every per-node limit can still fail `maxTotalNodes`, and a payload that satisfies `maxTotalNodes` can still fail `maxFrameBytes` if it is mostly long strings. Enforce all of them; do not pick one and skip the others.
+
+The reference implementation in this package does NOT enforce these by default (backward compatibility with existing local-binding use). They are expected to be wired at the transport adapter layer — either by extending `WebSocketServerTransport` or by writing a custom `ServerTransport` that runs `isJsonValue`-with-limits inline before forwarding the message to the shell.
+
 ## Connection lifecycle
 
 1. The server creates a `RemoteShellProxy`, which subscribes to the Core's declared events and starts forwarding updates.
