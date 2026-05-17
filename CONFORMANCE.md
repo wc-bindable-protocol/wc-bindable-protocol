@@ -63,6 +63,9 @@ Compound shorthand: `{1O, 2}` means "Level 1 observer facet + Level 2"; `{3-cons
 | 32 | Malformed `update` drops + warns; transport stays open; next valid `update` processed | `{3-consumer}` and `{3-both}` | Inject a malformed `update` envelope (missing `name`, non-string `name`, or present `value` that fails `JsonValue` deep validation). Expected: (a) the proxy does NOT throw, does NOT close the transport, and does NOT write the cache for the property whose `name` was malformed (if any); (b) the consumer's `bind()` callback receives NO event for the malformed envelope; (c) the proxy logger receives a warn-level entry naming the field that failed; (d) a subsequent well-formed `{ type: "update", name: "value", value: "ok" }` envelope is processed normally — the cache updates, `onUpdate("value", "ok")` fires. This is the asymmetry from vector 23: malformed `sync` escalates to TerminalFailure, malformed `update` degrades gracefully | [SPEC-extensions.md § Consumer-side malformed message handling](SPEC-extensions.md#consumer-side-malformed-message-handling) (malformed `update` row) |
 | 33 | Deferred initial-sync throw — `unbind()` is a literal no-op afterward | `{1O}` for general-purpose browser JS implementations that support `syncOn: "connect"` (skip applies under the same conditions as vector 13) | A `syncOn: "connect"` bind where the deferred initial-sync throws (e.g. a property getter throws on read inside the `MutationObserver` microtask). Expected: (a) the adapter's installed cleanups (listeners + the `MutationObserver`) MUST be torn down before the throw escapes the microtask; (b) the throw surfaces as an uncaught error on the dispatching microtask (`window.onerror` / `reportError` / `process.on('uncaughtException')`), NOT as a synchronous throw from the original `bind()` call frame; (c) the `unbind` function the caller received at `bind()` time MUST still be safe to invoke after the throw — calling `unbind()` MUST be a literal no-op (the closure-level `disposed` re-entry guard was set by the cleanup-on-throw path); (d) the `unbind()` call MUST NOT re-walk the cleanup list, MUST NOT throw, MUST NOT trigger any further uncaught error | [SPEC.md § Teardown Contract](SPEC.md#teardown-contract) (the "If a deferred initial-sync (`syncOn: \"connect\"`) throws" paragraph) + [§ bind() state machine summary](SPEC.md#bind-state-machine-summary) (InitialSyncing → Disposed via deferred throw) |
 | 34 | `set()` — sync throw on terminal (with `WC_BINDABLE_TERMINAL_FAILURE` code), no throw on transient outage | `{3-consumer}` and `{3-both}` — the line between terminal and transient is transport-implementation-defined per [SPEC-extensions.md § Transport lifecycle vocabulary](SPEC-extensions.md#transport-lifecycle-vocabulary-shared-by-extensions-1-and-2); the canonical vector uses a controllable mock transport that lets the test force each state explicitly | Setup: a mock transport with explicit `setTerminal()` / `setTransient()` hooks. Bring the proxy to Active. Expected — terminal path: after `mockTransport.setTerminal()` (e.g. emit `onClose` and refuse to accept further `send()`), `proxy.set("x", 1)` MUST throw synchronously at the call site, and the thrown Error MUST carry `error.code === "WC_BINDABLE_TERMINAL_FAILURE"` per the locally-synthesized-error MUST in [§ Error envelope](SPEC-extensions.md#error-envelope) (NOT `WC_BINDABLE_PROTOCOL_ERROR`, which is reserved for wire-protocol bugs; NOT `WC_BINDABLE_DISPOSED`, which is reserved for consumer-initiated teardown — keeping the three transport-side codes distinct is what lets the consumer pick the right recovery branch). Expected — transient path: after `mockTransport.setTransient()` (the transport's own reconnect/backoff layer is masking an outage; the proxy has NOT been notified of terminal failure), `proxy.set("x", 1)` MUST NOT throw — the message is either eventually delivered or silently lost (at-most-once contract). Verifying the silent-drop case: the test asserts only the absence of a synchronous throw and the absence of a wire frame on the underlying socket; whether the message lands on a later recovery is implementation-defined. The bifurcation is the canonical safety mechanism `setWithAck` is designed around | [SPEC-extensions.md § Methods](SPEC-extensions.md#methods) (the `set` row) + [§ Transport lifecycle vocabulary](SPEC-extensions.md#transport-lifecycle-vocabulary-shared-by-extensions-1-and-2) + [§ Error envelope](SPEC-extensions.md#error-envelope) (`WC_BINDABLE_TERMINAL_FAILURE` registry entry + locally-synthesized-error MUST) + [SPEC-extensions.md § Failure & recovery quick reference](SPEC-extensions.md#failure--recovery-quick-reference) (the `set` rows in both tables) |
+| 35 | Fingerprint `protocol` mismatch ⇒ TerminalFailure (always, regardless of strict mode) | `{3-consumer}` and `{3-both}` | Setup: proxy constructed against a local declaration with `protocol: "wc-bindable"`; producer emits a `sync` whose `declarationFingerprint.protocol` is a different string (e.g. `"wc-bindable-2"`) and whose other fingerprint fields match. Expected: (a) every queued pending entry rejects in caller order with `error.code === "WC_BINDABLE_PROTOCOL_ERROR"`; (b) the proxy transitions to TerminalFailure (subsequent `set` throws synchronously with the same code; subsequent `setWithAck` / `invoke` return already-rejected promises with the same code); (c) **no wire reply is emitted** for the offending `sync` (the new `protocol` identifier means the consumer can no longer prove its envelope shapes would be understood); (d) the transport is signaled to dispose. **Strict mode setting is irrelevant** — the `protocol`-mismatch terminal posture is a MUST regardless of `strictFingerprint` opt-in. This is the breaking-compatibility boundary defined in [SPEC.md § Versioning](SPEC.md#versioning); continuing past a `protocol` mismatch would let a v1 consumer silently process v2-shaped envelopes, the exact silent-corruption scenario [§ Wire format versioning](SPEC-extensions.md#wire-format-versioning) item 4 exists to prevent | [SPEC-extensions.md § Declaration fingerprint](SPEC-extensions.md#declaration-fingerprint) (`protocol differs` bullet) + [§ Wire format versioning](SPEC-extensions.md#wire-format-versioning) item 4 |
+| 36 | Legacy fingerprint without `protocol` is NOT malformed — falls through to non-`protocol` comparison | `{3-consumer}` and `{3-both}` | Setup: producer emits a `sync` whose `declarationFingerprint` object contains exactly `{ version, properties, inputs, commands }` — the `protocol` field is **omitted entirely** (the legacy-fingerprint shape from before the field was added). Expected: (a) the proxy does NOT transition to TerminalFailure; (b) the proxy does NOT reject any pending entry on the basis of the missing field; (c) the consumer does NOT log a fingerprint-shape / malformed-envelope error (the missing-`protocol`-field case is the legacy-fingerprint bridge, NOT a malformed envelope, and is explicitly carved out from the malformed-`sync` ⇒ terminal rule of vector 23); (d) the proxy proceeds to Active and per-message rules apply normally. The missing-`protocol` axis is treated as **comparison-unavailable** — equivalent to the no-fingerprint legacy fallback applied to that field only. If the remaining fields also match the consumer's local fingerprint, no warning fires; if they differ, the standard non-`protocol` mismatch rule (vector 37) applies | [SPEC-extensions.md § Declaration fingerprint](SPEC-extensions.md#declaration-fingerprint) (`Legacy fingerprint shape (no protocol)` paragraph) |
+| 37 | Non-`protocol` fingerprint mismatch — warn+continue (default mode), TerminalFailure (strict mode) | `{3-consumer}` and `{3-both}`. The strict-mode branch is conditional on implementations that ship a `strictFingerprint` (or equivalent) option; implementations that do not ship strict mode satisfy only the default-mode sub-case | Setup: proxy constructed with a local declaration that agrees with the producer on `protocol` but differs on at least one of `version` / `properties` / `inputs` / `commands` (e.g. local declares `commands: ["fetch"]`, producer's fingerprint carries `commands: ["fetch", "abort"]`). Two sub-cases: **Default mode** — (a) the proxy does NOT transition to TerminalFailure; (b) the consumer logger receives a warn-level entry identifying which field(s) differ; (c) pending queue entries are NOT rejected on the basis of the mismatch (subsequent per-message rejections — e.g. an `invoke("abort")` against a consumer that doesn't know `"abort"` — still fire per their own rules); (d) the proxy proceeds to Active. **Strict mode** (`strictFingerprint: true` or implementation-equivalent) — (a) every queued pending entry rejects in caller order with `error.code === "WC_BINDABLE_PROTOCOL_ERROR"`; (b) the proxy transitions to TerminalFailure (subsequent `set` throws synchronously with the same code; subsequent `setWithAck` / `invoke` return already-rejected promises with the same code); (c) **no wire reply is emitted**; (d) the transport is signaled to dispose. The split — `protocol` always terminal (vector 35), non-`protocol` opt-in terminal — is the canonical asymmetry between the two compatibility tiers | [SPEC-extensions.md § Declaration fingerprint](SPEC-extensions.md#declaration-fingerprint) (`Non-protocol mismatch` bullet + `Strict-mode opt-in` paragraph) |
 
 ---
 
@@ -1438,13 +1441,199 @@ try { proxy.set("x", 2); } catch (e) { threwOnTerminal = true; thrownError = e; 
 
 ---
 
+### 35. Fingerprint `protocol` mismatch ⇒ TerminalFailure (always)
+
+> **Why this vector is load-bearing.** `protocol` is the single field on `declarationFingerprint` whose disagreement marks a **breaking-compatibility boundary** per [SPEC.md § Versioning](SPEC.md#versioning). An implementation that warn-logs and continues here (treating `protocol` like the other fingerprint fields) silently breaks the design that [SPEC-extensions.md § Wire format versioning](SPEC-extensions.md#wire-format-versioning) item 4 relies on: a v1 consumer would keep parsing v2-shaped envelopes as if they were v1, producing exactly the silent corruption the breaking-change identifier was meant to prevent. This vector exists because that failure mode looks correct under naive testing — happy-path envelopes from a v2 producer often resemble v1 envelopes structurally — and only manifests when a renamed or repurposed field carries an unintended meaning.
+
+**Setup.** A consumer-side proxy constructed with a local declaration whose `protocol` is `"wc-bindable"`, a recording mock transport that exposes `dispose()` / `send` instrumentation, and at least one queued pending entry so the rejection-in-caller-order rule is observable. The producer emits a `sync` whose `declarationFingerprint.protocol` is `"wc-bindable-2"` (the other fingerprint fields match the consumer's local fingerprint to isolate the `protocol`-only mismatch):
+
+```javascript
+const localDeclaration = {
+  protocol: "wc-bindable",
+  version:  1,
+  properties: [{ name: "v", event: "x:v-changed" }],
+  inputs:     [{ name: "url" }],
+  commands:   [{ name: "fetch", async: true }],
+};
+
+const transport = new RecordingTransport();   // captures send() + disposed flag
+const proxy = createRemoteCoreProxy(localDeclaration, transport);
+
+// Queue two pending entries before the sync response arrives, so the
+// caller-order rejection contract is observable on a non-trivial queue.
+const p1 = proxy.setWithAck("url", "/api/users");
+const p2 = proxy.invoke("fetch");
+
+transport.emitInbound({
+  type:   "sync",
+  values: {},
+  capabilities: { setAck: true },
+  declarationFingerprint: {
+    protocol:   "wc-bindable-2",      // <— the only disagreement
+    version:    1,
+    properties: ["v"],
+    inputs:     ["url"],
+    commands:   ["fetch"],
+  },
+});
+```
+
+**Action.** `await Promise.allSettled([p1, p2])`; inspect each rejection's `error.code`, the proxy's lifecycle state, the recorded outbound traffic on `transport.send`, and the `transport.disposed` flag.
+
+**Expected.**
+- `p1` is rejected; `p1`'s error carries `error.code === "WC_BINDABLE_PROTOCOL_ERROR"`.
+- `p2` is rejected; `p2`'s error carries the same code.
+- The two rejections settle **in caller order** (`p1` before `p2`), per the TerminalFailure-drain rule referenced from [SPEC-extensions.md § Pre-sync call state machine](SPEC-extensions.md#pre-sync-call-state-machine).
+- The proxy has transitioned to TerminalFailure: `proxy.set("url", "/x")` MUST throw synchronously with `error.code === "WC_BINDABLE_TERMINAL_FAILURE"`; `proxy.setWithAck("url", "/x")` and `proxy.invoke("fetch")` MUST return already-rejected promises with the same `WC_BINDABLE_TERMINAL_FAILURE` code per vector 34's terminal-path rule.
+- `transport.sent.length === 0` for **any wire message emitted in response to the offending sync** — the consumer MUST NOT emit a reply (no `throw` envelope, no diagnostic frame). The new `protocol` identifier means the consumer can no longer prove its envelope shapes would be understood by the producer.
+- `transport.disposed === true` — the proxy signaled the transport to dispose as part of TerminalFailure transition.
+
+**Action — strict-mode invariance.** Re-run the entire scenario with `strictFingerprint: true` (or the implementation's equivalent option). The expected behavior MUST be **bit-identical** — every assertion above passes the same way.
+
+**Expected — strict-mode invariance.** Same as above. Strict mode does NOT change the `protocol`-mismatch path; it only governs the **non-`protocol`** mismatch path (vector 37). An implementation that conditionally applies the terminal posture only under strict mode is non-conformant.
+
+**Conformance interpretation.** This is the canonical breaking-change-detection vector. The `WC_BINDABLE_PROTOCOL_ERROR` code is the load-bearing assertion — it tells the consumer's application-level error handler that the failure is a wire-protocol disagreement (suggesting "upgrade one side or pin both") rather than a transport outage (suggesting "retry / reconnect") or a consumer-initiated teardown (suggesting "dispose was called somewhere"). Implementations MUST NOT substitute `WC_BINDABLE_TERMINAL_FAILURE` here — that code is reserved for transport failures and would obscure the actual root cause from operators following up on the failure.
+
+**Spec reference.** [SPEC-extensions.md § Declaration fingerprint](SPEC-extensions.md#declaration-fingerprint) (`protocol differs` bullet) + [§ Wire format versioning](SPEC-extensions.md#wire-format-versioning) item 4 + [§ Remote proxy lifecycle](SPEC-extensions.md#remote-proxy-lifecycle) (PreSync → TerminalFailure transition) + [§ Error envelope](SPEC-extensions.md#error-envelope) (`WC_BINDABLE_PROTOCOL_ERROR` registry entry).
+
+---
+
+### 36. Legacy fingerprint without `protocol` is NOT malformed
+
+> **Why this vector exists.** The fix that added `protocol` to `declarationFingerprint` (a clarification, not a breaking change) leaves a transition window where producers emit the four-field legacy shape. A naive strict-validator implementation would reject the legacy shape as malformed and escalate to TerminalFailure via vector 23's malformed-`sync` rule, refusing to interoperate with every producer that predates the clarification. The legacy bridge exists precisely to prevent that regression; this vector checks the bridge.
+
+**Setup.** A consumer-side proxy with a local declaration whose `protocol` is `"wc-bindable"`, plus a sync response whose `declarationFingerprint` contains exactly the four legacy fields and **omits** `protocol`:
+
+```javascript
+const localDeclaration = {
+  protocol: "wc-bindable",
+  version:  1,
+  properties: [{ name: "v", event: "x:v-changed" }],
+  inputs:     [{ name: "url" }],
+  commands:   [{ name: "fetch", async: true }],
+};
+
+const transport = new RecordingTransport();
+const proxy = createRemoteCoreProxy(localDeclaration, transport);
+const logEntries = [];                              // intercept warn / error
+proxy.setLogger?.({ warn: (...a) => logEntries.push(["warn", ...a]),
+                    error:(...a) => logEntries.push(["error", ...a]) });
+
+transport.emitInbound({
+  type:   "sync",
+  values: {},
+  capabilities: { setAck: true },
+  declarationFingerprint: {
+    // protocol intentionally omitted — legacy fingerprint shape
+    version:    1,
+    properties: ["v"],
+    inputs:     ["url"],
+    commands:   ["fetch"],
+  },
+});
+
+await new Promise((resolve) => setTimeout(resolve, 0));
+```
+
+**Action.** Inspect the proxy's lifecycle state, the log entries, and whether any rejections fired.
+
+**Expected.**
+- The proxy is in **Active** (NOT TerminalFailure). `proxy.setWithAck("url", "/api")` returns a pending promise that the recording transport observes as an outbound `setWithAck` envelope — i.e. the channel is alive and processing wire traffic.
+- `logEntries` contains **NO** error-level entry naming a malformed `declarationFingerprint` or missing required field. The legacy shape is explicitly NOT treated as malformed.
+- `logEntries` contains **NO** warn-level fingerprint mismatch entry either (the remaining four fields match in this setup, so no warning fires — equivalent to the all-equal case for the four non-`protocol` axes plus comparison-unavailable for the protocol axis).
+- No pending entry is rejected on the basis of the legacy shape; no `WC_BINDABLE_PROTOCOL_ERROR` is synthesized.
+
+**Variant — legacy shape with non-`protocol` mismatch.** Re-run with the producer's fingerprint differing on one of the non-`protocol` fields (e.g. `commands: ["fetch", "abort"]` while the local declares only `["fetch"]`), still omitting `protocol`. Expected: the proxy remains in Active, a warn-level entry fires identifying the differing field (per the non-`protocol` mismatch rule, vector 37), and no terminal transition occurs. The missing-`protocol` field does NOT block the non-`protocol` comparison from running.
+
+**Conformance interpretation.** The combination "fingerprint object present + `protocol` field absent" is the **legacy fingerprint shape**, not a malformed envelope. Implementations that close the transport here are conflating vector 23's malformed-`sync` rule with the legacy-bridge carve-out. The carve-out is one-directional: producers writing to the current spec MUST include `protocol`; consumers MUST accept the legacy shape from older producers without escalation.
+
+**Spec reference.** [SPEC-extensions.md § Declaration fingerprint](SPEC-extensions.md#declaration-fingerprint) (`Legacy fingerprint shape (no protocol)` paragraph) + [§ Consumer-side malformed message handling](SPEC-extensions.md#consumer-side-malformed-message-handling) (the malformed-`sync` row, whose scope explicitly excludes this case).
+
+---
+
+### 37. Non-`protocol` fingerprint mismatch — warn+continue (default), TerminalFailure (strict mode)
+
+> **Why two sub-cases.** This vector covers the **default-mode** path that every conformant `{3-consumer}` / `{3-both}` MUST satisfy, plus the **strict-mode** path that implementations shipping a strict-fingerprint option MUST also satisfy. Implementations that do not ship strict mode satisfy only the default-mode sub-case. The split is what makes "non-`protocol`" mismatches operationally distinct from the always-terminal `protocol` mismatch in vector 35.
+
+**Setup.** A consumer-side proxy with a local declaration that matches the producer on `protocol` but disagrees on `commands` (the easiest mismatch to construct that does not trip another rule):
+
+```javascript
+const localDeclaration = {
+  protocol: "wc-bindable",
+  version:  1,
+  properties: [{ name: "v", event: "x:v-changed" }],
+  inputs:     [{ name: "url" }],
+  commands:   [{ name: "fetch", async: true }],     // local knows only "fetch"
+};
+
+function emitMismatchingSync(transport) {
+  transport.emitInbound({
+    type:   "sync",
+    values: {},
+    capabilities: { setAck: true },
+    declarationFingerprint: {
+      protocol:   "wc-bindable",                    // matches
+      version:    1,
+      properties: ["v"],
+      inputs:     ["url"],
+      commands:   ["fetch", "abort"],               // producer additionally knows "abort"
+    },
+  });
+}
+```
+
+**Action — default mode.**
+
+```javascript
+const transport = new RecordingTransport();
+const proxy = createRemoteCoreProxy(localDeclaration, transport);
+const logEntries = [];
+proxy.setLogger?.({ warn: (...a) => logEntries.push(["warn", ...a]),
+                    error:(...a) => logEntries.push(["error", ...a]) });
+
+const p1 = proxy.setWithAck("url", "/api/users");
+emitMismatchingSync(transport);
+await new Promise((resolve) => setTimeout(resolve, 0));
+```
+
+**Expected — default mode.**
+- The proxy reaches **Active** (NOT TerminalFailure). `transport.disposed === false`.
+- `logEntries` contains **exactly one** warn-level entry identifying the mismatching field(s) — at minimum naming `commands` and the diff `["abort"]`. The exact log shape is implementation-defined; what matters is that the warning fires once and identifies the differing field.
+- `p1` settles per its own rules (the producer sees the `setWithAck` and replies normally on the recording transport, or the test asserts only that `p1` is still pending immediately after the sync, depending on whether the producer-stub is wired to reply). The mismatch does NOT reject `p1` on its own.
+- A subsequent `proxy.invoke("abort")` follows the normal "undeclared command" path from the consumer-side proxy's `commands` membership check — that path is governed by [SPEC-extensions.md § Methods](SPEC-extensions.md#methods) and is observable independently; the fingerprint warning surfaces the root cause of why that membership check fails.
+
+**Action — strict mode.**
+
+```javascript
+const strictProxy = createRemoteCoreProxy(localDeclaration, transport, {
+  strictFingerprint: true,                          // implementation-equivalent option name OK
+});
+const sp1 = strictProxy.setWithAck("url", "/api/users");
+const sp2 = strictProxy.invoke("fetch");
+emitMismatchingSync(transport);
+const settled = await Promise.allSettled([sp1, sp2]);
+```
+
+**Expected — strict mode.**
+- Both `sp1` and `sp2` are rejected, with `error.code === "WC_BINDABLE_PROTOCOL_ERROR"` on each. Caller-order rule applies (`sp1` before `sp2`).
+- `strictProxy` has transitioned to TerminalFailure: subsequent `set` throws synchronously with `error.code === "WC_BINDABLE_TERMINAL_FAILURE"`; subsequent `setWithAck` / `invoke` return already-rejected promises with the same `TERMINAL_FAILURE` code per vector 34's terminal-path rule.
+- `transport.sent` records **no outbound wire message** in response to the offending sync (no diagnostic frame, no `throw` envelope — the consumer's local synthesis is the conformant signal).
+- `transport.disposed === true`.
+
+**Skip rule for strict mode.** An implementation that does NOT ship a strict-fingerprint option is exempt from the strict-mode sub-case (the default-mode sub-case is still REQUIRED). Implementations claiming strict-mode support in their public API MUST pass the strict-mode sub-case; implementations that omit the option entirely MAY skip the strict-mode actions and assertions.
+
+**Conformance interpretation.** The default-mode behavior reflects the operational reality of partial deploys: a `commands` superset on the producer (added a new command before the consumer was upgraded) is a deployment drift, not a wire-protocol bug, and tearing down the channel would refuse interop with every healthy upgrade window. Strict mode is the appropriate escalation **only** when consumer and producer ship from the same versioned bundle and any drift is by definition a deployment bug. The asymmetry with vector 35's `protocol`-mismatch path is intentional: `protocol` carries breaking-compatibility weight that the other fingerprint fields do not.
+
+**Spec reference.** [SPEC-extensions.md § Declaration fingerprint](SPEC-extensions.md#declaration-fingerprint) (`Non-protocol mismatch` bullet + `Strict-mode opt-in` paragraph + the "Strict mode does NOT govern `protocol` mismatch" blockquote).
+
+---
+
 ## What this list does NOT cover
 
 These vectors are deliberately narrow — they target rules that are easy to violate in ways that pass naive smoke tests. They are **not** a complete conformance suite. Additional areas worth covering in a richer test corpus:
 
 - **Shadow-DOM attach** under `syncOn: "connect"` (the documented "observer doesn't traverse shadow roots" limitation)
 - **`AbortSignal` pre-aborted at `setWithAckOptions` / `invokeWithOptions` call time** (rejects immediately without sending — distinct from vector 18's "aborted/timed-out after send" case, which IS covered)
-- **Declaration fingerprint mismatch** on `sync` (MUST log warn, MUST continue accepting)
 - **`MutationObserver` callback after host detach** under `syncOn: "connect"` (observer rechecks `isConnected`, stays armed)
 - **Synchrony of `setWithAckOptions` / `invokeWithOptions` invalid-`timeoutMs` rejection.** Vector 30's `testInvalidAckOptions()` sub-case verifies the `code === "WC_BINDABLE_INVALID_ACK_OPTIONS"` rule, but its `try { await ... } catch` shape cannot distinguish "synchronously already-rejected Promise" (the normative requirement per [SPEC-extensions.md § AckOptions](SPEC-extensions.md#ackoptions)) from "Promise rejected on the next microtask" — both produce identical observable behavior under `await`. A dedicated vector that asserts the synchrony explicitly (e.g. via `Promise.race([call, Promise.resolve("sync-marker")])` ordering, or by inspecting the returned Promise's state before any await) would catch the easy-to-miss implementation bug of returning a Promise that rejects on a microtask hop. Implementations following the spec text already get this right; the vector is a future hardening rather than a current correctness gap.
 
