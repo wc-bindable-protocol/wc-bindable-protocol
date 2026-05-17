@@ -32,6 +32,8 @@ Third-party implementations of Extension 1 MAY use any factory name as long as t
 
 ### Methods
 
+> **`setWithAck` is an *assignment-execution* acknowledgement, not a *state-stability* acknowledgement.** The name is shorter than the contract: `setWithAck(name, value)` resolves once `target[name] = value` has executed on the producer side and **for no stronger reason**. It does NOT acknowledge that the resulting state is externally visible, durable, replicated, persisted, observed by downstream subscribers, or that any asynchronous side effect the setter scheduled has completed. A setter that internally `await`s a database write resolves the `setWithAck` promise *when the assignment ran*, not *when the write committed* — components that need to gate a later call on async post-set work MUST expose that work as a `command` so the caller can `await invoke(...)` instead. This precise contract is what the `setWithAck` row of the table below pins; the name is convenience shorthand for that contract, not a stronger guarantee.
+
 A *consumer-side proxy* that adopts this extension MUST expose the following surface:
 
 | Method | Signature | Semantics |
@@ -201,6 +203,8 @@ The core protocol's trust-boundary contract is defined in [SPEC.md § Trust Boun
 ## Extension 2 — Wire Format (Remote Proxying)
 
 This section is the **normative** wire-format specification for any implementation that transports wc-bindable across a network. Third-party implementations of the consumer-side proxy or the producer-side proxy MUST conform to this contract to interoperate with `@wc-bindable/remote` (the reference implementation). Concrete usage examples, error-handling tips, back-pressure controls, and framework-integration snippets live in [packages/remote/README.md](packages/remote/README.md); the contract itself is here.
+
+> **⚠ This wire format is NOT an authorization protocol.** Extension 2 defines how wc-bindable observations and invocations travel across a network. It does **not** define authentication, authorization, rate limiting, per-message payload validation, or trust between the peers. A conformant producer-side shell connected to an untrusted peer will accept every `set` against any declared `input` and every `invoke` against any declared `command` with any `JsonValue`-shape payload — that is the contract, not a bug. **A conformant producer MUST be placed behind an application-owned security layer** (auth handshake at the transport, allow-list filter at the `ServerTransport` adapter, per-command authorization in the Core's command implementation, etc.) before being exposed to an arbitrary peer. Treat `RemoteShellProxy` and `RemoteCoreProxy` as a protocol layer, never as a trust boundary. The full treatment of what this extension does and does NOT provide lives in [§ Trust boundary](#trust-boundary-shared-by-extensions-1-and-2) and in [packages/remote/README.md § Security model / trust boundary](packages/remote/README.md#security-model--trust-boundary).
 
 ### Design invariants
 

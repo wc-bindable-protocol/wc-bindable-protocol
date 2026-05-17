@@ -67,6 +67,8 @@ The "zero `npm` runtime dependencies" claim refers to Layer 1, which is what `@w
 
 **You do not need `@wc-bindable/remote` to use wc-bindable with a framework.** Layer 3 is for the specific case of running the Core in a different process / runtime / machine than the consumer. The framework adapters in the [Packages](#packages) table below all operate at Layer 1 and require nothing from Layer 3.
 
+> **Layer 3 narrows the value model.** Local layers (1, 2) carry whatever JavaScript value the producer exposes — `Date`, `Map`, `Set`, `BigInt`, typed arrays, class instances, functions, cyclic objects, anything. The remote transport profile narrows this to **`JsonValue`** (a recursive JSON-shape type) at every wire crossing: `Date`, `Map`, class instances, functions, `undefined`, non-finite numbers, and cyclic references are rejected by Layer 3 validation, not silently coerced. Components that expose those shapes locally need an explicit serialization boundary (encode to plain JSON objects at the producer, decode at the consumer) before they can be used through `@wc-bindable/remote`. The full algorithm and the `JsonValue` definition live in [SPEC-extensions.md § Extension 2 → Design invariants invariant 3](SPEC-extensions.md#extension-2--wire-format-remote-proxying); the protocol-level model split is summarized in [SPEC.md § Protocol Model and Assumptions → Value model](SPEC.md#protocol-model-and-assumptions).
+
 ## Why?
 
 - **Write once, use everywhere** — A Web Component that implements this protocol can be adapted to React, Vue, Svelte, Angular, Solid, and future frameworks without per-component glue. The component itself never changes; only a thin per-framework adapter ports the protocol callback into that framework's reactivity primitive.

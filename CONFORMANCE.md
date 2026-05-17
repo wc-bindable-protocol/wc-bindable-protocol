@@ -14,7 +14,18 @@ Each vector below is structured the same way: **Setup → Action → Expected �
 
 ## Summary
 
-The "Applies to" column uses the facet shorthand from [SPEC.md § Conformance Levels](SPEC.md#conformance-levels) — `{1O, 2}` means "Level 1 observer facet + Level 2"; `{3-consumer}` means the consumer-side of an Extension 2 implementation; `{3-producer}` is the producer-side shell; `{3-both}` is an implementation that ships both sides. `{1O}` standalone means any 1O-claiming implementation regardless of higher levels.
+Conformance is **facet-based, not monolithic** — an implementation does not need to pass every vector to be conformant; it needs to pass the vectors applicable to the level + role combination it claims. The facets:
+
+| Facet | What it means |
+|---|---|
+| **`{1O}`** | Consumer-side: can observe a wc-bindable target via `bind()`-equivalent semantics (the `in`-operator initial-sync rule, `syncOn` modes, teardown / exception-safety, `onUpdate` validity) |
+| **`{1P}`** | Producer-side: a target that exposes a valid `static wcBindable` declaration and dispatches the declared events (the contract a component author writes against) |
+| **`{2}`** | Drop-in Core JS API compatibility — exports `bind`, `getWcBindableDeclaration`, `isWcBindable` with the exact normative signatures; implies `{1O}` and `{1P}` because anything a framework adapter imports as `@wc-bindable/core` is gated by it |
+| **`{3-consumer}`** | Remote consumer-side proxy — implements Extension 2's wire format and Extension 1's call methods (`set`, `setWithAck`, `invoke`) from the consumer side |
+| **`{3-producer}`** | Remote producer-side shell — accepts the wire format on the producer side, dispatches per-property updates, runs `getter` server-side |
+| **`{3-both}`** | Implementation that ships both sides (the reference `@wc-bindable/remote` is `{1O, 2, 3-both}`) |
+
+Compound shorthand: `{1O, 2}` means "Level 1 observer facet + Level 2"; `{3-consumer}` is the consumer-side of an Extension 2 implementation; `{3-both}` ships both Level 3 sides. `{1O}` standalone means any 1O-claiming implementation regardless of higher levels. The full definitions live in [SPEC.md § Conformance Levels](SPEC.md#conformance-levels) — this legend is a navigation aid, not a re-definition.
 
 | # | Area | Applies to | Test case | Spec section |
 |---|---|---|---|---|

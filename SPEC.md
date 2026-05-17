@@ -44,6 +44,60 @@ The protocol requires no library dependencies and relies solely on standard plat
 
 ---
 
+## Protocol Model and Assumptions
+
+This section names the load-bearing model choices the rest of the spec depends on. Every later rule presupposes them, so re-stating them once in one place makes the chain of derivations explicit and lets readers locate the right normative section quickly.
+
+### Interface model — three distinct surfaces
+
+A `wcBindable` declaration models a component interface as **three independent surfaces**:
+
+| Surface | Field | Layer that interprets it |
+|---|---|---|
+| Observable outputs | `properties` | **Core** — consumed by `bind()` via event listeners + initial-sync read |
+| Declared inputs | `inputs` | **Core does not interpret** — purely metadata for tooling, codegen, devtools; behavior (the actual `set` / `setWithAck` semantics) lives in [SPEC-extensions.md § Extension 1](SPEC-extensions.md#extension-1--inputcommand-invocation) |
+| Declared commands | `commands` | **Core does not interpret** — purely metadata; behavior (the `invoke` semantics) lives in [SPEC-extensions.md § Extension 1](SPEC-extensions.md#extension-1--inputcommand-invocation) |
+
+The separation lets the core protocol stay narrow (observation only) while extensions add invocation semantics on top. Core still schema-validates every surface (an invalid `inputs` / `commands` descriptor invalidates the whole declaration — see [§ Discovery API](#discovery-api)) so downstream consumers of those surfaces can trust the shape of what `getWcBindableDeclaration()` returns.
+
+### Role model — Producer target vs Consumer-side bind target
+
+The two roles introduced in § Overview are the central model split: a **producer target** dispatches events; a **consumer-side bind target** observes them. They share the `add` / `removeEventListener` surface but a consumer-side target is NOT required to expose `dispatchEvent`. A relay wrapper, remote proxy, or test double that re-emits events through an internal channel is a valid bind target even when it deliberately hides `dispatchEvent`. This is why `bind()` works transparently against `RemoteCoreProxy` despite the proxy not being a literal event source.
+
+### Trust model — the declaration is executable, not inert metadata
+
+A `wcBindable` declaration **MAY contain executable functions** (the optional `getter` field) and **discovery itself performs JavaScript property access** on the target. The core protocol therefore assumes the target is trusted code the consumer intentionally loaded. Concretely:
+
+- A custom `getter` runs in the consumer's JS context on every dispatched event. Loading a component from an untrusted source loads a function that will run with consumer-context privileges.
+- Even reading `target.constructor.wcBindable` to discover a declaration goes through JS property access, so a hostile target's `Proxy` traps or accessor side effects fire during discovery.
+- The discovery helper's MUST-NOT-throw guard is a safety net against accidental hostility (e.g. a relay whose `constructor` is a `Proxy` that raises) — it is NOT a sandbox. See [§ Trust Boundaries](#trust-boundaries) for the full treatment.
+
+A declaration is therefore best thought of as **executable component interface metadata**, not as a JSON schema. Threat models that allow "just serialized metadata" but disallow "third-party code" MUST treat declarations as the latter.
+
+### Value model — local JS values vs remote `JsonValue`
+
+The core protocol's value model is "any JavaScript value" — initial sync reads `target[prop.name]` as-is, and event update reads `getter(event)` as-is. Local consumers see whatever the producer chose to expose: `Date`, `Map`, class instances, functions, cyclic graphs, anything.
+
+The **remote** profile ([SPEC-extensions.md § Extension 2](SPEC-extensions.md#extension-2--wire-format-remote-proxying)) narrows this to **`JsonValue`** at every wire crossing — a JSON-shape recursive type that excludes `undefined`, non-finite numbers, `Date`, `Map`, `Set`, `BigInt`, typed arrays, class instances, functions, symbols, and cyclic references. The narrowing is a discontinuity, not a coincidence: components designed for local use that surface non-`JsonValue` shapes MUST add an explicit serialization boundary before they can be exposed through Layer 3. The remote layer also runs `getter` functions on the producer side only — only the extracted value crosses the wire, never the function.
+
+### Discovery model — single-path, validation gate, not a normalized snapshot
+
+Discovery resolves the declaration through a **single path** — `target.constructor.wcBindable`. There is no global registry, no symbol fallback, no per-instance override. `getWcBindableDeclaration()` is a **validation gate**: it returns either the live declaration object (if every Schema-typed field is well-formed) or `undefined` (otherwise), without throwing on any access failure. It is NOT a normalizer — it does NOT freeze, clone, or otherwise hand `bind()` an immutable snapshot. Both discovery and `bind()` re-read the underlying descriptors when they need them, which is acceptable under the trust model above (hostile accessors that return different values on successive reads are out of scope) and keeps the helper lightweight. See [§ Discovery API](#discovery-api) and [§ Trust Boundaries](#trust-boundaries) for the formal contract and the explicit non-extension of snapshotting across the validator → `bind()` pipeline.
+
+### Failure model summary
+
+The protocol's failure-handling choices are spread across sections; they share a single model:
+
+- **Discovery never throws** — invalid input ⇒ `undefined` return; hostile access ⇒ `undefined` return (caught internally).
+- **`bind()` is exception-safe on install** — any throw during listener installation, initial sync, or observer setup MUST tear down whatever the same `bind()` call already installed before propagating the error. See [§ Teardown Contract](#teardown-contract).
+- **Cleanup is best-effort, not error-reporting** — a cleanup callback that throws does NOT abort the remaining cleanups, and the secondary error is swallowed.
+- **`onUpdate` errors after initial sync propagate via the standard event-dispatch path** — the adapter does NOT auto-unbind on consumer throws.
+- **Remote `set` is fire-and-forget, `setWithAck` is acknowledged delivery of the *assignment*** (not of state stability or async side-effect completion — see [SPEC-extensions.md § Methods](SPEC-extensions.md#methods)).
+
+The chain "discovery never throws → `bind()` is exception-safe on install → cleanup is best-effort" is what lets consumers call `bind()` on stray inputs without crashing the host, while still preserving normal error reporting for real producer-side bugs.
+
+---
+
 ## Protocol Declaration
 
 A producer target — **typically a class that extends `EventTarget`** (e.g. an `HTMLElement` subclass) — declares its bindable properties by defining a `static wcBindable` field on the class. A structural EventTarget-compatible object MAY also participate as long as it exposes the required `addEventListener` / `removeEventListener` / `dispatchEvent` methods and the same `constructor.wcBindable` discovery path; subclassing `EventTarget` is the recommended pattern but is not strictly required (see [§ Overview](#overview) for the consumer-vs-producer capability split).
@@ -146,6 +200,8 @@ When declaring inputs for a Shell (HTMLElement), the optional `attribute` field 
 
 Adapters **MUST** ignore unknown top-level fields. Future versions of this specification may add new optional root keys; older adapters that do not recognize them must still bind successfully to `properties`.
 
+> **`version` is NOT a compatibility upper bound.** A reader seeing `version: 2` on a declaration MAY reasonably assume a v1 adapter will reject it — that is a SemVer-shaped intuition, not the wc-bindable contract. Every adapter under the `"wc-bindable"` protocol identifier MUST accept **every integer `version >= 1`**, regardless of when the adapter was built. The `version` field exists to flag the presence of newer optional fields (which adapters MUST ignore if unrecognized), NOT to gate acceptance. Breaking changes to the binding contract live in a **new `protocol` identifier**, never in a version bump — see [§ Versioning](#versioning) for the full rule and the rationale.
+
 When `inputs` or `commands` is absent (`undefined`), consumers **MUST** treat it as an empty array (`[]`) — semantically equivalent to declaring "no inputs" / "no commands". An absent field and an explicit `[]` MUST behave identically for every consumer concern (e.g. Extension 1's "name MUST be declared in inputs/commands before a `set` / `invoke` reaches the producer" check rejects every name under both encodings).
 
 ### Property Descriptor
@@ -210,6 +266,8 @@ Implementations **MUST** expose two discovery primitives whose contracts are obs
 **Discovery is bindability — for `bind()` from `@wc-bindable/core`.** Because `getWcBindableDeclaration()` performs the complete schema validation (including the duplicate-name rule that invalidates a declaration per § Property Descriptor / § Input Descriptor / § Command Descriptor), a declaration that survives this filter is accepted by `bind()` as valid; whether listeners are installed depends on whether `properties` is non-empty (see § Property Descriptor for the empty-array case). The **malformed-declaration silent fallback to the non-bindable no-op path** that an earlier draft permitted is now impossible: discovery either rejects the target (and `bind()` returns the same non-bindable `() => {}` no-op) or accepts it (and `bind()` installs the declared listeners, or returns a functional no-op cleanup when `properties` is legitimately empty). The two no-op shapes are observationally identical at the cleanup callsite — by design, per § Property Descriptor — but they are produced by structurally different paths (`isWcBindable() === false` vs `=== true` with empty properties), and that distinction is what gates downstream logic. Consumers can therefore use `isWcBindable()` as the single decision point for "will `bind()` accept this target as a valid wc-bindable target and return a valid cleanup?" — **not** as a literal "will listeners be installed?" predicate. An empty `properties: []` is a valid declaration (see § Property Descriptor) describing a command-only target; `isWcBindable()` returns `true` for it and `bind()` accepts it, but no listeners are installed and no initial-sync event is delivered because there is nothing to observe — the cleanup is a functional no-op. The equivalence is between "passes discovery" and "is a valid bindable target", not "passes discovery" and "drives event listeners". This distinction matters for conformance tests that gate on `isWcBindable` and then assert listener-related side effects. (For why the discovery and bindability checks are unified rather than split, see [§ Appendix: Design rationale notes](#appendix-design-rationale-notes).)
 
 The "discovery is bindability" equivalence assumes the target's declaration is **stable for the duration of the bind**: it relies on the fact that the schema `getWcBindableDeclaration()` validated is the same schema `bind()` walks a few statements later. A hostile target whose accessor properties or `Proxy` traps return different values on successive reads can present a valid schema to discovery and an invalid one to `bind()` (or vice versa). This is outside the spec's threat model — see [§ Trust Boundaries](#trust-boundaries) — but third-party implementers writing against the equivalence should know the implicit assumption.
+
+> **Discovery is a validation gate, not a normalized-snapshot factory.** `getWcBindableDeclaration()` returns either the live declaration object as it exists on `target.constructor.wcBindable` (when every Schema-typed field is well-formed) or `undefined` (otherwise). It does NOT freeze, deep-clone, or otherwise hand `bind()` an immutable snapshot — both discovery and `bind()` re-read the underlying descriptors when they need them. This is a deliberate model choice: the protocol's trust model assumes the target is consumer-loaded code, so the cost of normalizing a snapshot (allocation, deep-equality comparison, deciding what "frozen" means for a `getter` function) is paid every `bind()` call without buying anything against the threats the spec actually defends against. A future revision MAY change this if the trust model widens, but the current contract is **live reference + per-read validation**, not snapshot. See the Discovery model bullet in [§ Protocol Model and Assumptions](#protocol-model-and-assumptions) for the model-level statement and [§ Trust Boundaries](#trust-boundaries) for the explicit non-extension of snapshotting across the validator → `bind()` pipeline.
 
 > **Scope.** This equivalence is normative for the core `bind()` only. Extensions MAY impose **additional** rejection conditions that core does not check — for example, [SPEC-extensions.md § Extension 2](SPEC-extensions.md#extension-2--wire-format-remote-proxying) rejects declarations whose `properties` / `inputs` / `commands` names collide with reserved wire names at proxy-construction time. `isWcBindable(target) === true` therefore guarantees `bind()` will succeed but does NOT guarantee that constructing a remote proxy (or any other extension consumer) will succeed; extension-level checks are layered on top, and an extension that rejects a target SHOULD throw at construction with a clear error rather than silently fall back.
 
@@ -729,6 +787,8 @@ In `syncOn: "call"` the **event payload is authoritative** in case the initial-s
 
 #### Deferring the Initial Sync Until Connection
 
+> **`syncOn: "connect"` is a best-effort DOM-convenience fallback, not a host-lifecycle replacement.** The name suggests a first-class lifecycle hook; the implementation is a single document-wide `MutationObserver` that observes the first insertion and then disconnects. Concretely it does NOT traverse shadow roots, does NOT re-fire on disconnect → reconnect cycles, does NOT survive a connect-then-immediate-disconnect race within the same task, MUST silently fall back to `"call"` in non-browser runtimes, and installs one observer per deferred bind so bulk-binding many elements scales the observer count linearly. None of these are bugs — each is a documented consequence of "the protocol does not own a host lifecycle and is borrowing a `MutationObserver` as the closest standard primitive". **An adapter that holds a host-lifecycle reference (React `useEffect`, Vue `onMounted`, Stencil `componentDidLoad`, a custom element's own `connectedCallback`, etc.) MUST prefer `syncOn: "call"` from inside that hook.** `syncOn: "connect"` exists for imperative light-DOM construction patterns (VanJS / MobX / RxJS / Signals binders that hand the caller a binder which is then `appendChild`-ed separately) where no host lifecycle is available; outside that narrow case it is the inferior choice. The full caveat list — shadow-root non-traversal, connect-then-disconnect race, observer-per-bind cost, synthetic / proxy fall-back — lives in the prose and callouts below.
+
 When `target` is an `HTMLElement` and `bind()` is called before the element has been inserted into a document (so `connectedCallback` has not yet run), reading properties synchronously may observe pre-connection state. To address this, `bind()` accepts an optional third argument:
 
 ```typescript
@@ -768,6 +828,30 @@ The two **SHOULD** be kept in agreement by the component author. If they diverge
 If a `getter` function throws during event handling, the adapter **MUST NOT** swallow the error silently. The error **MUST** propagate naturally (i.e., be thrown from the event listener). This preserves normal JavaScript error semantics and allows component authors to detect bugs in their getter implementations.
 
 Adapters **SHOULD NOT** wrap getter calls in try/catch unless they re-throw the error after performing cleanup.
+
+---
+
+## Producer Obligations
+
+The rules a *consumer-side* adapter must follow are scattered across § Discovery API, § Teardown Contract, § Initial Value Synchronization, and § onUpdate validity — that is the surface `bind()` directly implements and where most cross-impl interop tests live. The rules a **producer** must follow are equally normative but are easier to overlook because they are scattered across § Initial Value Synchronization, § Event detail vs Property Read, § Getter Errors, and § Trust Boundaries. This section gathers them in one place. None of them are new rules — each links to its normative home; this section exists so a component author writing a producer can audit their work against a single checklist.
+
+A wc-bindable producer MUST:
+
+- **Make every declared `properties[i].name` readable for initial sync.** `bind()` reads `target[name]` (gated by the `in` operator) at sync time and delivers the value to the consumer, including when it is `undefined`. A `name` declared in `properties` but missing from the target instance silently skips initial sync — see [§ Initial Value Synchronization](#initial-value-synchronization).
+- **Keep the property's current value and the corresponding event's payload (or `getter`-extracted value) representing the same logical state.** When they diverge, the event payload is authoritative for subsequent updates, and the consumer-side adapter is NOT required to detect, deduplicate, or repair the divergence — see [§ Event detail vs Property Read](#event-detail-vs-property-read).
+- **Avoid synchronously dispatching a wc-bindable change event from inside a declared property getter** (whether the getter is on the producer-side property descriptor or implicit via a Web Component attribute-backed read). Adapters attach listeners *before* performing the initial-sync read, so a getter that re-enters via `dispatchEvent` produces a double `onUpdate` whose second value is order-dependent. Conformant adapters are NOT required to detect, deduplicate, or repair this re-entrant case — see the producer-side rule paragraph in [§ Event detail vs Property Read](#event-detail-vs-property-read).
+- **Keep declared property getters side-effect-free with respect to wc-bindable change events.** A non-event side effect (e.g. a benign cache fill on first read) is permitted under the general "SHOULD be pure" guidance but is not the same relaxation — synchronously dispatching a declared change event during the read is the strong MUST NOT above. Unavoidable initialization side effects SHOULD happen at construction or in a dedicated initializer, NOT inside the getter.
+- **Allow `getter`-thrown errors to propagate.** The adapter contract requires consumers to NOT swallow getter throws — that error reporting is the producer's signal that its getter has a bug. See [§ Getter Errors](#getter-errors).
+- **Dispatch through `dispatchEvent` (`CustomEvent` or a structurally compatible event)** for every change to a declared property. The protocol's observation guarantee depends on this; without it, the consumer never receives an update.
+- **Treat declared `name`s as the public interface.** Renaming a `name` in `properties` / `inputs` / `commands` is a breaking change for every consumer that bound against the old name. Versioning provides no recovery path; the consumer's `bind()` simply stops delivering that property.
+
+A wc-bindable producer is **NOT required to**:
+
+- **Deduplicate or coalesce repeated events** for the same property. The consumer-side adapter delivers every event as-is; the producer MAY emit redundant change events and the consumer is responsible for any deduplication it needs — see [§ Repeated Events for the Same Property](#repeated-events-for-the-same-property).
+- **Make `getter` referentially stable.** The consumer-side adapter re-reads the descriptor at each `bind()` call; a producer that swaps `getter` at runtime is unusual but not forbidden — though it is the source of the hostile-accessor caveat in [§ Trust Boundaries](#trust-boundaries) and is strongly discouraged for stable interop.
+- **Implement `inputs` / `commands` behaviorally for Core conformance.** Core only schema-validates them; behavioral semantics belong to [SPEC-extensions.md § Extension 1](SPEC-extensions.md#extension-1--inputcommand-invocation). A core-only producer that declares `inputs` is making a true statement about its settable surface; it is not promising any particular `set` / `setWithAck` semantics until Extension 1 is also in play.
+
+These obligations are what the cross-impl interop guarantees rest on. A producer that violates the strong MUST NOTs above will appear to work against forgiving adapters and break against strict ones; testing against the reference adapter is not sufficient.
 
 ---
 
