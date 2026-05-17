@@ -686,6 +686,16 @@ transport.emitInbound({
   capabilities: { setAck: false },
 });
 
+// Flush a microtask turn so the proxy's sync-response handler completes
+// and drains the queue (emitting the `cmd` envelope for invoke("fetch"))
+// before we inspect the outbound list. Without this, the `find()` below
+// can race the proxy's microtask scheduler in some harnesses and observe
+// the outbound list before the cmd has been pushed. The vector's
+// settleOrder expectation likewise depends on the setWithAck rejection
+// settling before we inject the return — this await pins both orderings
+// to the post-sync-handler frame.
+await Promise.resolve();
+
 // After the sync response is processed, the proxy must respond to the
 // pending `cmd` envelope it sent for `invoke("fetch")`.
 const outboundCmd = transport.outboundMessages().find((m) => m.type === "cmd");
@@ -701,7 +711,15 @@ await Promise.allSettled([setPromise, invokePromise]);
 - `settleOrder[1] === "invoke:resolved"` — the queued `invoke` is **NOT** auto-cancelled by the preceding rejection; it is sent on the wire after sync-response processing and resolves on the matching `return` envelope
 - The recorded outbound list contains exactly ONE `cmd` envelope for `"fetch"` and ZERO id-bearing `set` envelopes (the proxy MUST NOT send a `setWithAck` it knows the producer will not handle)
 
-**Variant — post-sync, producer-side assignment throws.** With a producer that advertises `setAck: true`, issue `await proxy.setWithAck("badInput", v)` (where the producer's setter throws on receipt) immediately followed by `proxy.invoke("fetch")` *without* awaiting the first. The `setWithAck` rejects via a `throw` envelope; the `invoke` STILL sends on the wire and STILL completes per its own rules. The same FIFO-without-dependency rule applies post-sync — the pre-sync case is just the most visible place the distinction matters.
+**Variant — post-sync, producer-side assignment throws.** With a producer that advertises `setAck: true`, issue both calls without awaiting between them so they go onto the wire in caller order:
+
+```javascript
+const p1 = proxy.setWithAck("badInput", v); // producer setter throws on receipt
+const p2 = proxy.invoke("fetch");
+await Promise.allSettled([p1, p2]);
+```
+
+The `setWithAck` rejects via a `throw` envelope; the `invoke` STILL sends on the wire and STILL completes per its own rules. **The `await` MUST NOT be placed between the two calls** — awaiting `p1` first would let the rejection settle before the dependent call is even issued, which is the safe pattern the spec recommends consumers adopt for dependent calls (`await proxy.setWithAck(...); proxy.invoke(...)`) and is therefore not what this vector exercises. The point of this vector is to demonstrate that issuing the two calls back-to-back with no inter-call await still leaves the second call running even when the first rejects. The same FIFO-without-dependency rule applies post-sync — the pre-sync case is just the most visible place the distinction matters.
 
 **Spec reference.** [SPEC-extensions.md § Pre-sync call state machine](SPEC-extensions.md#pre-sync-call-state-machine) → "Queue ordering is not transactional" paragraph (with the same `setWithAck("url"); invoke("fetch")` example) plus the section's final paragraph extending the rule symmetrically to the steady-state post-sync case.
 
@@ -792,9 +810,13 @@ transport.emitInbound({ type: "return", id, value: null });
 await new Promise((resolve) => setTimeout(resolve, 0));
 
 // A subsequent normal call MUST still work — the late drop is per-id,
-// not a connection-level failure.
-const followUp = await proxy.invoke("fetch").catch((err) => err);
-// (assuming a co-operating producer that emits a matching return)
+// not a connection-level failure. Inject the matching return explicitly
+// so the vector is executable end-to-end against a recording transport.
+const followUpPromise = proxy.invoke("fetch");
+const outboundCmd = transport.outboundMessages()
+  .find((m) => m.type === "cmd" && m.name === "fetch");
+transport.emitInbound({ type: "return", id: outboundCmd.id, value: null });
+const followUp = await followUpPromise;
 ```
 
 **Action.** Inspect `settleSequence`, any warn-level logger output, and the follow-up call's outcome.
