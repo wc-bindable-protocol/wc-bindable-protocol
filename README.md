@@ -109,7 +109,10 @@ When the adapter binds to an element, it reads the current value of each declare
 
 For DOM elements that have not yet been connected when `bind()` is called, pass `{ syncOn: "connect" }` to defer the initial read until `connectedCallback` has run. Framework adapters that bind from a mounted-element lifecycle hook (React `useEffect`, Vue `onMounted`, Angular `AfterViewInit`, etc.) use the default `syncOn: "call"` because the host already guarantees the element is attached. The imperative binders this repository ships for VanJS / MobX / RxJS / Signals pass `syncOn: "connect"` internally so callers do not have to sequence `appendChild()` and `binder.bind(el)` manually; this is a guideline rather than a spec MUST.
 
-> **Prefer `syncOn: "call"` whenever the adapter can observe a mounted lifecycle.** `syncOn: "connect"` is a fallback for imperative light-DOM insertion only — it does NOT replace a proper lifecycle hook. Among other constraints, the deferred path uses a document-wide `MutationObserver` (shadow-root non-traversal, one observer per deferred bind) — full caveat list lives in [SPEC.md § Deferring the Initial Sync Until Connection](SPEC.md#deferring-the-initial-sync-until-connection).
+> **Prefer `syncOn: "call"` whenever the adapter can observe a mounted lifecycle.** `syncOn: "connect"` is a fallback for imperative light-DOM insertion only — it does NOT replace a proper lifecycle hook. Two reasons matter most:
+>
+> - **Errors from the deferred initial sync cannot be caught synchronously.** A getter throw or `onUpdate` throw during the deferred sync fires inside a `MutationObserver` microtask and surfaces as an uncaught error on the event loop (`window.onerror` / `reportError` in browsers, `process.on('uncaughtException')` in Node). There is no `try { bind(el, ...) } catch` frame the consumer can wrap to handle it. Consumers that need structured error handling MUST use `syncOn: "call"` from inside their own lifecycle hook so the throw lands on a frame they can catch.
+> - **The deferred path uses a document-wide `MutationObserver`.** Shadow-root non-traversal, one observer per deferred bind, connect-then-disconnect race — full caveat list lives in [SPEC.md § Deferring the Initial Sync Until Connection](SPEC.md#deferring-the-initial-sync-until-connection).
 
 | Situation | Recommended `syncOn` |
 |---|---|
