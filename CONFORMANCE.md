@@ -30,7 +30,7 @@ The "Applies to" column uses the facet shorthand from [SPEC.md § Conformance Le
 | 10 | setWithAck legacy | `{3-consumer}` and `{3-both}` (the consumer-side rejection rule is what is tested; producer side participates only as a stub that omits `setAck`) | If the producer's `sync` response omits / sets-false `capabilities.setAck`, `setWithAck` MUST return an already-rejected `Promise` and MUST NOT send an id-bearing `set` on the wire | [SPEC-extensions.md § Message types — server → client](SPEC-extensions.md#message-types--server--client) (setAck capability bullets) + [§ Pre-sync call state machine](SPEC-extensions.md#pre-sync-call-state-machine) |
 | 11 | onUpdate validity | **`{2}` MUST**; `{1O without 2}` SHOULD (MAY defer to first invocation — see body) | **`{2}` (binding pass/fail):** `bind(target, "not-a-function")` (and other non-function `onUpdate` values) MUST throw a synchronous `TypeError` at `bind()` entry, **including** on an empty-`properties` target where deferred detection would never fire. **`{1O without 2}` (informational):** SHOULD throw synchronously; an implementation that defers MUST still surface the `TypeError` at the first attempted `onUpdate` invocation, so a non-empty-`properties` target produces the throw at initial-sync delivery time | [SPEC.md § onUpdate validity](SPEC.md#onupdate-validity) |
 | 12 | Hostile discovery | `{1O, 2}` (any implementation exposing `getWcBindableDeclaration` / `isWcBindable`) | A target whose `constructor.wcBindable` access throws (Proxy `get` trap that raises, throwing accessor on a Schema field, null-prototype constructor) MUST result in `getWcBindableDeclaration() === undefined`, `isWcBindable() === false`, and `bind()` returning a non-bindable no-op cleanup — no error escapes the helpers | [SPEC.md § Discovery API](SPEC.md#discovery-api) (MUST NOT throw) |
-| 13 | Deferred sync ordering | `{1O}` (any 1O-claiming implementation that supports `syncOn: "connect"` — implementations whose deferred path silently falls back to `"call"` per the unknown-value rule are exempt; record the choice and skip) | Under `syncOn: "connect"`, a change event dispatched on the still-unconnected target BEFORE `connectedCallback` fires MUST be delivered to `onUpdate` first; the deferred initial sync runs afterward and delivers `target[prop.name]` as read at connection time | [SPEC.md § Initial Value Synchronization → Ordering vs subsequent events](SPEC.md#ordering-vs-subsequent-events) |
+| 13 | Deferred sync ordering | `{1O}` for general-purpose browser JS implementations targeting `HTMLElement` with `syncOn: "connect"`. MAY be skipped **only** under the spec-defined fallback conditions: non-browser runtime without DOM globals, non-`HTMLElement` / synthetic / already-connected target, or an explicitly scoped profile that documents non-support of browser DOM deferred-sync. A `{1O}` implementation **SHOULD NOT** skip this vector merely by ignoring `syncOn: "connect"` — see body | Under `syncOn: "connect"`, a setter-driven property mutation on the still-unconnected target (which dispatches the change event as a side effect) MUST surface the event to `onUpdate` first; the deferred initial sync runs afterward and delivers `target[prop.name]` as read at connection time | [SPEC.md § Initial Value Synchronization → Ordering vs subsequent events](SPEC.md#ordering-vs-subsequent-events) |
 | 14 | Cleanup-throw containment | `{1O, 2}` (and any 1O implementation that hands a cleanup function back to the caller) | If the first listener removal in the cleanup chain throws (hostile `removeEventListener`), the remaining listeners and `MutationObserver`s registered by the same `bind()` call MUST still be torn down; the secondary cleanup-time error is swallowed | [SPEC.md § Teardown Contract](SPEC.md#teardown-contract) (the "MUST continue running the remaining cleanup callbacks" paragraph) |
 | 15 | Reserved names | `{3-consumer}` and `{3-producer}` (and `{3-both}`) | A declaration containing a `properties` / `inputs` / `commands` `name` that begins with `@wc-bindable/` MUST cause the consumer-side proxy constructor and the producer-side shell constructor to throw synchronously with a clear error; no wire traffic MUST be sent for such a name even if validation is bypassed | [SPEC-extensions.md § Reserved names](SPEC-extensions.md#reserved-names) (Normative minimum) |
 
@@ -464,10 +464,12 @@ The discovery helper MUST wrap its entire validation body in a single `try / cat
 
 **Setup.** A bindable custom element that has been constructed but **not** yet appended to a document. Use `syncOn: "connect"`.
 
-> **Applicability of this vector.** A `{1O}` implementation MAY skip this vector **only** when the deferred path is not applicable under one of the spec-defined fallback conditions in [SPEC.md § Deferring the Initial Sync Until Connection](SPEC.md#deferring-the-initial-sync-until-connection):
-> - The runtime is non-browser and `HTMLElement` / `document` / `MutationObserver` are undefined (the deferred path's `typeof` guard short-circuits to `"call"`).
-> - The implementation profile does not claim `syncOn: "connect"` support and rejects or ignores it — this MUST be documented in the implementation's public API surface.
-> - The vector harness targets the non-`HTMLElement` short-circuit specifically (a headless `EventTarget` subclass, a synthetic proxy, an already-connected element).
+> **Applicability of this vector.** A **general-purpose browser JS implementation claiming `{1O}` SHOULD NOT skip this vector merely by ignoring `syncOn: "connect"`.** SPEC.md § Conformance Levels explicitly lists "the `in`-operator initial-sync rule with its `syncOn` modes" as part of `{1O}`, so silently no-oping on `"connect"` while otherwise claiming `{1O}` is a documentation gap, not a skip reason.
+>
+> Skipping is appropriate only under the spec-defined fallback conditions in [SPEC.md § Deferring the Initial Sync Until Connection](SPEC.md#deferring-the-initial-sync-until-connection):
+> - **Non-browser runtime** where `HTMLElement` / `document` / `MutationObserver` are undefined (the deferred path's `typeof` guard short-circuits to `"call"`).
+> - **Non-`HTMLElement` target** — a headless `EventTarget` subclass, a synthetic proxy, an already-connected element. The vector specifically tests the not-yet-connected `HTMLElement` path.
+> - **Explicitly scoped implementation profile** that documents non-support of browser DOM deferred-sync (e.g. "this is a server-only / Node-only consumer-side implementation; `syncOn: "connect"` is rejected with a clear error or ignored, and that scope is documented in the public API surface"). General-purpose `{1O}` implementations cannot use this carve-out.
 >
 > The unknown-`syncOn` fallback (an unrecognized string value collapsing to `"call"`) is **not** a valid skip reason — the caller here is passing the literal `"connect"`. A browser-runtime `{1O}` implementation that supports `syncOn: "connect"` against `HTMLElement` targets MUST pass this vector.
 
@@ -484,9 +486,15 @@ class T extends HTMLElement {
   }
   get value() { return this._value; }
 }
-customElements.define("t-deferred-sync", T);
 
-const target = new T();
+// Use a unique tag name per harness invocation. `customElements.define`
+// is process-global and throws on a duplicate definition, so a watch-mode
+// or repeated-run harness MUST NOT reuse a static tag literal. Replace
+// crypto.randomUUID() with the harness's preferred unique-id source if
+// the runtime lacks it.
+const tag = `t-deferred-sync-${crypto.randomUUID()}`;
+customElements.define(tag, T);
+const target = document.createElement(tag);
 target.value = "initial";  // setter records _value, but no listener is attached yet
 
 const calls = [];
