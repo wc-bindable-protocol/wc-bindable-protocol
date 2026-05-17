@@ -60,6 +60,8 @@ A `wcBindable` declaration models a component interface as **three independent s
 
 The separation lets the core protocol stay narrow (observation only) while extensions add invocation semantics on top. Core still schema-validates every surface (an invalid `inputs` / `commands` descriptor invalidates the whole declaration — see [§ Discovery API](#discovery-api)) so downstream consumers of those surfaces can trust the shape of what `getWcBindableDeclaration()` returns.
 
+> **Interface declaration vs. invocation capability.** Presence of `inputs` / `commands` declares the target's interface *surface* — what may be set, what may be called — and is NOT by itself an assertion that any particular call semantics are available. A consumer holding a core-conformant target MUST NOT infer, from the existence of `inputs` / `commands`, that ad-hoc property assignment or method invocation against that target carries the `set` / `setWithAck` / `invoke` semantics defined in [SPEC-extensions.md § Extension 1](SPEC-extensions.md#extension-1--inputcommand-invocation) (synchronous validation, ack delivery, error mapping, queue ordering, fire-and-forget vs. acked split). Those semantics come from interacting with an **Extension-1-capable surface** — typically a `RemoteShellProxy` / `RemoteCoreProxy` pair, a devtools / automation harness that explicitly implements the contract, or any other producer/consumer pair that claims Extension 1. A local Core that declares `inputs: [{ name: "url" }]` is making a true statement about its settable surface; what `core.url = "/api"` actually *does* (sync? async? throws? validates?) is between the consumer and that Core's implementation, exactly as for any plain JS object. This is the consumer-side counterpart to the producer-side disclaimer in [§ Producer Obligations](#producer-obligations) ("a core-only producer that declares `inputs` is making a true statement about its settable surface; it is not promising any particular `set` / `setWithAck` semantics until Extension 1 is also in play"). Remote tooling that needs runtime discoverability of which Extension-1 behaviors are honored uses the wire-level capability bits in `sync.capabilities` — see [SPEC-extensions.md § Message types — server → client](SPEC-extensions.md#message-types--server--client).
+
 ### Role model — Producer target vs Consumer-side bind target
 
 The two roles introduced in § Overview are the central model split: a **producer target** dispatches events; a **consumer-side bind target** observes them. They share the `add` / `removeEventListener` surface but a consumer-side target is NOT required to expose `dispatchEvent`. A relay wrapper, remote proxy, or test double that re-emits events through an internal channel is a valid bind target even when it deliberately hides `dispatchEvent`. This is why `bind()` works transparently against `RemoteCoreProxy` despite the proxy not being a literal event source.
@@ -901,6 +903,28 @@ The normative rule above ("integer `>= 1`") is the version contract every implem
 | Version | Status  | Notes            |
 |---------|---------|------------------|
 | `1`     | ✅ Current | Initial specification. Required: `protocol`, `version`, `properties`. Optional: `inputs`, `commands`. Initial sync uses `in` operator. `bind()` returns an unbind function. |
+
+### Change classification
+
+Within the `"wc-bindable"` protocol identifier, every spec revision falls into exactly one of three categories. The category determines whether the revision is allowed under the current `protocol` identifier and whether it bumps `version`:
+
+| Category | Compatibility | Allowed under `"wc-bindable"`? | Bumps `version`? | Examples |
+|---|---|---|---|---|
+| **Safely additive** | Old peers silently ignore the new field; "the field is absent" is a meaningful default that does not change observed behavior | ✅ | ✅ | New optional root key; new optional descriptor field (e.g. a `description` string on a descriptor); new optional metadata field on a wire envelope; new optional sibling on `error`; new envelope `type` whose absence-of-handling is itself the no-op behavior |
+| **Capability-gated additive** | Old peers cannot tell "modern peer with empty payload" from "legacy peer that doesn't know about the field"; new peers branch on an explicit capability advertisement before relying on the new behavior | ✅ | ✅ | New `sync.capabilities` bit (e.g. `setAck`, `undefinedProperties`, `getterFailures`); new diagnostic field whose absence on the wire is semantically ambiguous without a paired bit |
+| **Breaking** | No backward-compat path under the same identifier: old peers misinterpret, or new peers can no longer accept old declarations | ❌ — requires a new `protocol` identifier (e.g. `"wc-bindable-2"`) | n/a — `version` numbering restarts under the new identifier | A new **required** field on any descriptor; a change to existing-field semantics (`getter` execution position, `event` meaning, the `in`-operator initial-sync rule, the teardown contract); a change to the default behavior of an existing knob (e.g. flipping the unknown-`syncOn` fallback) |
+
+The line between "safely additive" and "capability-gated additive" is whether a current peer that **silently ignores** the new field still produces correct results. If yes, the field is safely additive. If a consumer needs to branch on whether the new behavior is available, the spec MUST introduce a capability bit instead — silently relying on field presence creates the "modern peer with no payload vs. legacy peer that doesn't know the field" ambiguity that the bit disambiguates. The existing `undefinedProperties` and `getterFailures` capabilities in [SPEC-extensions.md § Message types — server → client](SPEC-extensions.md#message-types--server--client) are the canonical worked examples.
+
+### Version-bump operating rules
+
+The `version` integer changes only for **normative schema additions** under the current `protocol` identifier. Concretely:
+
+- **MUST bump `version`** — any Safely-additive or Capability-gated-additive change above: a new optional root key, a new optional descriptor field, a newly defined capability bit, etc.
+- **MUST NOT bump `version`** — behavioral clarifications that do not change the schema (refined MUST/SHOULD wording on existing fields); new conformance vectors added to [CONFORMANCE.md](CONFORMANCE.md) that test pre-existing rules; typo / readability fixes; expanded rationale / FAQ entries.
+- **MUST NOT bump `version`** — breaking changes. Those require a new `protocol` identifier instead, per the third bullet of § Versioning above. Bumping the integer for a breaking change would silently invalidate the "every adapter accepts every integer `>= 1`" contract.
+
+In short: schema grows ⇒ bump; behavior is re-described ⇒ do not bump; contract breaks ⇒ new `protocol` identifier.
 
 ---
 
