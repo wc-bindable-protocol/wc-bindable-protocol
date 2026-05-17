@@ -162,6 +162,8 @@ const proxy = createRemoteCoreProxy(declaration, transport);
 
 A naive JS-`Proxy`-based implementation that lets `has` fall through to the underlying object will fire a spurious early initial-sync from `bind()` and then re-fire on `sync` arrival, breaking the "exactly one initial sync per property" guarantee. See [SPEC-extensions.md § Consumer-side proxy `has` trap contract](SPEC-extensions.md#consumer-side-proxy-has-trap-contract).
 
+**Scope: properties only.** This vector tests the `has`-trap rule that core's `bind()` depends on, which is defined over declared `properties` names. The rule does NOT extend to declared `inputs` / `commands` names — for those, `N in proxy` is implementation-defined per the "Scope: inputs and commands" note in the linked spec section, and no `bind()`-observable behavior depends on the choice. Test vectors targeting an implementation's `in` behavior for input or command names should branch on the implementation's documented stance, not assume the property-side rule.
+
 ---
 
 ### 6. Remote undefined — absent `update.value` delivers `undefined`, not `null`
@@ -226,7 +228,7 @@ const NEEDS_REJECT = [
 **Expected.** Every entry:
 - `isJsonValue(v) === false`
 - `proxy.setWithAck("name", v)` returns an already-rejected `Promise` (per [SPEC-extensions.md § Design invariants invariant 3](SPEC-extensions.md#extension-2--wire-format-remote-proxying)); no wire message is sent
-- `proxy.set("name", v)` (fire-and-forget) MUST throw synchronously (no silent drop; the caller has no other channel to learn about the validation failure)
+- `proxy.set("name", v)` (fire-and-forget) MUST throw synchronously **at the `set()` call site** (no silent drop, and crucially: even if the implementation is queueing fire-and-forget `set` calls before `sync` per [SPEC-extensions.md § Pre-sync call state machine](SPEC-extensions.md#pre-sync-call-state-machine), validation MUST happen at the call site, not at send time — `set()` returns `void` and deferring validation past the call site removes the caller's only signal that anything went wrong)
 
 A `try { JSON.stringify(v) }` based predicate fails this vector against `NaN`, `Infinity`, and any value containing them — `JSON.stringify` silently coerces them to `null` rather than throwing. See the "JSON.stringify is NOT sufficient validation" paragraph in invariant 3.
 

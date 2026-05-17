@@ -115,7 +115,7 @@ The core protocol does NOT inspect this field.
 
 ### Error envelope
 
-When `setWithAck` or `invoke` fails on the remote side, the consumer-side proxy SHOULD raise an `Error` whose `name`, `message`, and (when available) `stack` reflect the original throw. Implementations MAY attach the raw serialized payload as `cause`. Implementations MUST NOT silently swallow remote throws.
+When `setWithAck` or `invoke` fails on the remote side, the consumer-side proxy **MUST reject the returned `Promise` with a JavaScript `Error` instance** regardless of the thrown shape on the producer side — the `Error` boundary at the proxy preserves `try { await invoke() } catch (e) { ... }` ergonomics without leaking the producer-side throw oddity into the consumer's catch. The Error instance **SHOULD** preserve the original `name`, `message`, and (when available and permitted by the producer's stack-transmission policy) `stack`; implementations MAY attach the raw serialized payload as `cause`. Implementations MUST NOT silently swallow remote throws.
 
 #### Canonical mapping for non-Error throws
 
@@ -168,7 +168,7 @@ The literal string `"NonErrorThrow"` is normative: consumers MAY pattern-match o
 
 **`cause` field on the wire.** Producers MAY additionally attach the original thrown value as `cause` in the throw envelope's `error` object (see wire schema in § Message types — server → client) if it survives `JsonValue` validation (§ Design invariants invariant 3); non-JsonValue thrown values MUST be omitted from `cause` (the `name` + `message` pair is the canonical fallback). The validation runs *before* serialization, so a producer that violates JsonValue cannot leak silently. Consumers MAY surface a successfully-transmitted `cause` via JavaScript `Error.cause` on the proxy-side Error instance; the wire `cause` is OPTIONAL on both sides and consumers MUST cope with its absence.
 
-Consumers MUST surface the wire envelope as a JavaScript `Error` instance regardless of the thrown shape on the producer side — the `Error` boundary at the proxy preserves `try { await invoke() } catch (e) { ... }` ergonomics without leaking the producer-side throw oddity into the consumer's catch.
+(The "consumer MUST surface as a JavaScript `Error` instance" rule is the same one stated at the top of § Error envelope; it is repeated here only as a reminder when reading the canonical mapping table in isolation.)
 
 > **Security note on `stack`.** A producer-side stack trace typically includes internal file paths, function names, and runtime version markers — sensitive metadata that should NOT cross an untrusted trust boundary. The `stack` field is therefore conditional:
 >
@@ -263,7 +263,7 @@ This section is the **normative** wire-format specification for any implementati
 
    *Producer-side handling of malformed inbound messages:*
 
-   - The producer MUST reject any inbound message that fails JSON-shape validation (`set` without a string `name`; `cmd` without a string `name`, without a string `id`, or with `args` that is not an array; any envelope with extra unknown keys MUST still be processed, per the "ignore unknown fields" rule from core, but type-mismatched required keys MUST be rejected).
+   - The producer MUST reject any inbound message that fails JSON-shape validation (`set` without a string `name`; `cmd` without a string `name`, without a string `id`, or with `args` that is not an array; type-mismatched required keys MUST be rejected). Unknown extra keys on the envelope are governed by the separate wire-envelope rule below (§ Wire envelope unknown-fields rule), not by core's declaration-level unknown-fields rule — the two rules live at different layers and MUST be reasoned about independently.
    - For an inbound `setWithAck` / `cmd` that has an `id` but is otherwise malformed, the producer MUST emit a `throw` envelope referencing that `id` so the consumer's pending promise rejects with a clear error rather than hanging.
    - For an inbound fire-and-forget `set` that is malformed (no `id`), the producer cannot reply. It MUST log a warning and drop the message. This is the documented gap of the fire-and-forget channel.
    - The producer MUST NOT touch the Core (no setter invocation, no command call) until validation succeeds. Validation is the first step on the producer side.
@@ -282,6 +282,16 @@ This section is the **normative** wire-format specification for any implementati
 - `set` without an `id` is fire-and-forget (Extension 1 `set`); with an `id` it requires an acknowledgement (Extension 1 `setWithAck`).
 - `cmd.id` is a client-allocated identifier (e.g. UUID v4) unique within the lifetime of the proxy. The producer MUST echo it back in the `return` / `throw` envelope.
 - `{ type: "sync" }` carries no `id`. **At most one `sync` request MAY be outstanding per channel at a time.** The consumer-side proxy MUST NOT issue a new `sync` until the previous one has either received its `sync` response or the channel has been torn down. The producer MAY conflate back-to-back `sync` requests it has not yet answered into a single response. If a future revision needs concurrent `sync` requests (e.g. cross-shell snapshots on a multiplexed transport), introduce a new message type with an explicit `id` rather than overloading this one.
+
+#### Wire envelope unknown-fields rule
+
+Wire envelopes (client → server **and** server → client) MAY contain unknown top-level fields. Receivers MUST ignore unknown fields after validating `type` and all required fields for the matched message shape. Unknown fields MUST NOT change the semantics of the known fields. This rule:
+
+- is **wire-format-scoped** — it does not depend on, and is not the same as, core's "ignore unknown fields" rule on the `wcBindable` declaration schema (SPEC.md § Schema). The two rules govern different layers (network envelope vs. JavaScript declaration object) and may evolve independently in future spec revisions;
+- applies uniformly to every envelope shape defined in § Message types — client → server / server → client (`sync`, `set`, `cmd`, `update`, `return`, `throw`), as well as to any nested object inside them (`error`, `capabilities`, `declarationFingerprint`);
+- is the forward-compatibility hinge that lets a future spec revision add an optional field (e.g. a new capability bit, a new diagnostic key) without breaking older peers — they keep parsing the known fields and silently drop the new one.
+
+A receiver that rejects on unknown fields (or, equivalently, fails validation when an unknown key is present) is non-conformant. A receiver that *processes* an unknown field — assigning it semantic meaning, mutating state based on it, echoing it back into a different envelope — is also non-conformant: ignore means ignore.
 
 ### Message types — server → client
 
@@ -346,7 +356,7 @@ The behavior of `setWithAck` / `setWithAckOptions` calls issued **between proxy 
 |---|---|
 | `setWithAck` / `setWithAckOptions` | **MUST queue.** Do NOT send the wire message yet — `setAck` capability is unknown, and sending a `setWithAck` to a producer that ends up advertising `setAck: false` (or absent) is forbidden by the "MUST NOT send a message it knows the producer will not handle" rule above. The returned `Promise` stays pending. |
 | `invoke` / `invokeWithOptions` | MUST queue on the same queue, so per-caller FIFO is preserved across mixed `setWithAck` + `invoke` traffic. |
-| `set` (fire-and-forget) | MAY send immediately, because fire-and-forget `set` is unaffected by `setAck` (it is part of the baseline wire contract; see the bullet above). Implementations that queue it instead — to preserve global call-order with later `setWithAck` / `invoke` — are also conformant. The reference implementation queues. |
+| `set` (fire-and-forget) | MAY send immediately, because fire-and-forget `set` is unaffected by `setAck` (it is part of the baseline wire contract; see the bullet above). Implementations that queue it instead — to preserve global call-order with later `setWithAck` / `invoke` — are also conformant. The reference implementation queues. **JsonValue validation MUST happen at the `set()` call site regardless of whether the message is then queued or sent immediately**, because `set()` returns `void` and the caller has no other channel to learn about a validation failure; if validation fails, `set()` MUST throw synchronously and the message MUST NOT be queued. |
 
 On `sync` response arrival, the proxy MUST replay the queue **in caller order** (FIFO across all queued call sites — `setWithAck`, `setWithAckOptions`, `invoke`, `invokeWithOptions`, and `set` if it was queued):
 
@@ -424,12 +434,14 @@ This breaks the obvious "the proxy dispatches a per-property `CustomEvent` whose
 
 Core's initial-sync rule (SPEC.md § Initial Value Synchronization) gates per-property delivery on `prop.name in target`. For a remote proxy the producer's value is not present locally until the `sync` response lands, so the consumer's `bind()` MUST skip initial sync on first call and receive the value via the post-`sync` dispatch path instead. This depends on the proxy returning `false` from the `in` check for un-synced names — a requirement that becomes load-bearing the moment the consumer-side proxy is built on a JS `Proxy` (the obvious implementation, since the reference impl uses it to resolve `proxy.<name>` reads from the internal cache).
 
-**Normative rule.** A consumer-side proxy MUST satisfy the following `has`-trap contract for every declared `properties` / `inputs` / `commands` name `N`:
+**Normative rule.** A consumer-side proxy MUST satisfy the following `has`-trap contract **for every declared `properties` name `N`** (the rule does NOT extend to `inputs` / `commands` names — see the "Scope" note below):
 
 - **Before the `sync` response has been processed:** `N in proxy === false`.
 - **After the `sync` response has been processed:** `N in proxy === true` for `N` that appeared in `values` or `undefinedProperties`; `N in proxy === false` for `N` that the producer omitted from both (per § Undefined enumeration, this means "property not present on the producer" and core's `in`-operator gate MUST continue to skip it).
-- **For names NOT in the declaration at all:** behavior is unspecified by this contract — the proxy MAY return `true` (e.g. for inherited `EventTarget` method names) or `false`. Core's `bind()` only consults `in` for declared property names, so this does not affect initial-sync correctness.
+- **For names NOT in the declaration's `properties` at all:** behavior is unspecified by this contract — the proxy MAY return `true` (e.g. for inherited `EventTarget` method names) or `false`. Core's `bind()` only consults `in` for declared property names, so this does not affect initial-sync correctness.
 - **After a re-sync** (e.g. on reconnect): the same rules re-apply with respect to the new `sync` response.
+
+**Scope: inputs and commands.** The `has`-trap contract applies to declared `properties` only. `inputs` and `commands` are not part of the initial-value synchronization gate — core's `bind()` never consults `N in proxy` for them, and `values` / `undefinedProperties` in the `sync` response are property-side snapshots that do not carry input/command names. For declared `inputs` / `commands` names, `N in proxy` is **implementation-defined**: an implementation MAY expose `proxy.<inputName>` / `proxy.<commandName>` facades (returning the current input value, or the callable command method) and report `true`, MAY hide them and report `false`, or MAY do anything in between, as long as the consequence does not leak into a `bind()`-observed behavior change. Callers wanting to know whether an `inputName` or `commandName` is declared should read `proxy.constructor.wcBindable` and inspect the declaration directly, not probe with `in`.
 
 Without this rule, a JS-Proxy-based consumer that lets `has` fall through to the underlying object would let `bind()` fire a spurious *early* `onUpdate(name, value)` reading whatever the pre-sync state happens to be (typically `undefined`), and then fire *again* when the per-property `CustomEvent` arrives after `sync` — producing two initial deliveries for the same property and breaking the "exactly one initial sync per property at bind time" guarantee that the rest of the spec rests on.
 
@@ -512,7 +524,12 @@ function processSync(msg, prev, capabilities, logger) {
     // see "Known lossy interaction (legacy producers only)" blockquote.
     for (const name of declaredNames) {
       const wasCached  = prev.has(name);
-      const stillThere = name in values;
+      // Use Object.hasOwn (not `name in values`) so that inherited keys like
+      // "toString" / "constructor" on the values object cannot spuriously
+      // satisfy the gate. The wire "appeared in values" semantics are
+      // own-key only — see § Wire envelope unknown-fields rule and JSON's
+      // own-key serialization model.
+      const stillThere = Object.hasOwn(values, name);
       if (wasCached && !stillThere) {
         cache.set(name, undefined);
         dispatchInitialSyncUndefined(name);
@@ -614,7 +631,11 @@ The producer's return value (sync or eventual `Promise` resolution) MUST be JSON
 
 ### Reserved names
 
-Implementations MAY reserve a small namespace of `name` values for protocol-internal use (e.g. the reference implementation reserves names beginning with `@wc-bindable/`). Reserved names in a declaration's `properties` / `inputs` / `commands` MUST be rejected at proxy construction time and MUST NOT generate wire traffic. This is a safety net so a typo or hostile declaration cannot silently shadow protocol-level messages.
+**Normative minimum.** The namespace prefix `@wc-bindable/` is reserved by this specification. Every conformant Extension 2 implementation MUST reject any declared `properties` / `inputs` / `commands` `name` that begins with the literal string `@wc-bindable/` at proxy construction time (consumer-side) and at shell construction time (producer-side), and MUST NOT generate wire traffic for such a name. This is the cross-implementation portion of the reserved-name rule — pinning the prefix makes a single conformance vector test for it across every implementation, regardless of which other names that implementation also reserves.
+
+**Implementation-defined extensions.** Implementations MAY reserve additional names beyond the normative minimum (e.g. `__proto__`, vendor-prefixed namespaces, debugging-tool names). Such additions MUST be documented in the implementation's public API surface so consumers know which extra names are forbidden in their declarations. The reference implementation reserves only the normative minimum (`@wc-bindable/` prefix).
+
+The reservation is a safety net so a typo or hostile declaration cannot silently shadow protocol-level messages (the synthetic per-property event names the consumer-side proxy generates, the wire envelope `type` discriminator, and other internal identifiers all use the `@wc-bindable/` prefix). Reserved-name rejection happens at construction time, never at message-send time, so a passing-construction declaration is guaranteed to be reservation-clean for the lifetime of the proxy / shell.
 
 ### Transport adapter contract
 
