@@ -986,6 +986,8 @@ export interface MyFetchCommands {
 }
 ```
 
+**Scope of the subset rules below.** These TypeScript interfaces are optional — the lowercase "should export" in the paragraph above is advisory per [§ Requirements language](#requirements-language), not a protocol-conformance requirement. **When a component publishes them as part of its wc-bindable typing surface, the subset rules below are normative for that published typing surface** — they are not gates on the runtime `bind()` contract (Core does not inspect them) and a component that ships only `static wcBindable` without companion `.d.ts` files remains fully conformant. The MUSTs exist so that consumers, remote proxies, devtools, and codegen tools can rely on the typing surface as a faithful projection of the runtime declaration once a component opts in to publishing it.
+
 The `Inputs` interface's keys MUST be a subset of `wcBindable.inputs[].name`. The `Commands` interface's keys MUST be a subset of `wcBindable.commands[].name`, and each method's signature should match the underlying instance method. Remote-aware tooling can compose these into a typed surface (`MyFetchValues & RemoteCallable<MyFetchInputs, MyFetchCommands>`) without re-deriving anything.
 
 This three-interface pattern (`Values` / `Inputs` / `Commands`) is the recommended shape for any component whose interface is non-trivial. Components that only expose `properties` can stick to `Values` alone.
