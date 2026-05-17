@@ -55,6 +55,14 @@ Compound shorthand: `{1O, 2}` means "Level 1 observer facet + Level 2"; `{3-cons
 | 24 | Malformed `return`/`throw` ⇒ drop or per-entry reject | `{3-consumer}` and `{3-both}` | A malformed `return` or `throw` envelope MUST NOT close the transport. If the `id` field is well-formed AND matches a pending entry, the proxy MUST reject that entry with a `WC_BINDABLE_PROTOCOL_ERROR`-coded synthetic error built locally (NOT pass-through the malformed `error` object). Otherwise drop + warn-log | [SPEC-extensions.md § Consumer-side malformed message handling](SPEC-extensions.md#consumer-side-malformed-message-handling) |
 | 25 | `update.value` absence via key-presence | `{3-consumer}` and `{3-both}` | The consumer-side proxy MUST distinguish "the `value` key is absent" from "the `value` key is present and holds `undefined`" via key-presence check (`Object.hasOwn(msg, "value")`), not via `msg.value === undefined`. The two are equivalent post-`JSON.parse` but the spec contract is key-presence, not value comparison — implementations that use `=== undefined` are non-conformant against non-`JSON.parse` boundaries (in-process test harnesses, hand-rolled envelopes) | [SPEC-extensions.md § Update envelope value field](SPEC-extensions.md#update-envelope-value-field) (hasOwn rule) |
 | 26 | Transport at-most-once delivery | Any transport adapter packaged with `{3-consumer}` / `{3-producer}` / `{3-both}` | A conformant transport adapter MUST deliver each accepted `send(message)` to the peer's `onMessage` at most once. Adapters built on a medium that may duplicate frames MUST either de-duplicate at the adapter boundary (e.g. via a per-frame sequence number the adapter strips before invoking `onMessage`) or treat any observed duplication as a terminal transport failure (`onClose` fires; subsequent traffic dropped). Test by injecting a duplicate frame at the adapter's underlying medium and asserting one of the two behaviors; silent double-delivery to `onMessage` is non-conformant. **For transports whose underlying medium cannot duplicate frames under test** (a strict in-process mock, WebSocket-over-TCP with no proxy in front of it, single-`MessagePort` peer-to-peer), the duplicate-injection setup is not reachable and the vector MAY be satisfied by inspecting the adapter's `send` / `onMessage` paths and asserting it contains no retry / replay code path that can call `onMessage` twice for one accepted `send()` — i.e. the at-most-once property holds by construction rather than by runtime defense. Implementations SHOULD document which of the two satisfaction modes their adapter uses | [SPEC-extensions.md § Transport adapter contract](SPEC-extensions.md#transport-adapter-contract) (invariant 7) |
+| 27 | `dispose()` rejects pending in caller order; late envelopes dropped | `{3-consumer}` and `{3-both}` | `dispose()` MUST reject every pending `setWithAck` / `setWithAckOptions` / `invoke` / `invokeWithOptions` entry in **caller order** (FIFO across the pending table) before returning. Any subsequent inbound `return` / `throw` envelope referencing one of the already-rejected `id`s MUST be silently dropped (SHOULD warn-log) — the consumer `Promise` MUST NOT re-settle. `set()` after `dispose()` MUST throw synchronously; `setWithAck` / `setWithAckOptions` / `invoke` / `invokeWithOptions` after `dispose()` MUST return an already-rejected `Promise`. `dispose()` itself MUST be idempotent (safely re-callable as a no-op) | [SPEC-extensions.md § Lifecycle methods](SPEC-extensions.md#lifecycle-methods) + [§ Pending-call lifecycle](SPEC-extensions.md#pending-call-lifecycle-setwithack--setwithackoptions--invoke--invokewithoptions) + [§ AckOptions](SPEC-extensions.md#ackoptions) |
+| 28 | `reconnect()` after TerminalFailure: fresh `sync`; old pending NOT replayed | `{3-consumer}` and `{3-both}` that ship `reconnect()` (OPTIONAL per [§ Lifecycle methods](SPEC-extensions.md#lifecycle-methods); implementations that omit `reconnect` are conformant and this vector is N/A) | After the channel enters TerminalFailure, every pending entry MUST have been rejected (per vector 27's drain rule applied to TerminalFailure). On `reconnect(transport)` with a fresh transport, the proxy MUST send a new `{ "type": "sync" }` envelope and MUST NOT replay any of the previously-rejected pending messages on the new transport. `reconnect()` MUST throw synchronously when the proxy is already disposed OR when the existing transport is still active (re-attaching to a healthy connection is a programmer error) | [SPEC-extensions.md § Lifecycle methods](SPEC-extensions.md#lifecycle-methods) (reconnect row) + [§ Remote proxy lifecycle](SPEC-extensions.md#remote-proxy-lifecycle) (TerminalFailure → Reconnecting → PreSync) |
+| 29 | Cache validity across TerminalFailure / Reconnecting | `{3-consumer}` and `{3-both}` | During TransientFailure, TerminalFailure, and Reconnecting (before the next `sync` response arrives), the per-property cache MUST be preserved as last-known-value: `proxy.<N>` reads the same value it returned before the lifecycle transition, and `N in proxy` stays `true` for `N` that was cached before the transition. The proxy MUST NOT zero / clear / mark-stale the cache merely because the transport state changed. The new `sync` response (after reconnect) re-applies the [§ Consumer-side sync-response handling](SPEC-extensions.md#consumer-side-sync-response-handling--reference-pseudocode) rules diff-style: `N` now present in `values` / `undefinedProperties` updates the cache and re-fires `onUpdate`; `N` now omitted from both (and not in `getterFailures`) removes the cache entry and flips `has` back to `false` without dispatching a synthetic removal event | [SPEC-extensions.md § Cache validity across transport lifecycle](SPEC-extensions.md#cache-validity-across-transport-lifecycle) |
+| 30 | Locally-synthesized errors MUST carry `code` | `{3-consumer}` and `{3-both}` (consumer-side synthetic errors); `{3-producer}` and `{3-both}` (producer-side `throw` envelope emission for locally-synthesized failures) | Every locally-synthesized protocol error reaching the consumer's `catch` MUST carry `error.code` drawn from the registry in [SPEC-extensions.md § Error envelope → Machine-readable code field](SPEC-extensions.md#error-envelope). Concretely test: (a) `setWithAckOptions(name, value, { timeoutMs: 1 })` against an unresponsive producer rejects with `error.code === "WC_BINDABLE_TIMEOUT"`; (b) `invokeWithOptions(name, args, { signal })` aborted after send rejects with `error.code === "WC_BINDABLE_ABORTED"`; (c) `setWithAck(name, new Date())` (or any non-`JsonValue`) rejects with `error.code === "WC_BINDABLE_INVALID_JSON_VALUE"`; (d) malformed inbound `sync` (per vector 23) drains pending with `error.code === "WC_BINDABLE_PROTOCOL_ERROR"`. Application throws from the producer's command / setter (canonical example: `target.fetch()` throws a `RangeError`) MAY omit `code` or carry `WC_BINDABLE_REMOTE_THROW` — application throws MUST NOT repurpose any other registered `WC_BINDABLE_*` code | [SPEC-extensions.md § Error envelope → Producer-side code-emission rule](SPEC-extensions.md#error-envelope) (origin-conditional MUST / MAY) |
+| 31 | `getterFailures` does NOT touch cache; subsequent `update` recovers | `{3-consumer}` and `{3-both}` | Setup: producer's first `sync` response includes `values: { v: 42 }` and `capabilities: { setAck: true, getterFailures: true }`. After consumer caches `v === 42`, force a re-sync (via reconnect or a producer-issued fresh `sync`) whose response carries `values: {}` and `getterFailures: ["v"]`. Expected: (a) `proxy.v === 42` is preserved (cache NOT reverted to `undefined`); (b) no `onUpdate` event is dispatched for `v` as part of the failed-getter sync; (c) the consumer logger receives a warn-level message naming `v`; (d) a subsequent `{ type: "update", name: "v", value: 99 }` from the producer normally updates the cache to `99` and dispatches `onUpdate("v", 99)` — the getter failure does NOT permanently taint the property | [SPEC-extensions.md § `getterFailures` semantics](SPEC-extensions.md#getterfailures-semantics) + [§ Consumer-side sync-response handling](SPEC-extensions.md#consumer-side-sync-response-handling--reference-pseudocode) |
+| 32 | Malformed `update` drops + warns; transport stays open; next valid `update` processed | `{3-consumer}` and `{3-both}` | Inject a malformed `update` envelope (missing `name`, non-string `name`, or present `value` that fails `JsonValue` deep validation). Expected: (a) the proxy does NOT throw, does NOT close the transport, and does NOT write the cache for the property whose `name` was malformed (if any); (b) the consumer's `bind()` callback receives NO event for the malformed envelope; (c) the proxy logger receives a warn-level entry naming the field that failed; (d) a subsequent well-formed `{ type: "update", name: "value", value: "ok" }` envelope is processed normally — the cache updates, `onUpdate("value", "ok")` fires. This is the asymmetry from vector 23: malformed `sync` escalates to TerminalFailure, malformed `update` degrades gracefully | [SPEC-extensions.md § Consumer-side malformed message handling](SPEC-extensions.md#consumer-side-malformed-message-handling) (malformed `update` row) |
+| 33 | Deferred initial-sync throw — `unbind()` is a literal no-op afterward | `{1O}` for general-purpose browser JS implementations that support `syncOn: "connect"` (skip applies under the same conditions as vector 13) | A `syncOn: "connect"` bind where the deferred initial-sync throws (e.g. a property getter throws on read inside the `MutationObserver` microtask). Expected: (a) the adapter's installed cleanups (listeners + the `MutationObserver`) MUST be torn down before the throw escapes the microtask; (b) the throw surfaces as an uncaught error on the dispatching microtask (`window.onerror` / `reportError` / `process.on('uncaughtException')`), NOT as a synchronous throw from the original `bind()` call frame; (c) the `unbind` function the caller received at `bind()` time MUST still be safe to invoke after the throw — calling `unbind()` MUST be a literal no-op (the closure-level `disposed` re-entry guard was set by the cleanup-on-throw path); (d) the `unbind()` call MUST NOT re-walk the cleanup list, MUST NOT throw, MUST NOT trigger any further uncaught error | [SPEC.md § Teardown Contract](SPEC.md#teardown-contract) (the "If a deferred initial-sync (`syncOn: \"connect\"`) throws" paragraph) + [§ bind() state machine summary](SPEC.md#bind-state-machine-summary) (InitialSyncing → Disposed via deferred throw) |
+| 34 | `set()` — sync throw on terminal, no throw on transient outage | `{3-consumer}` and `{3-both}` — the line between terminal and transient is transport-implementation-defined per [SPEC-extensions.md § Transport lifecycle vocabulary](SPEC-extensions.md#transport-lifecycle-vocabulary-shared-by-extensions-1-and-2); the canonical vector uses a controllable mock transport that lets the test force each state explicitly | Setup: a mock transport with explicit `setTerminal()` / `setTransient()` hooks. Bring the proxy to Active. Expected — terminal path: after `mockTransport.setTerminal()` (e.g. emit `onClose` and refuse to accept further `send()`), `proxy.set("x", 1)` MUST throw synchronously at the call site with a clear terminal-failure error. Expected — transient path: after `mockTransport.setTransient()` (the transport's own reconnect/backoff layer is masking an outage; the proxy has NOT been notified of terminal failure), `proxy.set("x", 1)` MUST NOT throw — the message is either eventually delivered or silently lost (at-most-once contract). Verifying the silent-drop case: the test asserts only the absence of a synchronous throw and the absence of a wire frame on the underlying socket; whether the message lands on a later recovery is implementation-defined. The bifurcation is the canonical safety mechanism `setWithAck` is designed around | [SPEC-extensions.md § Methods](SPEC-extensions.md#methods) (the `set` row) + [§ Transport lifecycle vocabulary](SPEC-extensions.md#transport-lifecycle-vocabulary-shared-by-extensions-1-and-2) + [SPEC-extensions.md § Failure & recovery quick reference](SPEC-extensions.md#failure--recovery-quick-reference) (the `set` rows in both tables) |
 
 ---
 
@@ -890,6 +898,498 @@ unbind();
 
 ---
 
+### 27. `dispose()` — pending entries reject in caller order; late envelopes dropped
+
+**Setup.** A remote proxy in Active state with three outstanding pending entries issued in caller order (`setWithAck`, `invoke`, `setWithAck`), plus a recording transport that can inject late inbound envelopes after `dispose()`:
+
+```javascript
+const transport = new RecordingTransport();
+const proxy = createRemoteCoreProxy(declaration, transport);
+
+// Bring to Active.
+transport.emitInbound({
+  type: "sync",
+  values: {},
+  capabilities: { setAck: true },
+});
+await new Promise((resolve) => setTimeout(resolve, 0));
+
+const settleOrder = [];
+const p1 = proxy.setWithAck("url", "/api/users")
+  .catch((e) => settleOrder.push(["p1", e?.code, e?.name]));
+const p2 = proxy.invoke("fetch")
+  .catch((e) => settleOrder.push(["p2", e?.code, e?.name]));
+const p3 = proxy.setWithAck("method", "POST")
+  .catch((e) => settleOrder.push(["p3", e?.code, e?.name]));
+
+// Capture the on-wire ids before dispose so we can inject late envelopes.
+const outbound = transport.outboundMessages();
+const id1 = outbound.find((m) => m.type === "set" && m.name === "url").id;
+const id2 = outbound.find((m) => m.type === "cmd" && m.name === "fetch").id;
+const id3 = outbound.find((m) => m.type === "set" && m.name === "method").id;
+
+// Action: dispose.
+proxy.dispose();
+
+await Promise.allSettled([p1, p2, p3]);
+```
+
+**Action.** Inspect `settleOrder`, then inject late envelopes for the disposed ids and verify they do not re-settle.
+
+```javascript
+// Inject late envelopes for already-rejected ids.
+let lateReSettle = false;
+[p1, p2, p3].forEach((p) => p.then(() => { lateReSettle = true; }, () => {}));
+transport.emitInbound({ type: "return", id: id1, value: "should be dropped" });
+transport.emitInbound({ type: "throw",  id: id2, error: { name: "X", message: "should be dropped" } });
+transport.emitInbound({ type: "return", id: id3, value: null });
+await new Promise((resolve) => setTimeout(resolve, 0));
+
+// Action 2: subsequent dispose() call is a safe no-op (idempotent).
+proxy.dispose();
+```
+
+**Expected.**
+- `settleOrder.length === 3` and the entries appear in **caller order** — `[["p1", ..., ...], ["p2", ..., ...], ["p3", ..., ...]]` — regardless of `Map` iteration order in the proxy's internal `id → pending` table. The error code carried by each rejection MAY be `WC_BINDABLE_PROTOCOL_ERROR` (a generic terminal-failure synthetic) or an implementation-defined locally-namespaced equivalent that signals dispose; the **caller-order** part is the load-bearing contract here, not the exact code value.
+- `lateReSettle === false` — none of the three late envelopes injected after dispose re-settles the corresponding `Promise`. The proxy SHOULD log a warn-level entry for each late envelope it drops, but MUST NOT throw, MUST NOT reopen the transport, and MUST NOT re-fire `onUpdate` for any property.
+- The second `proxy.dispose()` call returns without throwing — `dispose()` is unconditionally idempotent.
+- After `dispose()`: `proxy.set("x", 1)` MUST throw synchronously; `proxy.setWithAck("x", 1)` / `proxy.invoke("fetch")` MUST return an already-rejected `Promise`.
+
+**Spec reference.** [SPEC-extensions.md § Lifecycle methods](SPEC-extensions.md#lifecycle-methods) (`dispose` row), [§ Pending-call lifecycle](SPEC-extensions.md#pending-call-lifecycle-setwithack--setwithackoptions--invoke--invokewithoptions) ("the `id → pending` table is the integration point" note about FIFO drain order), [§ AckOptions](SPEC-extensions.md#ackoptions) (late-envelope drop rule).
+
+---
+
+### 28. `reconnect()` after TerminalFailure — fresh `sync`, no pending replay
+
+> **Applicability.** This vector tests `reconnect()`, which is **OPTIONAL** per [SPEC-extensions.md § Lifecycle methods](SPEC-extensions.md#lifecycle-methods). Implementations that omit `reconnect` from their public surface are conformant and this vector is N/A — the conformant equivalent for the consumer is `dispose()` followed by constructing a new proxy. Implementations that ship `reconnect()` MUST pass this vector.
+
+**Setup.** A remote proxy that has been brought to Active, then driven to TerminalFailure (via `transport.simulateTerminalFailure()` or equivalent — explicit `onClose` firing followed by the transport refusing further `send()`). The proxy's pending-entry queue is drained by the TerminalFailure transition per vector 27's rule.
+
+```javascript
+const transport1 = new RecordingTransport();
+const proxy = createRemoteCoreProxy(declaration, transport1);
+
+transport1.emitInbound({
+  type: "sync",
+  values: { url: "/api/old" },
+  capabilities: { setAck: true },
+});
+await new Promise((resolve) => setTimeout(resolve, 0));
+
+// Issue a pending setWithAck that will get drained on TerminalFailure.
+const drainedPromise = proxy.setWithAck("url", "/api/users").catch(() => {});
+
+// Drive to TerminalFailure.
+transport1.simulateTerminalFailure();
+await drainedPromise; // settle (rejected) per vector 27
+
+// Action: reconnect with a fresh transport.
+const transport2 = new RecordingTransport();
+proxy.reconnect(transport2);
+```
+
+**Action.** Inspect what `transport2` observes, and verify `transport2` does NOT see any replay of the previously-rejected `setWithAck("url", "/api/users")` message.
+
+**Expected.**
+- `transport2.outboundMessages()` contains exactly ONE message immediately after `reconnect()`: a fresh `{ "type": "sync" }` envelope. The proxy MUST send a new sync request as part of reconnect — it MUST NOT assume the producer remembers any prior state.
+- `transport2.outboundMessages()` MUST NOT contain a replayed `{ type: "set", name: "url", value: "/api/users", id: ... }` envelope — the previously-rejected pending entry has already been settled (Rejected) on the consumer's side, and the spec deliberately does NOT auto-replay drained entries against a new transport (the consumer cannot tell which entries already reached the producer over the dying transport — see [SPEC-extensions.md § Failure & recovery quick reference](SPEC-extensions.md#failure--recovery-quick-reference), "Terminal transport failure" row in the Retry guidance table).
+- The proxy's cache MUST be preserved across the Reconnecting transition per vector 29 — `proxy.url === "/api/old"` immediately after `reconnect()` returns (still holding the pre-failure last-known value). The new value arrives once the fresh `sync` response lands on `transport2`.
+
+**Negative companions (synchronous throws).**
+- `proxy.dispose(); proxy.reconnect(transport3)` MUST throw synchronously — reconnect on a disposed proxy is a programmer error.
+- `proxy.reconnect(anotherTransport)` while the existing transport is still healthy (Active state) MUST throw synchronously — re-attaching to a live connection is a programmer error.
+
+**Spec reference.** [SPEC-extensions.md § Lifecycle methods](SPEC-extensions.md#lifecycle-methods) (`reconnect` row), [§ Remote proxy lifecycle](SPEC-extensions.md#remote-proxy-lifecycle) (TerminalFailure → Reconnecting → PreSync transition), [§ Failure & recovery quick reference](SPEC-extensions.md#failure--recovery-quick-reference) (Retry guidance table, "Terminal transport failure" row).
+
+---
+
+### 29. Cache validity across TerminalFailure / Reconnecting
+
+**Setup.** A remote proxy brought to Active with a non-trivial cache:
+
+```javascript
+const transport1 = new RecordingTransport();
+const proxy = createRemoteCoreProxy(declaration, transport1);
+
+transport1.emitInbound({
+  type: "sync",
+  values: { value: 42, label: "hello" },
+  capabilities: { setAck: true },
+});
+await new Promise((resolve) => setTimeout(resolve, 0));
+
+// Sanity: cache is populated.
+console.assert(proxy.value === 42 && proxy.label === "hello");
+console.assert("value" in proxy && "label" in proxy);
+```
+
+**Action.** Drive the proxy through TerminalFailure and Reconnecting, observing the cache at each step.
+
+```javascript
+// Step 1: TerminalFailure. Cache MUST be preserved.
+transport1.simulateTerminalFailure();
+const valueAfterTerminal  = proxy.value;
+const labelAfterTerminal  = proxy.label;
+const valueInAfterTerminal  = "value" in proxy;
+const labelInAfterTerminal  = "label" in proxy;
+
+// Step 2: Reconnect with a fresh transport. Cache MUST still be preserved
+//          until the new sync response is processed.
+const transport2 = new RecordingTransport();
+proxy.reconnect(transport2);
+const valueAfterReconnect = proxy.value;
+const labelAfterReconnect = proxy.label;
+
+// Step 3: New sync arrives. `value` updated to a new number; `label` no
+//          longer in `values` or `undefinedProperties` (producer dropped it).
+transport2.emitInbound({
+  type: "sync",
+  values: { value: 99 },
+  capabilities: { setAck: true, undefinedProperties: true },
+});
+await new Promise((resolve) => setTimeout(resolve, 0));
+
+const valueAfterResync = proxy.value;
+const labelAfterResync = proxy.label;
+const labelInAfterResync = "label" in proxy;
+```
+
+**Expected.**
+- `valueAfterTerminal === 42` and `labelAfterTerminal === "hello"` — the cache is preserved through TerminalFailure. Reads MUST NOT return `undefined` merely because the transport is terminal.
+- `valueInAfterTerminal === true` and `labelInAfterTerminal === true` — `name in proxy` stays `true` for cached names during TerminalFailure. The `has`-trap MUST NOT flip to `false` until a new `sync` response says so.
+- `valueAfterReconnect === 42` and `labelAfterReconnect === "hello"` — Reconnecting before the new sync arrives is observationally identical to TerminalFailure for cache reads. The cache changes only as part of the new sync-response processing.
+- After the new sync: `valueAfterResync === 99` (cache updated from the new snapshot, `onUpdate("value", 99)` re-fires per [§ Consumer-side sync-response handling](SPEC-extensions.md#consumer-side-sync-response-handling--reference-pseudocode)).
+- After the new sync: `labelAfterResync === undefined` and `labelInAfterResync === false` — the producer dropped `label` from both `values` and `undefinedProperties`, so the cache entry MUST be removed and `has` MUST flip to `false`. NO synthetic removal event is dispatched (the protocol does not surface property removal as a `bind()` event — adapters that need to detect this should compare against their own snapshot, per the [§ Cache validity across transport lifecycle](SPEC-extensions.md#cache-validity-across-transport-lifecycle) diff rules).
+
+**Variant — TransientFailure.** Same posture: simulate a transient outage (transport's own backoff layer is masking a network blip, the proxy has NOT been told the transport is terminal). The cache MUST behave identically to the TerminalFailure case above — preserved as-is, no entries cleared, no events re-fired on entering TransientFailure.
+
+**Spec reference.** [SPEC-extensions.md § Cache validity across transport lifecycle](SPEC-extensions.md#cache-validity-across-transport-lifecycle) (the per-state behavior table and the diff rule on new `sync` arrival).
+
+---
+
+### 30. Locally-synthesized errors MUST carry `code`
+
+**Setup.** A remote proxy in Active state with a mock producer that lets the test force each of the four canonical locally-synthesized failure modes.
+
+**Action.** Trigger each failure mode and inspect `error.code` on the rejection:
+
+```javascript
+// (a) Timeout — short-deadline call against an unresponsive producer.
+async function testTimeout() {
+  let err;
+  try {
+    await proxy.setWithAckOptions("x", 1, { timeoutMs: 1 });
+  } catch (e) { err = e; }
+  return err.code; // expected: "WC_BINDABLE_TIMEOUT"
+}
+
+// (b) Abort — abort after send.
+async function testAbort() {
+  const ac = new AbortController();
+  const p = proxy.invokeWithOptions("fetch", [], { signal: ac.signal });
+  ac.abort();
+  let err;
+  try { await p; } catch (e) { err = e; }
+  return err.code; // expected: "WC_BINDABLE_ABORTED"
+}
+
+// (c) Invalid JsonValue — value carries a Date.
+async function testInvalidJson() {
+  let err;
+  try {
+    await proxy.setWithAck("x", new Date());
+  } catch (e) { err = e; }
+  return err.code; // expected: "WC_BINDABLE_INVALID_JSON_VALUE"
+}
+
+// (d) Malformed sync ⇒ TerminalFailure drain (per vector 23).
+async function testMalformedSync() {
+  const t = new RecordingTransport();
+  const p = createRemoteCoreProxy(declaration, t);
+  const pending = p.setWithAck("x", 1).catch((e) => e);
+  // Producer sends a malformed sync (missing `values`).
+  t.emitInbound({ type: "sync" });
+  const err = await pending;
+  return err.code; // expected: "WC_BINDABLE_PROTOCOL_ERROR"
+}
+```
+
+**Expected.**
+- `testTimeout()` resolves to `"WC_BINDABLE_TIMEOUT"`.
+- `testAbort()` resolves to `"WC_BINDABLE_ABORTED"`.
+- `testInvalidJson()` resolves to `"WC_BINDABLE_INVALID_JSON_VALUE"`.
+- `testMalformedSync()` resolves to `"WC_BINDABLE_PROTOCOL_ERROR"`.
+
+**Application-throw companion.** Producer-side application throws (a setter or command implementation that throws a non-protocol error) MAY carry `code === "WC_BINDABLE_REMOTE_THROW"` or MAY omit `code` entirely, or MAY carry an application-namespaced code (e.g. `"MYAPP_VALIDATION_FAILED"`). The vector's strict rule is: an application throw MUST NOT carry any other `WC_BINDABLE_*` code from the registry — re-using e.g. `WC_BINDABLE_TIMEOUT` for an application throw is non-conformant because it would collide with the consumer's `code`-pattern-matching for the canonical timeout failure.
+
+**Why the assertion is on `code` and not `name`.** `error.name` varies across runtimes (`"TimeoutError"` in some, `"AbortError"` in others, `"Error"` as a fallback). `error.message` is human-readable and may be localized. The `code` field exists specifically to survive both axes; tests that match on `name` or `message` instead are testing implementation drift rather than the protocol contract.
+
+**Spec reference.** [SPEC-extensions.md § Error envelope → Producer-side code-emission rule](SPEC-extensions.md#error-envelope) (origin-conditional MUST / MAY) and the registry table immediately above it.
+
+---
+
+### 31. `getterFailures` does NOT touch cache; subsequent `update` recovers
+
+**Setup.** A remote proxy that has cached a non-`undefined` value, then receives a re-sync (e.g. via reconnect) whose response advertises `getterFailures` for that property.
+
+```javascript
+const transport1 = new RecordingTransport();
+const proxy = createRemoteCoreProxy(declaration, transport1);
+
+// First sync: v == 42, capability bits asserted.
+transport1.emitInbound({
+  type: "sync",
+  values: { v: 42 },
+  capabilities: { setAck: true, getterFailures: true, undefinedProperties: true },
+});
+await new Promise((resolve) => setTimeout(resolve, 0));
+
+const calls = [];
+const warns = [];
+bind(proxy, (name, value) => calls.push([name, value]));
+const proxyLogger = { warn: (msg) => warns.push(msg) }; // implementation-specific injection
+
+// Sanity: cache and bind initial sync.
+console.assert(proxy.v === 42);
+console.assert(calls.length === 1 && calls[0][0] === "v" && calls[0][1] === 42);
+calls.length = 0; // reset call tracker for the next phase
+
+// Action 1: force a re-sync whose response says `v` failed to read.
+const transport2 = new RecordingTransport();
+proxy.reconnect(transport2);
+transport2.emitInbound({
+  type: "sync",
+  values: {},                             // v intentionally omitted
+  getterFailures: ["v"],                  // ... because the read threw on the producer
+  capabilities: { setAck: true, getterFailures: true, undefinedProperties: true },
+});
+await new Promise((resolve) => setTimeout(resolve, 0));
+```
+
+**Expected (re-sync arrival).**
+- `proxy.v === 42` — the cache is **preserved**, NOT reverted to `undefined`. A getter failure is a *property-level* failure assertion, not a state assertion (see [SPEC-extensions.md § `getterFailures` semantics](SPEC-extensions.md#getterfailures-semantics)).
+- `calls.length === 0` — no `onUpdate` is dispatched for `v` as part of the failed-getter sync. The legacy revert-to-`undefined` heuristic is NOT applied here because `capabilities.undefinedProperties: true` opts the consumer out (see [§ Consumer-side sync-response handling](SPEC-extensions.md#consumer-side-sync-response-handling--reference-pseudocode) step 2 vs step 3).
+- `warns.length >= 1` and at least one entry mentions `v` — the consumer logs the producer-side getter failure for diagnostics.
+
+**Action 2.** The producer recovers and emits a normal `update` for `v`:
+
+```javascript
+transport2.emitInbound({ type: "update", name: "v", value: 99 });
+await new Promise((resolve) => setTimeout(resolve, 0));
+```
+
+**Expected (recovery).**
+- `proxy.v === 99` — the cache updates normally; the getter failure does NOT permanently taint the property.
+- `calls.length === 1` and `calls[0] === ["v", 99]` — `onUpdate` fires for the recovered value.
+
+**Spec reference.** [SPEC-extensions.md § `getterFailures` semantics](SPEC-extensions.md#getterfailures-semantics) + [§ Consumer-side sync-response handling](SPEC-extensions.md#consumer-side-sync-response-handling--reference-pseudocode) (the "`getterFailures` does NOT touch the cache" notice in step 3) + [§ Cache validity across transport lifecycle](SPEC-extensions.md#cache-validity-across-transport-lifecycle) (re-sync diff rule for `getterFailures`).
+
+---
+
+### 32. Malformed `update` drops + warns; transport stays open; next valid `update` processed
+
+**Setup.** A remote proxy in Active state with a recording transport and a known cached value:
+
+```javascript
+const transport = new RecordingTransport();
+const proxy = createRemoteCoreProxy(declaration, transport);
+
+transport.emitInbound({
+  type: "sync",
+  values: { value: "initial" },
+  capabilities: { setAck: true },
+});
+await new Promise((resolve) => setTimeout(resolve, 0));
+
+const calls = [];
+const warns = [];
+bind(proxy, (name, value) => calls.push([name, value]));
+calls.length = 0; // reset for the malformed-injection phase
+
+// Pre-condition: transport is open.
+console.assert(!transport.isClosed());
+```
+
+**Action.** Inject a malformed `update`, then a valid one:
+
+```javascript
+// (a) Missing `name`.
+transport.emitInbound({ type: "update", value: "oops" });
+// (b) Non-string `name`.
+transport.emitInbound({ type: "update", name: 42, value: "oops" });
+// (c) Present `value` that fails JsonValue validation.
+transport.emitInbound({ type: "update", name: "value", value: { d: new Date() } });
+
+await new Promise((resolve) => setTimeout(resolve, 0));
+
+// After the three malformed injections:
+const callsAfterBad = calls.slice();
+const transportOpenAfterBad = !transport.isClosed();
+const valueAfterBad = proxy.value;
+
+// (d) Valid update lands normally.
+transport.emitInbound({ type: "update", name: "value", value: "ok" });
+await new Promise((resolve) => setTimeout(resolve, 0));
+```
+
+**Expected.**
+- `callsAfterBad.length === 0` — no `onUpdate` fires for the three malformed envelopes. The `bind()` consumer MUST NOT see any of them.
+- `transportOpenAfterBad === true` — the malformed envelopes MUST NOT close the transport. Unlike malformed `sync` (vector 23), malformed `update` is per-message degradation, not connection-level failure.
+- `valueAfterBad === "initial"` — the proxy's cache for `value` MUST NOT be touched by the malformed envelopes (the JsonValue-validation failure on case (c) MUST be detected *before* the cache write, not after).
+- The proxy SHOULD log a warn-level entry naming the failing field for each malformed envelope (`name` missing, `name` non-string, `value` failed `JsonValue`).
+- After (d) lands: `calls.length === 1`, `calls[0] === ["value", "ok"]`, and `proxy.value === "ok"` — the next valid `update` is processed normally. Subsequent `setWithAck` / `invoke` calls on the same proxy MUST continue to work.
+
+**Spec reference.** [SPEC-extensions.md § Consumer-side malformed message handling](SPEC-extensions.md#consumer-side-malformed-message-handling) (malformed `update` row — drop + warn + connection liveness preserved).
+
+---
+
+### 33. Deferred initial-sync throw — `unbind()` is a literal no-op afterward
+
+> **Applicability.** Same scope as vector 13 — general-purpose browser JS implementations claiming `{1O}` that support `syncOn: "connect"` on `HTMLElement` targets. Skip applies under the spec-defined fallback conditions (non-browser runtime, non-`HTMLElement` target, explicitly scoped profile that documents non-support).
+
+**Setup.** A bindable custom element whose property getter throws on read, used via `syncOn: "connect"` so the throw lands inside the deferred-sync `MutationObserver` microtask:
+
+```javascript
+class T extends HTMLElement {
+  static wcBindable = {
+    protocol: "wc-bindable",
+    version: 1,
+    properties: [{ name: "value", event: "t:value-changed" }],
+  };
+  get value() { throw new Error("getter-throws-on-read"); }
+}
+const tag = `t-deferred-throw-${crypto.randomUUID()}`;
+customElements.define(tag, T);
+const target = document.createElement(tag);
+
+// Track uncaught errors during the deferred-throw window.
+const uncaught = [];
+const onError = (e) => { uncaught.push(e.error ?? e.reason ?? e); e.preventDefault?.(); };
+window.addEventListener("error", onError);
+window.addEventListener("unhandledrejection", onError);
+
+// Track listener removals on `target` so we can assert cleanup ran.
+const removedEvents = [];
+const realRemove = target.removeEventListener.bind(target);
+target.removeEventListener = (type, ...rest) => {
+  removedEvents.push(type);
+  realRemove(type, ...rest);
+};
+
+// bind() returns synchronously — the throw will land in the microtask.
+const unbind = bind(target, () => {}, { syncOn: "connect" });
+```
+
+**Action.** Connect the target so the deferred sync runs (and throws), then call `unbind()` and assert it is a no-op:
+
+```javascript
+document.body.appendChild(target);
+// Wait for the MutationObserver microtask + the deferred-sync throw to surface.
+await new Promise((resolve) => setTimeout(resolve, 0));
+
+// At this point: the getter throw fired inside the deferred-sync microtask,
+// the adapter tore down its cleanups, the throw surfaced as an uncaught
+// error on the microtask. Now call unbind:
+let unbindThrew = false;
+const removedCountBeforeUnbind = removedEvents.length;
+try { unbind(); } catch { unbindThrew = true; }
+const removedCountAfterUnbind = removedEvents.length;
+
+// Second call must also be safe.
+try { unbind(); } catch { unbindThrew = true; }
+
+window.removeEventListener("error", onError);
+window.removeEventListener("unhandledrejection", onError);
+```
+
+**Expected.**
+- `uncaught.length >= 1` and at least one entry's message includes `"getter-throws-on-read"` — the deferred throw surfaces as an uncaught error on the microtask (`window.onerror` / `reportError`), NOT as a synchronous throw on the `bind()` call frame the caller was holding.
+- `removedCountBeforeUnbind === removedCountAfterUnbind` — `unbind()` MUST be a literal no-op. The cleanup-on-throw path already removed every listener and disconnected the `MutationObserver` before the throw escaped; the closure's `disposed` re-entry guard was set during that path, so `unbind()` returns immediately without re-walking the cleanup list (which would trigger a second `removeEventListener` per registered listener and corrupt counters / produce duplicate calls).
+- `unbindThrew === false` — `unbind()` MUST NOT throw, even though the underlying state machine reached Disposed via the install-throw path rather than via consumer-initiated cleanup.
+- The second `unbind()` call MUST also be a safe no-op (re-entry idempotency).
+
+**Why this matters.** Without the closure-level re-entry guard, a deferred throw cleans up the listener set inside the catch path, but the caller's later `unbind()` call would re-walk the cleanup list — calling `removeEventListener` a second time per listener. On a friendly target the DOM swallows the second removal; on a hostile `Proxy`-wrapped target whose `removeEventListener` counts each call, the second walk corrupts state and may throw, and the `bind()` API contract degrades from "deterministic no-op" to "implementation-dependent".
+
+**Spec reference.** [SPEC.md § Teardown Contract](SPEC.md#teardown-contract) (the "If a *deferred* initial-sync (`syncOn: \"connect\"`) throws" paragraph — "calling it after the deferred throw is a literal no-op thanks to the re-entry guard mandated by the idempotency MUST"), [§ bind() state machine summary](SPEC.md#bind-state-machine-summary) (InitialSyncing → Disposed via deferred throw → terminal).
+
+---
+
+### 34. `set()` — sync throw on terminal, no throw on transient outage
+
+> **Why a mock transport.** [SPEC-extensions.md § Transport lifecycle vocabulary](SPEC-extensions.md#transport-lifecycle-vocabulary-shared-by-extensions-1-and-2) defines the terminal-vs-transient distinction in transport-implementation-defined terms (which signal each transport treats as terminal: `onClose`, `send`-throw, explicit `dispose()`). A canonical cross-implementation vector therefore uses a **mock transport with explicit `setTerminal()` / `setTransient()` hooks** so the test can force each state directly rather than depending on a real network's timing.
+
+**Setup.** A mock transport with explicit state hooks, plus a proxy in Active state with at least one declared input.
+
+```javascript
+class MockTransport {
+  constructor() {
+    this.state = "active";            // "active" | "transient" | "terminal"
+    this.sent = [];
+    this.onMessageHandler = null;
+    this.onCloseHandler = null;
+  }
+  send(msg) {
+    if (this.state === "terminal") throw new Error("transport is terminal");
+    if (this.state === "transient") { /* silently drop — masking the outage */ return; }
+    this.sent.push(msg);
+  }
+  onMessage(h)  { this.onMessageHandler = h; }
+  onClose(h)    { this.onCloseHandler = h; }
+  emitInbound(m) { this.onMessageHandler?.(m); }
+  setTransient() { this.state = "transient"; /* NO onClose fired */ }
+  setTerminal()  { this.state = "terminal"; this.onCloseHandler?.(); }
+}
+
+const transport = new MockTransport();
+const proxy = createRemoteCoreProxy(declaration, transport);
+
+transport.emitInbound({
+  type: "sync",
+  values: {},
+  capabilities: { setAck: true },
+});
+await new Promise((resolve) => setTimeout(resolve, 0));
+```
+
+**Action — transient path.**
+
+```javascript
+transport.setTransient();
+
+let threwOnTransient = false;
+const sentCountBefore = transport.sent.length;
+try { proxy.set("x", 1); } catch { threwOnTransient = true; }
+const sentCountAfter = transport.sent.length;
+```
+
+**Expected — transient.**
+- `threwOnTransient === false` — `set()` MUST NOT throw synchronously while the transport is transient. This is the gap `setWithAck` exists to make detectable; `set` is at-most-once by design and the silent-drop case is part of the contract.
+- The proxy MAY queue the message internally for later delivery, OR MAY drop it silently — both are conformant. The observable rule is just "no synchronous throw".
+- `sentCountAfter === sentCountBefore` — the mock's transient mode silently drops the call, so no message reaches the recorded `sent` list.
+
+**Action — terminal path.**
+
+```javascript
+transport.setTerminal();
+
+let threwOnTerminal = false;
+let thrownError;
+try { proxy.set("x", 2); } catch (e) { threwOnTerminal = true; thrownError = e; }
+```
+
+**Expected — terminal.**
+- `threwOnTerminal === true` — `set()` MUST throw synchronously when the transport is in terminal state at call time.
+- `thrownError.message` (or `thrownError.code`, if the implementation carries one) SHOULD clearly identify the failure as transport-terminal so the caller can distinguish it from a validation throw (`WC_BINDABLE_UNDECLARED_INPUT` / `WC_BINDABLE_INVALID_JSON_VALUE`). The exact `code` value is implementation-defined for the transport-terminal case (the registry table in [§ Error envelope](SPEC-extensions.md#error-envelope) does not pin one specifically for terminal-on-`set`; `WC_BINDABLE_PROTOCOL_ERROR` is a reasonable default).
+- After the throw: `proxy.setWithAck("x", 3)` MUST return an already-rejected `Promise`; `proxy.invoke("fetch")` MUST likewise reject.
+
+**Cross-profile invariant.** Validation throws still apply at the `set()` call site regardless of terminal/transient state — `proxy.set("not-a-declared-input", X)` and `proxy.set("validInput", { d: new Date() })` MUST throw synchronously on the validation gate, *before* the terminal-vs-transient gate runs. This composes with vector 17's call-site-validation rule.
+
+**Why the bifurcation matters.** The `set()` row of [SPEC-extensions.md § Failure & recovery quick reference](SPEC-extensions.md#failure--recovery-quick-reference) (both the failure-and-recovery table and the retry-guidance table) calls this out as the spec's most-confused surface. A consumer that uses `set(); invoke()` over a flaky link without realizing `set` is at-most-once on transient outages will see `invoke` run against producer state that never received the `set` update — a class of silent corruption that `setWithAck` exists to make detectable. This vector exists so an implementation cannot pass the surrounding test suite while collapsing the two paths (e.g. always throwing, or never throwing) — the bifurcation is the canonical safety mechanism the consumer relies on.
+
+**Spec reference.** [SPEC-extensions.md § Methods](SPEC-extensions.md#methods) (the `set` row, "Fast path — unsafe by design" and "transient outages — automatic reconnect attempts in progress ... are NOT terminal"), [§ Transport lifecycle vocabulary](SPEC-extensions.md#transport-lifecycle-vocabulary-shared-by-extensions-1-and-2), [§ Failure & recovery quick reference](SPEC-extensions.md#failure--recovery-quick-reference) (the `set` rows in both tables).
+
+---
+
 ## What this list does NOT cover
 
 These vectors are deliberately narrow — they target rules that are easy to violate in ways that pass naive smoke tests. They are **not** a complete conformance suite. Additional areas worth covering in a richer test corpus:
@@ -897,10 +1397,7 @@ These vectors are deliberately narrow — they target rules that are easy to vio
 - **Shadow-DOM attach** under `syncOn: "connect"` (the documented "observer doesn't traverse shadow roots" limitation)
 - **`AbortSignal` pre-aborted at `setWithAckOptions` / `invokeWithOptions` call time** (rejects immediately without sending — distinct from vector 18's "aborted/timed-out after send" case, which IS covered)
 - **Declaration fingerprint mismatch** on `sync` (MUST log warn, MUST continue accepting)
-- **`getterFailures` semantics** — MUST log, MUST NOT touch cache, MUST NOT dispatch
 - **`MutationObserver` callback after host detach** under `syncOn: "connect"` (observer rechecks `isConnected`, stays armed)
-- **Reconnect after TerminalFailure** — `reconnect(transport)` MUST send a fresh `sync` and MUST throw if the proxy is already disposed or the existing transport is still active (implementations that omit `reconnect()` entirely are conformant; vector applies only to those that ship it)
-- **`set` synchronously throws on terminal transport** but MUST NOT throw on a transient outage — the exact line between the two is transport-implementation-defined and best tested per-transport
 
 Implementations targeting full conformance should grow their own test suite to cover at minimum the items above; the in-tree tests under `packages/core/tests/` and `packages/remote/tests/` cover much of this space and can be used as a starting reference.
 
