@@ -398,7 +398,8 @@ Implementations that need de-duplication / tracing / observability metadata SHOU
   },
   "getterFailures"?: string[],
   "declarationFingerprint"?: {
-    "version": number,
+    "protocol": string,       // producer's protocol identifier (e.g. "wc-bindable")
+    "version":  number,
     "properties": string[],   // sorted, deduplicated property names
     "inputs":     string[],   // sorted, deduplicated input names
     "commands":   string[]    // sorted, deduplicated command names
@@ -780,6 +781,7 @@ Three things to notice in the branching:
 
 The optional `declarationFingerprint` field on a sync response carries a canonical structural summary of the producer's `wcBindable`:
 
+- `protocol` — the producer's `protocol` identifier string (e.g. `"wc-bindable"`). Included so a breaking-change protocol-identifier swap (e.g. a producer that ships `"wc-bindable-2"` while the consumer is still constructed against `"wc-bindable"`) is visible in the first sync response and participates in fingerprint comparison. Without this field, the breaking-change signal described in [§ Wire format versioning](#wire-format-versioning) item 4 (which relies on fingerprint comparison to surface the mismatch at handshake time) cannot reach the consumer over the wire — two declarations that differ only in `protocol` would hash-equal and the v1 consumer would silently process v2-shaped envelopes.
 - `version` — the integer version of the producer's declaration.
 - `properties`, `inputs`, `commands` — the **sorted, deduplicated** lists of declared `name`s on each surface. Event names are NOT included: the consumer-side proxy rewrites them to synthetic per-property identifiers (see § Design invariants invariant 2), so cross-the-wire event-name comparison would always report differences and defeat the purpose. (Dedup is a no-op for valid declarations — name uniqueness within each list is already required by [SPEC.md § Property / Input / Command Descriptor](SPEC.md#property-descriptor); the dedup step here is defense-in-depth against a malformed or hostile producer that bypasses construction-time validation, not a feature of the canonical algorithm.)
 
@@ -795,6 +797,8 @@ Consumers MAY suppress the warning after the first mismatch on a given transport
 **Strict-mode opt-in.** Implementations MAY offer a strict fingerprint mode (typical surface: a `strictFingerprint: true` option on `createRemoteCoreProxy`) that escalates a mismatch from warn-log into a **terminal protocol error** — the proxy transitions to TerminalFailure (per § Remote proxy lifecycle), every pending entry rejects with a `WC_BINDABLE_PROTOCOL_ERROR`-coded throw envelope shape (locally constructed; no wire message is emitted), and subsequent `set` / `setWithAck` / `invoke` calls fail per the TerminalFailure rules. This is appropriate for deployments where consumer and producer ship from the same versioned package and any drift is a deployment bug rather than expected partial-deploy state. The default behavior remains warn-then-continue; strict mode is opt-in, MUST be documented in the implementation's public API surface, and MUST NOT be the default — a default-strict implementation would refuse to interoperate with legacy producers that omit the field, violating the existing "treat absence as no fingerprint comparison available" legacy fallback.
 
 **Legacy fallback.** Producers from a release that predates the field omit it; consumers MUST treat absence as "no fingerprint comparison available" and proceed silently. This keeps the field purely additive on the wire.
+
+**Legacy fingerprint shape (no `protocol`).** A producer that emits a fingerprint object containing `version` / `properties` / `inputs` / `commands` but **omitting `protocol`** is a **legacy fingerprint emitter** (from a release that predates this clarification). Consumers MUST NOT treat the missing `protocol` as malformed-fingerprint and MUST NOT close the transport; they MUST instead perform the comparison on `version` / `properties` / `inputs` / `commands` only, and behave for the `protocol` field as in the Legacy fallback paragraph above ("no fingerprint comparison available for that field"). The forward-compat posture is identical to the rest of the wire schema: a future-known field absent on the wire means "this peer cannot help me decide this comparison", not "this envelope is broken". Producers writing to the current spec MUST include `protocol`; the carve-out is only for previously-released emitters.
 
 **What the fingerprint does NOT cover.** Two declarations whose names match but whose event-name space, getter semantics, or runtime types differ will hash-equal. The fingerprint is a structural-surface check, not a semantic-equivalence check. Use it to catch the common operational case (consumer and producer on different `@my-app/core` package versions); pair it with version-pinning in your dependency lockfile for stronger guarantees.
 
