@@ -141,7 +141,7 @@ This protocol intentionally does **not** cover:
 
 ## Packages
 
-All 19 packages below are published on npm at the same lockstep version, each has its own test suite that runs as part of the workspace `npm test`, and all are at the same maturity baseline (pre-1.0, API stable within a `0.x.y` line per the [release notes](RELEASE_NOTES.md)). One sub-feature is explicitly tagged as experimental in its row: Qwik 2.x via `/v2` — the Qwik 1.x main export is stable.
+All 20 packages below are published on npm at the same lockstep version, each has its own test suite that runs as part of the workspace `npm test`, and all are at the same maturity baseline (pre-1.0, API stable within a `0.x.y` line per the [release notes](RELEASE_NOTES.md)). One sub-feature is explicitly tagged as experimental in its row: Qwik 2.x via `/v2` — the Qwik 1.x main export is stable.
 
 | Package | Description |
 |---|---|
@@ -163,6 +163,7 @@ All 19 packages below are published on npm at the same lockstep version, each ha
 | [@wc-bindable/mobx](packages/mobx/) | MobX helper — `wcBindable()` / `createWcBindable()` |
 | [@wc-bindable/rxjs](packages/rxjs/) | RxJS helper — `wcBindable()` / `createWcBindable()` (one `BehaviorSubject` per property) |
 | [@wc-bindable/signals](packages/signals/) | TC39 Signals (`signal-polyfill`) helper — `wcBindable()` / `createWcBindable()` |
+| [@wc-bindable/composite](packages/composite/) | Composition profile — expose many wc-bindable targets as one, with headless, declarative custom-element, and Lit authoring APIs |
 | [@wc-bindable/remote](packages/remote/) | Remote proxy — connect Core and Shell over a network via WebSocket or custom transport |
 
 ## Quick start

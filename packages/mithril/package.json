@@ -1,6 +1,6 @@
 {
   "name": "@wc-bindable/mithril",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "description": "Mithril.js adapter for wc-bindable protocol",
   "type": "module",
   "main": "dist/index.js",
@@ -23,7 +23,7 @@
     "test:watch": "vitest tests"
   },
   "dependencies": {
-    "@wc-bindable/core": "^0.7.1"
+    "@wc-bindable/core": "^0.8.0"
   },
   "peerDependencies": {
     "mithril": ">=2"

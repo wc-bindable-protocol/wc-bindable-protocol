@@ -1,6 +1,6 @@
 {
   "name": "@wc-bindable/preact",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "description": "Preact adapter for wc-bindable protocol",
   "type": "module",
   "main": "dist/index.js",
@@ -19,7 +19,7 @@
     "dev": "tsc --watch"
   },
   "dependencies": {
-    "@wc-bindable/core": "^0.7.1"
+    "@wc-bindable/core": "^0.8.0"
   },
   "peerDependencies": {
     "preact": ">=10"

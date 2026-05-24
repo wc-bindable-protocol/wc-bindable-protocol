@@ -1,3 +1,70 @@
+# v0.8.0
+
+Substantial pre-1.0 minor release. Adds **`@wc-bindable/composite`** as a new
+published package, promotes the composition profile into the normative
+extension spec, and ships the first reference implementation for composing many
+wc-bindable targets into one shell. Existing `core`, adapter, and `remote`
+consumers remain on the same lockstep line; the new surface is additive.
+
+## New package
+
+- **`@wc-bindable/composite`** — reference implementation of the Composition
+  profile (Extension 4), exposing many wc-bindable sources as one ordinary
+  wc-bindable shell.
+  - Headless JavaScript API via `createCompositeTarget()`.
+  - Declarative custom-element authoring via `defineComposite()`,
+    `defineCompositeClass()`, and `registerCompositeDefinitions()`.
+  - Lit authoring support via `@wc-bindable/composite/lit`.
+  - Implements T1 observation and T2 local-facade composition with an explicit
+    per-instance tier claim; T3 / Extension-1 method routing remains out of
+    scope for this package.
+
+## Spec & conformance
+
+- **`SPEC-extensions.md`** — now includes **Extension 4: Composition** as the
+  authoritative normative home for the composed-shell profile, including tier
+  claims, collision rules, event rewriting, delegation semantics, remote
+  compatibility, and lifecycle requirements.
+- **`COMPOSITE.md`** — retained as the companion design document for Extension
+  4, with rationale, worked examples, package-API guidance, and open questions.
+- **`CONFORMANCE.md`** — adds composition vectors covering declaration
+  synthesis, initial sync, three-phase fan-out, facade delegation, reserved
+  names, teardown, remote-compatibility claims, and tier-claim discovery.
+
+## Documentation
+
+- **`README.md`** — package inventory updated to 20 published workspaces and
+  now lists `@wc-bindable/composite` alongside the rest of the family.
+- **Composite package docs** — new package README documents the headless,
+  declarative, and Lit authoring surfaces plus the T1/T2 capability split.
+
+## Packages
+
+| Package | Version |
+|---------|---------|
+| `@wc-bindable/core` | 0.8.0 |
+| `@wc-bindable/react` | 0.8.0 |
+| `@wc-bindable/vue` | 0.8.0 |
+| `@wc-bindable/angular` | 0.8.0 |
+| `@wc-bindable/svelte` | 0.8.0 |
+| `@wc-bindable/alpine` | 0.8.0 |
+| `@wc-bindable/lit` | 0.8.0 |
+| `@wc-bindable/marko` | 0.8.0 |
+| `@wc-bindable/mithril` | 0.8.0 |
+| `@wc-bindable/preact` | 0.8.0 |
+| `@wc-bindable/qwik` | 0.8.0 |
+| `@wc-bindable/riot` | 0.8.0 |
+| `@wc-bindable/solid` | 0.8.0 |
+| `@wc-bindable/stencil` | 0.8.0 |
+| `@wc-bindable/vanjs` | 0.8.0 |
+| `@wc-bindable/mobx` | 0.8.0 |
+| `@wc-bindable/rxjs` | 0.8.0 |
+| `@wc-bindable/signals` | 0.8.0 |
+| `@wc-bindable/composite` | 0.8.0 |
+| `@wc-bindable/remote` | 0.8.0 |
+
+---
+
 # v0.7.1
 
 Patch release. Closes the long tail of review items raised against the
