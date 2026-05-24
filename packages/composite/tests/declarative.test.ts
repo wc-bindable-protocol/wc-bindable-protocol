@@ -245,6 +245,86 @@ describe("defineComposite — concurrency, idempotency & validation", () => {
     container.remove();
   });
 
+  it("accepts singular data-wc-expose kind keywords (property/input/command)", async () => {
+    const container = document.createElement("div");
+    container.innerHTML = `
+      <composite-dsd-singular data-wc-composite-definition>
+        <template shadowrootmode="open">
+          <s3-uploader data-wc-source="s3"
+            data-wc-expose="property: progress; input: file; command: upload"></s3-uploader>
+        </template>
+      </composite-dsd-singular>`;
+    document.body.appendChild(container);
+
+    const [Ctor] = await registerCompositeDefinitions(container, { logger: silentLogger });
+    expect(Ctor.wcBindable.properties.map((p) => p.name)).toEqual(["s3.progress"]);
+    expect(Ctor.wcBindable.inputs?.map((i) => i.name)).toEqual(["s3.file"]);
+    expect(Ctor.wcBindable.commands?.map((c) => c.name)).toEqual(["s3.upload"]);
+    container.remove();
+  });
+
+  it("rejects a data-wc-expose segment with no colon (malformed)", async () => {
+    const container = document.createElement("div");
+    container.innerHTML = `
+      <composite-dsd-nocolon data-wc-composite-definition>
+        <template shadowrootmode="open">
+          <s3-uploader data-wc-source="s3" data-wc-expose="progress"></s3-uploader>
+        </template>
+      </composite-dsd-nocolon>`;
+    document.body.appendChild(container);
+    await expect(registerCompositeDefinitions(container, { logger: silentLogger })).rejects.toThrow(
+      /malformed data-wc-expose/,
+    );
+    container.remove();
+  });
+
+  it("rejects a data-wc-expose with an unknown kind keyword", async () => {
+    const container = document.createElement("div");
+    container.innerHTML = `
+      <composite-dsd-badkind data-wc-composite-definition>
+        <template shadowrootmode="open">
+          <s3-uploader data-wc-source="s3" data-wc-expose="bogus: progress"></s3-uploader>
+        </template>
+      </composite-dsd-badkind>`;
+    document.body.appendChild(container);
+    await expect(registerCompositeDefinitions(container, { logger: silentLogger })).rejects.toThrow(
+      /unknown data-wc-expose kind/,
+    );
+    container.remove();
+  });
+
+  it("skips a definition element with no shadow content (getDefinitionContent null)", async () => {
+    // A definition element with neither a shadowRoot nor a <template shadowroot>
+    // child yields null content -> parseDefinition returns null -> skipped.
+    const container = document.createElement("div");
+    container.innerHTML = `
+      <composite-dsd-nocontent data-wc-composite-definition>
+        <div>not a shadow template</div>
+      </composite-dsd-nocontent>`;
+    document.body.appendChild(container);
+
+    const ctors = await registerCompositeDefinitions(container, { logger: silentLogger });
+    expect(ctors).toHaveLength(0);
+    expect(customElements.get("composite-dsd-nocontent")).toBeUndefined();
+    container.remove();
+  });
+
+  it("skips a definition whose shadow content has no [data-wc-source] elements", async () => {
+    const container = document.createElement("div");
+    container.innerHTML = `
+      <composite-dsd-nosource data-wc-composite-definition>
+        <template shadowrootmode="open">
+          <div>no sources here</div>
+        </template>
+      </composite-dsd-nosource>`;
+    document.body.appendChild(container);
+
+    const ctors = await registerCompositeDefinitions(container, { logger: silentLogger });
+    expect(ctors).toHaveLength(0);
+    expect(customElements.get("composite-dsd-nosource")).toBeUndefined();
+    container.remove();
+  });
+
   it("can retry setup on reconnect after a failed install() (Finding 3)", async () => {
     // A source whose addEventListener throws on the first install attempt, then
     // succeeds — exercising the connectedCallback rollback + retry path.
@@ -295,5 +375,50 @@ describe("defineComposite — concurrency, idempotency & validation", () => {
     bind(el, (name, value) => updates.push([name, value]));
     expect(updates).toContainEqual(["f.v", 7]);
     el.remove();
+  });
+
+  it("rejects a direct self-reference synchronously instead of deadlocking (cycle guard)", async () => {
+    // A source tag equal to the composite's own tag would make
+    // registerCompositeElement await whenDefined() for a tag only define()d at
+    // the end of that same call — a silent forever-hang without the guard. Race
+    // against a timeout so a regression that reintroduces the hang fails fast
+    // rather than stalling the suite.
+    const call = defineComposite({
+      tagName: "composite-self-x",
+      sources: [{ id: "s", tag: "composite-self-x" }],
+      logger: silentLogger,
+    });
+    const guard = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("defineComposite hung on self-reference")), 1000),
+    );
+    await expect(Promise.race([call, guard])).rejects.toThrow(
+      /cannot list its own tag|cyclic|construction order/,
+    );
+    // The self-referencing tag must NOT have been registered.
+    expect(customElements.get("composite-self-x")).toBeUndefined();
+  });
+
+  it("propagates the self-reference guard through the declarative path", async () => {
+    // The definition element's own tag (<composite-self-decl>) appears as a
+    // data-wc-source inside its own shadow content, so the derived tagName equals
+    // a source tag — registerCompositeDefinitions -> defineComposite must reject.
+    const container = document.createElement("div");
+    container.innerHTML = `
+      <composite-self-decl data-wc-composite-definition>
+        <template shadowrootmode="open">
+          <composite-self-decl data-wc-source="self"></composite-self-decl>
+        </template>
+      </composite-self-decl>`;
+    document.body.appendChild(container);
+
+    const call = registerCompositeDefinitions(container, { logger: silentLogger });
+    const guard = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("registerCompositeDefinitions hung on self-reference")), 1000),
+    );
+    await expect(Promise.race([call, guard])).rejects.toThrow(
+      /cannot list its own tag|cyclic|construction order/,
+    );
+    expect(customElements.get("composite-self-decl")).toBeUndefined();
+    container.remove();
   });
 });

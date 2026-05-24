@@ -350,3 +350,46 @@ describe("createCompositeTarget — lifecycle (§ 10)", () => {
     expect(() => s3.setProgress(1)).not.toThrow();
   });
 });
+
+describe("createCompositeTarget — Proxy trap edge cases", () => {
+  it("reports `in` true for facade input / command members when localFacade is on (has trap 120-122)", () => {
+    const s3 = new UploaderSource();
+    const shell = createCompositeTarget({ sources: { s3 } });
+    // Inputs and commands are facade members — present so tooling sees the surface.
+    expect("s3.file" in shell).toBe(true);
+    expect("s3.upload" in shell).toBe(true);
+  });
+
+  it("allows ordinary (non-property/input) property assignment to fall through (set fallback 152)", () => {
+    const s3 = new UploaderSource();
+    const shell = createCompositeTarget({ sources: { s3 } });
+    // A key that is neither a composed property nor a composed input is a normal
+    // assignment onto the underlying target.
+    shell["someArbitraryKey"] = 42;
+    expect(shell["someArbitraryKey"]).toBe(42);
+  });
+
+  it("forwards reads of non-composed keys to the real target (get fallback)", () => {
+    const s3 = new UploaderSource();
+    const shell = createCompositeTarget({ sources: { s3 } });
+    expect(typeof shell.addEventListener).toBe("function");
+    expect(typeof shell.dispose).toBe("function");
+  });
+
+  it("does not materialize the facade when localFacade is forced false (T1)", () => {
+    const s3 = new UploaderSource();
+    const shell = createCompositeTarget({ sources: { s3 }, localFacade: false });
+    // The tier claim reflects T1.
+    expect(shell[COMPOSITE_TIERS_SYMBOL].localFacade).toBe(false);
+    // A command is NOT materialized as a callable facade member.
+    expect(typeof shell["s3.upload"]).not.toBe("function");
+    // An input assignment does not delegate to the source (it falls through as a
+    // plain set onto the target instead of throwing or reaching setInput).
+    shell["s3.file"] = "ignored-as-facade";
+    expect(s3.file).toBe(null); // source untouched; T1 inputs are metadata-only
+    // The declaration still advertises the inputs/commands as metadata.
+    const decl = getWcBindableDeclaration(shell)!;
+    expect(decl.inputs?.map((i) => i.name)).toContain("s3.file");
+    expect(decl.commands?.map((c) => c.name)).toContain("s3.upload");
+  });
+});

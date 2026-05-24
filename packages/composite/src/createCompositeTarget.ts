@@ -38,6 +38,10 @@ export function createCompositeTarget(config: CreateCompositeTargetConfig): Comp
   const expose = config.expose ?? "all-prefixed";
   const logger = config.logger ?? consoleLogger;
 
+  // No cycle check is needed here: `config.sources` are already-constructed
+  // instances and the shell is the return value, so a source can never be this
+  // shell — a cyclic composition is unconstructable by order (cf. the
+  // declarative `defineComposite` self-reference guard).
   const sourceDecls = declarationsFromSources(config.sources);
 
   // localFacade defaults to true whenever there is any input / command to

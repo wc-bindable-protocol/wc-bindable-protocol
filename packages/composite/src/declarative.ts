@@ -166,6 +166,24 @@ export function defineComposite(
   }
   const { tagName } = options;
 
+  // Direct self-reference guard. If a source tag equals this composite's own
+  // tag, registerCompositeElement would `await customElements.whenDefined(tag)`
+  // for a tag that is only `define()`d at the very end of that same call — a
+  // promise that can never resolve, so the registration would hang silently.
+  // The composition graph MUST be acyclic (SPEC-extensions.md § Composition /
+  // COMPOSITE.md § 4: "a cyclic composition has no conformant construction
+  // order"); fail fast with a clear synchronous rejection instead of
+  // deadlocking. (Transitive tag cycles are undetectable at define() time and
+  // are intentionally out of scope.)
+  if (options.sources.some((spec) => spec.tag === tagName)) {
+    return Promise.reject(
+      new Error(
+        `@wc-bindable/composite: composite <${tagName}> cannot list its own tag as a source ` +
+          `— a cyclic composition has no conformant construction order`,
+      ),
+    );
+  }
+
   // Fast path: an in-flight or settled registration for this tag is shared
   // verbatim, so concurrent same-tick calls never race to define() and a
   // re-call is idempotent. NOTE: re-registering an already-defined tag returns

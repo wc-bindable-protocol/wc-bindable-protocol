@@ -9,12 +9,13 @@
  */
 
 /**
- * The wire-namespace prefix. A composed *name* (not event name) whose first 13
- * characters equal this prefix case-insensitively is rejected under remote
- * compatibility — and by default here, per § 4's reference-implementation
- * SHOULD-reject-by-default guidance.
+ * The wire-namespace prefix. A composed *name* (not event name) that begins with
+ * this prefix case-insensitively is rejected under remote compatibility — and by
+ * default here, per § 4's reference-implementation SHOULD-reject-by-default
+ * guidance. The match length is always derived from the prefix's own `.length`
+ * (see {@link hasWireNamespacePrefix}); there is no hand-maintained magic number.
  */
-const WIRE_NAMESPACE_PREFIX = "@wc-bindable/"; // exactly 13 characters
+const WIRE_NAMESPACE_PREFIX = "@wc-bindable/";
 
 /** Prototype-pollution-prone strings, rejected as composed names everywhere. */
 const POLLUTION_NAMES: ReadonlySet<string> = new Set([
