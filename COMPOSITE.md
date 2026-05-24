@@ -1651,6 +1651,48 @@ copies the source's `async` flag through to the synthesized descriptor; if a
 source command does not declare `async`, the composed descriptor omits it too.
 The shell never guesses asynchrony.
 
+### Class authoring API
+
+The declarative element above generates an *opaque* class. A reference
+implementation can additionally offer a **base class** so an author can subclass
+the composed shell and add their own behavior (methods, extra rendering,
+lifecycle). This is purely a reference-implementation ergonomics layer — it adds
+no profile requirement; the resulting class is an ordinary composed shell bound
+by §§ 1–12 like any other.
+
+```typescript
+import { defineCompositeClass } from "@wc-bindable/composite";
+
+const Base = await defineCompositeClass({
+  sources: [
+    { id: "s3", tag: "s3-uploader" },
+    { id: "ai", tag: "ai-agent" },
+  ],
+});
+
+class MyAiWorkbench extends Base {
+  reset() { this["ai.prompt"] = ""; }
+}
+customElements.define("my-ai-workbench", MyAiWorkbench);
+```
+
+The same precondition applies as the declarative API: the base resolves only
+after every source tag is defined (`customElements.whenDefined`), so the
+synthesized `static wcBindable` is fully determined before the class is returned
+and is statically inherited by any subclass (keeping
+`target.constructor.wcBindable` discovery, § 1, intact).
+
+A framework-flavored variant can layer reactivity on the same base. The
+reference implementation ships `@wc-bindable/composite/lit`, whose
+`CompositeLitElement(options)` returns a `LitElement` base that is a composed
+shell *and* re-renders the author's template on each composed update (composed
+names are dotted strings, not framework-reactive properties, so the base bridges
+updates to the framework's invalidation hook). The sources live in the element's
+shadow root and the framework renders into the same root after them, so neither
+the §§ 5–7 observable semantics nor the framework's own styling/rendering are
+disturbed. None of this changes the profile; it only proves the "compete on
+ergonomics" goal across both vanilla and framework custom-element APIs.
+
 ### Use from `@wcstack/state`
 
 `@wcstack/state` does not need special composition support if the composed shell

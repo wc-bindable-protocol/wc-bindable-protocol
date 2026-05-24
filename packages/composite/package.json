@@ -9,6 +9,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./lit": {
+      "types": "./dist/lit.d.ts",
+      "default": "./dist/lit.js"
     }
   },
   "files": [
@@ -24,6 +28,14 @@
   },
   "dependencies": {
     "@wc-bindable/core": "^0.7.1"
+  },
+  "peerDependencies": {
+    "lit": ">=2"
+  },
+  "peerDependenciesMeta": {
+    "lit": {
+      "optional": true
+    }
   },
   "repository": {
     "type": "git",

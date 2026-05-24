@@ -10,9 +10,12 @@ export { createCompositeTarget } from "./createCompositeTarget.js";
 
 export {
   defineComposite,
+  defineCompositeClass,
   registerCompositeDefinitions,
   type DefineCompositeOptions,
+  type DefineCompositeClassOptions,
   type CompositeElementConstructor,
+  type SourceSpec,
 } from "./declarative.js";
 
 // Lower-level building blocks, exported for tooling and advanced composition.

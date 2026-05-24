@@ -10,16 +10,21 @@ import {
   type SourceRef,
 } from "./types.js";
 
-/** An ordered source spec discovered in a definition's shadow content. */
-interface SourceSpec {
+/** An ordered source spec: a stable id paired with a source custom-element tag. */
+export interface SourceSpec {
   id: string;
   /** The source custom-element tag name (e.g. `"s3-uploader"`). */
   tag: string;
 }
 
-export interface DefineCompositeOptions {
-  /** The custom-element tag name to register for the composed shell. */
-  tagName: string;
+/**
+ * Options shared by {@link defineCompositeClass} and {@link defineComposite}.
+ * Everything needed to synthesize the composed surface *except* the tag name —
+ * {@link defineCompositeClass} returns an unregistered base class the caller
+ * names itself, while {@link defineComposite} also takes a `tagName` and
+ * registers the class.
+ */
+export interface DefineCompositeClassOptions {
   /** Ordered source specs: a stable id paired with a source custom-element tag. */
   sources: SourceSpec[];
   /**
@@ -34,8 +39,21 @@ export interface DefineCompositeOptions {
   logger?: Logger;
 }
 
-/** The generated composite custom-element constructor. */
-export type CompositeElementConstructor = CustomElementConstructor & {
+export interface DefineCompositeOptions extends DefineCompositeClassOptions {
+  /** The custom-element tag name to register for the composed shell. */
+  tagName: string;
+}
+
+/**
+ * The generated composite custom-element constructor. Instances carry the
+ * composed surface (property getters, optional T2 facade members, the tier
+ * claim) and an idempotent `dispose()` terminal teardown. Returned by
+ * {@link defineComposite} (already registered) and by {@link defineCompositeClass}
+ * (an unregistered base class to subclass).
+ */
+export type CompositeElementConstructor = (new (
+  ...args: unknown[]
+) => HTMLElement & { dispose(): void }) & {
   wcBindable: WcBindableDeclaration;
 };
 
@@ -74,6 +92,17 @@ function readSourceDeclaration(tag: string): WcBindableDeclaration {
     );
   }
   return decl;
+}
+
+/**
+ * Remove the source elements this package created in a shadow root (marked with
+ * `data-wc-source`), leaving any other shadow content a subclass rendered
+ * intact. Used to de-duplicate sources on a retry without wiping the whole tree.
+ */
+function removeOwnedSources(shadow: ShadowRoot): void {
+  for (const stray of Array.from(shadow.querySelectorAll("[data-wc-source]"))) {
+    stray.remove();
+  }
 }
 
 /**
@@ -222,10 +251,32 @@ export function defineComposite(
   return promise;
 }
 
-async function registerCompositeElement(
-  options: DefineCompositeOptions,
-): Promise<CompositeElementConstructor> {
-  const { tagName } = options;
+/**
+ * The resolved, immutable composition derived from a set of source tags:
+ * everything needed to build a composite element class and to set up each
+ * instance. Produced by {@link synthesizeComposite}.
+ *
+ * @internal Shared between the vanilla custom-element path and the Lit subpath
+ * (`@wc-bindable/composite/lit`); not part of the public package surface.
+ */
+export interface SynthesizedComposite {
+  plan: CompositionPlan;
+  claimTemplate: CompositeTierClaim;
+  sourceSpecs: SourceSpec[];
+  logger: Logger;
+}
+
+/**
+ * Await every source tag's `customElements.whenDefined`, read each source's
+ * `static wcBindable`, and plan the composition — so the synthesized declaration
+ * and tier claim are fully determined before any class is built or any instance
+ * is observable (§ Declarative precondition / § 11 finalize-before-observe).
+ *
+ * @internal
+ */
+export async function synthesizeComposite(
+  options: DefineCompositeClassOptions,
+): Promise<SynthesizedComposite> {
   const logger = options.logger ?? consoleLogger;
 
   // § Declarative precondition: every source tag must be defined before the
@@ -242,8 +293,6 @@ async function registerCompositeElement(
   }
   const plan = planComposition(sourceDecls, options.expose ?? "all-prefixed", { localFacade });
 
-  const sourceSpecs = options.sources.slice();
-
   const claimTemplate: CompositeTierClaim = {
     protocol: "wc-bindable.composite",
     version: COMPOSITE_PROFILE_VERSION,
@@ -253,8 +302,87 @@ async function registerCompositeElement(
   if (options.remoteCompatible) claimTemplate.remoteCompatible = true;
   Object.freeze(claimTemplate);
 
+  return { plan, claimTemplate, sourceSpecs: options.sources.slice(), logger };
+}
+
+/**
+ * Set up one composite element instance: create a fresh source element per spec
+ * inside `shadow`, install the composed surface (property getters, optional T2
+ * facade, tier claim) on `host`, and bind the engine to the sources. Returns the
+ * installed engine. On an `install()` failure it rolls the sources back and
+ * rethrows, leaving `host` clean enough for a reconnect retry.
+ *
+ * Only the source elements this package owns (`[data-wc-source]`) are touched —
+ * any other shadow content (e.g. a Lit-rendered UI) is left intact.
+ *
+ * @internal
+ */
+export function setupCompositeInstance(
+  host: HTMLElement,
+  shadow: ShadowRoot,
+  synth: SynthesizedComposite,
+): CompositeEngine {
+  // Defensive backstop against a direct self-reference. `defineComposite()`
+  // rejects a source tag equal to the composite's own tag at registration time;
+  // the class-authoring paths (`defineCompositeClass` / `CompositeLitElement`)
+  // do not know the tag the caller will register the class under, so the check
+  // is repeated here where `host.localName` is known. In practice this never
+  // fires through the public API — a caller cannot register a class under one of
+  // its own source tags: that tag is either already defined (so
+  // `customElements.define` throws "already defined") or not yet defined (so
+  // `synthesizeComposite`'s `whenDefined()` never resolves and the class is
+  // never produced). It is kept because the failure it prevents — recursively
+  // creating a host-typed element inside its own shadow root on every connect,
+  // i.e. unbounded re-entry / stack overflow — is catastrophic, and the guard
+  // is free.
+  const selfTag = host.localName;
+  if (selfTag && synth.sourceSpecs.some((spec) => spec.tag === selfTag)) {
+    throw new Error(
+      `@wc-bindable/composite: composite <${selfTag}> cannot list its own tag as a source ` +
+        `— a cyclic composition has no conformant construction order`,
+    );
+  }
+
+  removeOwnedSources(shadow);
+
+  const sources = new Map<string, EventTarget>();
+  for (const spec of synth.sourceSpecs) {
+    const sourceEl = documentRef!.createElement(spec.tag);
+    sourceEl.setAttribute("data-wc-source", spec.id);
+    shadow.appendChild(sourceEl);
+    sources.set(spec.id, sourceEl);
+  }
+
+  const engine = new CompositeEngine(synth.plan, sources, host, synth.logger);
+  // The instance surface (defined with configurable members) is safe to
+  // (re)apply on a retry. install() is the only fallible step here; if it
+  // throws, roll the sources back so a reconnect can retry cleanly rather than
+  // stranding a half-initialized element.
+  installInstanceSurface(host, engine, synth.plan, synth.claimTemplate);
+  try {
+    engine.install();
+  } catch (err) {
+    engine.dispose();
+    removeOwnedSources(shadow);
+    throw err;
+  }
+  return engine;
+}
+
+/**
+ * Build (but do not register) the composite element class for `options`.
+ *
+ * Shared by {@link defineComposite} (which then calls `customElements.define`)
+ * and {@link defineCompositeClass} (which returns the class for the caller to
+ * subclass and register).
+ */
+async function buildCompositeClass(
+  options: DefineCompositeClassOptions,
+): Promise<CompositeElementConstructor> {
+  const synth = await synthesizeComposite(options);
+
   class CompositeElement extends HTMLElement {
-    static readonly wcBindable: WcBindableDeclaration = plan.declaration;
+    static readonly wcBindable: WcBindableDeclaration = synth.plan.declaration;
     static readonly [COMPOSITE_ELEMENT_BRAND] = true;
 
     #engine: CompositeEngine | undefined;
@@ -262,34 +390,8 @@ async function registerCompositeElement(
 
     connectedCallback(): void {
       if (this.#setup) return; // reconnect: listeners were kept, nothing to do
-
       const shadow = this.shadowRoot ?? this.attachShadow({ mode: "open" });
-      // Clear any sources left by a prior FAILED attempt so a retry does not
-      // duplicate them (success sets #setup and short-circuits future calls).
-      shadow.replaceChildren();
-
-      const sources = new Map<string, EventTarget>();
-      for (const spec of sourceSpecs) {
-        const sourceEl = documentRef!.createElement(spec.tag);
-        sourceEl.setAttribute("data-wc-source", spec.id);
-        shadow.appendChild(sourceEl);
-        sources.set(spec.id, sourceEl);
-      }
-
-      const engine = new CompositeEngine(plan, sources, this, logger);
-      // The instance surface (defined with configurable members) is safe to
-      // (re)apply on a retry. install() is the only fallible step here; if it
-      // throws, roll the shadow back and leave #setup false so a reconnect can
-      // retry cleanly rather than stranding a half-initialized element.
-      installInstanceSurface(this, engine, plan, claimTemplate);
-      try {
-        engine.install();
-      } catch (err) {
-        engine.dispose();
-        shadow.replaceChildren();
-        throw err;
-      }
-      this.#engine = engine;
+      this.#engine = setupCompositeInstance(this, shadow, synth);
       this.#setup = true;
     }
 
@@ -299,8 +401,57 @@ async function registerCompositeElement(
     }
   }
 
-  customElementsRef!.define(tagName, CompositeElement);
   return CompositeElement as unknown as CompositeElementConstructor;
+}
+
+async function registerCompositeElement(
+  options: DefineCompositeOptions,
+): Promise<CompositeElementConstructor> {
+  const CompositeElement = await buildCompositeClass(options);
+  customElementsRef!.define(options.tagName, CompositeElement);
+  return CompositeElement;
+}
+
+/**
+ * Build a composite custom-element **base class** without registering it, so a
+ * caller can subclass it to add their own behavior (methods, light-DOM
+ * rendering, extra lifecycle work) and then register it themselves with
+ * `customElements.define`. This is the class-authoring counterpart to
+ * {@link defineComposite}, which returns an opaque, already-registered class.
+ *
+ * ```ts
+ * const Base = await defineCompositeClass({
+ *   sources: [{ id: "s3", tag: "s3-uploader" }, { id: "ai", tag: "ai-agent" }],
+ * });
+ * class MyWorkbench extends Base {
+ *   reset() { this["ai.prompt"] = ""; } // your own behavior on top of the composite
+ * }
+ * customElements.define("my-ai-workbench", MyWorkbench);
+ * ```
+ *
+ * Like {@link defineComposite}, this awaits `customElements.whenDefined()` for
+ * every source tag before resolving, so the synthesized `static wcBindable` is
+ * fully determined on the returned class (and statically inherited by any
+ * subclass, keeping `target.constructor.wcBindable` discovery intact).
+ *
+ * The base class owns its shadow root for the source instances and sets them up
+ * in `connectedCallback`. A subclass that overrides `connectedCallback` MUST call
+ * `super.connectedCallback()` (and SHOULD do so before adding its own shadow
+ * content, which the base only initializes — never wipes — once). Unlike
+ * {@link defineComposite}, no tag-level caching or self-reference guard applies
+ * here — the caller owns the `customElements.define` call.
+ */
+export function defineCompositeClass(
+  options: DefineCompositeClassOptions,
+): Promise<CompositeElementConstructor> {
+  if (!customElementsRef || !documentRef) {
+    return Promise.reject(
+      new Error(
+        "@wc-bindable/composite: defineCompositeClass requires a DOM (customElements/document)",
+      ),
+    );
+  }
+  return buildCompositeClass(options);
 }
 
 /**

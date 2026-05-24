@@ -202,6 +202,134 @@ const Workbench = await defineComposite({
 > (`customElements.whenDefined`), so a shell instance is never observable with a
 > provisional declaration.
 
+## Class authoring
+
+`defineComposite` returns an opaque, already-registered class. When you want to
+**add your own behavior** (methods, extra rendering, lifecycle work) on top of
+the composed surface, use `defineCompositeClass`: it returns an *unregistered
+base class* you subclass and register yourself.
+
+```ts
+import { defineCompositeClass } from "@wc-bindable/composite";
+
+const Base = await defineCompositeClass({
+  sources: [
+    { id: "s3", tag: "s3-uploader" },
+    { id: "ai", tag: "ai-agent" },
+  ],
+  // expose?: ExposeConfig — defaults to "all-prefixed"
+});
+
+class MyAiWorkbench extends Base {
+  reset() {
+    this["ai.prompt"] = ""; // your own method on top of the composed T2 facade
+  }
+}
+customElements.define("my-ai-workbench", MyAiWorkbench);
+```
+
+The synthesized `static wcBindable` lives on the base and is statically inherited
+by your subclass, so `target.constructor.wcBindable` discovery, `bind()`, the
+framework adapters, and `@wc-bindable/remote` all work against instances
+unchanged. Like `defineComposite`, this awaits every source tag's
+`customElements.whenDefined()` first, so the declaration is fully determined
+before the class is returned.
+
+The base owns its shadow root for the source instances and sets them up in
+`connectedCallback`. A subclass that overrides `connectedCallback` MUST call
+`super.connectedCallback()`. The base only manages the source elements it
+creates (`[data-wc-source]`) — it never wipes other shadow content, so a subclass
+may render its own shadow DOM alongside the sources.
+
+### Lit
+
+`@wc-bindable/composite/lit` builds on the same machinery for
+[Lit](https://lit.dev). `CompositeLitElement(options)` returns a `LitElement`
+base that **is** a composite shell *and* re-renders your `render()` whenever a
+composed value changes (`lit` is an optional peer dependency):
+
+```ts
+import { html } from "lit";
+import { customElement } from "lit/decorators.js";
+import { CompositeLitElement } from "@wc-bindable/composite/lit";
+
+const Base = await CompositeLitElement({
+  sources: [
+    { id: "s3", tag: "s3-uploader" },
+    { id: "ai", tag: "ai-agent" },
+  ],
+});
+
+@customElement("my-ai-workbench")
+class MyAiWorkbench extends Base {
+  render() {
+    return html`
+      <progress .value=${(this["s3.progress"] as number) ?? 0}></progress>
+      <p>${this["ai.answer"]}</p>
+      <button @click=${() => { this["ai.prompt"] = "summarize"; (this["ai.run"] as () => unknown)(); }}>
+        Run
+      </button>
+    `;
+  }
+}
+```
+
+Composed names are dotted strings, not Lit reactive properties, so the base
+bridges each composed update to `requestUpdate()` for you. The source elements
+are created once in the element's shadow root; Lit renders your template into the
+**same** shadow root (after the sources), so `static styles` are adopted as
+usual and the two never clash. Call `el.dispose()` for terminal teardown.
+
+#### Lit `ReactiveController`
+
+When you'd rather **render the sources in your own template** and control their
+placement, use `CompositeController` instead of the base class. It composes the
+instances *you* render (captured via the Lit `ref` directive it hands you),
+exposes the composed values on `.values` (re-rendering the host on each change),
+and exposes the composed shell on `.shell`:
+
+```ts
+import { LitElement, html } from "lit";
+import { customElement } from "lit/decorators.js";
+import { CompositeController } from "@wc-bindable/composite/lit";
+
+@customElement("my-ai-workbench")
+class MyAiWorkbench extends LitElement {
+  #c = new CompositeController(this, {
+    sources: [
+      { id: "s3", tag: "s3-uploader" },
+      { id: "ai", tag: "ai-agent" },
+    ],
+  });
+  render() {
+    return html`
+      <s3-uploader ${this.#c.ref("s3")}></s3-uploader>
+      <ai-agent ${this.#c.ref("ai")}></ai-agent>
+      <p>${(this.#c.values as Record<string, unknown>)["ai.answer"]}</p>
+      <button @click=${() => { this.#c.shell!["ai.prompt"] = "hi"; this.#c.shell!["ai.run"](); }}>
+        Run
+      </button>
+    `;
+  }
+}
+```
+
+The difference from `CompositeLitElement`:
+
+| | `CompositeLitElement` (base class) | `CompositeController` |
+|---|---|---|
+| Sources | created for you (hidden in shadow) | **you render them**, tagged with `ref(id)` |
+| What is the shell | the **host element itself** | a separate handle on `.shell` |
+| Composed values | property getters on the element (`this["ai.answer"]`) | `.values` snapshot |
+| Shell identity | stable for the element's lifetime | rebuilt on reconnect (controller lifecycle) |
+
+`.shell` is a real wc-bindable target (built via `createCompositeTarget`), so you
+can also hand it to `@wc-bindable/remote` or `bind()` it elsewhere. Because the
+controller follows the usual connect/disconnect lifecycle, `.shell` is torn down
+on disconnect and rebuilt on reconnect — reach for `CompositeLitElement` or
+`createCompositeTarget` directly if you need a shell whose identity is stable
+across disconnects.
+
 ## Tier claim discovery
 
 Every shell exposes a frozen, per-instance tier claim under the well-known
