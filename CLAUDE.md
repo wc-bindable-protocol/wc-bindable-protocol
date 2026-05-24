@@ -40,7 +40,7 @@ npm run test:integration --workspace @wc-bindable/remote
 - **Protocol + adapters** — `core` defines the protocol contract; `react`, `vue`, `svelte`, `angular`, `solid`, `preact`, `alpine` are thin framework adapters that consume `bind()` to bridge component state into each framework's reactivity model. Adapters do not import each other.
 - **Remote** — `remote` re-implements the same Core/Shell boundary across a network (WebSocket or custom transport). It depends only on `@wc-bindable/core` and is itself transport-agnostic.
 
-`SPEC.md` is authoritative for the core protocol contract; [SPEC-extensions.md](SPEC-extensions.md) is authoritative for the input/command invocation surface and the wire format (Extensions 1 and 2). [CONFORMANCE.md](CONFORMANCE.md) hosts runnable test vectors for both. `README.md` is the user-facing intro. Treat `ls packages/` as the source of truth for the published-package set if the README and disk ever drift.
+`SPEC.md` is authoritative for the core protocol contract; [SPEC-extensions.md](SPEC-extensions.md) is authoritative for the input/command invocation surface, the wire format, and the composition profile (Extensions 1, 2, and 4; Extension 3 is informational). [COMPOSITE.md](COMPOSITE.md) is the non-authoritative companion design doc for Extension 4. [CONFORMANCE.md](CONFORMANCE.md) hosts runnable test vectors for all of them. `README.md` is the user-facing intro. Treat `ls packages/` as the source of truth for the published-package set if the README and disk ever drift.
 
 ### The core contract (≈60 LOC)
 
