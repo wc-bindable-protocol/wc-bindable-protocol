@@ -1149,6 +1149,316 @@ These are recommendations; adapter authors who pick a different default for a go
 
 ---
 
+## Extension 4 — Composition
+
+This extension defines the **Composition profile**: the interoperability invariants a target MUST preserve in order to expose **multiple wc-bindable source targets as one wc-bindable shell target**, so that existing consumers keep using the same `bind()` / framework-adapter / remote-proxy surfaces unchanged. Where Extension 1 adds invocation semantics on top of a single target and Extension 2 proxies a single target across a transport, Extension 4 exposes **many targets as one target**.
+
+> **Status — normative; authoritative home of the profile.** This section is the authoritative definition of the composition profile. The companion design document [COMPOSITE.md](COMPOSITE.md) retains the extended rationale, worked examples, candidate package APIs, and open questions; where COMPOSITE.md and this section disagree on a requirement, **this section is authoritative**. Conformance vectors live in [CONFORMANCE.md § Extension 4 — Composition vectors](CONFORMANCE.md). Section numbers in this extension (`§ 1`–`§ 12`) are local to Extension 4.
+
+> **Language / runtime scope.** Unlike SPEC.md's Level 1 protocol contract, this is a **JavaScript single-realm interoperability profile**. The discovery and execution surfaces it pins — `Symbol.for(...)`, `EventTarget`, own properties / getters, `Object.is`, `Object.freeze`, and same-turn / microtask ordering — are JavaScript runtime mechanisms. A non-JS implementation MAY mirror the model, but it cannot claim conformance to this profile unless it exposes an equivalent JS boundary for those pinned surfaces.
+
+> **Relationship to Extensions 1 and 2.** Composition reuses Extension 1's "declaration ≠ execution capability" model: a declared `inputs` / `commands` entry signals only that a name exists, never that it is assignable / invokable. The execution tiers (T2 / T3, below) are defined in terms of Extension 1's call surface; a composed shell that crosses the wire is additionally bound by Extension 2 (reserved names, `JsonValue` payloads). Composition is **not** a security boundary — auth, authorization, rate limiting, and application-payload validation remain upstream concerns exactly as for remote proxying (see [§ Trust boundary](#trust-boundary-shared-by-extensions-1-and-2)).
+
+> **Reading rule for callout blocks.** As in COMPOSITE.md, a blockquote containing RFC 2119 keywords in this extension is **normative** unless it is explicitly introduced as non-normative guidance ("Implementation guidance", "Reference-implementation choice", "Security note"). The `>` formatting is editorial emphasis, not a downgrade of the requirement level.
+
+### Terminology
+
+| Term | Meaning |
+|---|---|
+| **Source target** | A wc-bindable target included in a composition. |
+| **Composed shell** | The target exposed to consumers after composition. |
+| **Source id** | A stable local name for a source, such as `s3` or `ai`. |
+| **Source name** | A property / input / command name inside one source declaration. |
+| **Composed name** | The public name exposed by the shell, commonly `<sourceId>.<sourceName>`. |
+| **Event rewriting** | Re-emitting source updates as shell-owned events. |
+
+### Profile tiers
+
+Composition spans distinct capability surfaces that MUST NOT be conflated. The profile defines a base tier plus **two optional, independently-claimable** execution tiers. An implementation states which tiers a given shell **instance** claims (see § Tier-claim discovery surface).
+
+| Tier | Surface | Adds (on top of T1) |
+|---|---|---|
+| **T1 — Observation-only** | Property observation | Base. §§ 1–7, 10, 11, and the T1 rules of § 12 (discovery, declaration shape, name mapping, collision policy, initial sync, event rewriting, getter semantics, lifecycle, immutability). |
+| **T2 — Local facade** | `shell[N] = v` / `shell[N](...)` | § 8 (input assignment delegation), § 9 (command method delegation), and the cross-surface collision rule in § 4 (T2 materializes names as members of one object). |
+| **T3 — Extension-1-capable** | The full Extension 1 consumer-side call surface: `set` / `setWithAck` / `setWithAckOptions` / `invoke` / `invokeWithOptions` (plus the mandatory `dispose`) | The Extension-1 routing rules in §§ 8–9 (resolve the composed-name argument to the same source member) and the T3 rules of § 12. NOT subject to the § 4 cross-surface collision rule (its names are string arguments, not materialized members). |
+
+- T2 and T3 are **siblings, not a stack**: an implementation MAY claim **T1 only**, **T1 + T2**, **T1 + T3**, or **T1 + T2 + T3**.
+- A **T3** claim is a claim of **full Extension 1 conformance**. A shell exposing only some of those methods is **not** T3; it MUST expose such a smaller surface under its own name. See [§ Methods](#methods) for the authoritative Extension 1 surface.
+- A **T1** shell MAY still *declare* `inputs` / `commands`, but for tooling / docs / codegen only — the metadata alone installs no delegation. A T1 shell therefore **cannot** serve writable inputs / invokable commands over the wire; it can be exposed remotely for **observation** only (see § Remote interop).
+- The MUSTs in §§ 8–9 apply **only** to the tier each rule names.
+
+> **T3 (consumer-facing) vs. remote-producer capability.** `@wc-bindable/remote`'s `RemoteShellProxy` drives a producer only through the **local facade (T2)** — an inbound `set` becomes a property assignment (`core[name] = value`) and an inbound `cmd` becomes a method call (`core[name](...)`). T3's own `set` / `invoke` methods are a *consumer-facing* surface that `RemoteShellProxy` never calls. Therefore: writable / invokable remote exposure requires **T2**; a T3-only shell does **not** satisfy it; observation-only remote exposure needs no execution tier.
+
+### Tier-claim discovery surface
+
+A composed shell's tier claim is **not** derivable from `constructor.wcBindable` (the core declaration carries no composition metadata, and a declared `inputs` / `commands` entry signals only that a name exists). A T1 shell and a T2/T3 shell can present byte-identical declarations. The profile therefore pins **one standard discovery surface** every composed shell MUST support.
+
+> **Standard tier-claim surface (MUST).** A composed shell MUST expose a property keyed by the well-known symbol `Symbol.for("wc-bindable.composite.tiers")` whose value is an object carrying **at least** these four required fields, describing **this instance's** claim:
+>
+> - `protocol: "wc-bindable.composite"` — identifies the discovery object.
+> - `version: number` — an **integer `>= 1`** naming the **composite profile** version this object conforms to (this profile is `1`). A consumer MUST read `version` before relying on any other field. **Unlike core's "accept every integer `>= 1`" rule ([SPEC.md § Versioning](SPEC.md#versioning)), this field is a fail-closed compatibility gate**: consumers MUST NOT apply that rule here.
+>   - **Fail-closed on unsupported `version` (MUST).** A consumer that does not support the advertised `version` MUST treat the tier claim as **unavailable**: it MUST NOT render execution affordances on the basis of `localFacade` / `extension1` (falling back to "treat as observation-only until confirmed"), and MUST ignore the optional fields except for diagnostics. `protocol !== "wc-bindable.composite"` is treated the same way.
+> - `localFacade: boolean` — `true` ⇒ this instance claims T2.
+> - `extension1: boolean` — `true` ⇒ this instance claims T3. (Both `false` ⇒ T1-only.)
+>
+> The value MUST reflect the instance actually in hand, not merely what the producing implementation is capable of. Reading the symbol MUST NOT throw and MUST be stable for the shell's lifetime.
+
+> **Ownership and mutability (MUST).** The symbol MUST resolve as an **own** property of the shell (a data property or own getter), not via the prototype chain. Every read MUST yield the same logical claim (an own getter MUST be idempotent and side-effect-free). The returned object SHOULD be frozen (`Object.freeze`), and consumers MUST treat it as **read-only**; an implementation MUST NOT hand out a shared mutable object whose later mutation would change what another consumer already observed.
+
+> **Open shape (MUST ignore unknown fields).** The object MAY carry additional fields; consumers MUST ignore fields they do not recognize, and a validator MUST NOT reject the object for carrying fields beyond the required ones. The name space splits in two:
+> - **Profile-defined fields** are reserved by this profile. The four required fields above, plus two **conditionally-required** reserved fields: `remoteCompatible: boolean` (§ Remote interop) — a shell claiming remote compatibility MUST set it `true`; absent ≡ `false` — and `reconnectResync` (§ 10) — a shell that detaches/reinstalls listeners across reconnect MUST set it to one of `"unconditional" | "changed-only" | "silent"`; a shell with no such gap MAY omit it. Future revisions MAY reserve further plain names; an implementation MUST NOT repurpose a plain name.
+> - **Implementation-private fields** MAY be attached but MUST use an implementation namespace (e.g. `"myImpl:foo"` or a `vendor`-prefixed name) so they cannot collide with a present or future profile-defined name. A plain-named private field is non-conformant.
+
+A package-level conformance document is **not** a substitute for the per-instance symbol: "this implementation *supports* T3" does not tell a tool whether *this instance* claims it. Until a tool has confirmed a T2 or T3 claim through this surface, it **MUST NOT** present a declared input as assignable or a declared command as invokable — it MUST treat declaration-only `inputs` / `commands` as descriptive metadata and render no execution affordance.
+
+> **Security note — the claim is a hint, not a permission.** Any object in the same JS realm can set `Symbol.for("wc-bindable.composite.tiers")` (and the Extension-1 marker, § 8) to arbitrary values; these symbols are forgeable and carry no authenticity guarantee. A devtool / automation runner / adapter MUST NOT treat a `true` claim as permission to perform an action it would not otherwise be allowed to perform — composition is explicitly **not** a security boundary, and auth / authz remain upstream concerns. Reading the claim to decide *whether to show a set/invoke control* is fine; reading it to decide *whether the caller is allowed to* is not. (This restates the [§ Trust boundary](#trust-boundary-shared-by-extensions-1-and-2) responsibility; the binding statement lives there.)
+
+### 1. Discovery
+
+A composed shell MUST expose its synthesized declaration through `target.constructor.wcBindable`, and MUST NOT require consumers to read `target.wcBindable`. If per-instance declarations are needed, the shell MUST use an isolated constructor pattern (e.g. a generated subclass per composed target), the same shape remote proxies use for declaration isolation (see [SPEC.md § Discovery Contract](SPEC.md#discovery-contract)).
+
+### 2. Declaration shape
+
+The synthesized declaration MUST satisfy the core `WcBindableDeclaration` schema ([SPEC.md § Schema](SPEC.md#schema)). The profile SHOULD NOT add required composition-specific fields to the declaration object itself — core consumers MUST be able to ignore composition entirely and still bind to the shell.
+
+### 3. Name mapping
+
+Each exposed property / input / command MUST map to exactly one source member.
+
+The same underlying source object MAY appear behind more than one composed name or more than one source id. Those are distinct exposed members for naming and delegation, and the shell MAY keep separate lookup tables or even separate listener registrations for them. **But aliasing does not relax § 6's determinism requirements:** when two or more composed properties are backed by the same underlying source-event occurrence, the shell's observable result MUST still be equivalent to **one shared extract → commit → dispatch cycle** across that whole set, even if the implementation internally reached them through multiple aliases or duplicate listener registrations. The profile does not require listener deduplication across aliases or diamond-shaped graphs, but it does require **alias-transparent fan-out semantics**.
+
+Composition graphs MUST be **acyclic at construction time**: a shell MUST NOT depend on itself, directly or transitively, as one of its own sources. Because the declaration and tier claim are fixed before observation begins (§ 11), a cyclic composition has no conformant construction order.
+
+The mapping SHOULD be modeled internally as structured data (`{ source: string; name: string }`). String forms such as `"s3.progress"` MAY be used as display names, but implementations SHOULD NOT parse them as the only source of truth — source names are not forbidden from containing dots, so splitting on `.` is ambiguous. The recommended default composed name is `<sourceId>.<sourceName>`.
+
+An implementation that uses the default `<sourceId>.<sourceName>` naming MUST reject, at construction, an empty source id and a source id containing `.`. An implementation that requires every composed name to be given explicitly MAY relax the `.` restriction but still SHOULD reject an empty source id. Aliases are permitted but MUST still resolve to one source member unambiguously. Source ids are local labels, not source-declaration members, so the § 4 reserved-name rules do not apply to them.
+
+> **Implementation guidance — prototype-pollution-safe source maps.** Because source ids are not wire names, the § 4 reserved-name rule does not cover them, but a JS implementation that stores id-keyed lookup tables as plain objects can still trip over `__proto__` / `constructor` / `prototype` *as map keys*. Implementations SHOULD key source maps with a `Map` or a `null`-prototype record (`Object.create(null)`), and MAY reject prototype-pollution-prone source ids at construction.
+
+### 4. Collision policy
+
+The synthesized declaration MUST NOT contain duplicate names within `properties`, within `inputs`, or within `commands`.
+
+**Reserved (wire) names.** An implementation that claims remote compatibility MUST reject **the entire wire profile's reserved-name set** by applying the **same reserved-name decision** that [§ Reserved names](#reserved-names) defines normatively — a name is rejected here if and only if that section would reject it. Where it can share the wire validator it SHOULD do so rather than re-implement the predicate; the profile does **not** keep its own normative copy of the set (that is what prevents drift). As of the current § Reserved names the minimum is: any name whose first 13 characters compared case-insensitively equal `@wc-bindable/`; and the exact strings `__proto__`, `constructor`, `prototype`. (Note the default *event* naming in § 6 uses the `@wc-bindable/composite:` namespace, but that is an event name, not a declared `name`; a composed **name** beginning with `@wc-bindable/` MUST be rejected under remote compatibility.) The reference implementation SHOULD reject this whole set **by default** even when remote compatibility is not claimed, because a name that can never be remoted has little upside.
+
+**Fixed-API collisions (MUST).** A composed name that, once materialized, would shadow a member the shell requires as fixed public API MUST be rejected at construction. The reserved fixed-member set is the union of an **all-tiers base set** and the **per-tier sets** for whatever tiers the shell claims:
+
+- **All tiers** (discovery + bind-target operational surface), reserved in **every** tier including T1:
+  - **`constructor`** — core discovery reads `target.constructor.wcBindable`; a composed property named `constructor` breaks discovery.
+  - **`addEventListener` / `removeEventListener`** — the consumer-side EventTarget surface `bind()` depends on — and **`dispatchEvent`** when the shell is also a dispatchable event source. Materializing any of these as a property getter corrupts the listener-install surface and initial sync.
+  - **`__proto__` / `prototype`** — **MUST** reject when remote-compatible (they are in the wire reserved set) and **SHOULD** reject even for a local-only shell, because materializing them can corrupt the object's prototype chain. (The tier-claim symbol is symbol-keyed and cannot collide with a string composed name.)
+- **T3** additionally reserves `set`, `setWithAck`, `setWithAckOptions`, `invoke`, `invokeWithOptions`, and `dispose`. A T3 shell MUST reject a composed name equal to any of these (or alias it).
+- **T2** additionally reserves whatever own members it materializes for the local facade.
+- A **T2 + T3** shell applies the base set plus both per-tier sets.
+
+An implementation MAY reserve *additional* internal members, documented per the implementation-defined-extensions allowance in [§ Reserved names](#reserved-names).
+
+**Cross-surface collisions (T2 only).** Core's name-uniqueness rule is per-array — a name MAY appear once each in `properties`, `inputs`, and `commands` simultaneously, because core never materializes those names as members of one object. A **local facade (T2)** does: a property becomes a readable member, an input an assignable member, a command a callable member of the *same* object. A T2 shell MUST therefore reject any name that collides **across** `properties`, `inputs`, and `commands`. This rule does **not** apply to a T3-only shell (its `set` / `invoke` route a composed name passed as a *string argument*, so a name appearing in both `inputs` and `commands` is unambiguous). A shell claiming **both** T2 and T3 is bound by the T2 rule for whichever names it materializes as members.
+
+### 5. Initial synchronization
+
+For every exposed property name `N`, the shell MUST surface the current composed value through ordinary property access, gated by the same `in` check core uses ([SPEC.md § Initial Value Synchronization](SPEC.md#initial-value-synchronization)):
+
+- `N in shell` MUST reflect whether the mapped source member is currently known/present — it MUST NOT unconditionally return `true`.
+- For a **synchronous local source**, `N in shell` is `true` and `shell[N]` returns the source's current value once the source itself reports the property present (`N_source in source`).
+- For a **remote-proxy source** (or any source whose value arrives asynchronously), `N in shell` MUST be `false` until the source's value is known, then `true` once a value (or an explicit `undefined`) has been observed. A composed shell wrapping a remote source MUST preserve that source's `has` behavior (see [§ Consumer-side proxy `has` trap contract](#consumer-side-proxy-has-trap-contract)) rather than masking it with a blanket `true`.
+
+The correctness of initial sync still depends on each source honoring core's getter/property parity requirement: when a source declaration uses a custom event `getter`, the source property the shell reads for initial sync MUST represent the same logical value the getter would later extract from the event. If a source violates that core invariant, the mismatch is inherited by the shell rather than repaired by composition.
+
+If the shell's own initial-sync read for an exposed property throws, the shell is in the same position as core's install-time initial-sync throw: it MUST tear down any listeners already installed for that shell before propagating the error. This is a setup failure, so the § 12 getter-failure isolation rule does **not** apply to it. The shell MAY implement property access with generated getters, a `Proxy`, or any equivalent mechanism; the observable behavior is what matters.
+
+### 6. Event rewriting
+
+A composed shell MUST expose shell-owned event names in its synthesized `properties` descriptors. The shell SHOULD NOT expose source event names directly (reusing them leaks implementation details and collides when multiple sources share an event name). Recommended default event naming is `@wc-bindable/composite:<composedName>`, or another implementation-owned namespace that cannot collide with source events.
+
+**Each exposed property MUST map to a distinct shell-owned event name.** The default naming satisfies this automatically (composed names are unique per § 4); a different naming scheme MUST preserve the same one-property / one-event-name uniqueness.
+
+**Fan-out dispatch (shared source events).** A single source event MAY back more than one exposed property (core permits multiple property descriptors to share one `event`, discriminated by `getter` — the `value` / `status` on one `my-fetch:response` event is canonical). **The fan-out set is defined by the underlying source-event occurrence, not by source-id boundaries:** if the same source object is reachable through aliases or a diamond-shaped graph, every composed property backed by that one occurrence belongs to the same three-phase cycle. Here, an **occurrence** means one source-side `dispatchEvent(...)` call on one `EventTarget` — the unit that delivers the same `Event` instance to every listener for that dispatch.
+
+When a source event fires, the shell MUST process it in **three ordered phases**:
+
+1. **Extract.** Evaluate **every** exposed source property mapped to that occurrence (not only the first), applying each property's getter per § 7, and collect successfully-extracted values into a **temporary buffer**. A getter that throws is caught per § 12 (reported, and that property omitted from the buffer); its siblings are still evaluated. The shell MUST NOT write any extracted value to its readable cache / `in` presence during this phase.
+2. **Commit.** After all getters have run, commit the buffered values to the readable cache and `in` presence (§ 5) for every successfully-extracted property — still **before any shell event for this occurrence is dispatched**.
+3. **Dispatch.** Then dispatch **one** shell event per buffered (committed) property, in declaration order, on each property's own shell-owned event name.
+
+Separating extract from commit guarantees **no getter ever observes a partially-updated cache** (every getter in one fan-out sees the pre-event state). Separating commit from dispatch guarantees the **sibling-read snapshot**: a listener on `A`'s shell event that synchronously reads `shell["B"]` observes `B`'s **new** committed value. A property whose getter throws is neither committed nor dispatched while its successful siblings are. This makes the per-property fan-out deterministic rather than implementation-defined.
+
+> **Implementation guidance — fan-out multiplies synchronous work.** One source event can fan out to many composed properties, and nested shells / reentrant listeners multiply that cost further. Composition is not a security boundary, but implementers and operators SHOULD treat deep or wide graphs as a synchronous-cost amplifier when reasoning about performance.
+
+**Re-dispatch timing — synchronous, no batching (MUST).** When a source event fires, the shell MUST perform the value-cache update and the shell-event dispatch **synchronously, within the same call stack** as the source event listener — it MUST NOT defer to a microtask, later task, or batched flush, and MUST NOT deduplicate or coalesce repeated source events. This mirrors core's "every event produces a callback, no batching/dedup" rule ([SPEC.md § Repeated Events for the Same Property](SPEC.md#repeated-events-for-the-same-property)). Within one occurrence the per-property fan-out dispatches in declaration order. **Across different sources the profile guarantees no total order** beyond each source's own synchronous propagation — the shell does not reorder, interleave, or serialize events from independent sources.
+
+**Value-update-before-dispatch ordering (MUST).** For each composed property the shell dispatches, it MUST update the property's readable value and its `in` presence (§ 5) **before** dispatching the corresponding shell event, never after. A consumer reading `shell[N]` from inside a shell-event listener MUST observe the **new** value.
+
+**Reentrant source events dispatch immediately (nested), not queued (MUST).** A shell-event listener MAY synchronously cause another source event to fire (e.g. write-back to a source). The shell MUST process that reentrant occurrence immediately and nested — running its own full extract → commit → dispatch cycle to completion before the outer cycle's dispatch phase resumes — and MUST NOT queue it (queuing would re-introduce batching and make ordering implementation-defined). Consequences the shell MUST honor: the reentrant cycle's commit phase runs against the **already-committed state of the outer cycle** (the outer commits before it dispatches); after the nested cycle completes, the outer cycle continues dispatching its remaining listeners, which now observe whatever the reentrant cycle committed (the cache is monotonic forward, never rolled back). This is the same nesting model the DOM uses for synchronous `dispatchEvent` re-entry.
+
+If the shell exposes `dispose()` and a shell-event listener calls it synchronously during phase 3, `dispose()` MUST NOT retroactively cancel the already-buffered dispatch list for that same occurrence. The shell MUST finish dispatching the current cycle's already-committed properties in declaration order, then apply the disposed state to future source observation and pending-call handling per § 10 / § 12.
+
+### 7. Getter semantics
+
+The shell MUST preserve the observable getter semantics of each exposed source property. When a source property descriptor includes a custom `getter`, the shell MUST apply that getter to the source event and re-emit the already-extracted value on the shell event. Use a **presence check** on `getter`, not `getter?.(...) ?? sourceEvent.detail` — the `??` form discards a getter that intentionally extracts `undefined` / `null`. This matches core, which applies the declared getter and uses its result as-is, only falling back to the default getter when none is declared ([SPEC.md § Default Getter](SPEC.md#default-getter)).
+
+Getter execution is part of phase-1 extraction only. A getter MAY read shell state but MUST NOT synchronously cause a source event to fire or otherwise re-enter the shell's source-event pipeline (reentrant source events are defined only for phase-3 listener dispatch, § 6). The synthesized shell property descriptor SHOULD omit `getter` so the default `event => event.detail` getter reads the already-extracted value.
+
+> **Undefined / null preservation is a MUST; the mechanism is implementation-defined.** When a source getter (or the default extraction) yields a top-level `undefined` or `null`, the shell MUST deliver that exact value to a consumer binding the shell — observably identical to what a local consumer binding the source directly would have seen. A plain `new CustomEvent(shellEvent, { detail: undefined })` does **not** satisfy this (the `detail` boundary surfaces top-level `undefined` as `null`). The shell MUST use a mechanism that round-trips the value faithfully — a synthesized property `getter` returning the preserved value, a sentinel-envelope `detail` its own getter unwraps, or a non-`CustomEvent` internal event type. Only the observable result is normative: `undefined` stays `undefined`, `null` stays `null`. (This is the same representation gap Extension 2 addresses on the wire with `undefinedProperties`; locally there is no JSON boundary, so the shell simply preserves the JS value.)
+
+### 8. Inputs
+
+> **Execution-tier rule.** A **T1** shell MAY declare `inputs` as pure metadata and install no assignment delegation. The delegation MUSTs below bind a shell only once it claims an execution tier — property-assignment applies to **T2**, `set` / `setWithAck` applies to **T3**.
+
+**T2 (local facade).** If a T2 shell exposes an input, assignment to the composed input member MUST delegate to the mapped source input (default: property assignment, `shell["ai.prompt"] = v` → `aiSource.prompt = v`).
+
+**T3 (Extension 1).** If a T3 shell exposes an input, its `set()` / `setWithAck()` / `setWithAckOptions()` MUST resolve the composed input name to the mapped source input. When a shell claims both T2 and T3, both surfaces MUST resolve the same composed name to the same source input.
+
+> **T3 inherits the full Extension 1 contract; this section defines only source routing.** Beyond name resolution, a T3 surface MUST behave exactly as a consumer-side Extension 1 surface — method signatures, the mandatory `setWithAckOptions` / `invokeWithOptions` variants, `AckOptions` lifecycle (`signal`, `timeoutMs` and its documented default), at-most-once vs. acknowledged delivery, and the error-envelope / `error.code` rules all follow [§ Methods](#methods) and [§ Error envelope](#error-envelope) unchanged.
+>
+> **Caller-order is scoped to a single source / logical channel.** Extension 1's order guarantee is about one proxy's single logical channel; a composite fans calls out to many sources, so it cannot inherit that globally. The shell MUST begin delegation in the order calls were received (it MUST NOT reorder before handing each to its mapped source); calls to the **same source** inherit that source's ordering contract; calls to **different sources / channels** get **no** guaranteed producer-side relative order — cross-source sequencing is the caller's responsibility.
+>
+> **Default-timeout ownership (uniform shell contract).** A T3 shell MUST pick one of two policies and **document which**. A "no-default-timeout call" means the caller supplied no effective `timeoutMs` (`setWithAck(N,v)` / `invoke(N,…)`, **and** `*WithOptions` where `opts` is omitted/`undefined` or carries `timeoutMs: undefined`); such a call MAY still carry other `AckOptions` (most importantly a `signal`), which MUST be preserved.
+> - **Normalize (recommended):** the shell defines its own default `timeoutMs` and **merges** it into every no-default-timeout call before delegating — `source.setWithAckOptions(M, v, { ...opts, timeoutMs: shellDefault })` / `source.invokeWithOptions(M, args, { ...opts, timeoutMs: shellDefault })` — keeping the caller's `signal` and any other `AckOptions` verbatim. It MUST NOT forward only `{ timeoutMs: shellDefault }` when the caller passed a `signal` (that would drop the abort capability). The bare `source.setWithAck` / `source.invoke` form is never used under Normalize.
+> - **Inherit-and-document:** the shell does not normalize; a no-default-timeout call is delegated bare (when it carries no other `AckOptions`) or as `source.setWithAckOptions(M, v, opts)` (when it carries a `signal` but no `timeoutMs`). The shell MUST document that its effective default is per-source.
+>
+> Either way, an *explicit* `timeoutMs` (including `0`) is always forwarded unchanged, and the caller's `signal` is **always** forwarded. A pre-aborted `signal` is rejected before delegating (§ 12).
+
+The profile MUST also fix **what the shell calls on the source**, because the answer depends on the source's own capability:
+
+- **Extension-1-capable source** (exposes the full input-kind subset — `set`, `setWithAck`, **and** `setWithAckOptions`; e.g. a `RemoteCoreProxy`): the shell MUST delegate to the matching method (`shell.set(N,v)` → `source.set(M,v)`, etc., forwarding the same `AckOptions`), so the source's at-most-once vs. acknowledged semantics, timeout/abort handling, and error codes propagate end-to-end. A `shell.setWithAck()` resolves only when the **source's** ack arrives. Because `AckOptions` are forwarded, `abort` / `timeout` are owned by the **source** (see § 12 pending-call lifecycle); the shell adds only `dispose()` as its own terminal.
+- **Plain local source** (no Extension-1 surface): the shell wraps local assignment in Extension-1 semantics — `set()` does the assignment fire-and-forget; `setWithAck()` / `setWithAckOptions()` perform the assignment and resolve once it returns without throwing, or reject with the thrown error. A **pre-aborted** signal and **invalid options** MUST be checked before the assignment and reject without assigning, but `timeoutMs` **cannot preempt a synchronous setter** — the profile does NOT require `WC_BINDABLE_TIMEOUT` for synchronous local assignment (an implementation MAY ignore `timeoutMs` for that path).
+
+**Three-way capability classification (MUST).** A shell detects source capability by feature-testing the methods it will actually call, and MUST classify each source per delegation kind into one of **three** states (not two). The default is **auto**:
+
+- **Fully Extension-1-capable** — exposes the *entire* required subset for that kind (inputs: `set`, `setWithAck`, **and** `setWithAckOptions`; commands: `invoke` **and** `invokeWithOptions`) **and** advertises the marker (below). The shell delegates to the source's Extension 1 methods.
+- **No Extension 1 surface at all** — exposes *none* of those methods for that kind (a genuine ordinary local target). Only then MAY the shell use the plain-local path.
+- **Partial Extension 1 surface** — exposes *some but not all* required methods for that kind. The shell MUST reject at construction; it MUST NOT silently fall back to local assignment (which could corrupt a proxy's internal state) and MUST NOT call the missing method.
+
+Test the specific methods (`typeof source.setWithAckOptions === "function"`, etc.), not source kind. A source MAY be fully capable for inputs but plain-local for commands or vice versa; the two kinds are classified independently.
+
+> **`auto` requires a positive marker, not method names alone.** Core does NOT reserve `set` / `setWithAck` / `invoke` / … as input/command names, so method names alone misfire in both directions (a local source with a command literally named `invoke` looks *partial*; one exposing `set`+`setWithAck`+`setWithAckOptions` looks *full* and would be silently misrouted). Therefore a source counts as Extension-1-capable under `auto` only if it both exposes the full required subset **and** advertises the standard marker at `source[Symbol.for("wc-bindable.extension1")]`. Full method set present but marker **absent** ⇒ the source is **ambiguous**: the shell MUST NOT route it as Extension 1 and MUST reject at construction unless an explicit override disambiguates it.
+>
+> **The marker is a versioned discovery object** (same fail-closed reason as the tier claim):
+>
+> ```typescript
+> { protocol: "wc-bindable.extension1", version: 1, inputs: boolean, commands: boolean }
+> ```
+>
+> where `inputs` / `commands` state which delegation kinds the source supports. A consumer MUST read `protocol` / `version` first and **fail closed on an unsupported `version` or unrecognized `protocol`** — treating the source as *not* marker-capable (hence ambiguous under `auto`, resolvable only by an explicit override). Unknown fields are ignored (open shape); `version` MUST be an **integer `>= 1`**. The marker MUST obey the same access rules as the tier-claim object (own property/getter, stable, read-only, and a **throwing read ⇒ marker unavailable**).
+>
+> **Composite-to-composite interop.** A composed shell that claims **T3** and is intended to be usable as a source for another composite SHOULD also expose the marker at `Symbol.for("wc-bindable.extension1")`, with `inputs` / `commands` reflecting the kinds it actually routes. If a shell exposes both the composite tier claim and the marker, they MUST agree: a shell with `extension1: true` on the tier claim MUST NOT advertise a contradictory marker, and one with `extension1: false` MUST NOT present itself as Extension-1-capable via the marker.
+>
+> **Legacy shorthand:** a bare boolean `source[Symbol.for("wc-bindable.extension1")] === true` MAY be accepted as a v1 shorthand for `{ protocol: "wc-bindable.extension1", version: 1, inputs: true, commands: true }`. Implementations SHOULD emit the object form.
+>
+> **Standardization status.** This marker is introduced by this profile. A third-party source implementing only Extensions 1/2 (including current/legacy `@wc-bindable/remote` proxies) does **not** advertise it and is *intentionally ambiguous under `auto`* — delegating to it requires the explicit `extension1` override. `auto` detection is a convenience, not the interop contract; the explicit override is the guaranteed-interoperable path. The marker's `Symbol.for(...)` value is **forgeable** and carries no authenticity guarantee (same trust caveat as the tier claim): a shell MAY read it to *route* but MUST NOT treat it as authorization.
+>
+> **Override (interop requirement).** Independently of detection, an implementation MUST provide a way to override classification per delegation kind, so a legal local source is never permanently locked out by a name collision and an unmarked-but-genuine Extension 1 source can be opted in. The three modes:
+> - **auto** (default) — the marker-gated full / none / partial / ambiguous classification above.
+> - **local** — treat the source as an ordinary local target; Extension-1-looking names (and any marker) are ignored; no partial/ambiguous rejection.
+> - **extension1** — assert the source is Extension-1-capable; delegate to its Extension 1 methods and reject at construction if the full required subset is absent. (Also how a genuine but unmarked Extension 1 source is opted in.)
+>
+> The override **MUST be expressible per delegation kind** (input-kind and command-kind are classified independently). A whole-source value is a permitted shorthand for "both kinds"; a per-kind value MUST take precedence.
+
+The profile does not require a shell to expose every source input; it MAY expose an allowlist.
+
+### 9. Commands
+
+> **Execution-tier rule.** A **T1** shell MAY declare `commands` as pure metadata with no invocation delegation. The method-call rule applies to **T2**, the `invoke` rule to **T3**.
+
+**T2 (local facade).** If a T2 shell exposes a command as a callable member, invoking it MUST delegate to the mapped source command (default: `await shell["ai.run"](...args)` → `await aiSource.run(...args)`).
+
+**T3 (Extension 1).** If a T3 shell exposes a command, its `invoke()` / `invokeWithOptions()` MUST resolve the composed command name to the mapped source command. When a shell claims both T2 and T3, both MUST resolve the same composed name to the same source command. The full-Extension-1-contract note in § 8 applies identically. Delegation target depends on the source's command-kind capability, classified by the three-way rule in § 8 (full → `invoke` + `invokeWithOptions`; none → plain local; partial → reject in auto mode), tested independently and subject to the same per-kind override:
+
+- **Extension-1-capable source** (`invoke` **and** `invokeWithOptions`): the shell MUST delegate (`shell.invoke(N, ...args)` → `source.invoke(M, ...args)`; `shell.invokeWithOptions(N, args, opts)` → `source.invokeWithOptions(M, args, opts)`, forwarding the same `AckOptions`), subject to the default-timeout policy of § 8.
+- **Plain local source** (no `invoke`): the shell wraps the method call — `invoke()` calls `source[M](...args)`, resolves with the return value (awaiting it if thenable), or rejects with the thrown error / rejection, honoring inherited `AckOptions`. A pre-aborted signal and invalid options are checked before the call. Unlike the synchronous-setter case in § 8, `timeoutMs` **is** meaningful when the method returns a thenable: the shell races the awaited thenable against the timeout and rejects with `WC_BINDABLE_TIMEOUT` if it elapses first (the source method keeps running — the timeout is local, no cancellation is sent). For a synchronous return there is nothing to await, so `timeoutMs` does not apply.
+
+If the source declaration marks a command `async: true`, the shell MUST preserve that hint in the synthesized command descriptor (read straight from the source descriptor; the shell never infers asynchrony). In the first profile version a composed command MUST map to exactly one source command — **command fan-out is out of scope**.
+
+### 10. Lifecycle and teardown
+
+On final teardown (dispose, or whatever terminal lifecycle event the implementation defines), a composed shell MUST remove every source event listener it installed — leaking source listeners is the failure this section prevents. Whether the shell *also* detaches listeners on a non-terminal disconnect (e.g. a DOM `disconnectedCallback`) is an implementation choice: a DOM shell MAY detach on disconnect and reinstall on reconnect; a headless shell with no such lifecycle keeps its listeners for its whole life. Both are conformant.
+
+The shell's **source-subscription lifecycle is owned by the shell itself, not by downstream consumers binding to the shell**. A consumer's `bind(shell, …)` / unbind cycle adds or removes listeners on the shell only; it MUST NOT be the event that decides whether the shell installs or removes its own source listeners, except insofar as the shell instance itself is created, connected, disconnected, or disposed as part of the broader application lifecycle.
+
+**`dispose()` obligation by tier.** A **T3** shell MUST expose `dispose()` (part of the mandatory Extension 1 surface, [§ Lifecycle methods](#lifecycle-methods)): idempotent, and after it `set()` throws while `setWithAck` / `setWithAckOptions` / `invoke` / `invokeWithOptions` reject. A **T1 or T2** shell is not required to expose `dispose()`; if it does, that API SHOULD be idempotent and SHOULD make subsequent delegation fail predictably. Either way the final-teardown listener-removal MUST holds regardless of the terminal trigger.
+
+**Source ownership — composition borrows its sources by default.** On `dispose()` (or final teardown) a composed shell MUST: remove every source event listener it installed; and reject every **shell-owned** pending call (a T3 shell's in-flight acknowledged promises reject with `WC_BINDABLE_DISPOSED` per the Extension 1 disposed contract). A composed shell MUST NOT dispose its source targets (MUST NOT call `source.dispose()` or any source-terminal API) **unless** the application explicitly configures cascading ownership. An implementation MAY offer an opt-in (e.g. `ownsSources`) that cascades `dispose()` to sources, but it MUST be off by default and documented; when enabled, the shell SHOULD dispose sources after detaching its own listeners and SHOULD tolerate a source `dispose()` that throws (best-effort, continue disposing the rest).
+
+**Late source settlements after dispose are dropped.** After the shell's `dispose()` has rejected the shell-side promise with `WC_BINDABLE_DISPOSED`, a later `return` / `throw` settlement arriving from an Extension-1-capable source MUST NOT re-settle the shell-side promise (single-settlement) and MUST NOT be surfaced through any other channel; it SHOULD be dropped (optionally logged). The shell does not, and cannot, cancel the source-side call (no wire cancellation). This is the same late-envelope-drop posture `@wc-bindable/remote` uses.
+
+**Updates missed while disconnected.** If a shell detaches its source listeners on disconnect, a source value MAY change before reconnect, leaving the last-dispatched value stale. The shell MUST make its choice observable; it MUST do one of:
+
+- **Re-sync on reconnect (recommended).** When listeners are reinstalled, re-read each exposed source property (gated by the § 5 `in` check) and dispatch a shell event for every known/present property. Two equally-conformant dispatch policies are allowed; the shell MUST pick one:
+  - **Unconditional** — dispatch for every known/present property (core permits repeated events with no dedup).
+  - **Changed-only** — suppress a property whose re-read value has not changed since the last-dispatched value. The comparison MUST be `Object.is` (NOT `===`, which mishandles `+0`/`-0` and `NaN`, and NOT deep equality, which is undefined over the "any JS value" model).
+- **Document silence explicitly.** If the shell does not re-sync, it MUST document that updates occurring while disconnected are not observed, and the next observed value is whatever the next source event carries after reconnect.
+
+A shell that never detaches its listeners has no gap and is unaffected.
+
+**Declaring the chosen policy (conditional MUST).** A shell that **detaches and reinstalls listeners across a disconnect/reconnect cycle** MUST expose its policy as a `reconnectResync: "unconditional" | "changed-only" | "silent"` field on the tier-claim object. A shell that **never detaches** MAY omit the field. Adding a new `reconnectResync` enum value is a **profile-version** change, not a same-version extension point; a consumer encountering an unknown value on an otherwise-supported claim MUST treat the field as unavailable for behavioral purposes (as if omitted) and MAY surface it only as a diagnostic.
+
+### 11. Dynamic reconfiguration
+
+The synthesized declaration MUST be **immutable for the lifetime of a given shell target**: once any consumer can observe it via `getWcBindableDeclaration()` or `bind()`, neither the declaration object nor the set of exposed property / input / command names may change on that target. This is a MUST (not SHOULD) because core's `bind()` reads the declaration once at bind time and there is no declaration-change notification channel; an existing consumer would never learn the surface changed. If the source set or expose map changes, the implementation MUST create a new shell target (or new isolated constructor) and let consumers re-bind, rather than mutating an existing target in place.
+
+### 12. Delegation and error propagation
+
+Where a behavior is tier-specific it is marked.
+
+- **Source getter throws (T1+).** One shell listener may drive several composed properties off a single occurrence (§ 6), so an escaping throw would suppress the **siblings**. The shell MUST **isolate getter failures per composed property**: (1) catch each getter throw individually; (2) **report** it — never silently swallow it (preserving core's guarantee, [SPEC.md § Getter Errors](SPEC.md#getter-errors)) — via, in priority order, `reportError(error)` if available, else a deferred re-throw (`queueMicrotask` / `setTimeout`) so it surfaces as an uncaught error without aborting the fan-out, else (or additionally) the implementation's structured logger at error level; (3) dispatch **no** shell event for the failed property on that occurrence; (4) **continue** evaluating the remaining mapped properties and dispatch their shell events normally. The hard requirement is "no silent catch": at least one path MUST make the error observable, and the report MUST NOT abort the synchronous fan-out loop. The exact deferral (microtask vs. macrotask) is non-normative. A bare `catch {}` is non-conformant. If the report mechanism itself throws, the shell SHOULD fall through to the next mechanism and MUST NOT let the secondary throw abort the fan-out.
+
+  > **Reference-implementation choice.** The re-throw fallback surfaces an *uncaught* error, which in Node can terminate the process under the default policy — too aggressive for one getter bug. A reference implementation SHOULD prefer `reportError` where present and otherwise route to an injected logger at error level, reserving the throw-on-a-task path for runtimes that expose neither, and SHOULD document which path it takes.
+
+- **Source listener install failure / source missing at shell setup (T1+).** If a declared source is absent, or installing a source listener throws, the shell MUST tear down every source listener it already installed for that shell before propagating the error (matching core's install-time throw). A composed shell MUST NOT expose a property whose source cannot be resolved at construction time — resolve the full source set up front.
+
+- **Input assignment throws (T2).** When local property-assignment delegation (`shell[N] = v` → `source[M] = v`) triggers a throwing source setter, the throw MUST propagate synchronously to the assigning caller, unaltered. The shell MUST NOT swallow or defer it.
+
+- **Command invocation throws / rejects (T2).** A local method-call delegation MUST preserve the source method's completion shape: a synchronous throw propagates synchronously; a returned promise's rejection propagates as a rejection. The shell MUST NOT flatten one into the other.
+
+- **Extension-1 surfaces (T3).** Failure mapping follows Extension 1, not the local-facade rules: `set()` is fire-and-forget, and acknowledged calls' failures surface as promise rejections carrying the Extension-1 error envelope with the appropriate `error.code` (`WC_BINDABLE_TIMEOUT` on `timeoutMs` elapse, `WC_BINDABLE_ABORTED` on signal abort — the rejection value still carries the caller's `signal.reason` when present, else an `AbortError` — `WC_BINDABLE_DISPOSED` after `dispose()`, the producer's serialized error on an application throw, etc., per § 8 / § 9 and [§ Error envelope](#error-envelope)). A T3 shell MUST NOT mix the synchronous-throw semantics of the local facade into its Extension-1 surface for the same underlying source failure.
+
+  **This holds even when the underlying source is a plain local target** — the T3 error contract MUST NOT leak whether the source was local or Extension-1-capable. For a T3 call wrapping a plain local source: a **non-`Error` throw** MUST be canonicalized to an `Error` using the mapping Extension 1 pins ([§ Canonical mapping for non-Error throws](#canonical-mapping-for-non-error-throws): `name === "NonErrorThrow"`, safely-stringified `message`); an **application error** carries no protocol `error.code` by default (the shell SHOULD surface it under `WC_BINDABLE_REMOTE_THROW` or leave `code` unset, but MUST NOT invent a fake protocol code); a **shell-synthesized protocol error** (pre-aborted signal, invalid options, disposed, timeout on an awaited thenable) MUST carry its registered `WC_BINDABLE_*` code. In short: T3 normalizes local-source failures up to the Extension 1 contract, whereas **T2** deliberately does NOT normalize — its `shell[N] = v` / `shell[N](...)` surface re-raises the source's raw synchronous throw unaltered.
+
+  > **T3 pending-call lifecycle.** A T3 acknowledged call MUST be backed by a **shell-owned pending entry** so the shell can apply `dispose()` as its own terminal. **Which component owns `abort` / `timeout` depends on the source kind, and the two MUST NOT both act on the same call.**
+  > - **Extension-1-capable source.** The shell forwards the caller's `AckOptions` (same `signal` / `timeoutMs`) to `source.setWithAckOptions` / `source.invokeWithOptions`, so **`abort` and `timeout` are owned by the source's** Extension 1 layer: the source rejects its own pending with `AbortError` / `WC_BINDABLE_TIMEOUT` and sends no wire cancellation, and the shell-owned entry simply **mirrors** that settlement. The shell MUST NOT also install its own abort/timeout for the same call, and a pre-aborted signal rejects before delegating. The shell adds exactly one terminal of its own: `dispose()`.
+  > - **Plain local source.** There is no source-side lifecycle, so the **shell owns `abort` / `timeout` locally** (pre-aborted signal and invalid options checked before the call; `timeoutMs` applies only to an awaited thenable, never to a synchronous setter). The source call, once started, runs to completion; the shell drops its late settlement if the entry already settled.
+  >
+  > State machine (each terminal single-settlement, first-wins): `Pending → Settled | Disposed | Aborted | TimedOut`.
+  > - On `dispose()`, the shell MUST reject all shell-owned pending entries **in caller order** with `WC_BINDABLE_DISPOSED`, drop any later source settlement for those entries, and MUST NOT dispose or cancel the source. `dispose()` wins even over a source settlement already in flight.
+  > - **Same-turn race.** `dispose()` settles entries **synchronously at the call site**: invoking it MUST, before returning, mark every not-yet-settled shell-owned entry `Disposed` and reject it. Any source-settlement (or abort/timeout) callback that later runs for one of those entries MUST be a no-op — even when the source promise had already *resolved* and the shell's `.then` continuation was still queued. Conversely, an entry whose settlement callback already ran before `dispose()` is terminal; `dispose()` does not re-settle it. The outcome reduces to "which executed first — the synchronous `dispose()` mark or the settlement callback"; microtask vs. macrotask ordering never changes it.
+
+The first profile version does not aggregate errors across sources (it does not support fan-out, § 9): each delegation resolves to exactly one source member, so each failure has exactly one origin.
+
+### Remote interop
+
+Two remote patterns are supported: (1) a composite shell can include remote proxies as sources; (2) a composite shell can itself be exposed through `@wc-bindable/remote`.
+
+**Pattern 1 — remote proxies as sources.** The shell treats each remote proxy like any other source: bind to its synthetic per-property events and read its cached properties for initial sync. Pure observation of a remote-proxy source needs no override. But delegating **inputs / commands** to a current/legacy `RemoteCoreProxy` under a T3 shell requires pinning that source's mode to `extension1` explicitly — a markerless remote proxy is ambiguous under `auto` and rejected (§ 8).
+
+**Pattern 2 — composite shell exposed remotely.** The synthesized declaration must satisfy the same rules as any remote-producer declaration: reserved names rejected, every ordinary wire payload `JsonValue`-serializable.
+
+> **The wire declaration MUST only advertise an execution surface the remote layer can actually drive.** `RemoteShellProxy` drives the producer only through the **local facade (T2)** — inbound `set` → `core[name] = value`, inbound `cmd` → `core[name](...)`. A composed shell that does not implement T2 has no such assignable property / callable method, so advertising `inputs` / `commands` it cannot drive is an interop break. Therefore:
+> - A shell that **implements T2** MAY include in its wire declaration the `inputs` / `commands` it actually delegates; those are remote-writable / invokable as usual.
+> - A shell that does **not** implement T2 (a T1 observation-only shell, or a T3-only shell whose Extension-1 methods `RemoteShellProxy` never calls) MUST be exposed with an **observation-only wire declaration** — `constructor.wcBindable` keeping `properties` only and omitting `inputs` / `commands`. Properties still sync and update normally.
+
+> **Responsibility boundary — the composite implementation owns the projection, not `@wc-bindable/remote`.** `RemoteShellProxy` reads `producerTarget.constructor.wcBindable` **verbatim** and has no declaration-override / projection parameter. Consequently: passing a T1 shell that declares `inputs` / `commands` for local tooling *directly* to `new RemoteShellProxy(shell, transport)` is **non-conformant** (it would advertise un-drivable names). A composite implementation exposing a non-T2 shell remotely MUST hand `RemoteShellProxy` a **distinct remote-facing target whose `constructor.wcBindable` omits `inputs` / `commands`** — a generated isolated constructor / wrapper. The original shell keeps its full declaration for local tooling; only the remote-facing projection drops them. Mutating the original shell's `constructor.wcBindable` to delete `inputs` / `commands` is NOT acceptable (it destroys local metadata and violates § 11 immutability for any bound consumer).
+
+> **A *reachable* remote-facing projection is itself a composed shell and MUST carry its own tier claim.** "Reachable" means a consumer can inspect or `bind()` the projection target directly. Such a projection MUST expose the `Symbol.for("wc-bindable.composite.tiers")` surface describing **the projection's own** surface: `localFacade` / `extension1` reflect what is actually drivable on the projection (an observation-only projection reports both `false`; a projection keeping a drivable T2 facade reports `localFacade: true`), and `remoteCompatible` MUST be `true`. The original shell keeps its own, possibly different, tier claim. A projection kept purely as an internal transport artifact never exposed to tooling MAY omit the claim.
+
+#### Discovering remote compatibility
+
+Remote compatibility is a **conditional** requirement: a shell claiming it must reject the full reserved-name set (§ 4) and keep every wire payload `JsonValue`-serializable, but a local-only shell need not. The profile reserves the optional `remoteCompatible: boolean` field on the tier-claim object so a tool knows *whether to apply those checks* without implementation-specific knowledge.
+
+> **Exact meaning.** `remoteCompatible: true` ≡ "this object's *current declaration* can be handed directly to `RemoteShellProxy`" — a **responsibility claim, not a static payload guarantee**. It is the green light for `new RemoteShellProxy(thatObject, transport)`; a tool MUST NOT pass an object lacking the flag. A **non-T2 shell's original object MUST NOT set `remoteCompatible: true`** (passing it directly is the forbidden dead-write / method-not-found path); the flag belongs on the **remote-facing projection**. A T2 shell that is itself directly exposable MAY set it on its own object. "This implementation can *produce* a projection" is a different, weaker statement advertised out-of-band, never by setting `remoteCompatible` on a non-exposable object. A conformance runner treats absent/`false` as "no claim" and skips the remote-only vectors (hence MUST, not SHOULD).
+
+`JsonValue`-serializability cannot be fully checked at construction (a property may later update to a function / symbol / cyclic object, a command may return one). So `remoteCompatible: true` is a claim that the shell **defers enforcement to the existing wire profile's validation gates** rather than inventing its own. The profile pins *which* failure modes apply:
+
+- **`set.value` / `cmd.args[i]`** (inbound, T2 producer path): a non-`JsonValue` is rejected with `WC_BINDABLE_INVALID_JSON_VALUE` by the remote producer exactly as today.
+- **Command return value** (T2 producer path): a non-`JsonValue` return is rejected with `WC_BINDABLE_INVALID_RETURN_VALUE` by the existing producer-side gate.
+- **Property update / initial-sync value** (the observation path the composite drives): a value that cannot cross the JSON boundary MUST NOT be silently delivered as corrupted; the remote-facing target MUST let the wire layer's existing send-time serialization handle it — the non-serializable update is **dropped at the wire boundary** (never mutated into `null` / `{}` and forwarded). The drop MUST be **reported, not silent**. Responsibility sits with whichever layer performs the drop and is not duplicated: if the remote layer's send path already performs the producer-side non-`JsonValue` warning/drop (as `@wc-bindable/remote`'s `_safeSend` does), that satisfies the report requirement; the composite layer owns the report only when it drops the value itself before handing it to the wire layer, in which case the minimum report follows the same priority order as getter-failure reporting (§ 12). Local `bind()` consumers of the same shell still observe the real JS value; only the wire view is bound by `JsonValue`.
+
+### Extension-1 capability marker (summary)
+
+The marker object at `source[Symbol.for("wc-bindable.extension1")]` — `{ protocol: "wc-bindable.extension1", version: 1, inputs: boolean, commands: boolean }` — is defined normatively in § 8 (its shape, versioned fail-closed reading, access rules, composite-to-composite agreement rule, legacy boolean shorthand, and forgeability caveat). It is **proposed for promotion** into a future revision of this document's Extension 1 surface so that auto-detection becomes a cross-extension property rather than a composition-only one; until then it is defined here.
+
+---
+
 ## License
 
 MIT

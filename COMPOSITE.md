@@ -1,19 +1,31 @@
-# wc-bindable Composite Draft
+# wc-bindable Composite Profile (companion to Extension 4)
 
-> **Draft status.** This document is a design draft for a future composition
-> layer. It is **not** authoritative protocol text. The current normative
-> contracts remain [SPEC.md](SPEC.md) for the core protocol and
-> [SPEC-extensions.md](SPEC-extensions.md) for optional behavioral extensions.
+> **Status — promoted to a normative extension.** The composition profile defined
+> in this document has been **promoted to [SPEC-extensions.md § Extension 4 —
+> Composition](SPEC-extensions.md#extension-4--composition), which is now its
+> authoritative, normative home.** This document is retained as the **companion
+> design document** — extended rationale, worked examples, candidate package APIs,
+> and open questions that the condensed Extension 4 text does not carry. Where this
+> document and Extension 4 disagree on a requirement, **Extension 4 is
+> authoritative.** The normative contract for the core protocol remains
+> [SPEC.md](SPEC.md); the other behavioral extensions live alongside Extension 4 in
+> [SPEC-extensions.md](SPEC-extensions.md); conformance vectors live in
+> [CONFORMANCE.md § Extension 4 — Composition vectors](CONFORMANCE.md).
 >
-> **Scope of MUST / SHOULD in this document.** Every RFC 2119 keyword below is a
-> **candidate requirement for the COMPOSITE draft profile**, not a current
-> normative requirement of wc-bindable core or its extensions — nothing here adds
-> obligations to a plain `bind()` / `@wc-bindable/core` / `@wc-bindable/remote`
-> user. These keywords become binding in exactly one situation: **an
-> implementation (e.g. `@wc-bindable/composite`) that claims conformance to this
-> draft profile MUST satisfy them.** When the stable subset is later promoted into
-> `SPEC-extensions.md`, the promoted rules become normative there; until then,
-> "MUST" means "MUST, *if you claim this profile*."
+> **Scope of MUST / SHOULD in this document.** The RFC 2119 keywords below now
+> correspond to the **normative requirements of Extension 4** — an implementation
+> that claims the composition profile MUST satisfy them. They add no obligation to
+> a plain `bind()` / `@wc-bindable/core` / `@wc-bindable/remote` user who does not
+> use composition. Because Extension 4 is authoritative, the wording here is a
+> **non-authoritative restatement** kept in sync with that section; cite Extension
+> 4, not this document, in conformance discussions.
+
+**Reading rule for callout blocks.** This draft uses blockquotes for callouts of
+several kinds. A blockquote that contains RFC 2119 keywords is still normative
+unless it is explicitly introduced as non-normative guidance such as
+"Implementation guidance", "Reference-implementation choice", or "Security
+note". The `>` formatting is editorial emphasis, not a downgrade of the
+requirement level.
 
 This draft explores a small composition profile plus a possible reference
 implementation package, tentatively named `@wc-bindable/composite`.
@@ -61,6 +73,18 @@ In short:
 The composite implementation makes composition convenient.
 The spec only defines the invariants required for interop.
 ```
+
+## Interop Core At A Glance
+
+| Slice | What v1 fixes | Where |
+|---|---|---|
+| **T1 core** | discovery, synthesized declaration, name mapping, initial sync, three-phase event fan-out, getter semantics, teardown, immutability | §§ 1-7, 10, 11, 12(T1 rules) |
+| **T2 optional** | local facade assignment / method delegation | §§ 8-9, § 4 collision rules |
+| **T3 optional** | Extension-1-capable `set` / `setWithAck` / `invoke` routing and pending-call lifecycle | §§ 8-10, 12(T3 rules) |
+| **Remote interop** | when a composed shell may be handed directly to `RemoteShellProxy` | § Remote interop |
+
+The minimum interoperability nucleus is **T1**. T2, T3, and remote-facing
+projection rules layer on top of that nucleus; they do not redefine it.
 
 ## Goals
 
@@ -356,11 +380,16 @@ entirely and still bind to the shell.
 Each exposed property / input / command MUST map to exactly one source member.
 
 The same underlying source object MAY appear behind more than one composed name
-or more than one source id. Those are distinct exposed members, so the shell MAY
-install separate listeners / delegation paths and process each composed property
-independently even when they ultimately point at the same source object. The
-profile does not require listener deduplication across aliases or diamond-shaped
-composition graphs.
+or more than one source id. Those are distinct exposed members for naming and
+delegation, and the shell MAY keep separate lookup tables or even separate
+listener registrations for them. But aliasing does not relax § 6's determinism
+requirements: when two or more composed properties are backed by the same
+underlying source-event occurrence, the shell's observable result MUST still be
+equivalent to one shared extract → commit → dispatch cycle across that whole
+set, even if the implementation internally reached them through multiple aliases
+or duplicate listener registrations. The profile therefore does not require
+listener deduplication across aliases or diamond-shaped composition graphs, but
+it does require alias-transparent fan-out semantics.
 
 Composition graphs MUST still be acyclic at construction time: a shell MUST NOT
 depend on itself, directly or transitively, as one of its own sources. The
@@ -554,6 +583,13 @@ This requirement exists because re-emitting events alone is not sufficient: core
 initial sync reads `target[prop.name]` after checking `prop.name in target`, so
 the shell must answer both the `in` probe and the value read consistently.
 
+The correctness of that initial sync still depends on each source honoring
+core's getter/property parity requirement: when a source declaration uses a
+custom event `getter`, the source property the shell reads for initial sync MUST
+represent the same logical value that the getter would later extract from the
+event. If a source violates that core invariant, the mismatch is inherited by
+the shell rather than repaired by composition.
+
 If the shell's own initial-sync read for an exposed property throws — e.g. a
 source accessor throws while the shell is answering `shell[N]` after `N in shell
 === true` — the shell is in the same position as core's install-time initial
@@ -583,11 +619,24 @@ Recommended default event naming:
 or another implementation-owned namespace that cannot collide with source
 events by accident.
 
+Each exposed property MUST map to a **distinct** shell-owned event name. The
+default `@wc-bindable/composite:<composedName>` naming satisfies this
+automatically because composed names are unique per § 4; an implementation that
+chooses a different naming scheme MUST preserve the same one-property / one-
+event-name uniqueness.
+
 **Fan-out dispatch algorithm (shared source events).** A single source event MAY
 back more than one exposed property — core permits multiple property descriptors
 to share one `event` name, discriminated by their `getter` (the `value` / `status`
 on one `my-fetch:response` event is the canonical case; see conformance vector 5
 and the rationale `@wc-bindable/remote` uses synthetic per-property events for).
+This fan-out set is defined by the **underlying source-event occurrence**, not
+by source-id boundaries: if the same source object is reachable through aliases
+or a diamond-shaped composition graph, every composed property backed by that
+one occurrence belongs to the same three-phase cycle.
+Here, an **occurrence** means one source-side `dispatchEvent(...)` call on one
+`EventTarget` — the unit that delivers the same `Event` instance to every
+listener for that dispatch.
 When a source event fires, the shell MUST process it in **three ordered phases**,
 so that both getter evaluation *and* the dispatched listeners observe one coherent
 state:
@@ -630,6 +679,12 @@ siblings; see § 12 for the exact catch-report-continue rule). This makes the
 per-property fan-out deterministic instead of implementation-defined ("first match
 only" vs "all" vs "successful only", "interleaved" vs "snapshot", and
 "getter sees partial cache" vs "getter sees pre-event state").
+
+> **Implementation guidance — fan-out multiplies synchronous work.** One source
+> event can fan out to many composed properties, and nested shells / reentrant
+> listeners multiply that cost further. Composition is not a security boundary,
+> but implementers and operators SHOULD treat deep or wide graphs as a
+> synchronous-cost amplifier when reasoning about performance.
 
 **Re-dispatch timing — synchronous, no batching.** When a source event fires, the
 shell MUST perform the value-cache update (below) and the shell-event dispatch
@@ -677,6 +732,13 @@ ordering implementation-defined). Two consequences the shell MUST honor:
   the same hazard core flags for re-entrant producers — component / consumer
   authors SHOULD avoid deep synchronous write-back loops, but the ordering is
   defined rather than left to the implementation.
+
+If the shell exposes `dispose()` and a shell-event listener calls it
+synchronously during phase 3, `dispose()` MUST NOT retroactively cancel the
+already-buffered dispatch list for that same source-event cycle. The shell MUST
+finish dispatching the current cycle's already-committed properties in
+declaration order, then apply the disposed state to future source observation and
+pending-call handling per § 10 / § 12.
 
 ### 7. Getter semantics
 
@@ -977,6 +1039,16 @@ kinds are classified independently.
 > ambiguous under `auto`, resolvable only by an explicit override), never routed
 > as Extension 1 on a throwing read.
 >
+> **Composite-to-composite interop.** A composed shell that claims **T3** and is
+> intended to be usable as a source for another composite SHOULD also expose the
+> standard Extension-1 marker at `Symbol.for("wc-bindable.extension1")`, with
+> `inputs` / `commands` reflecting the delegation kinds it actually routes on its
+> own Extension-1 surface. If a shell exposes both the composite tier claim and
+> the Extension-1 marker, they MUST agree: a shell with `extension1: true` on the
+> tier claim MUST NOT advertise a contradictory marker, and a shell with
+> `extension1: false` MUST NOT present itself as Extension-1-capable via the
+> marker.
+>
 > **Legacy shorthand:** a bare boolean `source[Symbol.for("wc-bindable.extension1")]
 > === true` MAY be accepted as a v1 shorthand for
 > `{ protocol: "wc-bindable.extension1", version: 1, inputs: true, commands: true }`.
@@ -1120,6 +1192,13 @@ keeps its listeners for its whole life. Both are conformant; the MUST is about
 not leaking listeners past the shell's end of life, not about forcing a
 disconnect-time detach.
 
+The shell's **source-subscription lifecycle is owned by the shell itself, not by
+downstream consumers binding to the shell**. A consumer's `bind(shell, …)` /
+unbind cycle adds or removes listeners on the shell only; it MUST NOT be the
+event that decides whether the shell installs or removes its own source
+listeners, except insofar as the shell instance itself is created, connected,
+disconnected, or disposed as part of that broader application lifecycle.
+
 **`dispose()` obligation by tier.** A **T3** shell MUST expose `dispose()` —
 it is part of the mandatory Extension 1 consumer-side surface (see
 [SPEC-extensions.md § Methods](SPEC-extensions.md#methods)), so a T3 shell's
@@ -1225,6 +1304,12 @@ reconnect re-sync to describe. The package-level conformance document MAY restat
 the policy but does not substitute for the per-instance field on a shell that has
 the gap.
 
+Adding a new `reconnectResync` enum value is a **profile-version** change, not a
+same-version extension point. A consumer that somehow encounters an unknown
+value on an otherwise-supported claim MUST treat the field as unavailable for
+behavioral purposes (effectively as if it were omitted) and MAY surface it only
+as a diagnostic.
+
 ### 11. Dynamic reconfiguration
 
 The synthesized declaration MUST be immutable for the lifetime of a given shell
@@ -1311,7 +1396,7 @@ behavior is tier-specific it is marked.
   > that expose neither. Implementations SHOULD document which path they take so
   > operators know where these errors land.
 
-- **Source listener install failure / source missing at bind (T1+).** If a
+- **Source listener install failure / source missing at shell setup (T1+).** If a
   declared source is absent, or installing a source listener throws, the shell
   is in the same position as core's install-time throw: it MUST tear down every
   source listener it already installed for that shell before propagating the
@@ -1335,10 +1420,11 @@ behavior is tier-specific it is marked.
   the failure mapping follows Extension 1, not the local-facade rules above:
   `set()` is fire-and-forget, and the acknowledged calls' failures surface as
   promise rejections carrying the Extension-1 error envelope with the
-  appropriate `error.code` (`WC_BINDABLE_TIMEOUT` on `timeoutMs` elapse, the
-  abort reason / `AbortError` on signal abort, `WC_BINDABLE_DISPOSED` after
+  appropriate `error.code` (`WC_BINDABLE_TIMEOUT` on `timeoutMs` elapse,
+  `WC_BINDABLE_ABORTED` on signal abort, `WC_BINDABLE_DISPOSED` after
   `dispose()`, the producer's serialized error on an application throw, etc. —
-  per § 8 / § 9, these inherit the SPEC-extensions.md envelope rules unchanged).
+  on abort the rejection value still carries the caller's `signal.reason` when
+  present, else an `AbortError`, per § 8 / § 9 and SPEC-extensions.md).
   A T3 shell MUST NOT mix the synchronous-throw semantics of the local facade
   into its Extension-1 surface for the same underlying source failure.
 
@@ -2151,3 +2237,20 @@ vectors and MAY skip the [T2]-only ones.
     pre-guaranteed `JsonValue`", only as "directly `RemoteShellProxy`-able and
     bound by the wire profile's reserved-name + `JsonValue` failure semantics"
     (§ Discovering remote compatibility).
+48. **[T1]** Alias-transparent fan-out: if the same underlying source-event
+  occurrence is exposed through multiple aliases / source ids, the affected
+  composed properties still behave as one § 6 three-phase cycle — a listener on
+  `a.x` that synchronously reads `shell["b.y"]` after the shared commit point
+  observes `b.y`'s committed value, not an implementation-defined pre/post
+  interleaving.
+49. **[T1]** Source subscription ownership belongs to the shell, not downstream
+  `bind(shell, …)` consumers: a shell with no current consumers continues to
+  honor whatever source-listener lifecycle § 10 gives it, and a later consumer
+  observes state derived from that shell-owned source tracking rather than from
+  a fresh consumer-triggered source subscription.
+50. **[T3]** A composed shell that claims T3 and is then used as a source for a
+  parent composite SHOULD advertise a matching
+  `Symbol.for("wc-bindable.extension1")` marker so the parent's `auto`
+  classification accepts it without an explicit override; if both the marker
+  and the tier claim are present, they agree on whether the child is
+  Extension-1-capable (§ 8 composite-to-composite interop).
