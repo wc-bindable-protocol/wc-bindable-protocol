@@ -18,6 +18,15 @@
 This draft explores a small composition profile plus a possible reference
 implementation package, tentatively named `@wc-bindable/composite`.
 
+**Language / runtime scope for v1.** Unlike core's Level 1 protocol contract,
+this draft profile is a **JavaScript single-realm interoperability profile**.
+The standard discovery and execution surfaces pinned here — `Symbol.for(...)`,
+`EventTarget`, own properties/getters, `Object.is`, `Object.freeze`, and the
+same-turn / microtask ordering notes — are JavaScript runtime mechanisms. A
+non-JS implementation may mirror the model, but it cannot claim conformance to
+this v1 profile unless it exposes an equivalent JS boundary for those pinned
+surfaces.
+
 The central idea is simple: multiple wc-bindable source targets can be exposed
 as one ordinary wc-bindable shell target. Existing consumers then keep using the
 same `bind()` / framework adapter / remote proxy surfaces they already know.
@@ -208,13 +217,17 @@ from any conforming shell without per-implementation glue:
 >
 > - `protocol: "wc-bindable.composite"` — identifies the discovery object so a
 >   reader can tell it apart from an unrelated symbol value.
-> - `version: number` — the **composite profile** version this object conforms to
->   (this version of the profile is `1`). This is deliberately separate from the
->   core protocol version on `constructor.wcBindable.version`: that field versions
->   the binding contract, this one versions the composition discovery surface and
->   its tier semantics. A consumer MUST read `version` before relying on the
->   meaning of any other field, so a future revision can tighten semantics
->   without an old consumer silently misreading a new object as v1.
+> - `version: number` — an **integer `>= 1`** naming the **composite profile**
+>   version this object conforms to (this version of the profile is `1`). This
+>   is deliberately separate from the core protocol version on
+>   `constructor.wcBindable.version`: that field versions the binding contract,
+>   this one versions the composition discovery surface and its tier semantics.
+>   A consumer MUST read `version` before relying on the meaning of any other
+>   field, so a future revision can tighten semantics without an old consumer
+>   silently misreading a new object as v1. **Unlike core's protocol versioning
+>   rule in [SPEC.md § Versioning](SPEC.md#versioning), this field is a
+>   fail-closed compatibility gate**: consumers MUST NOT apply core's
+>   "accept every integer `>= 1`" rule to the tier-claim object.
 >
 >   **Fail-closed on an unsupported `version` (MUST).** A consumer that does not
 >   support the advertised `version` MUST treat the tier claim as **unavailable**:
@@ -342,6 +355,18 @@ entirely and still bind to the shell.
 
 Each exposed property / input / command MUST map to exactly one source member.
 
+The same underlying source object MAY appear behind more than one composed name
+or more than one source id. Those are distinct exposed members, so the shell MAY
+install separate listeners / delegation paths and process each composed property
+independently even when they ultimately point at the same source object. The
+profile does not require listener deduplication across aliases or diamond-shaped
+composition graphs.
+
+Composition graphs MUST still be acyclic at construction time: a shell MUST NOT
+depend on itself, directly or transitively, as one of its own sources. The
+profile's declaration and tier claim are fixed before observation begins (§ 11),
+so a cyclic composition has no conformant construction order.
+
 The mapping SHOULD be modeled internally as structured data:
 
 ```typescript
@@ -401,9 +426,10 @@ implementation MUST apply the **same reserved-name decision** that
 normatively — i.e. a name is rejected here if and only if that section would
 reject it. Where the implementation can share the wire profile's validator (e.g.
 a JS implementation importing `@wc-bindable/remote`'s reserved-name check) it
-SHOULD do so rather than re-implementing the predicate; a non-JS or
-separate-package implementation MUST instead track the SPEC-extensions.md
-definition itself. Either way the COMPOSITE profile does **not** re-list the set
+SHOULD do so rather than re-implementing the predicate; a separate-package
+implementation (or one mirroring the model in another runtime per § scope) MUST
+instead track the SPEC-extensions.md definition itself. Either way the COMPOSITE
+profile does **not** re-list the set
 as its own normative copy — that is what keeps it from drifting as the wire
 profile evolves. As of the current SPEC-extensions.md the minimum is:
 
@@ -528,6 +554,14 @@ This requirement exists because re-emitting events alone is not sufficient: core
 initial sync reads `target[prop.name]` after checking `prop.name in target`, so
 the shell must answer both the `in` probe and the value read consistently.
 
+If the shell's own initial-sync read for an exposed property throws — e.g. a
+source accessor throws while the shell is answering `shell[N]` after `N in shell
+=== true` — the shell is in the same position as core's install-time initial
+sync throw: it MUST tear down any listeners already installed for that shell
+before propagating the error. This is an initial-sync/setup failure, not a per-
+event fan-out failure, so the § 12 getter-failure isolation rule does not apply
+to it.
+
 The shell MAY implement this with generated getters, a JavaScript `Proxy`, or
 any equivalent mechanism. The observable behavior is what matters.
 
@@ -623,8 +657,8 @@ that is fully observable even though `bind()` itself happens to read from the
 event payload / getter and would hide the difference.
 
 **Reentrant source events dispatch immediately (nested), not queued.** A shell
-event listener (or a getter) MAY synchronously cause **another** source event to
-fire — e.g. a listener that writes back to a source. Consistent with the
+event listener MAY synchronously cause **another** source event to fire — e.g.
+listener code that writes back to a source. Consistent with the
 "synchronous, no batching" rule, the shell MUST process that reentrant source
 event **immediately and nested**, running its own full extract → commit →
 dispatch cycle to completion before the outer cycle's dispatch phase resumes. The
@@ -671,6 +705,13 @@ DEFAULT_GETTER; getter(event)` — only falling back to the default getter when 
 getter is declared, never based on the extracted value (see
 [packages/core/src/index.ts](packages/core/src/index.ts) and [SPEC.md § Default
 Getter](SPEC.md#default-getter)).
+
+Getter execution is part of phase-1 extraction only. A getter MAY read shell
+state, but it MUST NOT synchronously cause a source event to fire or otherwise
+re-enter the shell's source-event pipeline. Reentrant source events are defined
+only for work triggered from phase-3 listener dispatch (§ 6); allowing phase-1
+re-entry would break the "nested work sees the outer cycle's already-committed
+state" guarantee.
 
 The synthesized shell property descriptor SHOULD omit `getter` so the default
 `event => event.detail` getter reads the already-extracted value.
@@ -922,7 +963,8 @@ kinds are classified independently.
 > unsupported `version` or an unrecognized `protocol`** — treating the source as
 > *not* marker-capable (hence ambiguous under `auto`, resolvable only by an
 > explicit override), exactly as § Tier claim does for its own object. Unknown
-> fields are ignored (open shape).
+> fields are ignored (open shape). `version` here too MUST be an **integer `>=
+> 1`**.
 >
 > **Read rules (same discipline as the tier claim).** To keep capability
 > detection from diverging across wrapped / proxied / prototype-inheriting
@@ -2087,7 +2129,7 @@ vectors and MAY skip the [T2]-only ones.
     get **no** guaranteed producer-side relative order — cross-source sequencing
     is the caller's responsibility (§ 8 caller-order preservation).
 45. **[T1]** A source event that fires **reentrantly** from inside a shell-event
-    listener or getter is processed immediately and nested (its full
+    listener is processed immediately and nested (its full
     extract→commit→dispatch cycle runs to completion before the outer cycle's
     remaining listeners resume), not queued; the nested cycle sees the outer
     cycle's already-committed values, and the cache is never rolled back (§ 6
