@@ -1,0 +1,34 @@
+{
+  "name": "@wc-bindable/composite",
+  "version": "0.7.1",
+  "description": "Composition profile for wc-bindable — expose many wc-bindable targets as one (Extension 4)",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest run tests",
+    "test:watch": "vitest tests",
+    "test:coverage": "vitest run tests --coverage --coverage.include=src/**/*.ts --coverage.exclude=src/index.ts --coverage.exclude=src/types.ts"
+  },
+  "dependencies": {
+    "@wc-bindable/core": "^0.7.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wc-bindable-protocol/wc-bindable-protocol.git",
+    "directory": "packages/composite"
+  },
+  "license": "MIT"
+}
