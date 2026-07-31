@@ -804,4 +804,237 @@ describe("bind", () => {
       expect(onUpdate).toHaveBeenCalledWith("value", "headless");
     });
   });
+
+  describe("syncOn: define", () => {
+    // happy-dom (20.x) does not implement custom element *upgrade*. After
+    // `customElements.define()`, an element instance created or parsed
+    // beforehand keeps `constructor === HTMLElement` forever — neither
+    // insertion nor `customElements.upgrade()` swaps its prototype (both
+    // were verified against happy-dom 20.8.3). Real browsers perform the
+    // swap, and the deferred path depends only on its observable result
+    // (`target.constructor.wcBindable` becoming readable), so these tests
+    // perform the swap explicitly at the point the platform would: inside
+    // `customElements.define()`, before `whenDefined()`'s promise resolves.
+    // Per CLAUDE.md § Test environment, an explicit in-test workaround is
+    // the sanctioned option for a happy-dom gap.
+    function defineUpgrading(tag: string, Ctor: CustomElementConstructor, ...instances: HTMLElement[]): void {
+      customElements.define(tag, Ctor);
+      for (const el of instances) Object.setPrototypeOf(el, Ctor.prototype);
+    }
+
+    // Accessors (not class fields) so the declared property survives the
+    // prototype swap above — a class field is assigned by the constructor,
+    // which the simulated upgrade does not run.
+    function lateBindableClass(initial: unknown): CustomElementConstructor {
+      let current = initial;
+      return class LateElement extends HTMLElement {
+        static wcBindable: WcBindableDeclaration = validDeclaration;
+        get value(): unknown { return current; }
+        set value(v: unknown) { current = v; }
+      };
+    }
+
+    const uniqueTag = (prefix: string) =>
+      `${prefix}-${Math.random().toString(36).slice(2, 8)}`;
+
+    it("behaves exactly like syncOn:call when the declaration is already readable", () => {
+      const el = createBindableElement(validDeclaration);
+      (el as unknown as Record<string, unknown>).value = "already-defined";
+      const onUpdate = vi.fn();
+
+      const unbind = bind(el, onUpdate, { syncOn: "define" });
+
+      // Same synchronous point as "call" — no microtask in between.
+      expect(onUpdate).toHaveBeenCalledWith("value", "already-defined");
+      unbind();
+    });
+
+    it("does not wait on customElements when the declaration is already readable", () => {
+      const el = createBindableElement(validDeclaration);
+      const whenDefinedSpy = vi.spyOn(customElements, "whenDefined");
+      try {
+        bind(el, () => {}, { syncOn: "define" })();
+        expect(whenDefinedSpy).not.toHaveBeenCalled();
+      } finally {
+        whenDefinedSpy.mockRestore();
+      }
+    });
+
+    it("delivers the initial sync and subsequent events after a later define()", async () => {
+      const tag = uniqueTag("late");
+      const el = document.createElement(tag);
+      const onUpdate = vi.fn();
+
+      const unbind = bind(el, onUpdate, { syncOn: "define" });
+      expect(onUpdate).not.toHaveBeenCalled();
+
+      defineUpgrading(tag, lateBindableClass("arrived"), el);
+      await customElements.whenDefined(tag);
+      await Promise.resolve();
+
+      expect(onUpdate).toHaveBeenCalledWith("value", "arrived");
+
+      onUpdate.mockClear();
+      el.dispatchEvent(new CustomEvent("test:value-changed", { detail: "next" }));
+      expect(onUpdate).toHaveBeenCalledWith("value", "next");
+
+      unbind();
+      el.dispatchEvent(new CustomEvent("test:value-changed", { detail: "after-unbind" }));
+      expect(onUpdate).not.toHaveBeenCalledWith("value", "after-unbind");
+    });
+
+    it("registers nothing when the cleanup runs while the wait is still pending", async () => {
+      const tag = uniqueTag("cancelled");
+      const el = document.createElement(tag);
+      const onUpdate = vi.fn();
+
+      const unbind = bind(el, onUpdate, { syncOn: "define" });
+      unbind();
+
+      defineUpgrading(tag, lateBindableClass("never-delivered"), el);
+      await customElements.whenDefined(tag);
+      await Promise.resolve();
+
+      expect(onUpdate).not.toHaveBeenCalled();
+
+      // No listener was installed either, so a later event stays silent.
+      el.dispatchEvent(new CustomEvent("test:value-changed", { detail: "x" }));
+      expect(onUpdate).not.toHaveBeenCalled();
+
+      // Idempotent, as always.
+      expect(() => unbind()).not.toThrow();
+    });
+
+    it("does not wait for a plain dashless element", () => {
+      const el = document.createElement("div");
+      const onUpdate = vi.fn();
+      const whenDefinedSpy = vi.spyOn(customElements, "whenDefined");
+
+      try {
+        const unbind = bind(el, onUpdate, { syncOn: "define" });
+        expect(whenDefinedSpy).not.toHaveBeenCalled();
+        expect(onUpdate).not.toHaveBeenCalled();
+        expect(() => unbind()).not.toThrow();
+      } finally {
+        whenDefinedSpy.mockRestore();
+      }
+    });
+
+    it("does not wait for a non-element target", () => {
+      const whenDefinedSpy = vi.spyOn(customElements, "whenDefined");
+      try {
+        for (const target of [null, undefined, {}, new EventTarget()]) {
+          expect(() => bind(target, () => {}, { syncOn: "define" })()).not.toThrow();
+        }
+        expect(whenDefinedSpy).not.toHaveBeenCalled();
+      } finally {
+        whenDefinedSpy.mockRestore();
+      }
+    });
+
+    it("registers nothing when the tag is defined but not wc-bindable", async () => {
+      const tag = uniqueTag("plain");
+      const el = document.createElement(tag);
+      const onUpdate = vi.fn();
+
+      const unbind = bind(el, onUpdate, { syncOn: "define" });
+      defineUpgrading(tag, class extends HTMLElement {}, el);
+      await customElements.whenDefined(tag);
+      await Promise.resolve();
+
+      expect(onUpdate).not.toHaveBeenCalled();
+      el.dispatchEvent(new CustomEvent("test:value-changed", { detail: "x" }));
+      expect(onUpdate).not.toHaveBeenCalled();
+      expect(() => unbind()).not.toThrow();
+    });
+
+    it("honours an unbind() called from onUpdate during the deferred initial sync", async () => {
+      // This mode is the first in which the caller holds the unbind
+      // function *before* the initial sync runs, so a self-tearing-down
+      // onUpdate re-enters the cleanup while the registration is only
+      // half-recorded. Without the post-registration disposal re-check,
+      // the listeners installed in that same reaction would stay attached.
+      const tag = uniqueTag("reentrant");
+      const el = document.createElement(tag);
+      const seen: unknown[] = [];
+
+      let unbind: (() => void) | undefined;
+      unbind = bind(el, (_name, value) => {
+        seen.push(value);
+        unbind?.();
+      }, { syncOn: "define" });
+
+      defineUpgrading(tag, lateBindableClass("first"), el);
+      await customElements.whenDefined(tag);
+      await Promise.resolve();
+
+      expect(seen).toEqual(["first"]);
+
+      // The listener installed during that reaction must be gone.
+      el.dispatchEvent(new CustomEvent("test:value-changed", { detail: "after" }));
+      expect(seen).toEqual(["first"]);
+
+      // And the cleanup stays idempotent.
+      expect(() => unbind?.()).not.toThrow();
+      el.dispatchEvent(new CustomEvent("test:value-changed", { detail: "again" }));
+      expect(seen).toEqual(["first"]);
+    });
+
+    it("keeps concurrent waits on the same element independent", async () => {
+      const tag = uniqueTag("shared");
+      const el = document.createElement(tag);
+      const first = vi.fn();
+      const second = vi.fn();
+
+      const unbindFirst = bind(el, first, { syncOn: "define" });
+      bind(el, second, { syncOn: "define" });
+
+      // Cancelling one wait must not disturb the other.
+      unbindFirst();
+
+      defineUpgrading(tag, lateBindableClass("shared-value"), el);
+      await customElements.whenDefined(tag);
+      await Promise.resolve();
+
+      expect(first).not.toHaveBeenCalled();
+      expect(second).toHaveBeenCalledWith("value", "shared-value");
+    });
+
+    it("does not reject for a hyphenated name that can never be a custom element", async () => {
+      // `font-face` and friends contain a `-` but are reserved names, so
+      // `customElements.whenDefined()` returns a *rejected* promise. The
+      // implementation attaches a rejection handler; if it did not, vitest
+      // would fail this run with an unhandled rejection.
+      const el = document.createElement("font-face");
+      const onUpdate = vi.fn();
+
+      expect(() => bind(el, onUpdate, { syncOn: "define" })()).not.toThrow();
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(onUpdate).not.toHaveBeenCalled();
+    });
+
+    it("leaves the default modes unchanged for an un-upgraded element", async () => {
+      // The regression guard for "no default behavior change": under
+      // "call", "connect", and an unrecognized value, an un-upgraded
+      // custom element still takes the historical silent no-op path.
+      const tag = uniqueTag("default");
+      const el = document.createElement(tag);
+      const onCall = vi.fn();
+      const onConnect = vi.fn();
+      const onUnknown = vi.fn();
+
+      bind(el, onCall);
+      bind(el, onConnect, { syncOn: "connect" });
+      bind(el, onUnknown, { syncOn: "later" as unknown as "call" });
+
+      defineUpgrading(tag, lateBindableClass("ignored"), el);
+      await customElements.whenDefined(tag);
+      await Promise.resolve();
+
+      expect(onCall).not.toHaveBeenCalled();
+      expect(onConnect).not.toHaveBeenCalled();
+      expect(onUnknown).not.toHaveBeenCalled();
+    });
+  });
 });

@@ -245,21 +245,71 @@ export interface BindOptions {
    *   `syncOn: "call"` from inside that hook rather than relying on
    *   `syncOn: "connect"`. See SPEC.md § Deferring the Initial Sync Until
    *   Connection.
+   *
+   * - `"define"`: when discovery fails **and** `target` is an element whose
+   *   tag name contains a `-` (i.e. it may still be an un-upgraded custom
+   *   element), defer discovery, listener registration, and the initial
+   *   sync until `customElements.whenDefined(tagName)` resolves, then
+   *   register exactly as `"call"` would. When discovery already succeeds,
+   *   `"define"` is indistinguishable from `"call"` — same synchronous
+   *   frame, same ordering. This is the option that distinguishes "this
+   *   target is not wc-bindable" from "this custom element has not
+   *   upgraded yet"; without it both collapse into the same silent no-op
+   *   cleanup. See SPEC.md § Deferring Discovery Until Definition.
+   *
+   *   Note that `"define"` and `"connect"` do not compose: a deferred
+   *   `"define"` bind performs its initial sync at definition time, not at
+   *   connection time. A composite form (array / object `syncOn`) is a
+   *   possible future addition and would be purely additive.
    */
-  syncOn?: "call" | "connect";
+  syncOn?: "call" | "connect" | "define";
 }
 
 // DOM globals are accessed through these locals so that the module
 // imports cleanly in headless runtimes (Node, Deno, Workers) where
-// `HTMLElement` / `document` / `MutationObserver` are not defined as
-// globals. When any of them is undefined, the `syncOn: "connect"` path
-// silently falls back to the synchronous `"call"` path.
+// `HTMLElement` / `document` / `MutationObserver` / `customElements` are
+// not defined as globals. When any of them is undefined, the
+// `syncOn: "connect"` and `syncOn: "define"` paths silently fall back to
+// the synchronous `"call"` path.
 const HTMLElementCtor: typeof HTMLElement | undefined =
   typeof HTMLElement !== "undefined" ? HTMLElement : undefined;
 const documentRef: Document | undefined =
   typeof document !== "undefined" ? document : undefined;
 const MutationObserverCtor: typeof MutationObserver | undefined =
   typeof MutationObserver !== "undefined" ? MutationObserver : undefined;
+const customElementsRef: CustomElementRegistry | undefined =
+  typeof customElements !== "undefined" ? customElements : undefined;
+
+/**
+ * Return the tag name to wait on when discovery failed but `target` may
+ * still be an un-upgraded custom element, or `undefined` when there is
+ * nothing to wait for.
+ *
+ * The gate is deliberately narrow — a `-` in the tag name is the only
+ * signal the platform gives us before upgrade, and it is exactly the
+ * condition under which `customElements.whenDefined()` could ever resolve.
+ * A dashless element, a synthetic `EventTarget`, a plain object, `null`,
+ * and a runtime without `customElements` all return `undefined` so the
+ * caller falls straight through to the historical no-op.
+ *
+ * Like the discovery helper, this MUST NOT throw on any input shape: a
+ * hostile `Proxy` can raise from the `instanceof` (`Symbol.hasInstance`)
+ * check or from the `localName` read, so the whole body is wrapped.
+ */
+function pendingCustomElementTag(target: unknown): string | undefined {
+  if (customElementsRef === undefined || HTMLElementCtor === undefined) return undefined;
+  try {
+    if (!(target instanceof HTMLElementCtor)) return undefined;
+    // `localName` (not `tagName`) because custom element names are always
+    // lowercase while `tagName` is upper-cased for HTML elements, and
+    // `whenDefined()` matches on the lowercase name.
+    const tag = target.localName;
+    if (typeof tag !== "string" || !tag.includes("-")) return undefined;
+    return tag;
+  } catch {
+    return undefined;
+  }
+}
 
 export function bind(
   target: unknown,
@@ -280,7 +330,118 @@ export function bind(
   // true but bind() silently no-ops on the same target. "Protocol-valid"
   // is not a security predicate (see SPEC.md § Trust Boundaries).
   const decl = getWcBindableDeclaration(target);
-  if (decl === undefined) return () => {};
+  if (decl !== undefined) return bindDeclared(target, decl, onUpdate, options);
+
+  // Discovery failed. Under the default `"call"` (and under `"connect"`,
+  // and under any unrecognized value per the unknown-syncOn fallback) that
+  // is terminal — return the historical no-op. Only `"define"` asks us to
+  // distinguish "not bindable" from "not upgraded yet".
+  if ((options?.syncOn ?? "call") !== "define") return () => {};
+  const tag = pendingCustomElementTag(target);
+  if (tag === undefined) return () => {};
+  return bindWhenDefined(target, tag, onUpdate, options);
+}
+
+/**
+ * `syncOn: "define"` deferral. Waits for `customElements.whenDefined(tag)`,
+ * re-runs discovery against the (now upgraded) target, and — if it is
+ * bindable — hands off to the ordinary `bindDeclared()` path.
+ *
+ * The cleanup returned here is safe to call while the wait is pending: it
+ * cancels the pending work and registers nothing, even if the tag is
+ * defined later. What it cannot do is cancel the underlying promise —
+ * `whenDefined()` offers no such affordance — so the closure (and with it
+ * the `target` reference) stays reachable until the tag is defined. For a
+ * tag that is never defined, that lives as long as the registry does.
+ */
+function bindWhenDefined(
+  target: unknown,
+  tag: string,
+  onUpdate: (name: string, value: unknown) => void,
+  options?: BindOptions,
+): UnbindFn {
+  let disposed = false;
+  let inner: UnbindFn | undefined;
+
+  let pending: Promise<unknown>;
+  try {
+    pending = customElementsRef!.whenDefined(tag);
+  } catch {
+    // A registry whose whenDefined() throws synchronously is non-conformant
+    // (the DOM spec mandates a rejected promise), but bind()'s MUST-NOT-
+    // throw-on-invalid-input posture applies here too.
+    return () => {};
+  }
+
+  pending.then(
+    () => {
+      if (disposed) return;
+      // `define()` upgrades elements that are already in a document, but a
+      // detached element is only upgraded on insertion. Ask for it
+      // explicitly so the "create imperatively → bind → append later"
+      // pattern is not silently excluded. On an already-upgraded element
+      // this is a no-op.
+      try {
+        customElementsRef!.upgrade?.(target as Node);
+      } catch {
+        /* non-conformant / minimal registry — fall through to discovery */
+      }
+      const decl = getWcBindableDeclaration(target);
+      // Defined, but not wc-bindable after all: this is case 1 from
+      // SPEC.md § Deferring Discovery Until Definition, arrived at one
+      // microtask late. Register nothing, exactly as the synchronous
+      // discovery failure would have.
+      if (decl === undefined) return;
+      try {
+        inner = bindDeclared(target, decl, onUpdate, options);
+        // Unlike the synchronous path, the caller ALREADY holds this
+        // closure's unbind function while the deferred initial sync runs —
+        // so an `onUpdate` that tears itself down re-enters the cleanup
+        // below at a moment when `inner` is still unassigned, and would
+        // otherwise leave the listeners bindDeclared() just installed
+        // attached forever. Re-check the flag once bindDeclared() returns
+        // and honour the disposal that happened underneath it. (The
+        // `syncOn: "connect"` path has no equivalent hole: its listeners
+        // are already in the shared cleanup list before the deferred sync
+        // runs.)
+        if (disposed) {
+          const late = inner;
+          inner = undefined;
+          late();
+        }
+      } catch (err) {
+        // bindDeclared() already tore down everything it installed. Mark
+        // this closure disposed so the caller's later unbind() is a literal
+        // no-op, mirroring the deferred-throw rule in § Teardown Contract.
+        disposed = true;
+        throw err;
+      }
+    },
+    // Rejection handler passed as the SECOND argument to .then(), NOT a
+    // trailing .catch(): it swallows only whenDefined()'s own rejection —
+    // the reserved SVG/MathML names (`font-face`, `annotation-xml`,
+    // `missing-glyph`, …) contain a hyphen yet are not valid custom element
+    // names, so the registry rejects with a SyntaxError that is not an
+    // error the consumer can act on. A throw from the fulfillment handler
+    // above lands on the *derived* promise and is therefore NOT swallowed
+    // here — it stays observable as an unhandled rejection, per
+    // § Teardown Contract.
+    () => { /* not a valid custom element name — nothing will ever define it */ },
+  );
+
+  return () => {
+    if (disposed) return;
+    disposed = true;
+    inner?.();
+  };
+}
+
+function bindDeclared(
+  target: unknown,
+  decl: WcBindableDeclaration,
+  onUpdate: (name: string, value: unknown) => void,
+  options?: BindOptions,
+): UnbindFn {
   // After the discovery guard, `target` is known to expose
   // addEventListener / removeEventListener (the helper's EventTarget
   // capability check), so the assertion below is safe — narrowing

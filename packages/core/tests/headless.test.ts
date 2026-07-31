@@ -72,6 +72,33 @@ describe("headless runtime (no HTMLElement / document / MutationObserver)", () =
     expect(onUpdate).toHaveBeenCalledWith("value", "headless");
   });
 
+  it("syncOn: \"define\" silently falls back when customElements is missing", () => {
+    // Same shape as the "connect" fallback above, for the other DOM global
+    // the deferred paths touch. A headless runtime has no custom element
+    // registry at all, so the "is this an un-upgraded custom element?"
+    // question can never be answered — bind() must take the synchronous
+    // path rather than throwing a ReferenceError on `customElements`.
+    expect(typeof customElements).toBe("undefined");
+
+    class HeadlessCore extends EventTarget {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [{ name: "value", event: "core:value-changed" }],
+      };
+      value = "headless";
+    }
+    const onUpdate = vi.fn();
+
+    expect(() => bind(new HeadlessCore(), onUpdate, { syncOn: "define" })).not.toThrow();
+    expect(onUpdate).toHaveBeenCalledWith("value", "headless");
+
+    // A non-bindable target still returns the no-op cleanup, without
+    // touching the absent registry.
+    const noop = bind({}, onUpdate, { syncOn: "define" });
+    expect(() => noop()).not.toThrow();
+  });
+
   it("returns a working unbind() that removes listeners in headless mode", () => {
     class HeadlessCore extends EventTarget {
       static wcBindable: WcBindableDeclaration = {
