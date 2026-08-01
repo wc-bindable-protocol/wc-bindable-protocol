@@ -16,7 +16,8 @@
   ],
   "scripts": {
     "build": "tsc",
-    "dev": "tsc --watch"
+    "dev": "tsc --watch",
+    "test:integration": "playwright test"
   },
   "dependencies": {
     "@wc-bindable/core": "^0.8.0"

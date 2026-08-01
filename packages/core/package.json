@@ -18,7 +18,8 @@
   ],
   "scripts": {
     "build": "tsc",
-    "dev": "tsc --watch"
+    "dev": "tsc --watch",
+    "test:integration": "playwright test"
   },
   "repository": {
     "type": "git",

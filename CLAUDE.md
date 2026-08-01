@@ -23,11 +23,16 @@ npx vitest run -t "name fragment"              # filter by test name
 npm test --workspace @wc-bindable/remote       # only one package
 ```
 
-Remote integration tests (Playwright, real WebSocket — excluded from `npm test`):
+Integration tests (Playwright, real browser — excluded from `npm test`). All three need `npm run build` first, because they load the packages' built `dist/` through an import map rather than the TypeScript source:
 
 ```bash
-npm run test:integration --workspace @wc-bindable/remote
+npm run build                                            # required first
+npm run test:integration --workspace @wc-bindable/remote  # real WebSocket round-trip
+npm run test:integration --workspace @wc-bindable/core    # real custom element upgrade
+npm run test:integration --workspace @wc-bindable/alpine  # real upgrade, through Alpine's scope tree
 ```
+
+The `core` and `alpine` suites exist for one reason: **happy-dom does not implement custom element upgrade**, which is the platform behavior `syncOn: "define"` is built on. Two divergences (verified against happy-dom 20.8.3) make the relevant cases untestable under vitest — an instance created before `customElements.define()` keeps `constructor === HTMLElement` forever even after `customElements.upgrade()`, and an element already in the document has its *node replaced* by `define()` rather than upgraded in place. The unit tests simulate the prototype swap, which pins our logic but not the platform's half of the contract; these suites cover the rest. Anything that depends on a real upgrade belongs here, not in `tests/*.test.ts`.
 
 `npm install` requires `--legacy-peer-deps`: `@qwik.dev/core@2.0.0-beta.35` declares a peer of `vitest@">=2 <4"`, but the repo is on `vitest@^4`. The conflict is benign for our test suite, but plain `npm install` will ERESOLVE-fail.
 
