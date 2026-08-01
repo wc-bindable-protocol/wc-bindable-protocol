@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>wc-bindable Alpine integration harness</title>
+  <script type="importmap">
+    {
+      "imports": {
+        "@wc-bindable/core": "/packages/core/dist/index.js",
+        "@wc-bindable/alpine": "/packages/alpine/dist/index.js",
+        "alpinejs": "/vendor/alpine.esm.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <!-- `late-alpine` is deliberately NOT defined when this page loads. The
+       spec defines it afterwards, which is the whole scenario. -->
+  <div id="scope" x-data="{ value: '' }">
+    <late-alpine id="target" x-wc-bindable></late-alpine>
+    <span id="out" x-text="value"></span>
+  </div>
+
+  <div id="ready">starting</div>
+
+  <script type="module">
+    import Alpine from "alpinejs";
+    import wcBindablePlugin from "@wc-bindable/alpine";
+
+    // `?syncOn=call` exercises the opt-out. The plugin takes its option once
+    // at registration because Alpine directives have no per-element slot,
+    // so the two modes need two page loads rather than two elements.
+    const requested = new URLSearchParams(location.search).get("syncOn");
+
+    Alpine.plugin(
+      requested
+        ? (alpine) => wcBindablePlugin(alpine, { syncOn: requested })
+        : wcBindablePlugin,
+    );
+
+    window.Alpine = Alpine;
+    Alpine.start();
+
+    document.getElementById("ready").textContent = "ready";
+  </script>
+</body>
+</html>

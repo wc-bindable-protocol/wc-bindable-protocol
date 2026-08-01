@@ -133,7 +133,10 @@ describe("x-wc-bindable", () => {
 // and an orphaned node has none, so the directive's callback has nowhere to
 // write.
 //
-// The behavior is covered at the protocol level by CONFORMANCE.md vector 38
-// and packages/core/tests/index.test.ts § syncOn: define, which exercise the
-// same code path this plugin delegates to. Re-testing it here needs a real
-// browser; the natural home is a Playwright integration suite.
+// It IS covered, in a real browser, by
+// packages/alpine/tests/integration/lateDefinition.spec.ts — run it with
+// `npm run test:integration --workspace @wc-bindable/alpine`. That suite is
+// excluded from `npm test` because it needs Playwright and a built `dist/`.
+// The protocol-level behavior it delegates to is additionally covered by
+// CONFORMANCE.md vector 38, packages/core/tests/index.test.ts § syncOn:
+// define, and packages/core/tests/integration/syncOnDefine.spec.ts.

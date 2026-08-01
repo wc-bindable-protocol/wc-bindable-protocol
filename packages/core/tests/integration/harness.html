@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>wc-bindable core integration harness</title>
+  <script type="importmap">
+    {
+      "imports": {
+        "@wc-bindable/core": "/packages/core/dist/index.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="module">
+    // Every test drives the page through `page.evaluate`, so the harness
+    // only has to do two things: make the bare specifier resolvable (via the
+    // import map above) and record the two async error channels the spec
+    // distinguishes.
+    //
+    // SPEC.md § Teardown Contract pins them apart: a deferred `"connect"`
+    // sync throws inside a MutationObserver callback and surfaces as an
+    // uncaught error, while a deferred `"define"` registration runs in a
+    // promise reaction and surfaces as an unhandled rejection. Asserting
+    // that difference needs both listeners installed before any test code
+    // runs, and needs them to swallow the event so the run stays clean.
+    window.__errors = { uncaught: [], rejections: [] };
+
+    window.addEventListener("error", (e) => {
+      e.preventDefault();
+      window.__errors.uncaught.push(String(e.message ?? e.error));
+    });
+
+    window.addEventListener("unhandledrejection", (e) => {
+      e.preventDefault();
+      window.__errors.rejections.push(String(e.reason?.message ?? e.reason));
+    });
+
+    // Signals to the spec that the import map is live and the listeners are
+    // armed. Tests wait on this before evaluating anything.
+    const { bind, isWcBindable, getWcBindableDeclaration } = await import("@wc-bindable/core");
+    window.__wcb = { bind, isWcBindable, getWcBindableDeclaration };
+    document.getElementById("root").textContent = "ready";
+  </script>
+</body>
+</html>
