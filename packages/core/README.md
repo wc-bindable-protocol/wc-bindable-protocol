@@ -54,7 +54,7 @@ if (isWcBindable(element)) {
 
 | Export | Description |
 |---|---|
-| `bind(target, onUpdate, options?)` | Attaches listeners for every declared property and reads each property's current value. Returns an `UnbindFn` that removes every listener it installed. `options.syncOn` is `"call"` (default) or `"connect"` (defer the initial-value read until `connectedCallback` for unmounted `HTMLElement`s). |
+| `bind(target, onUpdate, options?)` | Attaches listeners for every declared property and reads each property's current value. Returns an `UnbindFn` that removes every listener it installed. `options.syncOn` is `"call"` (default), `"connect"` (defer the initial-value read until `connectedCallback` for unmounted `HTMLElement`s), or `"define"` (defer *discovery* until `customElements.whenDefined()` resolves, for elements whose definition may load later). The two deferrals compose — pass an array, e.g. `["define", "connect"]`. |
 | `getWcBindableDeclaration(target)` | Returns the validated declaration or `undefined`. MUST NOT throw, even on hostile targets — see [SPEC.md § Discovery API](../../SPEC.md#discovery-api). |
 | `isWcBindable(target)` | Type guard wrapping `getWcBindableDeclaration() !== undefined`. Narrows `target` to `WcBindableElement`. |
 | `WcBindableDeclaration` | Type for the `static wcBindable` field. |

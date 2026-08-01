@@ -66,6 +66,8 @@ Compound shorthand: `{1O, 2}` means "Level 1 observer facet + Level 2"; `{3-cons
 | 35 | Fingerprint `protocol` mismatch ⇒ TerminalFailure (always, regardless of strict mode) | `{3-consumer}` and `{3-both}` | Setup: proxy constructed against a local declaration with `protocol: "wc-bindable"`; producer emits a `sync` whose `declarationFingerprint.protocol` is a different string (e.g. `"wc-bindable-2"`) and whose other fingerprint fields match. Expected: (a) every queued pending entry rejects in caller order with `error.code === "WC_BINDABLE_PROTOCOL_ERROR"` (this is the code for the *trigger* — the wire-protocol disagreement that drove the transition); (b) the proxy transitions to TerminalFailure; (c) **after** the transition, subsequent `set` throws synchronously with `error.code === "WC_BINDABLE_TERMINAL_FAILURE"`, and subsequent `setWithAck` / `invoke` return already-rejected promises with the same `WC_BINDABLE_TERMINAL_FAILURE` code (this is the code for *new calls against an already-terminal proxy*, per vector 34's terminal-path rule — distinct from the drain code so the consumer's recovery branch can tell "wire-protocol disagreement caused teardown" apart from "I called set on an already-dead proxy"); (d) **no wire reply is emitted** for the offending `sync` (the new `protocol` identifier means the consumer can no longer prove its envelope shapes would be understood); (e) the transport is signaled to dispose. **Strict mode setting is irrelevant** — the `protocol`-mismatch terminal posture is a MUST regardless of `strictFingerprint` opt-in. This is the breaking-compatibility boundary defined in [SPEC.md § Versioning](SPEC.md#versioning); continuing past a `protocol` mismatch would let a v1 consumer silently process v2-shaped envelopes, the exact silent-corruption scenario [§ Wire format versioning](SPEC-extensions.md#wire-format-versioning) item 4 exists to prevent | [SPEC-extensions.md § Declaration fingerprint](SPEC-extensions.md#declaration-fingerprint) (`protocol differs` bullet) + [§ Wire format versioning](SPEC-extensions.md#wire-format-versioning) item 4 + [§ Error envelope](SPEC-extensions.md#error-envelope) (the three-way code split: `WC_BINDABLE_PROTOCOL_ERROR` for the trigger, `WC_BINDABLE_TERMINAL_FAILURE` for subsequent calls, `WC_BINDABLE_DISPOSED` for consumer-initiated teardown) |
 | 36 | Legacy fingerprint without `protocol` is NOT malformed — falls through to non-`protocol` comparison | `{3-consumer}` and `{3-both}` | Setup: producer emits a `sync` whose `declarationFingerprint` object contains exactly `{ version, properties, inputs, commands }` — the `protocol` field is **omitted entirely** (the legacy-fingerprint shape from before the field was added). Expected: (a) the proxy does NOT transition to TerminalFailure; (b) the proxy does NOT reject any pending entry on the basis of the missing field; (c) the consumer does NOT log a fingerprint-shape / malformed-envelope error (the missing-`protocol`-field case is the legacy-fingerprint bridge, NOT a malformed envelope, and is explicitly carved out from the malformed-`sync` ⇒ terminal rule of vector 23); (d) the proxy proceeds to Active and per-message rules apply normally. The missing-`protocol` axis is treated as **comparison-unavailable** — equivalent to the no-fingerprint legacy fallback applied to that field only. If the remaining fields also match the consumer's local fingerprint, no warning fires; if they differ, the standard non-`protocol` mismatch rule (vector 37) applies | [SPEC-extensions.md § Declaration fingerprint](SPEC-extensions.md#declaration-fingerprint) (`Legacy fingerprint shape (no protocol)` paragraph) |
 | 37 | Non-`protocol` fingerprint mismatch — warn+continue (default mode), TerminalFailure (strict mode) | `{3-consumer}` and `{3-both}`. The strict-mode branch is conditional on implementations that ship a `strictFingerprint` (or equivalent) option; implementations that do not ship strict mode satisfy only the default-mode sub-case | Setup: proxy constructed with a local declaration that agrees with the producer on `protocol` but differs on at least one of `version` / `properties` / `inputs` / `commands` (e.g. local declares `commands: ["fetch"]`, producer's fingerprint carries `commands: ["fetch", "abort"]`). Two sub-cases: **Default mode** — (a) the proxy does NOT transition to TerminalFailure; (b) the consumer logger receives a warn-level entry identifying which field(s) differ; (c) pending queue entries are NOT rejected on the basis of the mismatch (subsequent per-message rejections — e.g. an `invoke("abort")` against a consumer that doesn't know `"abort"` — still fire per their own rules); (d) the proxy proceeds to Active. **Strict mode** (`strictFingerprint: true` or implementation-equivalent) — (a) every queued pending entry rejects in caller order with `error.code === "WC_BINDABLE_PROTOCOL_ERROR"` (the trigger code); (b) the proxy transitions to TerminalFailure; (c) **after** the transition, subsequent `set` throws synchronously with `error.code === "WC_BINDABLE_TERMINAL_FAILURE"`, and subsequent `setWithAck` / `invoke` return already-rejected promises with the same `WC_BINDABLE_TERMINAL_FAILURE` code (per vector 34's terminal-path rule — distinct from the drain code, same separation as vector 35); (d) **no wire reply is emitted**; (e) the transport is signaled to dispose. The split — `protocol` always terminal (vector 35), non-`protocol` opt-in terminal — is the canonical asymmetry between the two compatibility tiers | [SPEC-extensions.md § Declaration fingerprint](SPEC-extensions.md#declaration-fingerprint) (`Non-protocol mismatch` bullet + `Strict-mode opt-in` paragraph) |
+| 38 | Deferred discovery — a late `customElements.define()` completes the bind | `{1O}` for general-purpose browser JS implementations. MAY be skipped **only** under the spec-defined fallback conditions: a runtime without `customElements`, or an explicitly scoped profile documenting non-support of deferred discovery. Ignoring `syncOn: "define"` while claiming general-purpose `{1O}` is a documentation gap, not a skip reason — see body | Binding an un-upgraded custom element with `syncOn: "define"` installs nothing up front; once the tag is defined, the implementation upgrades the target, re-runs discovery, and registers on `syncOn: "call"` terms — delivering both the initial property read and every subsequent event. A cleanup invoked while the wait is pending registers nothing even after a later `define()` and MUST release the target rather than merely flagging the work dead; concurrent waits on the same element are independent and one waiter's throw does not stop its siblings; an `onUpdate` that calls its own `unbind()` during the deferred initial sync leaves no listener attached | [SPEC.md § Deferring Discovery Until Definition](SPEC.md#deferring-discovery-until-definition) |
+| 39 | Deferred discovery — the non-deferral matrix | `{1O}`, same scope and skip conditions as vector 38 (the headless row is REQUIRED even for implementations that skip the rest) | Under `syncOn: "define"`: an already-readable declaration is indistinguishable from `syncOn: "call"` (same synchronous frame, `whenDefined()` never consulted); a dashless element, a non-element target, and a runtime without `customElements` do not wait at all; a tag that is defined but not wc-bindable registers nothing after the single re-run; a reserved hyphenated name (`font-face`, …) produces no unhandled rejection; and `"call"` / `"connect"` / unrecognized values keep the historical silent no-op for an un-upgraded element. Also covers the array form: `["define", "connect"]` gates discovery *and* the initial read independently, order is insignificant, `"call"` entries are inert, duplicates are idempotent, and every malformed shape falls back to `"call"` without throwing | [SPEC.md § Deferring Discovery Until Definition](SPEC.md#deferring-discovery-until-definition) + [§ Composing `syncOn` modes](SPEC.md#composing-syncon-modes) + [§ Teardown Contract](SPEC.md#teardown-contract) |
 
 ---
 
@@ -1889,6 +1891,171 @@ const settled = await Promise.allSettled([sp1, sp2]);
 **Conformance interpretation.** The default-mode behavior reflects the operational reality of partial deploys: a `commands` superset on the producer (added a new command before the consumer was upgraded) is a deployment drift, not a wire-protocol bug, and tearing down the channel would refuse interop with every healthy upgrade window. Strict mode is the appropriate escalation **only** when consumer and producer ship from the same versioned bundle and any drift is by definition a deployment bug. The asymmetry with vector 35's `protocol`-mismatch path is intentional: `protocol` carries breaking-compatibility weight that the other fingerprint fields do not.
 
 **Spec reference.** [SPEC-extensions.md § Declaration fingerprint](SPEC-extensions.md#declaration-fingerprint) (`Non-protocol mismatch` bullet + `Strict-mode opt-in` paragraph + the "Strict mode does NOT govern `protocol` mismatch" blockquote).
+
+---
+
+### 38. `syncOn: "define"` — a late definition delivers initial sync and events; cancelling while pending registers nothing
+
+**Setup.** An element whose tag name is **not yet defined**, bound with `syncOn: "define"`.
+
+> **Applicability.** `{1O}` for general-purpose browser JS implementations. Skipping is appropriate only under the spec-defined fallback conditions in [SPEC.md § Deferring Discovery Until Definition](SPEC.md#deferring-discovery-until-definition): a **non-browser runtime** without `customElements` (the `typeof` guard short-circuits to the synchronous path), or an **explicitly scoped implementation profile** that documents non-support of deferred discovery in its public API surface. As with vector 13, silently ignoring `"define"` while claiming general-purpose `{1O}` is a documentation gap, not a skip reason — and the unknown-`syncOn` fallback is not a skip reason either, since the caller is passing the literal `"define"`.
+>
+> **Harness note.** The reference test environment for this repository (`happy-dom` 20.x) does **not** implement custom element upgrade at all: after `customElements.define()`, an instance created beforehand keeps `constructor === HTMLElement`, and neither insertion nor `customElements.upgrade()` swaps its prototype. This vector is written against real browser semantics. A harness on such an environment MUST either run it in a real browser or simulate the upgrade explicitly (swap the instance's prototype at `define()` time) — the deferred path depends only on the observable result of the upgrade, namely `target.constructor.wcBindable` becoming readable.
+
+```javascript
+// A unique, not-yet-defined tag. Same uniqueness requirement as vector 13:
+// `customElements.define` is process-global and throws on redefinition.
+const tag = `t-late-define-${crypto.randomUUID()}`;
+const target = document.createElement(tag);   // un-upgraded: constructor is HTMLElement
+
+const calls = [];
+const unbind = bind(target, (name, value) => { calls.push([name, value]); }, { syncOn: "define" });
+```
+
+**Action.** Assert nothing has been delivered yet, then define the element and let the `whenDefined()` reaction run:
+
+```javascript
+// Nothing yet: discovery has not succeeded, so no listener is installed
+// and no initial sync has run.
+// calls === []
+
+class T extends HTMLElement {
+  static wcBindable = {
+    protocol: "wc-bindable",
+    version: 1,
+    properties: [{ name: "value", event: "t:value-changed" }],
+  };
+  #value = "arrived";
+  get value() { return this.#value; }
+  set value(v) {
+    this.#value = v;
+    this.dispatchEvent(new CustomEvent("t:value-changed", { detail: v }));
+  }
+}
+customElements.define(tag, T);
+
+// Wait to the next macrotask, for the same reason vector 13 does: the
+// registration runs in a promise reaction (a microtask), and harnesses
+// that re-queue microtasks can need more than one turn.
+await new Promise((r) => setTimeout(r, 0));
+
+target.value = "next";
+```
+
+**Expected.**
+
+```javascript
+calls[0]  // ["value", "arrived"]   ← initial sync, run at definition time
+calls[1]  // ["value", "next"]      ← the listener installed at definition time
+calls.length === 2
+```
+
+- (a) Before `define()`, `calls` is empty: the deferral installs **nothing** — no listener, no initial sync, no observer.
+- (b) After `define()` resolves, the implementation upgrades the target if needed, re-runs discovery, and registers on `syncOn: "call"` terms — the initial-sync read and the listener attach happen in the same reaction, so no event can interleave between them.
+- (c) The value delivered by the initial sync is read **at definition time**, not at `bind()` time.
+- (d) `unbind()` after the definition removes the listener exactly as an ordinary bind would.
+
+**Cancellation sub-case.** Repeat the setup with a fresh tag, call `unbind()` **before** `customElements.define()`, then define:
+
+```javascript
+const unbind = bind(target, cb, { syncOn: "define" });
+unbind();                       // cancels the pending wait
+customElements.define(tag, T);  // arrives afterwards
+await new Promise((r) => setTimeout(r, 0));
+target.dispatchEvent(new CustomEvent("t:value-changed", { detail: "x" }));
+```
+
+Expected: `cb` is never called — no initial sync and **no listener was ever installed**, so the post-definition event is not observed either. A second `unbind()` MUST be a safe no-op, per the idempotency rule in [SPEC.md § Teardown Contract](SPEC.md#teardown-contract).
+
+**Independence sub-case.** Two `bind(..., { syncOn: "define" })` calls on the same un-upgraded element, one of which is cancelled before the definition arrives: the surviving bind MUST still register and deliver on definition. Each `bind()` owns its own disposal state.
+
+**Failure-isolation sub-case.** Two `bind(..., { syncOn: "define" })` calls against the same not-yet-defined **tag**, where the first one's `onUpdate` throws on the initial sync:
+
+```javascript
+bind(first,  () => { throw new Error("boom"); }, { syncOn: "define" });
+bind(second, cb,                                 { syncOn: "define" });
+customElements.define(tag, T);
+await new Promise((r) => setTimeout(r, 0));
+```
+
+Expected: `cb` still receives its initial sync — the first bind's throw MUST NOT prevent the second from registering — and the throw is still reported on the channel from [SPEC.md § Teardown Contract](SPEC.md#teardown-contract) (an unhandled rejection, distinct from the uncaught error that `syncOn: "connect"` produces). This sub-case exists because implementations are expected to pool waits per tag name to satisfy the release rule below, and a shared reaction makes cross-bind failure coupling possible in a way that a reaction-per-bind implementation could not produce.
+
+**Release-on-cancel requirement.** A cleanup invoked while the wait is pending MUST drop the target from whatever the pending wait retains, not merely flag the work as dead. `whenDefined()` cannot be cancelled and a promise reaction pins what it closes over until the promise settles, so a reaction-per-bind implementation retains every cancelled bind's target until the tag is defined — unboundedly, under mount/unmount churn against a tag that never arrives.
+
+Retention is not directly assertable in a portable harness (it needs `WeakRef` + a forced GC, or a heap snapshot). Two observable proxies are:
+
+- **One wait per tag.** Spy on `customElements.whenDefined` and assert that N deferred binds against the same not-yet-defined tag call it **once**, not N times.
+- **Re-arm after drain.** Cancel every pending bind on a tag, then bind again on the same tag and define it: the later bind MUST still register. This pins the "keep the pool entry when its set drains" behavior — an implementation that deletes the entry re-arms a fresh reaction per churn cycle and is back to accumulating one per bind.
+
+Pooling is one conformant strategy; an implementation that releases by other means satisfies the requirement and MAY fail the "one wait per tag" proxy, in which case it SHOULD document how release is achieved.
+
+**Re-entrant teardown sub-case.** An `onUpdate` that calls its own `unbind()` during the deferred initial sync:
+
+```javascript
+let unbind;
+const seen = [];
+unbind = bind(target, (name, value) => { seen.push(value); unbind(); }, { syncOn: "define" });
+customElements.define(tag, T);
+await new Promise((r) => setTimeout(r, 0));
+
+target.dispatchEvent(new CustomEvent("t:value-changed", { detail: "after" }));
+```
+
+Expected: `seen` holds exactly the one initial-sync value; the post-teardown event is **not** delivered, i.e. the listener installed during that same reaction was actually removed. This case is unique to `"define"` — it is the first mode in which the caller holds the unbind function *before* the initial sync runs, so a naive implementation that records the inner cleanup only after registration completes re-enters its own teardown while the cleanup slot is still empty and leaks every listener it just installed. A second `unbind()` MUST remain a safe no-op.
+
+**Conformance interpretation.** This vector is what separates "this target is not wc-bindable" from "this custom element has not upgraded yet". Under every other `syncOn` value both cases produce the same silent no-op cleanup, which is correct but indistinguishable; `"define"` is the only mode in which a failed discovery is re-asked, and it is re-asked exactly once.
+
+**Spec reference.** [SPEC.md § Deferring Discovery Until Definition](SPEC.md#deferring-discovery-until-definition) + [§ bind() state machine summary](SPEC.md#bind-state-machine-summary) (AwaitingDefinition → InstallingListeners / NonBindable / Disposed).
+
+---
+
+### 39. `syncOn: "define"` — the non-deferral matrix
+
+**Setup.** Five targets that MUST NOT be deferred, each bound with `syncOn: "define"`.
+
+> **Applicability.** Same as vector 38. The last row (no `customElements`) is the one a headless `{1O}` implementation MUST pass even when it skips the rest.
+
+| Target | Expected |
+|---|---|
+| An element whose declaration is **already readable** | Indistinguishable from `syncOn: "call"`: the initial sync is delivered inside the same synchronous `bind()` frame, before `bind()` returns. The implementation MUST NOT consult `customElements.whenDefined()` at all |
+| A **plain dashless** element (`document.createElement("div")`) | Immediate no-op cleanup; no wait is armed. A dashless tag can never be a custom element, so there is nothing to wait for |
+| A **non-element** target (`null`, `{}`, a bare `EventTarget`, a synthetic proxy that failed validation) | Immediate no-op cleanup; no wait is armed |
+| A hyphenated tag that is **defined but not wc-bindable** | Nothing is registered. The bind resolves one reaction later and takes the NonBindable path — discovery is re-run exactly once and its answer is final |
+| A runtime **without `customElements`** (headless Node / Deno / Workers) | MUST NOT throw. Falls back to the synchronous `"call"` path: a valid declaration binds normally, an invalid one returns the no-op cleanup |
+
+**Reserved-name sub-case.** A hyphenated name that is *not* a valid custom element name — `font-face`, `annotation-xml`, `missing-glyph`, and the rest of the reserved set — passes the `-` gate but causes `customElements.whenDefined()` to return a **rejected** promise (per the DOM standard; verified against happy-dom 20.x, which is spec-compliant here).
+
+```javascript
+const target = document.createElement("font-face");
+const unbind = bind(target, cb, { syncOn: "define" });
+await new Promise((r) => setTimeout(r, 0));
+```
+
+Expected: (a) `bind()` does not throw; (b) `cb` is never called; (c) **no unhandled promise rejection is produced** — the implementation absorbs `whenDefined()`'s own rejection; (d) absorbing it MUST NOT also absorb a throw from the registration path, which is why the conformant shape is a two-argument `.then(onFulfilled, onRejected)` rather than a trailing `.catch()`.
+
+**Default-mode regression sub-case.** The same un-upgraded element bound with `syncOn: "call"`, with `syncOn: "connect"`, and with an unrecognized value (`"later"`) MUST all take the historical silent no-op path even after the tag is later defined. `"define"` changes behavior **only** for callers that opt into it; this sub-case is what pins the "no default behavior change" claim.
+
+**Composition sub-case.** `syncOn: ["define", "connect"]` against an element that is **neither defined nor attached**:
+
+```javascript
+const unbind = bind(target, cb, { syncOn: ["define", "connect"] });
+
+customElements.define(tag, T);
+await new Promise((r) => setTimeout(r, 0));
+// cb has NOT been called: defined, but still detached.
+
+target.value = "at-connection";       // moves after definition
+document.body.appendChild(target);
+await new Promise((r) => setTimeout(r, 0));
+```
+
+Expected: nothing is delivered at definition time, and the initial sync runs at **connection** time reading `target[name]` as of then — `["value", "at-connection"]`, not the value the property held when the definition landed. The two deferrals apply independently: `"define"` gates discovery, `"connect"` then gates the initial read under its ordinary rules from vector 13.
+
+Also required of the array form: **order is not significant** (`["connect", "define"]` behaves identically); `"call"` inside an array is **inert** (`["call", "connect"]` ≡ `["connect"]`); **duplicates are idempotent**; and an empty array, an array of only-unrecognized entries, a non-array non-string (`42`, `null`, `{}`), and a hostile array whose element reads throw all behave as `"call"` **without throwing**.
+
+**Spec reference (composition).** [SPEC.md § Composing `syncOn` modes](SPEC.md#composing-syncon-modes).
+
+**Spec reference.** [SPEC.md § Deferring Discovery Until Definition](SPEC.md#deferring-discovery-until-definition) (the `-` gate, the re-run-once rule, the headless fallback) + [§ Teardown Contract](SPEC.md#teardown-contract) (the `whenDefined()`-rejection callout) + [§ Deferring the Initial Sync Until Connection](SPEC.md#deferring-the-initial-sync-until-connection) (the unknown-`syncOn` fallback).
 
 ---
 

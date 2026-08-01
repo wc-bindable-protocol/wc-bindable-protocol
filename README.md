@@ -114,17 +114,38 @@ For DOM elements that have not yet been connected when `bind()` is called, pass 
 > - **Errors from the deferred initial sync cannot be caught synchronously.** A getter throw or `onUpdate` throw during the deferred sync fires inside a `MutationObserver` microtask and surfaces as an uncaught error on the event loop (`window.onerror` / `reportError` in browsers, `process.on('uncaughtException')` in Node). There is no `try { bind(el, ...) } catch` frame the consumer can wrap to handle it. Consumers that need structured error handling MUST use `syncOn: "call"` from inside their own lifecycle hook so the throw lands on a frame they can catch.
 > - **The deferred path uses a document-wide `MutationObserver`.** Shadow-root non-traversal, one observer per deferred bind, connect-then-disconnect race — full caveat list lives in [SPEC.md § Deferring the Initial Sync Until Connection](SPEC.md#deferring-the-initial-sync-until-connection).
 
+When the element's *definition* may not have arrived yet — an import map that autoloads on first use, a CDN `<script type="module">`, a code-split route — pass `{ syncOn: "define" }` instead. Without it, `bind()` cannot tell "this target is not wc-bindable" from "this custom element has not upgraded yet": both fail discovery, both return the same no-op cleanup, and because the element reference does not change on upgrade, nothing re-runs. `"define"` waits on `customElements.whenDefined(tagName)`, re-runs discovery once, and then registers exactly as `"call"` would.
+
+```javascript
+// <my-counter> may be defined now, or in a moment, or never.
+const unbind = bind(el, onUpdate, { syncOn: "define" });
+```
+
+The default is unchanged, so this only affects calls that opt in. If the declaration is already readable, `"define"` is indistinguishable from `"call"` — same synchronous frame. If the target could never be a custom element (no `-` in the tag name, a headless `EventTarget`, a runtime with no `customElements`), nothing is deferred and you get today's immediate no-op. Full rules in [SPEC.md § Deferring Discovery Until Definition](SPEC.md#deferring-discovery-until-definition).
+
+`"define"` and `"connect"` answer different questions, and they compose — pass both when the element may be *neither* defined nor attached yet:
+
+```javascript
+bind(el, onUpdate, { syncOn: ["define", "connect"] });
+```
+
+That waits for the definition, then still defers the initial read until the element is connected. It is the right combination for an imperative binder handed a detached element; the binders this repository ships for VanJS / MobX / RxJS / Signals use it. Order in the array does not matter, `"call"` inside an array is inert, and unrecognized entries are ignored the same way an unrecognized bare string is.
+
+> **`"define"` does not address the input side.** A property assigned to an element *before* upgrade becomes an own property that shadows the accessor the upgrade installs, so the component's setter never runs. That is the element author's problem to solve (conventionally, by re-applying own properties from `connectedCallback`); no `syncOn` value changes it.
+
 | Situation | Recommended `syncOn` |
 |---|---|
 | React / Vue / Lit / Stencil / Angular — adapter binds from a lifecycle hook | `"call"` |
 | Imperative construction followed by `appendChild()` into light DOM | `"connect"` |
+| The element's definition may load after the binding code runs (import maps, CDN, code splitting) | `"define"` |
+| Imperative construction where the definition may also load late | `["define", "connect"]` |
 | Element may be appended into a shadow root | `"call"` from the host's own `connectedCallback` (document-level `MutationObserver` does not traverse shadow roots) |
-| Bulk-binding many deferred elements at once | Audit first — each deferred bind installs its own document-wide `MutationObserver` |
-| Headless `EventTarget` / remote proxy / test double | `"call"` (the deferred-path gate silently falls back to `"call"` here anyway) |
+| Bulk-binding many deferred elements at once | Audit first — each `"connect"` bind installs its own document-wide `MutationObserver`, and each `"define"` bind holds a pending `whenDefined()` promise until the tag is defined |
+| Headless `EventTarget` / remote proxy / test double | `"call"` (both deferred-path gates silently fall back to `"call"` here anyway) |
 
 ### Runtime note
 
-`@wc-bindable/core` ships **zero `npm` runtime dependencies**. The default `bind(target, onUpdate)` path uses only `static` class fields and standard `addEventListener` / `removeEventListener` calls, so it works unchanged in browsers, Node, Deno, and Cloudflare Workers. The optional `{ syncOn: "connect" }` path additionally touches three DOM globals — `HTMLElement`, `document`, `MutationObserver` — through `typeof` guards; in non-browser runtimes where these are undefined, that path silently degrades to the synchronous `"call"` behavior. The package-manifest no-dependency posture is unaffected either way.
+`@wc-bindable/core` ships **zero `npm` runtime dependencies**. The default `bind(target, onUpdate)` path uses only `static` class fields and standard `addEventListener` / `removeEventListener` calls, so it works unchanged in browsers, Node, Deno, and Cloudflare Workers. The optional `{ syncOn: "connect" }` path additionally touches three DOM globals — `HTMLElement`, `document`, `MutationObserver` — and `{ syncOn: "define" }` touches a fourth, `customElements` — all through `typeof` guards; in non-browser runtimes where these are undefined, both paths silently degrade to the synchronous `"call"` behavior. The package-manifest no-dependency posture is unaffected either way.
 
 ### Security at-a-glance
 

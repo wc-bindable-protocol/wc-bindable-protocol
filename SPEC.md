@@ -95,6 +95,7 @@ Discovery resolves the declaration through a **single path** — `target.constru
 The protocol's failure-handling choices are spread across sections; they share a single model:
 
 - **Discovery never throws** — invalid input ⇒ `undefined` return; hostile access ⇒ `undefined` return (caught internally).
+- **A failed discovery is terminal by default, and `syncOn: "define"` is the sole exception** — `bind()` returning a no-op cleanup means "this target is not bindable *now*", and under `syncOn: "call"` / `"connect"` it also means "and it never will be". The one case where "not now" is genuinely recoverable is an un-upgraded custom element, so `syncOn: "define"` re-runs discovery once, after `customElements.whenDefined()` resolves. There is no general retry, no polling, and no other re-discovery trigger. See [§ Deferring Discovery Until Definition](#deferring-discovery-until-definition).
 - **`bind()` is exception-safe on install** — any throw during listener installation, initial sync, or observer setup MUST tear down whatever the same `bind()` call already installed before propagating the error. See [§ Teardown Contract](#teardown-contract).
 - **Cleanup is best-effort, not error-reporting** — a cleanup callback that throws does NOT abort the remaining cleanups, and the secondary error is swallowed.
 - **`onUpdate` errors after initial sync propagate via the standard event-dispatch path** — the adapter does NOT auto-unbind on consumer throws.
@@ -369,7 +370,7 @@ Level 1 has two facets. An implementation claiming Level 1 MUST specify which:
 | Facet | Scope | What it covers |
 |---|---|---|
 | **1P — Producer conformance** | A target that emits change events for declared properties. | The `static wcBindable` declaration shape (§ Schema); the event-naming convention; the **declaration** of `getter` semantics (a function the dispatched `CustomEvent` payload MUST be interpretable by — the *site* of getter invocation differs by profile: under Level 1O local binding the observer/adapter runs the getter against each received event; under a remote profile the producer-side shell applies it before the value crosses the wire, so the consumer side never sees the function — see [SPEC-extensions.md § Extension 2](SPEC-extensions.md#extension-2--wire-format-remote-proxying) Design invariants invariant 2); the EventTarget-or-equivalent `dispatchEvent` requirement (§ Overview); the no-side-effect-event-dispatch-from-property-getter rule (§ Event detail vs Property Read). |
-| **1O — Observer conformance** | A consumer-side implementation of `bind()`-equivalent semantics. | The consumer-side EventTarget capability rule (`addEventListener` / `removeEventListener`); the `in`-operator initial-sync rule with its `syncOn` modes (§ Initial Value Synchronization, § Deferring); the teardown / exception-safety / partial-delivery rules (§ Teardown Contract); the unknown-`syncOn` fallback (§ Deferring); the `onUpdate` validity rule (§ onUpdate validity). |
+| **1O — Observer conformance** | A consumer-side implementation of `bind()`-equivalent semantics. | The consumer-side EventTarget capability rule (`addEventListener` / `removeEventListener`); the `in`-operator initial-sync rule with its `syncOn` modes, including the deferred-discovery mode (§ Initial Value Synchronization, § Deferring the Initial Sync Until Connection, § Deferring Discovery Until Definition); the teardown / exception-safety / partial-delivery rules (§ Teardown Contract); the unknown-`syncOn` fallback (§ Deferring the Initial Sync Until Connection); the `onUpdate` validity rule (§ onUpdate validity). |
 
 An implementation MAY claim 1P alone (typical: a non-JS server-side component implementation), 1O alone (typical: a JS-only inspector / devtools harness that binds to existing components but never authors them), or both (typical: `@wc-bindable/core`, which exposes both `bind()` for consumers and the declaration-discovery surface every producer needs).
 
@@ -477,8 +478,10 @@ type OnUpdate = (name: string, value: unknown) => void;
 type UnbindFn = () => void;
 
 interface BindOptions {
-  syncOn?: "call" | "connect";  // default: "call"
+  syncOn?: SyncOnMode | SyncOnMode[];  // default: "call"
 }
+
+type SyncOnMode = "call" | "connect" | "define";
 
 /** Discovery primitives. Both MUST accept `unknown` and never throw — see
  *  § Discovery API for the full contract. `target` is typed `unknown`
@@ -522,14 +525,17 @@ const MIN_COMPATIBLE_VERSION = 1;
 
 // DOM globals are referenced through these locals so that the reference
 // implementation runs unmodified in headless runtimes (Node, Deno,
-// Workers) where `HTMLElement` / `document` / `MutationObserver` are not
-// defined as globals. In a headless runtime all three are `undefined`,
-// `syncOn: "connect"` silently falls back to the synchronous `"call"`
-// path, and only `EventTarget`-based targets are touched.
+// Workers) where `HTMLElement` / `document` / `MutationObserver` /
+// `customElements` are not defined as globals. In a headless runtime all
+// four are `undefined`, `syncOn: "connect"` and `syncOn: "define"`
+// silently fall back to the synchronous `"call"` path, and only
+// `EventTarget`-based targets are touched.
 const HTMLElementCtor = typeof HTMLElement !== "undefined" ? HTMLElement : undefined;
 const documentRef = typeof document !== "undefined" ? document : undefined;
 const MutationObserverCtor =
   typeof MutationObserver !== "undefined" ? MutationObserver : undefined;
+const customElementsRef =
+  typeof customElements !== "undefined" ? customElements : undefined;
 
 // Discovery — full schema validation, including descriptor shape and
 // name-uniqueness within properties / inputs / commands. MUST NOT throw
@@ -639,6 +645,40 @@ function isValidCommandDescriptor(p) {
   return true;
 }
 
+// The gate for the `syncOn: "define"` deferral: return the tag name to
+// wait on when discovery failed but `target` may still be an un-upgraded
+// custom element, or undefined when there is nothing to wait for. A `-`
+// in the tag name is the only signal the platform gives before upgrade,
+// and it is exactly the condition under which whenDefined() could ever
+// resolve. MUST NOT throw on any input shape (a hostile Proxy can raise
+// from the instanceof check or the localName read), same posture as
+// getWcBindableDeclaration.
+// Does the caller's syncOn request `mode`? Accepts the bare-string and
+// array forms. MUST NOT throw on a malformed value — an unrecognized
+// string, an array of unrecognized entries, a non-string non-array, and a
+// Proxy-wrapped array whose reads throw all resolve to "not requested",
+// i.e. the "call" default. See § Composing syncOn modes.
+function wantsSyncMode(options, mode) {
+  const syncOn = options?.syncOn;
+  if (syncOn === mode) return true;
+  if (!Array.isArray(syncOn)) return false;
+  try { return syncOn.includes(mode); } catch { return false; }
+}
+
+function pendingCustomElementTag(target) {
+  if (customElementsRef === undefined || HTMLElementCtor === undefined) return undefined;
+  try {
+    if (!(target instanceof HTMLElementCtor)) return undefined;
+    // localName, not tagName: custom element names are lowercase and
+    // whenDefined() matches on the lowercase name.
+    const tag = target.localName;
+    if (typeof tag !== "string" || !tag.includes("-")) return undefined;
+    return tag;
+  } catch {
+    return undefined;
+  }
+}
+
 function bind(target, onUpdate, options) {
   // Programmer error: a non-function onUpdate cannot be reached for an
   // empty-properties target (no event would ever fire it), so defer-and-
@@ -653,7 +693,120 @@ function bind(target, onUpdate, options) {
   // upper bound exists. "Protocol-valid" is not a security predicate
   // (see § Trust Boundaries).
   const decl = getWcBindableDeclaration(target);
-  if (decl === undefined) return () => {};
+  if (decl !== undefined) return bindDeclared(target, decl, onUpdate, options);
+
+  // Discovery failed. Under "call" / "connect" — and under any
+  // unrecognized value, per the unknown-syncOn fallback — that is
+  // terminal. Only "define" asks us to distinguish "not bindable" from
+  // "not upgraded yet". See § Deferring Discovery Until Definition.
+  if (!wantsSyncMode(options, "define")) return () => {};
+  const tag = pendingCustomElementTag(target);
+  if (tag === undefined) return () => {};
+  return bindWhenDefined(target, tag, onUpdate, options);
+}
+
+// Pending "define" waits, pooled per tag name. whenDefined() cannot be
+// cancelled and a promise reaction pins what it closes over until the
+// promise settles, so one reaction per bind() would retain every
+// cancelled bind's target until the tag is defined — forever, for a tag
+// that never is. One reaction per TAG plus a removable waiter entry makes
+// cancellation actually release. The map entry is kept when its set
+// drains so the next bind on the same tag reuses the existing reaction
+// instead of adding another (the churn case); the residual cost is one
+// empty Set per distinct never-defined tag name. See § Deferring
+// Discovery Until Definition.
+const definitionWaiters = new Map();
+
+function addDefinitionWaiter(tag, waiter) {
+  const existing = definitionWaiters.get(tag);
+  if (existing !== undefined) { existing.add(waiter); return true; }
+
+  let pending;
+  try {
+    pending = customElementsRef.whenDefined(tag);
+  } catch {
+    // A registry whose whenDefined() throws synchronously is
+    // non-conformant (the DOM spec mandates a rejected promise), but
+    // bind()'s MUST-NOT-throw-on-invalid-input posture applies here too.
+    return false;
+  }
+
+  const waiters = new Set([waiter]);
+  definitionWaiters.set(tag, waiters);
+  pending.then(
+    () => {
+      // Drop the entry before running anything: a waiter's own initial
+      // sync can re-enter bind() for the same tag, and that call must arm
+      // a fresh wait rather than join a set that is already draining.
+      definitionWaiters.delete(tag);
+      for (const w of [...waiters]) {
+        // Re-checked per iteration: an earlier waiter's onUpdate may have
+        // unbound a later one.
+        if (!waiters.has(w)) continue;
+        // Each bind is independent — one bind's throw MUST NOT stop the
+        // siblings on the same tag from registering. Re-raising on a fresh
+        // rejection keeps the § Teardown Contract reporting channel while
+        // letting the loop continue.
+        try { w(); } catch (err) { void Promise.reject(err); }
+      }
+    },
+    // Rejection handler as the SECOND .then() argument, NOT a trailing
+    // .catch(): it absorbs only whenDefined()'s own rejection (reserved
+    // hyphenated names such as `font-face` are never valid custom element
+    // names, so the registry rejects with a SyntaxError). A throw escaping
+    // the fulfillment handler must stay observable — see § Teardown
+    // Contract.
+    () => { definitionWaiters.delete(tag); },
+  );
+  return true;
+}
+
+function bindWhenDefined(target, tag, onUpdate, options) {
+  let disposed = false;
+  let inner;
+
+  const waiter = () => {
+    if (disposed) return;
+    // define() upgrades elements already in a document, but a detached
+    // element is only upgraded on insertion. Ask explicitly so the
+    // "create imperatively → bind → append later" pattern is not
+    // silently excluded. No-op on an already-upgraded element.
+    try { customElementsRef.upgrade?.(target); } catch {}
+    const decl = getWcBindableDeclaration(target);
+    // Defined, but not wc-bindable after all — register nothing, exactly
+    // as the synchronous discovery failure would have.
+    if (decl === undefined) return;
+    try {
+      inner = bindDeclared(target, decl, onUpdate, options);
+      // Unlike the synchronous path, the caller ALREADY holds this
+      // closure's unbind while the deferred initial sync runs, so an
+      // onUpdate that tears itself down re-enters the cleanup below while
+      // `inner` is still unassigned. Honour that disposal once
+      // bindDeclared() returns, or its listeners leak.
+      if (disposed) { const late = inner; inner = undefined; late(); }
+    } catch (err) {
+      // bindDeclared() already tore down what it installed. Mark this
+      // closure disposed so the caller's later unbind() is a literal
+      // no-op — same rule as the deferred-sync throw in § Teardown
+      // Contract.
+      disposed = true;
+      throw err;
+    }
+  };
+
+  if (!addDefinitionWaiter(tag, waiter)) return () => {};
+
+  return () => {
+    if (disposed) return;
+    disposed = true;
+    // Drop out of the tag's waiter set so a cancelled wait stops
+    // retaining `target` — the whole point of pooling per tag.
+    definitionWaiters.get(tag)?.delete(waiter);
+    if (inner !== undefined) inner();
+  };
+}
+
+function bindDeclared(target, decl, onUpdate, options) {
   // After the discovery guard, `target` is known to expose
   // addEventListener / removeEventListener (the helper's consumer-side
   // capability check — see WcBindableElement in § Normative TypeScript
@@ -706,12 +859,15 @@ function bind(target, onUpdate, options) {
     }
   };
 
-  const syncOn = options?.syncOn ?? "call";
   // Short-circuit when there are no observable properties: the deferred
   // path has nothing to do, and installing a MutationObserver here would
   // violate the "empty properties returns a real no-op cleanup" rule.
+  // Reached from bind() directly AND from the deferred-discovery path,
+  // which forwards the caller's original options — so ["define",
+  // "connect"] still defers the initial sync here after the definition
+  // arrives.
   const canDefer =
-    syncOn === "connect" &&
+    wantsSyncMode(options, "connect") &&
     decl.properties.length > 0 &&
     HTMLElementCtor !== undefined &&
     et instanceof HTMLElementCtor &&
@@ -778,6 +934,10 @@ The `disposed` flag is also set by `runOrCleanup`'s catch path on **every** inst
 
 **If a *deferred* initial-sync (`syncOn: "connect"`) throws** the same cleanup runs — but the error has no synchronous caller to propagate to. The throw originates inside a `MutationObserver` callback (a microtask), so the runtime treats it as an uncaught error: browsers surface it via `window.onerror` / `reportError`, Node surfaces it via `process.on('uncaughtException')`, etc. The unbind function the caller already received remains valid; calling it after the deferred throw is a literal no-op thanks to the re-entry guard mandated by the idempotency MUST above (the throw path already set the closure's `disposed` flag, so the user's later `unbind()` returns immediately without re-walking the cleanup list). Adapters SHOULD treat deferred-throw cleanup as a best-effort safety net — consumers who need structured error handling from initial-sync should use `syncOn: "call"` from inside their own lifecycle hook so that the throw lands on a frame they can catch.
 
+**If a *deferred-discovery* bind (`syncOn: "define"`) throws** — i.e. registration or the initial sync throws after `customElements.whenDefined()` resolved — the same cleanup runs and the same "no synchronous caller" rule applies, but the **reporting channel differs**: the work runs inside a promise reaction, so it surfaces as an **unhandled promise rejection** (`window.onunhandledrejection` / `process.on('unhandledRejection')`), *not* as the uncaught error that the `MutationObserver`-based `"connect"` path produces. Implementations MUST NOT convert one channel into the other. The rule is "report in the category the work actually ran in": a deferred `"define"` registration runs in a promise reaction and a deferred `"connect"` sync runs in an observer callback, and trampolining either one into the other's channel would put a misleading context on the error a consumer has to debug. Note that an implementation which pools waits per tag (see [§ Deferring Discovery Until Definition](#deferring-discovery-until-definition)) must re-raise each waiter's throw explicitly, since it cannot let the throw escape the shared reaction and abort its siblings; re-raising on a fresh rejection keeps this rule satisfied. Everything else is identical to the `"connect"` case: cleanups run before the error escapes, the `disposed` flag is set, and the caller's already-received unbind function stays valid and becomes a literal no-op. Consumers who need structured error handling from a late-defined element should `await customElements.whenDefined(tag)` themselves and then call `bind()` with the default `syncOn: "call"` inside a frame they control.
+
+> **`whenDefined()`'s own rejection is not an adapter error.** `customElements.whenDefined()` rejects with a `SyntaxError` when the name is not a valid custom element name — the reserved hyphenated names (`font-face`, `annotation-xml`, `missing-glyph`, …) satisfy the `-` gate yet can never be defined. That rejection MUST be absorbed by the implementation (it carries no information the consumer can act on and the bind is simply a permanent no-op), and absorbing it MUST NOT also absorb a throw from the registration path above. The conformant shape is a two-argument `.then(onFulfilled, onRejected)` rather than a trailing `.catch()`, so that only the `whenDefined()` rejection reaches the handler while a registration throw propagates on the derived promise.
+
 **If `onUpdate` throws on a post-initial-sync event** — i.e. after `bind()` has returned and a normal change event fires the registered listener — the error propagates out of the event listener via the standard DOM dispatch path (i.e. it becomes an unhandled error on the dispatching event-loop turn). The listener remains attached; the adapter does NOT auto-unbind on consumer throws, and subsequent events continue to fire normally. Consumers that want fail-fast teardown on their own throws are responsible for calling the returned unbind from a catch in their `onUpdate`.
 
 **If a cleanup callback itself throws during the consumer-invoked unbind** — for example, a `Proxy`-wrapped target whose `removeEventListener` raises, or an overridden `observer.disconnect()` — the adapter **MUST** continue running the remaining cleanup callbacks instead of aborting. Without this, a single misbehaving cleanup at the head of the list would orphan every later listener and observer the same `bind()` installed, contradicting the "MUST remove every listener" rule. The conformant pattern is to wrap each cleanup invocation in `try { ... } catch {}` and swallow secondary errors; teardown is best-effort, not error-reporting. (Same rationale and shape as the synchronous initial-sync throw path described above.)
@@ -812,6 +972,7 @@ In `syncOn: "call"` the **event payload is authoritative** in case the initial-s
 |---|---|---|---|
 | `syncOn: "call"` (default) | Inside the same synchronous `bind()` frame | Impossible by construction (listeners + sync delivered in-frame; the only window is consumer-initiated `dispatchEvent` re-entry during the initial-sync loop) | **Event payload** is authoritative (`getter(event)` value is what the consumer holds last) |
 | `syncOn: "connect"` (DOM-deferred) | After the first `MutationObserver`-observed connection | delivered to `onUpdate` in arrival order | **Deferred property read** is authoritative (the post-event deferred sync reads `target[prop.name]` and that read wins last) |
+| `syncOn: "define"` (discovery-deferred) | Inside the same synchronous `bind()` frame when discovery already succeeds; otherwise inside the `whenDefined()` reaction, on `"call"` terms from that point on | Impossible by construction *within* the registration frame — but no listener exists at all before the definition arrives, so pre-definition events are not observed by this bind | **Event payload** is authoritative, same as `"call"` |
 
 The inversion of the "disagreement winner" axis between the two modes is the most-asked design question; see the paragraph above for the rationale (producers should not dispatch on unconnected elements, but when they do the sync-time property read is the better source-of-truth at the moment the consumer first becomes attentive). Consumers who want event-payload-wins semantics on an unconnected target should use `syncOn: "call"` from inside their own lifecycle hook (the normative form of this rule lives in the bullets above).
 
@@ -825,10 +986,11 @@ When `target` is an `HTMLElement` and `bind()` is called before the element has 
 bind(target, onUpdate, { syncOn: "connect" })
 ```
 
-- `syncOn: "call"` (default): perform the initial sync synchronously inside `bind()`. Backward-compatible behavior. Also the fallback for any value other than `"connect"` — see the unknown-value rule below.
+- `syncOn: "call"` (default): perform the initial sync synchronously inside `bind()`. Backward-compatible behavior. Also the fallback for any **unrecognized** value — see the unknown-value rule below.
+- `syncOn: "define"`: defers *discovery* rather than the initial sync, and is documented in [§ Deferring Discovery Until Definition](#deferring-discovery-until-definition). Once discovery succeeds it registers on `"call"` terms, so it never reaches the deferred-sync machinery described in this section.
 - `syncOn: "connect"`: if the target is an `HTMLElement` that is not yet connected, defer the initial sync until the element becomes connected **for the first time**. The reference implementation observes the top-level `document` via a `MutationObserver`. For headless `EventTarget`s and already-connected elements, behaves like `"call"`. The DOM globals (`HTMLElement`, `document`, `MutationObserver`) are referenced through `typeof` guards so that the reference implementation runs unmodified in non-browser runtimes where these globals are undefined — in that case `syncOn: "connect"` silently falls back to the `"call"` path. **Disconnect → reconnect cycles after the first connection do NOT re-trigger the initial sync** — the observer disconnects as soon as the deferred sync fires once. Consumers that need a fresh initial-sync on every re-attach should unbind and re-bind from their own lifecycle hook.
 
-**Unknown `syncOn` values MUST be treated as `"call"`.** TypeScript narrows the field to the `"call" | "connect"` literal union, but JavaScript callers can pass any string (or any value). An implementation MUST NOT throw on an unrecognized value; it MUST fall back to the synchronous default. This matches `bind()`'s overall "MUST NOT throw on invalid input" posture from [§ Normative TypeScript surface](#normative-typescript-surface) — `syncOn` is an input field like any other, and a typo (`"later"`, `"defer"`) is a programmer error best handled by a safe fallback that the consumer can notice via the observed behavior, not by a hard runtime throw. Future spec revisions MAY add new `syncOn` values; older implementations that pre-date those values will then behave as if the caller passed `"call"`, preserving forward compatibility.
+**Unknown `syncOn` values MUST be treated as `"call"`.** TypeScript narrows the field to `SyncOnMode | SyncOnMode[]`, but JavaScript callers can pass any string, any array, or any value at all; the rule below applies to a bare value and to each array entry alike (see [§ Composing `syncOn` modes](#composing-syncon-modes)). An implementation MUST NOT throw on an unrecognized value; it MUST fall back to the synchronous default. This matches `bind()`'s overall "MUST NOT throw on invalid input" posture from [§ Normative TypeScript surface](#normative-typescript-surface) — `syncOn` is an input field like any other, and a typo (`"later"`, `"defer"`) is a programmer error best handled by a safe fallback that the consumer can notice via the observed behavior, not by a hard runtime throw. Future spec revisions MAY add new `syncOn` values; older implementations that pre-date those values will then behave as if the caller passed `"call"`, preserving forward compatibility.
 
 The returned unbind function tears down the `MutationObserver` as well, so cancelling a deferred bind is safe.
 
@@ -837,6 +999,54 @@ The returned unbind function tears down the `MutationObserver` as well, so cance
 > **Connect-then-disconnect race.** `MutationObserver` callbacks are delivered as microtasks, not synchronously. If the host appends the target and then synchronously detaches it again within the same task — for example, a transient mount inside a virtual-DOM diff — the observer callback runs after both mutations and observes `target.isConnected === false`. The reference implementation rechecks `isConnected` inside the callback, so it does NOT fire the initial sync in this case and the observer remains armed; a later re-attach will re-fire the observer and complete the sync. If the target is never re-attached, the observer is held alive until `unbind()` is called and never delivers the initial sync. This is an intentional consequence of "deferred until first real connection" — adapters that need a tighter binding to host lifecycle MUST use `syncOn: "call"` from their own lifecycle hook instead.
 
 > **Synthetic / proxy targets fall back to `"call"` automatically.** Synthetic targets that subclass `EventTarget` rather than `HTMLElement` — typically used by remote proxies, test doubles, and the per-declaration isolated subclasses described in [§ Discovery Contract](#discovery-contract) — fail the `target instanceof HTMLElement` check inside the deferred-path gate and silently fall back to the synchronous `"call"` behavior. This is the desired outcome: deferred-sync presumes a DOM `connectedCallback` lifecycle that proxy/test targets do not have, and the proxy's initial value arrives via its own wire `sync` (see [§ Initial Value Synchronization](#initial-value-synchronization) note) regardless of which `syncOn` value the caller passed. Adapters that wrap `bind()` and forward `syncOn: "connect"` blindly therefore do the right thing on non-DOM targets without special-casing.
+
+#### Deferring Discovery Until Definition
+
+`syncOn: "connect"` defers the initial **sync**; it does not defer **discovery**. The discovery gate runs first and unconditionally, so an element whose definition has not arrived yet fails it and takes the same permanent no-op path as a target that is not wc-bindable at all. `syncOn: "define"` exists to separate those two cases.
+
+```typescript
+bind(target, onUpdate, { syncOn: "define" })
+```
+
+**Normative rule.** If `target` is an element whose tag name contains a `-` and whose constructor does not yet expose a valid wc-bindable declaration, `bind()` **MUST** defer discovery and listener registration until `customElements.whenDefined(tagName)` resolves, then perform the same registration and initial sync as `syncOn: "call"`. If the declaration is already readable, `bind()` **MUST** behave exactly as `syncOn: "call"` — same synchronous frame, same ordering guarantees, no observable difference whatsoever. The returned cleanup **MUST** be safe to call while the wait is pending: it cancels the wait and registers nothing, even if the tag is defined afterwards. Implementations without `customElements` (headless runtimes) **MUST** fall back to the synchronous `"call"` path rather than throwing.
+
+The remaining rules follow from that one:
+
+- **The `-` gate is the whole gate.** A dashless element, a synthetic `EventTarget`, a plain object, and `null` all fail it and take the immediate no-op path. Nothing is deferred for a target that could never become a custom element. The check MUST use the lowercase tag name (`localName`), since custom element names are lowercase and `whenDefined()` matches on that form.
+- **The element MUST be upgraded before the re-run.** `customElements.define()` upgrades elements that are already in a document, but a **detached** element is only upgraded on insertion — so a bind that waited on a detached target would resolve and *still* observe `constructor === HTMLElement`, silently reproducing the failure this mode exists to fix. Implementations therefore **MUST** attempt `customElements.upgrade(target)` (a no-op on an already-upgraded element) before re-running discovery, and MUST tolerate its absence in minimal registries.
+- **Discovery re-runs exactly once.** If the now-defined element is still not wc-bindable, the bind registers nothing and stays a no-op — that is case 1 (genuinely not bindable), arrived at one microtask late. There is no second wait and no retry.
+- **A rejected `whenDefined()` is absorbed, not reported.** See the callout in [§ Teardown Contract](#teardown-contract).
+- **Re-entrant teardown from the deferred initial sync MUST be honoured.** This mode is the first in which the caller holds the unbind function *before* the initial sync runs, so an `onUpdate` that tears its own binding down re-enters the cleanup at a moment when the registration is only half-recorded. Implementations MUST NOT leave the listeners installed during that reaction attached; the cleanup **MUST** end up running exactly once, whether the disposal request arrives before, during, or after the registration. (`syncOn: "connect"` has no equivalent case — its listeners are already recorded in the shared cleanup list before the deferred sync runs.)
+- **`"define"` alone syncs at definition time; combine it with `"connect"` to sync at connection time.** The two deferrals address different questions — "is the declaration readable?" and "has the element been connected?" — and they compose. `syncOn: ["define", "connect"]` waits for the definition, and then, if the now-upgraded element is still detached, defers the initial sync until connection under the ordinary `"connect"` rules. See [§ Composing `syncOn` modes](#composing-syncon-modes).
+
+> **What `"define"` does not do.** It is a one-shot wait on one standard promise, not a retry mechanism. It does not poll, does not observe the registry for unrelated definitions, does not re-discover on attribute or DOM changes, and does not address the **input** side of late definition — a property assigned to an element before upgrade becomes an own property that shadows the prototype accessor the upgrade installs, so the component's setter never runs. That is the element author's problem to solve (conventionally, by re-applying own properties from `connectedCallback`), and no `syncOn` value changes it.
+
+> **Cancellation MUST release the target.** `customElements.whenDefined()` exposes no cancellation affordance, and a promise reaction pins everything it closes over until the promise settles — so an implementation that attaches one reaction per `bind()` call keeps every cancelled bind's `target` alive until the tag is defined, and *forever* for a tag that never is. Under mount / unmount churn against a tag that never arrives (a typo, a code-split chunk that failed to load) that is an unbounded leak. A cleanup invoked while the wait is pending therefore **MUST** drop the target from whatever the pending wait retains, not merely mark the work dead.
+>
+> The reference implementation satisfies this by pooling: one `whenDefined()` reaction **per tag name**, with each pending bind an entry in that tag's waiter set that its own cleanup removes. The pool entry is deliberately kept when its set drains to empty — that is what lets the next bind on the same tag reuse the single existing reaction instead of attaching another one, which is precisely the churn case. The residual cost is one empty set per distinct never-defined tag name, bounded by the number of tag names rather than the number of binds. Pooling is one conformant strategy, not a required one; what is required is the release.
+>
+> **Concurrent waits are independent, and pooling MUST NOT couple them.** Each `bind()` call owns its own disposal state, so cancelling one bind on an element MUST NOT affect any other bind on the same element or tag, and multiple deferred binds MUST all register when the definition arrives. An implementation that shares one reaction across binds MUST additionally isolate failures: a registration or initial-sync throw from one waiter **MUST NOT** prevent the remaining waiters on the same tag from registering. The throw is still reported (see [§ Teardown Contract](#teardown-contract)); it is only the abort-the-others behavior that is forbidden.
+
+#### Composing `syncOn` modes
+
+`syncOn` accepts either a single mode or an **array** of modes:
+
+```typescript
+bind(target, onUpdate, { syncOn: ["define", "connect"] })
+```
+
+`"define"` and `"connect"` defer different things — discovery and the initial-value read — so an implementation **MUST** treat the array as a set of independently-applied deferrals rather than as an ordered pipeline of alternatives. Concretely, for `["define", "connect"]`: discovery is deferred until the definition arrives, and then the resulting registration applies the `"connect"` rule to the initial sync exactly as a plain `syncOn: "connect"` bind would. **Order within the array is not significant** — discovery necessarily precedes the initial sync, so there is no second ordering to express.
+
+- `"call"` inside an array is **inert**: it names the *absence* of a deferral, so `["call", "connect"]` is `["connect"]` and `["call"]` is `"call"`. It is accepted rather than rejected so that a caller assembling the array programmatically does not need to special-case it.
+- **Unrecognized entries are ignored**, exactly as an unrecognized bare string collapses to `"call"` (see the unknown-value rule in [§ Deferring the Initial Sync Until Connection](#deferring-the-initial-sync-until-connection)). An array of only-unrecognized entries, and an empty array, therefore both behave as `"call"`.
+- **Duplicates are idempotent.** `["define", "define"]` is `["define"]`.
+- A `syncOn` that is neither a recognized string nor an array — a number, `null`, an object — behaves as `"call"`. As everywhere else in `bind()`, a malformed value **MUST NOT** throw, and that includes a hostile array whose element reads raise.
+
+The combination exists for one concrete shape: an **imperative binder** that is handed a detached element and appends it later, built from a definition that may not have loaded yet. `"connect"` alone leaves it stuck at the discovery gate; `"define"` alone makes it read pre-`connectedCallback` state. The binders this repository ships for VanJS / MobX / RxJS / Signals are exactly that shape and pass both.
+
+Forward compatibility works in the usual direction: an implementation that predates the array form sees a non-string `syncOn`, fails to recognize it, and falls back to `"call"` — the same safe degradation as any unknown value.
+
+**Why this lives in core rather than in each adapter.** A consumer can already work around late definition by awaiting `customElements.whenDefined()` before mounting whatever calls `bind()`. Three properties of the failure argue for a core-level answer anyway: it is **silent** (no throw, no log, no return value that distinguishes the two cases, so nothing leads a debugging user back to definition timing); it is **uniform** (every adapter that gates on `isWcBindable()` needs the same workaround, and independent implementations of it will diverge); and it is **common** (import-map autoloading, CDN `<script type="module">`, and route-level code-splitting all produce it — for buildless CDN-first distribution it is the normal case). Keeping the vocabulary for "not yet" next to the discovery rule it qualifies is what makes a single answer possible.
 
 ### Repeated Events for the Same Property
 
@@ -865,10 +1075,11 @@ The observable transition rules in §§ [Discovery API](#discovery-api), [Teardo
 
 | State | Entry condition | Behavior in state | Permitted exits |
 |---|---|---|---|
-| **NonBindable** | `getWcBindableDeclaration(target)` returned `undefined` (target is `null`, schema-invalid, lacks consumer-side EventTarget capability, etc.) | `bind()` returned a no-op cleanup (`() => {}`); no listeners installed, no initial sync attempted | → Disposed (cleanup invoked; observably a no-op) |
-| **InstallingListeners** | Declaration valid; entered immediately after discovery | Registration loop attaches one listener per declared property; each cleanup pushed to the closure's cleanup list | → InitialSyncing (`syncOn: "call"`, or `"connect"` falling back to synchronous) <br> → AwaitingConnection (`syncOn: "connect"` on an unconnected `HTMLElement` in a DOM runtime) <br> → Disposed (install-time throw — cleanups run, error rethrown synchronously) |
+| **NonBindable** | `getWcBindableDeclaration(target)` returned `undefined` (target is `null`, schema-invalid, lacks consumer-side EventTarget capability, etc.) **and** the `syncOn: "define"` deferral did not apply | `bind()` returned a no-op cleanup (`() => {}`); no listeners installed, no initial sync attempted | → Disposed (cleanup invoked; observably a no-op) |
+| **AwaitingDefinition** | Discovery returned `undefined`, `syncOn: "define"`, and `target` is an element with a hyphenated tag name in a runtime that has `customElements` | Waiting on `customElements.whenDefined(tagName)`; nothing installed yet, no listeners, no initial sync | → InstallingListeners (definition arrived, `upgrade()` applied, re-run discovery succeeded) <br> → NonBindable (definition arrived but the target is still not wc-bindable; or `whenDefined()` rejected on a reserved name) <br> → Disposed (consumer calls cleanup before the definition arrives — the wait is marked dead and registers nothing thereafter) |
+| **InstallingListeners** | Declaration valid; entered immediately after discovery — synchronously on the first attempt, or in the `whenDefined()` reaction when arriving from AwaitingDefinition | Registration loop attaches one listener per declared property; each cleanup pushed to the closure's cleanup list | → InitialSyncing (`syncOn: "call"` / `"define"`, or `"connect"` falling back to synchronous) <br> → AwaitingConnection (`syncOn: "connect"` on an unconnected `HTMLElement` in a DOM runtime) <br> → Disposed (install-time throw — cleanups run, error rethrown synchronously in the `"call"` path, surfaced as an unhandled rejection when arriving from AwaitingDefinition) |
 | **AwaitingConnection** | `syncOn: "connect"` deferred path armed; `MutationObserver` installed on `document` | No initial-sync `onUpdate` delivered yet, but subsequent change events DO fire normally and reach the consumer per the [Ordering vs subsequent events](#ordering-vs-subsequent-events) rule | → InitialSyncing (target observed as connected) <br> → Disposed (consumer calls cleanup before connection) |
-| **InitialSyncing** | All listeners installed; reading `target[name]` (gated by `in`) for each declared property and delivering `onUpdate` | Synchronous loop in `"call"` mode; runs inside the `MutationObserver` microtask in `"connect"` mode | → Observing (initial sync completes) <br> → Disposed (sync throw — cleanups run; error rethrown synchronously in `"call"` mode, surfaced as an uncaught error on the microtask in `"connect"` mode) |
+| **InitialSyncing** | All listeners installed; reading `target[name]` (gated by `in`) for each declared property and delivering `onUpdate` | Synchronous loop in `"call"` mode; runs inside the `MutationObserver` microtask in `"connect"` mode; runs inside the `whenDefined()` promise reaction for a deferred `"define"` bind | → Observing (initial sync completes) <br> → Disposed (sync throw — cleanups run; error rethrown synchronously in `"call"` mode, surfaced as an uncaught error on the microtask in `"connect"` mode, and as an unhandled rejection for a deferred `"define"` bind) |
 | **Observing** | Initial sync completed | Steady state; listeners deliver `onUpdate` for every dispatched event in DOM dispatch order; `onUpdate` throws after this point propagate via the standard event-dispatch path and do NOT auto-unbind | → Disposed (consumer invokes the returned cleanup) |
 | **Disposed** | Any of the above (install-time throw, deferred-throw, or consumer-invoked cleanup) | Closure's internal `disposed` flag set; subsequent invocations of the cleanup are an unconditional no-op (re-entry guard) | (terminal — `bind()` returns a new closure on the next call, which starts its own state machine) |
 
@@ -877,6 +1088,7 @@ Notes:
 - **Disposed is reached on every install-time throw**, not only consumer-initiated cleanup. The InstallingListeners → Disposed and InitialSyncing → Disposed paths run cleanups *before* the rethrow, so the listener set never leaks even when the caller never received the unbind function. See [§ Teardown Contract](#teardown-contract).
 - The `NonBindable → Disposed` and `Observing → Disposed` paths are the two visible-to-consumer routes; the install-throw paths reach Disposed before the cleanup function would have been returned to the caller, so the consumer's `disposed`-flag observation only matters for those two visible routes.
 - **Empty-`properties: []` declarations** transition InstallingListeners → InitialSyncing → Observing without installing any listener and without delivering any `onUpdate`, returning a functionally no-op cleanup — see [§ Property Descriptor](#property-descriptor). This is distinct from NonBindable: discovery succeeded, just there is nothing to observe.
+- **AwaitingDefinition is the only state entered from a *failed* discovery**, and it is reachable only under `syncOn: "define"`. Every other mode treats the first failed discovery as terminal (NonBindable). The AwaitingDefinition → NonBindable exit is what keeps "discovery == bindability" intact: the deferral changes *when* the question is answered, never *what* counts as an answer. See [§ Deferring Discovery Until Definition](#deferring-discovery-until-definition).
 - A single `bind()` invocation produces ONE closure; a second `bind()` call constructs a fresh state machine independent of the first. Adapters that wrap multiple binds (e.g. framework adapters re-binding on dependency change) run each as its own machine.
 
 ---
