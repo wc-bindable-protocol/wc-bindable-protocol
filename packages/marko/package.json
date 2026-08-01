@@ -1,6 +1,6 @@
 {
   "name": "@wc-bindable/marko",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Marko adapter for wc-bindable protocol",
   "type": "module",
   "main": "dist/index.js",
@@ -24,7 +24,7 @@
     "test:integration": "vitest run --config vitest.integration.config.ts integration"
   },
   "dependencies": {
-    "@wc-bindable/core": "^0.8.0"
+    "@wc-bindable/core": "^0.9.0"
   },
   "peerDependencies": {
     "marko": ">=5"

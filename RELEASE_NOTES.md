@@ -1,3 +1,117 @@
+# v0.9.0
+
+Pre-1.0 minor release built around a single defect: `bind()` could not tell
+**"this target is not wc-bindable"** apart from **"this custom element has not
+upgraded yet"**. Both failed discovery, both returned the same no-op cleanup,
+and because an element keeps its identity across upgrade, nothing ever re-ran
+to notice. The failure was completely silent — no throw, no log, no return
+value a caller could branch on ([#22](https://github.com/wc-bindable-protocol/wc-bindable-protocol/issues/22)).
+
+`core` gains the vocabulary for "not yet", and **every adapter now uses it by
+default**. That default is the one behavior change in this release: an element
+that used to be skipped permanently now binds when its definition lands. Every
+adapter accepts a `syncOn` of your own to opt back out.
+
+## Core
+
+- **`syncOn: "define"`** — when discovery fails and the target is an element
+  whose tag name contains a `-`, `bind()` defers discovery and listener
+  registration until `customElements.whenDefined(tagName)` resolves, upgrades
+  the target, re-runs discovery **once**, and then registers exactly as
+  `syncOn: "call"` would. When the declaration is already readable it is
+  indistinguishable from `"call"` — same synchronous frame, same ordering,
+  `whenDefined()` never consulted.
+- **`syncOn` accepts an array** — `SyncOnMode | SyncOnMode[]`. The two
+  deferrals answer different questions, so an array is a set of independently
+  applied deferrals rather than an ordered pipeline: order is insignificant,
+  `"call"` is inert, duplicates are idempotent, and unrecognized entries are
+  ignored exactly as an unrecognized bare string collapses to `"call"`.
+  `["define", "connect"]` is the correct setting for an imperative binder handed
+  a detached element built from a definition that may not have loaded yet.
+- **`SyncOnMode`** is exported.
+- Deferred waits are **pooled per tag name**, so cancelling a pending bind
+  releases its target instead of pinning it until the tag is defined —
+  unbounded under mount / unmount churn against a tag that never arrives. A
+  waiter that throws is isolated from its siblings and re-raised on its own
+  rejection.
+- The default stays `"call"`. Nothing changes for callers that do not opt in,
+  and an implementation predating the array form degrades to `"call"` in the
+  usual direction.
+
+## Adapters
+
+- All 17 adapters drop the redundant `isWcBindable()` gate — `bind()` has
+  always returned a no-op cleanup for a non-bindable target, and the gate was
+  what prevented `"define"` from ever reaching one.
+- The 13 lifecycle-hook adapters default to `syncOn: "define"`.
+- The 4 imperative binders (`vanjs`, `mobx`, `rxjs`, `signals`) default to
+  `["define", "connect"]` from `createWcBindable().bind()`, since they are
+  handed a detached element and need both deferrals; their standalone
+  `wcBindable()` helper uses `"define"`.
+- Each adapter takes a caller-supplied `syncOn` in whatever slot is idiomatic:
+  an options argument for the hooks and binders, a params field for the Svelte
+  action, `@Input() wcBindableSyncOn` for the Angular directive, a fourth
+  constructor argument for the Lit and Stencil controllers, and a plugin option
+  for Alpine.
+- **`@wc-bindable/lit` / `@wc-bindable/stencil`** no longer re-attach on every
+  host update while nothing is bound. That polling retry only recovered a late
+  target if the host happened to re-render; the single `whenDefined()` wait
+  replaces it.
+- **`@wc-bindable/composite`** is unchanged — it already awaits
+  `customElements.whenDefined()` for every source tag before composing.
+
+## Spec & conformance
+
+- **`SPEC.md`** — adds § Deferring Discovery Until Definition and § Composing
+  `syncOn` modes as normative sections; adds the `AwaitingDefinition` state to
+  the `bind()` state machine; extends § Teardown Contract with the deferred-
+  discovery reporting channel (an unhandled rejection, kept deliberately
+  distinct from the uncaught error the `"connect"` path produces), the
+  `whenDefined()`-rejection rule, and the re-entrant-teardown MUST; and records
+  in § Failure model summary that a failed discovery is terminal with exactly
+  one exception.
+- **`CONFORMANCE.md`** — adds vectors 38 (deferral: late define, cancel-while-
+  pending, independence, failure isolation, re-entrant teardown, release-on-
+  cancel) and 39 (the non-deferral matrix, reserved names, composition, and the
+  default-mode regression).
+
+## Tests
+
+- Two new Playwright suites cover what `happy-dom` cannot express, since it
+  does not implement custom element upgrade at all: `packages/core` for real
+  in-place upgrade, node identity, the `customElements.upgrade()` MUST for
+  detached targets, and the two async error channels; `packages/alpine` for the
+  adapter whose scope resolution needs a node that is still in the tree.
+- Both are excluded from `npm test` and run via `test:integration` per
+  workspace. They load built `dist/`, so `npm run build` must precede them.
+
+## Packages
+
+| Package | Version |
+|---------|---------|
+| `@wc-bindable/core` | 0.9.0 |
+| `@wc-bindable/react` | 0.9.0 |
+| `@wc-bindable/vue` | 0.9.0 |
+| `@wc-bindable/angular` | 0.9.0 |
+| `@wc-bindable/svelte` | 0.9.0 |
+| `@wc-bindable/alpine` | 0.9.0 |
+| `@wc-bindable/lit` | 0.9.0 |
+| `@wc-bindable/marko` | 0.9.0 |
+| `@wc-bindable/mithril` | 0.9.0 |
+| `@wc-bindable/preact` | 0.9.0 |
+| `@wc-bindable/qwik` | 0.9.0 |
+| `@wc-bindable/riot` | 0.9.0 |
+| `@wc-bindable/solid` | 0.9.0 |
+| `@wc-bindable/stencil` | 0.9.0 |
+| `@wc-bindable/vanjs` | 0.9.0 |
+| `@wc-bindable/mobx` | 0.9.0 |
+| `@wc-bindable/rxjs` | 0.9.0 |
+| `@wc-bindable/signals` | 0.9.0 |
+| `@wc-bindable/composite` | 0.9.0 |
+| `@wc-bindable/remote` | 0.9.0 |
+
+---
+
 # v0.8.0
 
 Substantial pre-1.0 minor release. Adds **`@wc-bindable/composite`** as a new
