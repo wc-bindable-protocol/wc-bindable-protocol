@@ -161,3 +161,65 @@ describe("useWcBindable (Qwik 2 / v2 entry)", () => {
     expect(() => runTask(undefined)).not.toThrow();
   });
 });
+
+describe("late definition", () => {
+  /**
+   * Define `tag` late and stand in for the custom element upgrade a real
+   * browser performs inside `define()`. happy-dom does not implement
+   * upgrade at all. See packages/core/tests/index.test.ts § syncOn: define.
+   */
+  function defineLate(tag: string, current: unknown, ...instances: Element[]) {
+    const Cls = class extends HTMLElement {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [{ name: "value", event: `${tag}:value-changed` }],
+      };
+      get value() { return current; }
+    };
+    customElements.define(tag, Cls);
+    for (const el of instances) Object.setPrototypeOf(el, Cls.prototype);
+  }
+
+  it("binds an element defined after the visible task ran", async () => {
+    const tag = "qwik-v2-late-task";
+    const { values } = useWcBindable<HTMLElement, { value: string }>({ value: "" });
+
+    const el = document.createElement(tag);
+    const cleanup = runTask(el);
+
+    el.dispatchEvent(new CustomEvent(`${tag}:value-changed`, { detail: "early" }));
+    expect(values.value).toBe("");
+
+    defineLate(tag, "at-definition", el);
+    await customElements.whenDefined(tag);
+    await Promise.resolve();
+
+    // track(() => ref.value) never re-fires — the deferred bind stands alone.
+    expect(values.value).toBe("at-definition");
+    el.dispatchEvent(new CustomEvent(`${tag}:value-changed`, { detail: "after" }));
+    expect(values.value).toBe("after");
+
+    cleanup();
+    el.dispatchEvent(new CustomEvent(`${tag}:value-changed`, { detail: "gone" }));
+    expect(values.value).toBe("after");
+  });
+
+  it("syncOn: \"call\" opts back into skipping a not-yet-upgraded element", async () => {
+    const tag = "qwik-v2-late-optout";
+    const { values } = useWcBindable<HTMLElement, { value: string }>(
+      { value: "" },
+      { syncOn: "call" },
+    );
+
+    const el = document.createElement(tag);
+    runTask(el);
+
+    defineLate(tag, "ignored", el);
+    await customElements.whenDefined(tag);
+    await Promise.resolve();
+
+    el.dispatchEvent(new CustomEvent(`${tag}:value-changed`, { detail: "after" }));
+    expect(values.value).toBe("");
+  });
+});

@@ -45,7 +45,7 @@ A standalone directive applied via the `wcBindable` attribute selector.
 | `wcBindableChange` | `{ name: string; value: unknown }` | Emitted whenever a bindable property changes |
 
 - Binds on `ngOnInit` and cleans up on `ngOnDestroy`.
-- If the element does not implement `wc-bindable`, the directive is a no-op.
+- If the element does not implement `wc-bindable` — and is not a custom element still waiting for its definition — the directive is a no-op. See [Late-defined elements](#late-defined-elements).
 
 ## Design Notes
 
@@ -54,6 +54,23 @@ This directive uses `@Output()` with `EventEmitter` rather than the newer `outpu
 - **Broader compatibility** — works with Angular 17+ (matching the `peerDependencies` requirement).
 - **Testability** — `@Output()` does not require an injection context, so the directive can be instantiated directly in unit tests.
 - **Stability** — `EventEmitter` is a long-established, stable Angular API with no deprecation planned.
+
+## Late-defined elements
+
+`bind()` is called with `syncOn: "define"` by default, so an element whose custom element
+definition arrives *after* this adapter runs — import-map autoloading, a CDN
+`<script type="module">`, a code-split route — still binds once the definition lands. Nothing
+has to re-run, and no re-render is needed.
+
+Before this default, a not-yet-upgraded element was skipped permanently and silently: discovery
+failed, the adapter returned early, and because the element keeps its identity across upgrade
+nothing ever noticed. Opt back into that behavior with `syncOn: "call"`.
+
+```html
+<my-input wcBindable [wcBindableSyncOn]="'call'" (wcBindableChange)="onChange($event)"></my-input>
+```
+
+See [SPEC.md § Deferring Discovery Until Definition](../../SPEC.md#deferring-discovery-until-definition).
 
 ## Specification
 

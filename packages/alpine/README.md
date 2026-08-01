@@ -53,7 +53,27 @@ Default export. Pass to `Alpine.plugin()` to register the `x-wc-bindable` direct
 | `<target>` (expression) | `string` *(optional)* | Name of an object on the surrounding `x-data` scope. When present, bound properties are written into that object; when omitted, they are written directly onto the scope. |
 
 - Binds on directive setup and cleans up automatically via Alpine's `cleanup` hook.
-- If the element does not implement `wc-bindable`, the directive is a no-op.
+- If the element does not implement `wc-bindable` — and is not a custom element still waiting for its definition — the directive is a no-op. See [Late-defined elements](#late-defined-elements).
+
+## Late-defined elements
+
+`bind()` is called with `syncOn: "define"` by default, so an element whose custom element
+definition arrives *after* this adapter runs — import-map autoloading, a CDN
+`<script type="module">`, a code-split route — still binds once the definition lands. Nothing
+has to re-run, and no re-render is needed.
+
+Before this default, a not-yet-upgraded element was skipped permanently and silently: discovery
+failed, the adapter returned early, and because the element keeps its identity across upgrade
+nothing ever noticed. Opt back into that behavior with `syncOn: "call"`.
+
+```ts
+Alpine.plugin(wcBindablePlugin, { syncOn: "call" });
+```
+
+Alpine directives have no per-element options slot, so this is set once when the plugin is
+registered.
+
+See [SPEC.md § Deferring Discovery Until Definition](../../SPEC.md#deferring-discovery-until-definition).
 
 ## Specification
 

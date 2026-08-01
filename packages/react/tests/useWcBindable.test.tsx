@@ -16,6 +16,27 @@ function defineBindableElement(
   }
 }
 
+/**
+ * Define `tag` late and stand in for the custom element upgrade a real
+ * browser performs inside `define()` — happy-dom does not implement
+ * upgrade at all, so an instance created before the definition keeps
+ * `constructor === HTMLElement` forever. The deferred bind depends only on
+ * the observable result of the upgrade (`constructor.wcBindable` becoming
+ * readable), which the prototype swap reproduces. See
+ * packages/core/tests/index.test.ts § syncOn: define.
+ */
+function defineLate(tag: string, ...instances: Element[]) {
+  const Cls = class extends HTMLElement {
+    static wcBindable: WcBindableDeclaration = {
+      protocol: "wc-bindable",
+      version: 1,
+      properties: [{ name: "value", event: `${tag}:value-changed` }],
+    };
+  };
+  customElements.define(tag, Cls);
+  for (const el of instances) Object.setPrototypeOf(el, Cls.prototype);
+}
+
 const TAG = "test-input";
 defineBindableElement(TAG, {
   protocol: "wc-bindable",
@@ -93,5 +114,58 @@ describe("useWcBindable", () => {
 
     const { getByTestId } = render(React.createElement(NonBindable));
     expect(getByTestId("plain").textContent).toBe("{}");
+  });
+
+  it("binds an element whose definition arrives after mount", async () => {
+    const lateTag = "test-late-react";
+    let captured: Record<string, unknown> = {};
+
+    function Late() {
+      const [ref, values] = useWcBindable<HTMLElement>({ value: "" });
+      captured = values;
+      return React.createElement(lateTag, { ref });
+    }
+
+    const { container } = render(React.createElement(Late));
+    const el = container.querySelector(lateTag)!;
+
+    // Not defined yet: the effect has run and bound nothing observable.
+    el.dispatchEvent(new CustomEvent("test-late-react:value-changed", { detail: "early" }));
+    expect(captured.value).toBe("");
+
+    await act(async () => {
+      defineLate(lateTag, el);
+      await customElements.whenDefined(lateTag);
+    });
+
+    // No re-render, no ref change — the deferred bind completed on its own.
+    await act(() => {
+      el.dispatchEvent(new CustomEvent("test-late-react:value-changed", { detail: "after" }));
+    });
+    expect(captured.value).toBe("after");
+  });
+
+  it("syncOn: \"call\" opts back into skipping a not-yet-upgraded element", async () => {
+    const lateTag = "test-late-react-optout";
+    let captured: Record<string, unknown> = {};
+
+    function Late() {
+      const [ref, values] = useWcBindable<HTMLElement>({ value: "" }, { syncOn: "call" });
+      captured = values;
+      return React.createElement(lateTag, { ref });
+    }
+
+    const { container } = render(React.createElement(Late));
+    const el = container.querySelector(lateTag)!;
+
+    await act(async () => {
+      defineLate(lateTag, el);
+      await customElements.whenDefined(lateTag);
+    });
+
+    await act(() => {
+      el.dispatchEvent(new CustomEvent(`${lateTag}:value-changed`, { detail: "after" }));
+    });
+    expect(captured.value).toBe("");
   });
 });

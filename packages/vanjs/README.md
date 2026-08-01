@@ -15,7 +15,7 @@ npm install @wc-bindable/vanjs vanjs-core
 
 ## API
 
-### `wcBindable(el, onUpdate): unbind`
+### `wcBindable(el, onUpdate, options?): unbind`
 
 Low-level helper. Call it with the DOM node and a callback that receives every
 property update. The adapter does no reactivity wiring — you decide what to do
@@ -29,7 +29,7 @@ with each update (typically writing to a `van.state` you control).
 Returns an `unbind` function. If `el` does not implement the wc-bindable
 protocol, the helper is a no-op and the returned function is safe to call.
 
-### `createWcBindable<V>(initialValues?): WcBindableBinder<V>`
+### `createWcBindable<V>(initialValues?, options?): WcBindableBinder<V>`
 
 Stateful helper. Pre-creates one `van.state` per key in `initialValues` and
 keeps each state's `.val` in sync with the component's matching declared
@@ -114,6 +114,31 @@ const unbind = wcBindable(el, (name, v) => {
 // later
 unbind();
 ```
+
+## Late-defined elements
+
+This package binds with a deferral by default, so an element whose custom element definition
+arrives *after* the binder runs — import-map autoloading, a CDN `<script type="module">`, a
+code-split route — still binds once the definition lands.
+
+| Entry point | Default `syncOn` | Why |
+|---|---|---|
+| `wcBindable(el, onUpdate)` | `"define"` | Wait for the definition, then register as usual |
+| `createWcBindable().bind(el)` | `["define", "connect"]` | This binder is handed a **detached** element, so it also has to defer the initial-value read until the element is attached — the two deferrals compose |
+
+Before these defaults, a not-yet-upgraded element was skipped permanently and silently: discovery
+failed, the binder returned early, and because the element keeps its identity across upgrade
+nothing ever noticed. `syncOn: "connect"` alone did not help — the discovery gate runs first.
+
+Opt back into the historical behavior with `syncOn`:
+
+```ts
+wcBindable(el, onUpdate, { syncOn: "call" });
+createWcBindable({ value: "" }, { syncOn: "connect" });
+```
+
+See [SPEC.md § Deferring Discovery Until Definition](../../SPEC.md#deferring-discovery-until-definition)
+and [§ Composing `syncOn` modes](../../SPEC.md#composing-syncon-modes).
 
 ## Specification
 

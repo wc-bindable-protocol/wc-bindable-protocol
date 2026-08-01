@@ -264,3 +264,88 @@ describe("createWcBindable", () => {
     binder.unbind();
   });
 });
+
+describe("late definition", () => {
+  /**
+   * Define `tag` late and stand in for the custom element upgrade a real
+   * browser performs inside `define()`. happy-dom does not implement
+   * upgrade at all, so an instance created beforehand keeps
+   * `constructor === HTMLElement` forever; the deferred bind depends only
+   * on the observable result (`constructor.wcBindable` becoming readable),
+   * which the prototype swap reproduces. See
+   * packages/core/tests/index.test.ts § syncOn: define.
+   */
+  function defineLate(tag: string, current: unknown, ...instances: Element[]) {
+    const Cls = class extends HTMLElement {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [{ name: "value", event: `${tag}:value-changed` }],
+      };
+      get value() { return current; }
+    };
+    customElements.define(tag, Cls);
+    for (const el of instances) Object.setPrototypeOf(el, Cls.prototype);
+  }
+
+  it("wcBindable() binds an element defined after the call", async () => {
+    const tag = "mobx-late-helper";
+    const el = document.createElement(tag);
+    const onUpdate = vi.fn();
+
+    const unbind = wcBindable(el, onUpdate);
+    el.dispatchEvent(new CustomEvent(`${tag}:value-changed`, { detail: "early" }));
+    expect(onUpdate).not.toHaveBeenCalled();
+
+    defineLate(tag, "at-definition", el);
+    await customElements.whenDefined(tag);
+    await Promise.resolve();
+
+    // Initial sync ran at definition time, and the listener is live.
+    expect(onUpdate).toHaveBeenCalledWith("value", "at-definition");
+    el.dispatchEvent(new CustomEvent(`${tag}:value-changed`, { detail: "after" }));
+    expect(onUpdate).toHaveBeenCalledWith("value", "after");
+
+    unbind();
+    el.dispatchEvent(new CustomEvent(`${tag}:value-changed`, { detail: "gone" }));
+    expect(onUpdate).not.toHaveBeenCalledWith("value", "gone");
+  });
+
+  it("wcBindable() honours syncOn: \"call\" as an opt-out", async () => {
+    const tag = "mobx-late-optout";
+    const el = document.createElement(tag);
+    const onUpdate = vi.fn();
+
+    wcBindable(el, onUpdate, { syncOn: "call" });
+    defineLate(tag, "ignored", el);
+    await customElements.whenDefined(tag);
+    await Promise.resolve();
+
+    el.dispatchEvent(new CustomEvent(`${tag}:value-changed`, { detail: "after" }));
+    expect(onUpdate).not.toHaveBeenCalled();
+  });
+
+  it("createWcBindable().bind() waits for the definition AND the connection", async () => {
+    // The binder default is ["define", "connect"]: the element here is
+    // neither defined nor attached, and both deferrals have to apply.
+    const tag = "mobx-late-binder";
+    const el = document.createElement(tag);
+    const binder = createWcBindable<{ value: string }>({ value: "" });
+
+    binder.bind(el);
+
+    defineLate(tag, "at-connection", el);
+    await customElements.whenDefined(tag);
+    await Promise.resolve();
+
+    // Defined, but still detached — the initial sync is still deferred.
+    expect(binder.state.value).toBe("");
+
+    document.body.appendChild(el);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(binder.state.value).toBe("at-connection");
+
+    binder.unbind();
+    document.body.removeChild(el);
+  });
+});

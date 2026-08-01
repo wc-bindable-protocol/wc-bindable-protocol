@@ -1,15 +1,33 @@
 import m from "mithril";
-import { bind, isWcBindable } from "@wc-bindable/core";
+import { bind, type BindOptions } from "@wc-bindable/core";
 
 export type UnbindFn = () => void;
 export type OnUpdate = (name: string, value: unknown) => void;
 
-export function wcBindable(el: HTMLElement, onUpdate: OnUpdate): UnbindFn {
-  if (!isWcBindable(el)) return () => {};
-  return bind(el, onUpdate);
+export interface WcBindableOptions {
+  /**
+   * Forwarded to `bind()`. Defaults to `"define"` so an element whose
+   * definition arrives after this call still binds — see SPEC.md
+   * § Deferring Discovery Until Definition. Pass `"call"` to opt back into
+   * the historical behavior, where a not-yet-upgraded element is skipped
+   * permanently.
+   */
+  syncOn?: BindOptions["syncOn"];
 }
 
-export interface CreateWcBindableOptions {
+export function wcBindable(
+  el: HTMLElement,
+  onUpdate: OnUpdate,
+  options: WcBindableOptions = {},
+): UnbindFn {
+  // No `isWcBindable()` gate: bind() already returns a no-op cleanup for a
+  // non-bindable target, and the gate is precisely what defeated
+  // `syncOn: "define"` — it fails for a not-yet-upgraded custom element,
+  // and nothing re-runs this call on upgrade.
+  return bind(el, onUpdate, { syncOn: options.syncOn ?? "define" });
+}
+
+export interface CreateWcBindableOptions extends WcBindableOptions {
   redraw?: () => void;
 }
 
@@ -33,11 +51,10 @@ export function createWcBindable<V extends object = Record<string, unknown>>(
     },
     oncreate(vnode) {
       const el = vnode.dom as HTMLElement;
-      if (!isWcBindable(el)) return;
       unbind = bind(el, (name, value) => {
         (state as Record<string, unknown>)[name] = value;
         redraw();
-      });
+      }, { syncOn: options.syncOn ?? "define" });
     },
     onremove() {
       if (unbind) {

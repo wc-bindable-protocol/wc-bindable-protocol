@@ -44,7 +44,7 @@ this.controller = new WcBindableController(this, this);
 
 ## API
 
-### `new WcBindableController<V>(host, target, initialValues?)`
+### `new WcBindableController<V>(host, target, initialValues?, options?)`
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -59,7 +59,24 @@ this.controller = new WcBindableController(this, this);
 - Binds on `hostConnected` and unbinds on `hostDisconnected`.
 - On every host update the target is re-resolved; if it changed, listeners are rebound to the new element.
 - Calls `host.requestUpdate()` whenever a bindable property changes.
-- If the element does not implement `wc-bindable`, the controller is a no-op.
+- If the element does not implement `wc-bindable` — and is not a custom element still waiting for its definition — the controller is a no-op. See [Late-defined elements](#late-defined-elements).
+
+## Late-defined elements
+
+`bind()` is called with `syncOn: "define"` by default, so an element whose custom element
+definition arrives *after* this adapter runs — import-map autoloading, a CDN
+`<script type="module">`, a code-split route — still binds once the definition lands. Nothing
+has to re-run, and no re-render is needed.
+
+Before this default, a not-yet-upgraded element was skipped permanently and silently: discovery
+failed, the adapter returned early, and because the element keeps its identity across upgrade
+nothing ever noticed. Opt back into that behavior with `syncOn: "call"`.
+
+```ts
+new WcBindableController(host, () => this.el, { value: "" }, { syncOn: "call" });
+```
+
+See [SPEC.md § Deferring Discovery Until Definition](../../SPEC.md#deferring-discovery-until-definition).
 
 ## Specification
 
