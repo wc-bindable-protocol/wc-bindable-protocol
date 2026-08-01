@@ -1,6 +1,6 @@
 {
   "name": "@wc-bindable/alpine",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Alpine.js plugin adapter for wc-bindable protocol",
   "type": "module",
   "main": "dist/index.js",
@@ -20,7 +20,7 @@
     "test:integration": "playwright test"
   },
   "dependencies": {
-    "@wc-bindable/core": "^0.8.0"
+    "@wc-bindable/core": "^0.9.0"
   },
   "peerDependencies": {
     "alpinejs": ">=3"
