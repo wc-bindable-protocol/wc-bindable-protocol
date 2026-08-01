@@ -114,3 +114,26 @@ describe("x-wc-bindable", () => {
     expect(document.querySelector("[data-testid='value']")!.textContent).toBe("before");
   });
 });
+
+// ── Late definition ──────────────────────────────────────────────────────
+//
+// The plugin now binds with `syncOn: "define"` by default (configurable via
+// `Alpine.plugin(wcBindablePlugin, { syncOn })`), so an element whose
+// definition arrives after the directive runs still binds. That behavior is
+// NOT covered by a test here, and deliberately so:
+//
+// happy-dom 20.x does not upgrade custom elements in place. For an element
+// that is already in the document, `customElements.define()` **replaces the
+// node** — the original reference is orphaned (`parentElement` becomes
+// undefined and `querySelector` returns a different object), while a fresh
+// node takes its place in the tree. Every other adapter's late-definition
+// test works around this by asserting directly on the orphaned reference,
+// which still carries the listeners the deferred bind installed. Alpine
+// cannot: `Alpine.$data(el)` resolves the scope by walking `el`'s ancestors,
+// and an orphaned node has none, so the directive's callback has nowhere to
+// write.
+//
+// The behavior is covered at the protocol level by CONFORMANCE.md vector 38
+// and packages/core/tests/index.test.ts § syncOn: define, which exercise the
+// same code path this plugin delegates to. Re-testing it here needs a real
+// browser; the natural home is a Playwright integration suite.

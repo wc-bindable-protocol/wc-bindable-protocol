@@ -157,39 +157,53 @@ describe("WcBindableController", () => {
     c.hostDisconnected();
   });
 
-  it("binds on a later hostUpdated when the target becomes wc-bindable in place", () => {
+  it("binds a target whose definition arrives after hostConnected, with no host update", async () => {
+    // Replaces an earlier test that relied on `hostUpdated()` re-attaching
+    // on every host update while nothing was bound — a polling retry that
+    // only recovered a late target if the host happened to re-render.
+    // `syncOn: "define"` (the controller's default) replaces it with a
+    // single `customElements.whenDefined()` wait, so the bind completes
+    // without any host update at all.
     const { host, requestUpdate } = createFakeHost();
 
-    class LateClass extends HTMLElement {}
-    const lateTag = "lit-test-late-upgrade";
-    if (!customElements.get(lateTag)) customElements.define(lateTag, LateClass);
-
-    const el = document.createElement(lateTag);
+    const lateTag = "lit-test-late-define";
+    const el = document.createElement(lateTag);  // not yet defined
 
     const c = new WcBindableController<{ value: string }>(host, el, { value: "" });
     c.hostConnected();
 
     el.dispatchEvent(
-      new CustomEvent("lit-test-late-upgrade:value-changed", { detail: "early" }),
+      new CustomEvent("lit-test-late-define:value-changed", { detail: "early" }),
     );
     expect(c.values.value).toBe("");
     expect(requestUpdate).not.toHaveBeenCalled();
 
-    (LateClass as unknown as { wcBindable: WcBindableDeclaration }).wcBindable = {
-      protocol: "wc-bindable",
-      version: 1,
-      properties: [
-        { name: "value", event: "lit-test-late-upgrade:value-changed" },
-      ],
-    };
+    class LateClass extends HTMLElement {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [
+          { name: "value", event: "lit-test-late-define:value-changed" },
+        ],
+      };
+    }
+    customElements.define(lateTag, LateClass);
+    // happy-dom does not implement custom element upgrade, so stand in for
+    // the prototype swap a real browser performs inside `define()`. See
+    // packages/core/tests/index.test.ts § syncOn: define for the details.
+    Object.setPrototypeOf(el, LateClass.prototype);
 
-    c.hostUpdated();
+    await customElements.whenDefined(lateTag);
+    await Promise.resolve();
 
+    // No hostUpdated() call here — that is the point.
     el.dispatchEvent(
-      new CustomEvent("lit-test-late-upgrade:value-changed", { detail: "after" }),
+      new CustomEvent("lit-test-late-define:value-changed", { detail: "after" }),
     );
     expect(c.values.value).toBe("after");
     expect(requestUpdate).toHaveBeenCalled();
+
+    c.hostDisconnected();
   });
 
   it("performs an initial sync from properties already present on the element", () => {

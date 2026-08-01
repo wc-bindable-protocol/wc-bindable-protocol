@@ -146,15 +146,17 @@ describe("WcBindableController", () => {
     c.disconnect();
   });
 
-  it("binds on a later update() when the target becomes wc-bindable in place", () => {
+  it("binds a target whose definition arrives after connect(), with no update()", async () => {
+    // Replaces an earlier test that relied on `update()` re-attaching on
+    // every host update while nothing was bound — a polling retry that
+    // only recovered a late target if the host happened to re-render.
+    // `syncOn: "define"` (the controller's default) replaces it with a
+    // single `customElements.whenDefined()` wait, so the bind completes
+    // without any update() call at all.
     const host = {};
 
-    class LateClass extends HTMLElement {}
-    const lateTag = "stencil-test-late-upgrade";
-    if (!customElements.get(lateTag))
-      customElements.define(lateTag, LateClass);
-
-    const el = document.createElement(lateTag);
+    const lateTag = "stencil-test-late-define";
+    const el = document.createElement(lateTag);  // not yet defined
 
     const c = new WcBindableController<{ value: string }>(host, el, {
       value: "",
@@ -162,31 +164,41 @@ describe("WcBindableController", () => {
     c.connect();
 
     el.dispatchEvent(
-      new CustomEvent("stencil-test-late-upgrade:value-changed", {
+      new CustomEvent("stencil-test-late-define:value-changed", {
         detail: "early",
       }),
     );
     expect(c.values.value).toBe("");
     expect(forceUpdate).not.toHaveBeenCalled();
 
-    (LateClass as unknown as { wcBindable: WcBindableDeclaration }).wcBindable =
-      {
+    class LateClass extends HTMLElement {
+      static wcBindable: WcBindableDeclaration = {
         protocol: "wc-bindable",
         version: 1,
         properties: [
-          { name: "value", event: "stencil-test-late-upgrade:value-changed" },
+          { name: "value", event: "stencil-test-late-define:value-changed" },
         ],
       };
+    }
+    customElements.define(lateTag, LateClass);
+    // happy-dom does not implement custom element upgrade, so stand in for
+    // the prototype swap a real browser performs inside `define()`. See
+    // packages/core/tests/index.test.ts § syncOn: define for the details.
+    Object.setPrototypeOf(el, LateClass.prototype);
 
-    c.update();
+    await customElements.whenDefined(lateTag);
+    await Promise.resolve();
 
+    // No update() call here — that is the point.
     el.dispatchEvent(
-      new CustomEvent("stencil-test-late-upgrade:value-changed", {
+      new CustomEvent("stencil-test-late-define:value-changed", {
         detail: "after",
       }),
     );
     expect(c.values.value).toBe("after");
     expect(forceUpdate).toHaveBeenCalledWith(host);
+
+    c.disconnect();
   });
 
   it("performs an initial sync from properties already present on the element", () => {

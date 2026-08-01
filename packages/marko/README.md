@@ -15,7 +15,7 @@ npm install @wc-bindable/marko marko
 
 ## API
 
-### `wcBindable(el, onUpdate): unbind`
+### `wcBindable(el, onUpdate, options?): unbind`
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -70,6 +70,23 @@ plain HTML element:
 $ const TAG = "my-input";
 <${TAG} key="input"/>
 ```
+
+## Late-defined elements
+
+`bind()` is called with `syncOn: "define"` by default, so an element whose custom element
+definition arrives *after* this adapter runs — import-map autoloading, a CDN
+`<script type="module">`, a code-split route — still binds once the definition lands. Nothing
+has to re-run, and no re-render is needed.
+
+Before this default, a not-yet-upgraded element was skipped permanently and silently: discovery
+failed, the adapter returned early, and because the element keeps its identity across upgrade
+nothing ever noticed. Opt back into that behavior with `syncOn: "call"`.
+
+```ts
+wcBindable(el, onUpdate, { syncOn: "call" });
+```
+
+See [SPEC.md § Deferring Discovery Until Definition](../../SPEC.md#deferring-discovery-until-definition).
 
 ## Specification
 

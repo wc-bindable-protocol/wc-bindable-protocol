@@ -1,12 +1,29 @@
 import { BehaviorSubject } from "rxjs";
-import { bind, isWcBindable } from "@wc-bindable/core";
+import { bind, type BindOptions } from "@wc-bindable/core";
 
 export type UnbindFn = () => void;
 export type OnUpdate = (name: string, value: unknown) => void;
 
-export function wcBindable(el: Element, onUpdate: OnUpdate): UnbindFn {
-  if (!isWcBindable(el)) return () => {};
-  return bind(el, onUpdate);
+export interface WcBindableOptions {
+  /**
+   * Forwarded to `bind()`. Note the two different defaults: `wcBindable()`
+   * uses `"define"`, while `createWcBindable().bind()` uses
+   * `["define", "connect"]` because it is handed a detached element. Pass
+   * `"call"` to opt back into the historical synchronous behavior.
+   */
+  syncOn?: BindOptions["syncOn"];
+}
+
+export function wcBindable(
+  el: Element,
+  onUpdate: OnUpdate,
+  options: WcBindableOptions = {},
+): UnbindFn {
+  // No `isWcBindable()` gate: bind() already returns a no-op cleanup for a
+  // non-bindable target, and the gate is precisely what defeated
+  // `syncOn: "define"` — it fails for a not-yet-upgraded custom element,
+  // and nothing re-runs this call on upgrade.
+  return bind(el, onUpdate, { syncOn: options.syncOn ?? "define" });
 }
 
 export type WcBindableSubjects<V extends object> = {
@@ -21,6 +38,7 @@ export interface WcBindableBinder<V extends object> {
 
 export function createWcBindable<V extends object = Record<string, unknown>>(
   initialValues: Partial<V> = {},
+  options: WcBindableOptions = {},
 ): WcBindableBinder<V> {
   const subjects = {} as Record<string, BehaviorSubject<unknown>>;
   for (const key of Object.keys(initialValues) as (keyof V)[]) {
@@ -40,10 +58,17 @@ export function createWcBindable<V extends object = Record<string, unknown>>(
         unbindFn();
         unbindFn = null;
       }
-      if (!isWcBindable(el)) return;
-      // syncOn: "connect" defers the initial-value read until the element is
-      // attached to the document so users do not have to sequence
-      // bind() after appendChild() manually.
+      // syncOn: ["define", "connect"] because this binder is handed a
+      // detached element built from a definition that may not have loaded
+      // yet, and both deferrals are needed:
+      //   - "define" so a not-yet-upgraded element is not skipped
+      //     permanently. Without it, the discovery gate fails and nothing
+      //     re-runs when the definition arrives.
+      //   - "connect" so the initial-value read still happens after the
+      //     element is attached, and users do not have to sequence bind()
+      //     after appendChild() manually.
+      // The `isWcBindable()` gate is gone for the same reason: it ran
+      // before "define" could ever help.
       unbindFn = bind(el, (name, value) => {
         const existing = subjects[name];
         if (existing) {
@@ -51,7 +76,7 @@ export function createWcBindable<V extends object = Record<string, unknown>>(
         } else {
           subjects[name] = new BehaviorSubject<unknown>(value);
         }
-      }, { syncOn: "connect" });
+      }, { syncOn: options.syncOn ?? ["define", "connect"] });
     },
     unbind() {
       if (unbindFn) {

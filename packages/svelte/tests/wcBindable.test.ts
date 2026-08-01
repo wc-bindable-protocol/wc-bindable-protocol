@@ -88,3 +88,76 @@ describe("wcBindable action", () => {
     expect(onUpdate).not.toHaveBeenCalled();
   });
 });
+
+describe("late definition", () => {
+  /**
+   * Define `tag` late and stand in for the custom element upgrade a real
+   * browser performs inside `define()`. happy-dom does not implement
+   * upgrade at all. See packages/core/tests/index.test.ts § syncOn: define.
+   */
+  function defineLate(tag: string, current: unknown, ...instances: Element[]) {
+    const Cls = class extends HTMLElement {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [{ name: "value", event: `${tag}:value-changed` }],
+      };
+      get value() { return current; }
+    };
+    customElements.define(tag, Cls);
+    for (const el of instances) Object.setPrototypeOf(el, Cls.prototype);
+  }
+
+  it("binds an element defined after the action ran", async () => {
+    const tag = "svelte-late-action";
+    const el = document.createElement(tag);
+    const onUpdate = vi.fn();
+
+    const action = wcBindable(el, { onUpdate });
+    el.dispatchEvent(new CustomEvent(`${tag}:value-changed`, { detail: "early" }));
+    expect(onUpdate).not.toHaveBeenCalled();
+
+    defineLate(tag, "at-definition", el);
+    await customElements.whenDefined(tag);
+    await Promise.resolve();
+
+    // `update` was never called — the deferred bind completed on its own.
+    expect(onUpdate).toHaveBeenCalledWith("value", "at-definition");
+    el.dispatchEvent(new CustomEvent(`${tag}:value-changed`, { detail: "after" }));
+    expect(onUpdate).toHaveBeenCalledWith("value", "after");
+
+    action?.destroy?.();
+    el.dispatchEvent(new CustomEvent(`${tag}:value-changed`, { detail: "gone" }));
+    expect(onUpdate).not.toHaveBeenCalledWith("value", "gone");
+  });
+
+  it("honours syncOn: \"call\" as an opt-out", async () => {
+    const tag = "svelte-late-optout";
+    const el = document.createElement(tag);
+    const onUpdate = vi.fn();
+
+    wcBindable(el, { onUpdate, syncOn: "call" });
+    defineLate(tag, "ignored", el);
+    await customElements.whenDefined(tag);
+    await Promise.resolve();
+
+    el.dispatchEvent(new CustomEvent(`${tag}:value-changed`, { detail: "after" }));
+    expect(onUpdate).not.toHaveBeenCalled();
+  });
+
+  it("destroy() while the wait is pending registers nothing", async () => {
+    const tag = "svelte-late-cancelled";
+    const el = document.createElement(tag);
+    const onUpdate = vi.fn();
+
+    const action = wcBindable(el, { onUpdate });
+    action?.destroy?.();
+
+    defineLate(tag, "never", el);
+    await customElements.whenDefined(tag);
+    await Promise.resolve();
+
+    el.dispatchEvent(new CustomEvent(`${tag}:value-changed`, { detail: "after" }));
+    expect(onUpdate).not.toHaveBeenCalled();
+  });
+});

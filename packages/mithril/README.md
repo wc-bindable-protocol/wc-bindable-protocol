@@ -14,7 +14,7 @@ npm install @wc-bindable/mithril mithril
 
 ## API
 
-### `wcBindable(el, onUpdate): unbind`
+### `wcBindable(el, onUpdate, options?): unbind`
 
 Low-level helper. Call it from any lifecycle hook that gives you the DOM node;
 the adapter does no redraw — you decide what to do with each update.
@@ -116,6 +116,24 @@ const Form = () => {
   };
 };
 ```
+
+## Late-defined elements
+
+`bind()` is called with `syncOn: "define"` by default, so an element whose custom element
+definition arrives *after* this adapter runs — import-map autoloading, a CDN
+`<script type="module">`, a code-split route — still binds once the definition lands. Nothing
+has to re-run, and no re-render is needed.
+
+Before this default, a not-yet-upgraded element was skipped permanently and silently: discovery
+failed, the adapter returned early, and because the element keeps its identity across upgrade
+nothing ever noticed. Opt back into that behavior with `syncOn: "call"`.
+
+```ts
+wcBindable(el, onUpdate, { syncOn: "call" });
+createWcBindable({ value: "" }, { syncOn: "call" });
+```
+
+See [SPEC.md § Deferring Discovery Until Definition](../../SPEC.md#deferring-discovery-until-definition).
 
 ## Specification
 

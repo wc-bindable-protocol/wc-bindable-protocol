@@ -88,3 +88,63 @@ describe("wcBindable helper", () => {
     expect(onUpdate).not.toHaveBeenCalled();
   });
 });
+
+describe("late definition", () => {
+  /**
+   * Define `tag` late and stand in for the custom element upgrade a real
+   * browser performs inside `define()`. happy-dom does not implement
+   * upgrade at all, so an instance created beforehand keeps
+   * `constructor === HTMLElement` forever; the deferred bind depends only
+   * on the observable result (`constructor.wcBindable` becoming readable),
+   * which the prototype swap reproduces. See
+   * packages/core/tests/index.test.ts § syncOn: define.
+   */
+  function defineLate(tag: string, current: unknown, ...instances: Element[]) {
+    const Cls = class extends HTMLElement {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [{ name: "value", event: `${tag}:value-changed` }],
+      };
+      get value() { return current; }
+    };
+    customElements.define(tag, Cls);
+    for (const el of instances) Object.setPrototypeOf(el, Cls.prototype);
+  }
+
+  it("wcBindable() binds an element defined after the call", async () => {
+    const tag = "marko-late-helper";
+    const el = document.createElement(tag);
+    const onUpdate = vi.fn();
+
+    const unbind = wcBindable(el, onUpdate);
+    el.dispatchEvent(new CustomEvent(`${tag}:value-changed`, { detail: "early" }));
+    expect(onUpdate).not.toHaveBeenCalled();
+
+    defineLate(tag, "at-definition", el);
+    await customElements.whenDefined(tag);
+    await Promise.resolve();
+
+    expect(onUpdate).toHaveBeenCalledWith("value", "at-definition");
+    el.dispatchEvent(new CustomEvent(`${tag}:value-changed`, { detail: "after" }));
+    expect(onUpdate).toHaveBeenCalledWith("value", "after");
+
+    unbind();
+    el.dispatchEvent(new CustomEvent(`${tag}:value-changed`, { detail: "gone" }));
+    expect(onUpdate).not.toHaveBeenCalledWith("value", "gone");
+  });
+
+  it("wcBindable() honours syncOn: \"call\" as an opt-out", async () => {
+    const tag = "marko-late-optout";
+    const el = document.createElement(tag);
+    const onUpdate = vi.fn();
+
+    wcBindable(el, onUpdate, { syncOn: "call" });
+    defineLate(tag, "ignored", el);
+    await customElements.whenDefined(tag);
+    await Promise.resolve();
+
+    el.dispatchEvent(new CustomEvent(`${tag}:value-changed`, { detail: "after" }));
+    expect(onUpdate).not.toHaveBeenCalled();
+  });
+});

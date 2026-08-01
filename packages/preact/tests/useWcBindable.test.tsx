@@ -92,4 +92,41 @@ describe("useWcBindable (Preact)", () => {
     const { getByTestId } = render(h(NonBindable, null));
     expect(getByTestId("plain").textContent).toBe("{}");
   });
+
+  it("binds an element whose definition arrives after mount", async () => {
+    // happy-dom does not implement custom element upgrade, so the helper
+    // stands in for the prototype swap a real browser performs inside
+    // `define()`. See packages/core/tests/index.test.ts § syncOn: define.
+    const tag = "test-preact-late";
+    let captured: Record<string, unknown> = {};
+
+    function Late() {
+      const [ref, values] = useWcBindable<HTMLElement>({ value: "" });
+      captured = values;
+      return h(tag, { ref });
+    }
+
+    const { container } = render(h(Late, null));
+    const el = container.querySelector(tag)!;
+
+    el.dispatchEvent(new CustomEvent(`${tag}:value-changed`, { detail: "early" }));
+    expect(captured.value).toBe("");
+
+    const Cls = class extends HTMLElement {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [{ name: "value", event: `${tag}:value-changed` }],
+      };
+    };
+    customElements.define(tag, Cls);
+    Object.setPrototypeOf(el, Cls.prototype);
+    await customElements.whenDefined(tag);
+    await Promise.resolve();
+
+    // No re-render and no ref change — the deferred bind completed alone.
+    el.dispatchEvent(new CustomEvent(`${tag}:value-changed`, { detail: "after" }));
+    await Promise.resolve();
+    expect(captured.value).toBe("after");
+  });
 });

@@ -103,4 +103,76 @@ describe("useWcBindable (Vue)", () => {
     const wrapper = mount(Comp);
     expect(Object.keys(wrapper.vm.values)).toHaveLength(0);
   });
+
+  it("binds an element whose definition arrives after onMounted", async () => {
+    // happy-dom does not implement custom element upgrade, so the swap
+    // below stands in for the one a real browser performs inside
+    // `define()`. See packages/core/tests/index.test.ts § syncOn: define.
+    const tag = "vue-test-late";
+    const Comp = defineComponent({
+      setup() {
+        const { ref, values } = useWcBindable<HTMLElement>({ value: "" });
+        return { elRef: ref, values };
+      },
+      render() {
+        return h(tag, { ref: "elRef" });
+      },
+    });
+
+    const wrapper = mount(Comp);
+    const el = wrapper.element as HTMLElement;
+
+    el.dispatchEvent(new CustomEvent(`${tag}:value-changed`, { detail: "early" }));
+    await nextTick();
+    expect(wrapper.vm.values.value).toBe("");
+
+    const Cls = class extends HTMLElement {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [{ name: "value", event: `${tag}:value-changed` }],
+      };
+    };
+    customElements.define(tag, Cls);
+    Object.setPrototypeOf(el, Cls.prototype);
+    await customElements.whenDefined(tag);
+    await Promise.resolve();
+
+    // onMounted does not run again — the deferred bind completed alone.
+    el.dispatchEvent(new CustomEvent(`${tag}:value-changed`, { detail: "after" }));
+    await nextTick();
+    expect(wrapper.vm.values.value).toBe("after");
+  });
+
+  it("syncOn: \"call\" opts back into skipping a not-yet-upgraded element", async () => {
+    const tag = "vue-test-late-optout";
+    const Comp = defineComponent({
+      setup() {
+        const { ref, values } = useWcBindable<HTMLElement>({ value: "" }, { syncOn: "call" });
+        return { elRef: ref, values };
+      },
+      render() {
+        return h(tag, { ref: "elRef" });
+      },
+    });
+
+    const wrapper = mount(Comp);
+    const el = wrapper.element as HTMLElement;
+
+    const Cls = class extends HTMLElement {
+      static wcBindable: WcBindableDeclaration = {
+        protocol: "wc-bindable",
+        version: 1,
+        properties: [{ name: "value", event: `${tag}:value-changed` }],
+      };
+    };
+    customElements.define(tag, Cls);
+    Object.setPrototypeOf(el, Cls.prototype);
+    await customElements.whenDefined(tag);
+    await Promise.resolve();
+
+    el.dispatchEvent(new CustomEvent(`${tag}:value-changed`, { detail: "after" }));
+    await nextTick();
+    expect(wrapper.vm.values.value).toBe("");
+  });
 });

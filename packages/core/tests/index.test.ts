@@ -806,15 +806,29 @@ describe("bind", () => {
   });
 
   describe("syncOn: define", () => {
-    // happy-dom (20.x) does not implement custom element *upgrade*. After
-    // `customElements.define()`, an element instance created or parsed
-    // beforehand keeps `constructor === HTMLElement` forever — neither
-    // insertion nor `customElements.upgrade()` swaps its prototype (both
-    // were verified against happy-dom 20.8.3). Real browsers perform the
-    // swap, and the deferred path depends only on its observable result
-    // (`target.constructor.wcBindable` becoming readable), so these tests
-    // perform the swap explicitly at the point the platform would: inside
-    // `customElements.define()`, before `whenDefined()`'s promise resolves.
+    // happy-dom (20.x) does not implement custom element *upgrade*. Two
+    // divergences from real browsers matter, both verified against
+    // happy-dom 20.8.3:
+    //
+    //   1. After `customElements.define()`, an instance created or parsed
+    //      beforehand keeps `constructor === HTMLElement` forever —
+    //      neither insertion nor `customElements.upgrade()` swaps its
+    //      prototype.
+    //   2. For an element already IN the document, `define()` *replaces
+    //      the node*: the original reference is orphaned (`parentElement`
+    //      becomes undefined, `querySelector` returns a different object)
+    //      while a fresh node takes its place. Real browsers upgrade in
+    //      place and preserve node identity.
+    //
+    // Real browsers do (1) as a prototype swap, and the deferred path
+    // depends only on its observable result (`target.constructor.wcBindable`
+    // becoming readable), so these tests perform the swap explicitly at the
+    // point the platform would: inside `customElements.define()`, before
+    // `whenDefined()`'s promise resolves. (2) does not affect these tests —
+    // they assert on the reference they hold, which keeps its listeners —
+    // but it is why the Alpine adapter cannot carry an equivalent test; see
+    // packages/alpine/tests/wcBindable.test.ts for that note.
+    //
     // Per CLAUDE.md § Test environment, an explicit in-test workaround is
     // the sanctioned option for a happy-dom gap.
     function defineUpgrading(tag: string, Ctor: CustomElementConstructor, ...instances: HTMLElement[]): void {

@@ -45,7 +45,7 @@ function App() {
 
 ## API
 
-### `createWcBindable()`
+### `createWcBindable(initialValues?, options?)`
 
 **Returns:** `[values, directive]`
 
@@ -54,7 +54,7 @@ function App() {
 | `values` | `Accessor<Record<string, unknown>>` | Signal with the latest property values |
 | `directive` | `(el: HTMLElement) => void` | Pass to `ref` to bind the element |
 
-### `wcBindable(el, accessor)`
+### `wcBindable(el, accessor, options?)`
 
 Solid directive for use with `use:wcBindable`.
 
@@ -62,6 +62,24 @@ Solid directive for use with `use:wcBindable`.
 |---|---|---|
 | `el` | `HTMLElement` | The target element (provided by Solid) |
 | `accessor` | `Accessor<(name, value) => void>` | Callback invoked on property changes |
+
+## Late-defined elements
+
+`bind()` is called with `syncOn: "define"` by default, so an element whose custom element
+definition arrives *after* this adapter runs — import-map autoloading, a CDN
+`<script type="module">`, a code-split route — still binds once the definition lands. Nothing
+has to re-run, and no re-render is needed.
+
+Before this default, a not-yet-upgraded element was skipped permanently and silently: discovery
+failed, the adapter returned early, and because the element keeps its identity across upgrade
+nothing ever noticed. Opt back into that behavior with `syncOn: "call"`.
+
+```ts
+wcBindable(el, () => onUpdate, { syncOn: "call" });
+const [values, directive] = createWcBindable({ value: "" }, { syncOn: "call" });
+```
+
+See [SPEC.md § Deferring Discovery Until Definition](../../SPEC.md#deferring-discovery-until-definition).
 
 ## Specification
 
