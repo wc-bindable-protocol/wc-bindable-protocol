@@ -1000,6 +1000,96 @@ describe("bind", () => {
       expect(second).toHaveBeenCalledWith("value", "shared-value");
     });
 
+    it("arms one whenDefined() wait per tag, however many binds join it", async () => {
+      // Waits are pooled per tag name so that a cancelled bind can drop out
+      // of the pool and stop retaining its target — a reaction-per-bind
+      // implementation cannot release anything, because whenDefined()
+      // offers no cancellation and a promise reaction pins what it closes
+      // over until the promise settles.
+      const tag = uniqueTag("pooled");
+      const first = document.createElement(tag);
+      const second = document.createElement(tag);
+      const onFirst = vi.fn();
+      const onSecond = vi.fn();
+      const whenDefinedSpy = vi.spyOn(customElements, "whenDefined");
+
+      try {
+        bind(first, onFirst, { syncOn: "define" });
+        bind(second, onSecond, { syncOn: "define" });
+        expect(whenDefinedSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        whenDefinedSpy.mockRestore();
+      }
+
+      defineUpgrading(tag, lateBindableClass("pooled-value"), first, second);
+      await customElements.whenDefined(tag);
+      await Promise.resolve();
+
+      // Pooling is an implementation detail, not a behavioral one: both
+      // binds still register and deliver independently.
+      expect(onFirst).toHaveBeenCalledWith("value", "pooled-value");
+      expect(onSecond).toHaveBeenCalledWith("value", "pooled-value");
+    });
+
+    it("re-arms a wait for the same tag after every earlier bind was cancelled", async () => {
+      // The pool entry survives its set going empty (so churn against a
+      // never-defined tag reuses one reaction instead of accumulating one
+      // per bind). A later bind on that tag MUST still work.
+      const tag = uniqueTag("rearm");
+      const early = document.createElement(tag);
+      const late = document.createElement(tag);
+      const onEarly = vi.fn();
+      const onLate = vi.fn();
+
+      bind(early, onEarly, { syncOn: "define" })();  // bound then immediately cancelled
+      bind(late, onLate, { syncOn: "define" });
+
+      defineUpgrading(tag, lateBindableClass("rearmed"), early, late);
+      await customElements.whenDefined(tag);
+      await Promise.resolve();
+
+      expect(onEarly).not.toHaveBeenCalled();
+      expect(onLate).toHaveBeenCalledWith("value", "rearmed");
+    });
+
+    it("keeps a sibling bind registering when another bind on the same tag throws", async () => {
+      // The waits share one promise reaction, so the loop that runs them
+      // must isolate failures: one bind whose initial sync throws MUST NOT
+      // stop the next bind on the same tag from registering. The throw is
+      // still reported — on its own unhandled rejection, per SPEC.md
+      // § Teardown Contract — which this test intercepts at the Node level
+      // so it does not surface as a suite-level unhandled error.
+      const tag = uniqueTag("throwing");
+      const throwing = document.createElement(tag);
+      const healthy = document.createElement(tag);
+      const onHealthy = vi.fn();
+      const rejections: unknown[] = [];
+      const onRejection = (reason: unknown) => { rejections.push(reason); };
+      process.on("unhandledRejection", onRejection);
+
+      try {
+        const boom = new Error("consumer onUpdate exploded");
+        const unbindThrowing = bind(throwing, () => { throw boom; }, { syncOn: "define" });
+        bind(healthy, onHealthy, { syncOn: "define" });
+
+        defineUpgrading(tag, lateBindableClass("survives"), throwing, healthy);
+        await customElements.whenDefined(tag);
+        await new Promise((r) => setTimeout(r, 0));
+
+        // The sibling registered despite the earlier waiter throwing.
+        expect(onHealthy).toHaveBeenCalledWith("value", "survives");
+
+        // The failure was reported, not swallowed.
+        expect(rejections).toContain(boom);
+
+        // And the failed bind tore its own listeners down, so its unbind()
+        // is a literal no-op afterwards.
+        expect(() => unbindThrowing()).not.toThrow();
+      } finally {
+        process.off("unhandledRejection", onRejection);
+      }
+    });
+
     it("does not reject for a hyphenated name that can never be a custom element", async () => {
       // `font-face` and friends contain a `-` but are reserved names, so
       // `customElements.whenDefined()` returns a *rejected* promise. The

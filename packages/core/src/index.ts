@@ -343,16 +343,103 @@ export function bind(
 }
 
 /**
+ * Pending `syncOn: "define"` waits, grouped by tag name.
+ *
+ * `customElements.whenDefined()` exposes no cancellation affordance, and a
+ * promise reaction pins everything it closes over until the promise
+ * settles — so attaching one reaction per `bind()` call would keep every
+ * cancelled bind's `target` alive until the tag is defined, and *forever*
+ * for a tag that never is. Under mount / unmount churn against a tag that
+ * never arrives (a typo, a code-split chunk that failed to load) that is
+ * an unbounded leak, which is not an acceptable cost to impose on a bind
+ * that the caller already tore down.
+ *
+ * So the reaction is attached **once per tag name**, and each pending bind
+ * is an entry in that tag's waiter set which its own cleanup removes. A
+ * cancelled wait therefore releases its `target` immediately.
+ *
+ * The map entry is deliberately **not** deleted when its set becomes
+ * empty: keeping it is what lets the next `bind()` on the same tag reuse
+ * the single existing reaction instead of attaching another one, which is
+ * exactly the churn case above. The residual cost is one empty `Set` per
+ * distinct never-defined tag name — bounded by the number of tag names,
+ * not by the number of binds. Once a tag *is* defined the entry is dropped
+ * entirely.
+ */
+const definitionWaiters = new Map<string, Set<() => void>>();
+
+/**
+ * Register `waiter` to run when `tag` is defined. Returns `false` when no
+ * wait could be armed (a non-conformant registry whose `whenDefined()`
+ * throws synchronously instead of returning a rejected promise), in which
+ * case the caller falls back to the no-op cleanup.
+ */
+function addDefinitionWaiter(tag: string, waiter: () => void): boolean {
+  const existing = definitionWaiters.get(tag);
+  if (existing !== undefined) {
+    existing.add(waiter);
+    return true;
+  }
+
+  let pending: Promise<unknown>;
+  try {
+    pending = customElementsRef!.whenDefined(tag);
+  } catch {
+    // A registry whose whenDefined() throws synchronously is non-conformant
+    // (the DOM spec mandates a rejected promise), but bind()'s MUST-NOT-
+    // throw-on-invalid-input posture applies here too.
+    return false;
+  }
+
+  const waiters = new Set<() => void>([waiter]);
+  definitionWaiters.set(tag, waiters);
+  pending.then(
+    () => {
+      // Drop the entry before running anything: a waiter's own initial sync
+      // can re-enter bind() for the same tag, and that call must arm a
+      // fresh wait rather than join a set that is already draining.
+      definitionWaiters.delete(tag);
+      for (const w of [...waiters]) {
+        // Re-checked per iteration because an earlier waiter's onUpdate may
+        // have unbound a later one.
+        if (!waiters.has(w)) continue;
+        try {
+          w();
+        } catch (err) {
+          // Each bind is independent: one bind's registration throw MUST
+          // NOT stop the sibling binds on the same tag from registering.
+          // Re-raising on a fresh unhandled rejection preserves the
+          // reporting channel documented in SPEC.md § Teardown Contract
+          // while keeping the loop going — which is what a
+          // reaction-per-bind implementation would have done anyway.
+          void Promise.reject(err);
+        }
+      }
+    },
+    () => {
+      // Not a valid custom element name — the reserved hyphenated names
+      // (`font-face`, `annotation-xml`, `missing-glyph`, …) pass the `-`
+      // gate yet can never be defined, and the registry rejects with a
+      // SyntaxError the consumer cannot act on. Absorb it and drop the
+      // waiters; nothing will ever run them.
+      //
+      // Note this is the SECOND argument to .then(), not a trailing
+      // .catch(): a throw escaping the fulfillment handler above must stay
+      // observable, and a .catch() here would swallow it too.
+      definitionWaiters.delete(tag);
+    },
+  );
+  return true;
+}
+
+/**
  * `syncOn: "define"` deferral. Waits for `customElements.whenDefined(tag)`,
  * re-runs discovery against the (now upgraded) target, and — if it is
  * bindable — hands off to the ordinary `bindDeclared()` path.
  *
  * The cleanup returned here is safe to call while the wait is pending: it
- * cancels the pending work and registers nothing, even if the tag is
- * defined later. What it cannot do is cancel the underlying promise —
- * `whenDefined()` offers no such affordance — so the closure (and with it
- * the `target` reference) stays reachable until the tag is defined. For a
- * tag that is never defined, that lives as long as the registry does.
+ * cancels the pending work, registers nothing even if the tag is defined
+ * later, and releases the target (see `definitionWaiters`).
  */
 function bindWhenDefined(
   target: unknown,
@@ -363,75 +450,58 @@ function bindWhenDefined(
   let disposed = false;
   let inner: UnbindFn | undefined;
 
-  let pending: Promise<unknown>;
-  try {
-    pending = customElementsRef!.whenDefined(tag);
-  } catch {
-    // A registry whose whenDefined() throws synchronously is non-conformant
-    // (the DOM spec mandates a rejected promise), but bind()'s MUST-NOT-
-    // throw-on-invalid-input posture applies here too.
-    return () => {};
-  }
+  const waiter = () => {
+    if (disposed) return;
+    // `define()` upgrades elements that are already in a document, but a
+    // detached element is only upgraded on insertion. Ask for it
+    // explicitly so the "create imperatively → bind → append later"
+    // pattern is not silently excluded. On an already-upgraded element
+    // this is a no-op.
+    try {
+      customElementsRef!.upgrade?.(target as Node);
+    } catch {
+      /* non-conformant / minimal registry — fall through to discovery */
+    }
+    const decl = getWcBindableDeclaration(target);
+    // Defined, but not wc-bindable after all: this is case 1 from
+    // SPEC.md § Deferring Discovery Until Definition, arrived at one
+    // microtask late. Register nothing, exactly as the synchronous
+    // discovery failure would have.
+    if (decl === undefined) return;
+    try {
+      inner = bindDeclared(target, decl, onUpdate, options);
+      // Unlike the synchronous path, the caller ALREADY holds this
+      // closure's unbind function while the deferred initial sync runs —
+      // so an `onUpdate` that tears itself down re-enters the cleanup
+      // below at a moment when `inner` is still unassigned, and would
+      // otherwise leave the listeners bindDeclared() just installed
+      // attached forever. Re-check the flag once bindDeclared() returns
+      // and honour the disposal that happened underneath it. (The
+      // `syncOn: "connect"` path has no equivalent hole: its listeners
+      // are already in the shared cleanup list before the deferred sync
+      // runs.)
+      if (disposed) {
+        const late = inner;
+        inner = undefined;
+        late();
+      }
+    } catch (err) {
+      // bindDeclared() already tore down everything it installed. Mark
+      // this closure disposed so the caller's later unbind() is a literal
+      // no-op, mirroring the deferred-throw rule in § Teardown Contract.
+      disposed = true;
+      throw err;
+    }
+  };
 
-  pending.then(
-    () => {
-      if (disposed) return;
-      // `define()` upgrades elements that are already in a document, but a
-      // detached element is only upgraded on insertion. Ask for it
-      // explicitly so the "create imperatively → bind → append later"
-      // pattern is not silently excluded. On an already-upgraded element
-      // this is a no-op.
-      try {
-        customElementsRef!.upgrade?.(target as Node);
-      } catch {
-        /* non-conformant / minimal registry — fall through to discovery */
-      }
-      const decl = getWcBindableDeclaration(target);
-      // Defined, but not wc-bindable after all: this is case 1 from
-      // SPEC.md § Deferring Discovery Until Definition, arrived at one
-      // microtask late. Register nothing, exactly as the synchronous
-      // discovery failure would have.
-      if (decl === undefined) return;
-      try {
-        inner = bindDeclared(target, decl, onUpdate, options);
-        // Unlike the synchronous path, the caller ALREADY holds this
-        // closure's unbind function while the deferred initial sync runs —
-        // so an `onUpdate` that tears itself down re-enters the cleanup
-        // below at a moment when `inner` is still unassigned, and would
-        // otherwise leave the listeners bindDeclared() just installed
-        // attached forever. Re-check the flag once bindDeclared() returns
-        // and honour the disposal that happened underneath it. (The
-        // `syncOn: "connect"` path has no equivalent hole: its listeners
-        // are already in the shared cleanup list before the deferred sync
-        // runs.)
-        if (disposed) {
-          const late = inner;
-          inner = undefined;
-          late();
-        }
-      } catch (err) {
-        // bindDeclared() already tore down everything it installed. Mark
-        // this closure disposed so the caller's later unbind() is a literal
-        // no-op, mirroring the deferred-throw rule in § Teardown Contract.
-        disposed = true;
-        throw err;
-      }
-    },
-    // Rejection handler passed as the SECOND argument to .then(), NOT a
-    // trailing .catch(): it swallows only whenDefined()'s own rejection —
-    // the reserved SVG/MathML names (`font-face`, `annotation-xml`,
-    // `missing-glyph`, …) contain a hyphen yet are not valid custom element
-    // names, so the registry rejects with a SyntaxError that is not an
-    // error the consumer can act on. A throw from the fulfillment handler
-    // above lands on the *derived* promise and is therefore NOT swallowed
-    // here — it stays observable as an unhandled rejection, per
-    // § Teardown Contract.
-    () => { /* not a valid custom element name — nothing will ever define it */ },
-  );
+  if (!addDefinitionWaiter(tag, waiter)) return () => {};
 
   return () => {
     if (disposed) return;
     disposed = true;
+    // Drop out of the tag's waiter set so a cancelled wait stops retaining
+    // `target` — the whole reason the waits are pooled per tag.
+    definitionWaiters.get(tag)?.delete(waiter);
     inner?.();
   };
 }
