@@ -123,15 +123,22 @@ const unbind = bind(el, onUpdate, { syncOn: "define" });
 
 The default is unchanged, so this only affects calls that opt in. If the declaration is already readable, `"define"` is indistinguishable from `"call"` — same synchronous frame. If the target could never be a custom element (no `-` in the tag name, a headless `EventTarget`, a runtime with no `customElements`), nothing is deferred and you get today's immediate no-op. Full rules in [SPEC.md § Deferring Discovery Until Definition](SPEC.md#deferring-discovery-until-definition).
 
-> **`"define"` and `"connect"` do not compose.** A deferred `"define"` bind performs its initial sync at definition time, not at connection time.
->
-> **It does not address the input side.** A property assigned to an element *before* upgrade becomes an own property that shadows the accessor the upgrade installs, so the component's setter never runs. That is the element author's problem to solve (conventionally, by re-applying own properties from `connectedCallback`); no `syncOn` value changes it.
+`"define"` and `"connect"` answer different questions, and they compose — pass both when the element may be *neither* defined nor attached yet:
+
+```javascript
+bind(el, onUpdate, { syncOn: ["define", "connect"] });
+```
+
+That waits for the definition, then still defers the initial read until the element is connected. It is the right combination for an imperative binder handed a detached element; the binders this repository ships for VanJS / MobX / RxJS / Signals use it. Order in the array does not matter, `"call"` inside an array is inert, and unrecognized entries are ignored the same way an unrecognized bare string is.
+
+> **`"define"` does not address the input side.** A property assigned to an element *before* upgrade becomes an own property that shadows the accessor the upgrade installs, so the component's setter never runs. That is the element author's problem to solve (conventionally, by re-applying own properties from `connectedCallback`); no `syncOn` value changes it.
 
 | Situation | Recommended `syncOn` |
 |---|---|
 | React / Vue / Lit / Stencil / Angular — adapter binds from a lifecycle hook | `"call"` |
 | Imperative construction followed by `appendChild()` into light DOM | `"connect"` |
 | The element's definition may load after the binding code runs (import maps, CDN, code splitting) | `"define"` |
+| Imperative construction where the definition may also load late | `["define", "connect"]` |
 | Element may be appended into a shadow root | `"call"` from the host's own `connectedCallback` (document-level `MutationObserver` does not traverse shadow roots) |
 | Bulk-binding many deferred elements at once | Audit first — each `"connect"` bind installs its own document-wide `MutationObserver`, and each `"define"` bind holds a pending `whenDefined()` promise until the tag is defined |
 | Headless `EventTarget` / remote proxy / test double | `"call"` (both deferred-path gates silently fall back to `"call"` here anyway) |

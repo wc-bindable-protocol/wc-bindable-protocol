@@ -478,8 +478,10 @@ type OnUpdate = (name: string, value: unknown) => void;
 type UnbindFn = () => void;
 
 interface BindOptions {
-  syncOn?: "call" | "connect" | "define";  // default: "call"
+  syncOn?: SyncOnMode | SyncOnMode[];  // default: "call"
 }
+
+type SyncOnMode = "call" | "connect" | "define";
 
 /** Discovery primitives. Both MUST accept `unknown` and never throw — see
  *  § Discovery API for the full contract. `target` is typed `unknown`
@@ -651,6 +653,18 @@ function isValidCommandDescriptor(p) {
 // resolve. MUST NOT throw on any input shape (a hostile Proxy can raise
 // from the instanceof check or the localName read), same posture as
 // getWcBindableDeclaration.
+// Does the caller's syncOn request `mode`? Accepts the bare-string and
+// array forms. MUST NOT throw on a malformed value — an unrecognized
+// string, an array of unrecognized entries, a non-string non-array, and a
+// Proxy-wrapped array whose reads throw all resolve to "not requested",
+// i.e. the "call" default. See § Composing syncOn modes.
+function wantsSyncMode(options, mode) {
+  const syncOn = options?.syncOn;
+  if (syncOn === mode) return true;
+  if (!Array.isArray(syncOn)) return false;
+  try { return syncOn.includes(mode); } catch { return false; }
+}
+
 function pendingCustomElementTag(target) {
   if (customElementsRef === undefined || HTMLElementCtor === undefined) return undefined;
   try {
@@ -685,7 +699,7 @@ function bind(target, onUpdate, options) {
   // unrecognized value, per the unknown-syncOn fallback — that is
   // terminal. Only "define" asks us to distinguish "not bindable" from
   // "not upgraded yet". See § Deferring Discovery Until Definition.
-  if ((options?.syncOn ?? "call") !== "define") return () => {};
+  if (!wantsSyncMode(options, "define")) return () => {};
   const tag = pendingCustomElementTag(target);
   if (tag === undefined) return () => {};
   return bindWhenDefined(target, tag, onUpdate, options);
@@ -845,12 +859,15 @@ function bindDeclared(target, decl, onUpdate, options) {
     }
   };
 
-  const syncOn = options?.syncOn ?? "call";
   // Short-circuit when there are no observable properties: the deferred
   // path has nothing to do, and installing a MutationObserver here would
   // violate the "empty properties returns a real no-op cleanup" rule.
+  // Reached from bind() directly AND from the deferred-discovery path,
+  // which forwards the caller's original options — so ["define",
+  // "connect"] still defers the initial sync here after the definition
+  // arrives.
   const canDefer =
-    syncOn === "connect" &&
+    wantsSyncMode(options, "connect") &&
     decl.properties.length > 0 &&
     HTMLElementCtor !== undefined &&
     et instanceof HTMLElementCtor &&
@@ -973,7 +990,7 @@ bind(target, onUpdate, { syncOn: "connect" })
 - `syncOn: "define"`: defers *discovery* rather than the initial sync, and is documented in [§ Deferring Discovery Until Definition](#deferring-discovery-until-definition). Once discovery succeeds it registers on `"call"` terms, so it never reaches the deferred-sync machinery described in this section.
 - `syncOn: "connect"`: if the target is an `HTMLElement` that is not yet connected, defer the initial sync until the element becomes connected **for the first time**. The reference implementation observes the top-level `document` via a `MutationObserver`. For headless `EventTarget`s and already-connected elements, behaves like `"call"`. The DOM globals (`HTMLElement`, `document`, `MutationObserver`) are referenced through `typeof` guards so that the reference implementation runs unmodified in non-browser runtimes where these globals are undefined — in that case `syncOn: "connect"` silently falls back to the `"call"` path. **Disconnect → reconnect cycles after the first connection do NOT re-trigger the initial sync** — the observer disconnects as soon as the deferred sync fires once. Consumers that need a fresh initial-sync on every re-attach should unbind and re-bind from their own lifecycle hook.
 
-**Unknown `syncOn` values MUST be treated as `"call"`.** TypeScript narrows the field to the `"call" | "connect" | "define"` literal union, but JavaScript callers can pass any string (or any value). An implementation MUST NOT throw on an unrecognized value; it MUST fall back to the synchronous default. This matches `bind()`'s overall "MUST NOT throw on invalid input" posture from [§ Normative TypeScript surface](#normative-typescript-surface) — `syncOn` is an input field like any other, and a typo (`"later"`, `"defer"`) is a programmer error best handled by a safe fallback that the consumer can notice via the observed behavior, not by a hard runtime throw. Future spec revisions MAY add new `syncOn` values; older implementations that pre-date those values will then behave as if the caller passed `"call"`, preserving forward compatibility.
+**Unknown `syncOn` values MUST be treated as `"call"`.** TypeScript narrows the field to `SyncOnMode | SyncOnMode[]`, but JavaScript callers can pass any string, any array, or any value at all; the rule below applies to a bare value and to each array entry alike (see [§ Composing `syncOn` modes](#composing-syncon-modes)). An implementation MUST NOT throw on an unrecognized value; it MUST fall back to the synchronous default. This matches `bind()`'s overall "MUST NOT throw on invalid input" posture from [§ Normative TypeScript surface](#normative-typescript-surface) — `syncOn` is an input field like any other, and a typo (`"later"`, `"defer"`) is a programmer error best handled by a safe fallback that the consumer can notice via the observed behavior, not by a hard runtime throw. Future spec revisions MAY add new `syncOn` values; older implementations that pre-date those values will then behave as if the caller passed `"call"`, preserving forward compatibility.
 
 The returned unbind function tears down the `MutationObserver` as well, so cancelling a deferred bind is safe.
 
@@ -1000,7 +1017,7 @@ The remaining rules follow from that one:
 - **Discovery re-runs exactly once.** If the now-defined element is still not wc-bindable, the bind registers nothing and stays a no-op — that is case 1 (genuinely not bindable), arrived at one microtask late. There is no second wait and no retry.
 - **A rejected `whenDefined()` is absorbed, not reported.** See the callout in [§ Teardown Contract](#teardown-contract).
 - **Re-entrant teardown from the deferred initial sync MUST be honoured.** This mode is the first in which the caller holds the unbind function *before* the initial sync runs, so an `onUpdate` that tears its own binding down re-enters the cleanup at a moment when the registration is only half-recorded. Implementations MUST NOT leave the listeners installed during that reaction attached; the cleanup **MUST** end up running exactly once, whether the disposal request arrives before, during, or after the registration. (`syncOn: "connect"` has no equivalent case — its listeners are already recorded in the shared cleanup list before the deferred sync runs.)
-- **`"define"` does not compose with `"connect"`.** A deferred `"define"` bind performs its initial sync at definition time, not at connection time, because the rule above pins it to `"call"` semantics. A composite form (an array or object `syncOn`) is a plausible future addition; it would be purely additive, since today's single-string field remains valid under any such extension.
+- **`"define"` alone syncs at definition time; combine it with `"connect"` to sync at connection time.** The two deferrals address different questions — "is the declaration readable?" and "has the element been connected?" — and they compose. `syncOn: ["define", "connect"]` waits for the definition, and then, if the now-upgraded element is still detached, defers the initial sync until connection under the ordinary `"connect"` rules. See [§ Composing `syncOn` modes](#composing-syncon-modes).
 
 > **What `"define"` does not do.** It is a one-shot wait on one standard promise, not a retry mechanism. It does not poll, does not observe the registry for unrelated definitions, does not re-discover on attribute or DOM changes, and does not address the **input** side of late definition — a property assigned to an element before upgrade becomes an own property that shadows the prototype accessor the upgrade installs, so the component's setter never runs. That is the element author's problem to solve (conventionally, by re-applying own properties from `connectedCallback`), and no `syncOn` value changes it.
 
@@ -1009,6 +1026,25 @@ The remaining rules follow from that one:
 > The reference implementation satisfies this by pooling: one `whenDefined()` reaction **per tag name**, with each pending bind an entry in that tag's waiter set that its own cleanup removes. The pool entry is deliberately kept when its set drains to empty — that is what lets the next bind on the same tag reuse the single existing reaction instead of attaching another one, which is precisely the churn case. The residual cost is one empty set per distinct never-defined tag name, bounded by the number of tag names rather than the number of binds. Pooling is one conformant strategy, not a required one; what is required is the release.
 >
 > **Concurrent waits are independent, and pooling MUST NOT couple them.** Each `bind()` call owns its own disposal state, so cancelling one bind on an element MUST NOT affect any other bind on the same element or tag, and multiple deferred binds MUST all register when the definition arrives. An implementation that shares one reaction across binds MUST additionally isolate failures: a registration or initial-sync throw from one waiter **MUST NOT** prevent the remaining waiters on the same tag from registering. The throw is still reported (see [§ Teardown Contract](#teardown-contract)); it is only the abort-the-others behavior that is forbidden.
+
+#### Composing `syncOn` modes
+
+`syncOn` accepts either a single mode or an **array** of modes:
+
+```typescript
+bind(target, onUpdate, { syncOn: ["define", "connect"] })
+```
+
+`"define"` and `"connect"` defer different things — discovery and the initial-value read — so an implementation **MUST** treat the array as a set of independently-applied deferrals rather than as an ordered pipeline of alternatives. Concretely, for `["define", "connect"]`: discovery is deferred until the definition arrives, and then the resulting registration applies the `"connect"` rule to the initial sync exactly as a plain `syncOn: "connect"` bind would. **Order within the array is not significant** — discovery necessarily precedes the initial sync, so there is no second ordering to express.
+
+- `"call"` inside an array is **inert**: it names the *absence* of a deferral, so `["call", "connect"]` is `["connect"]` and `["call"]` is `"call"`. It is accepted rather than rejected so that a caller assembling the array programmatically does not need to special-case it.
+- **Unrecognized entries are ignored**, exactly as an unrecognized bare string collapses to `"call"` (see the unknown-value rule in [§ Deferring the Initial Sync Until Connection](#deferring-the-initial-sync-until-connection)). An array of only-unrecognized entries, and an empty array, therefore both behave as `"call"`.
+- **Duplicates are idempotent.** `["define", "define"]` is `["define"]`.
+- A `syncOn` that is neither a recognized string nor an array — a number, `null`, an object — behaves as `"call"`. As everywhere else in `bind()`, a malformed value **MUST NOT** throw, and that includes a hostile array whose element reads raise.
+
+The combination exists for one concrete shape: an **imperative binder** that is handed a detached element and appends it later, built from a definition that may not have loaded yet. `"connect"` alone leaves it stuck at the discovery gate; `"define"` alone makes it read pre-`connectedCallback` state. The binders this repository ships for VanJS / MobX / RxJS / Signals are exactly that shape and pass both.
+
+Forward compatibility works in the usual direction: an implementation that predates the array form sees a non-string `syncOn`, fails to recognize it, and falls back to `"call"` — the same safe degradation as any unknown value.
 
 **Why this lives in core rather than in each adapter.** A consumer can already work around late definition by awaiting `customElements.whenDefined()` before mounting whatever calls `bind()`. Three properties of the failure argue for a core-level answer anyway: it is **silent** (no throw, no log, no return value that distinguishes the two cases, so nothing leads a debugging user back to definition timing); it is **uniform** (every adapter that gates on `isWcBindable()` needs the same workaround, and independent implementations of it will diverge); and it is **common** (import-map autoloading, CDN `<script type="module">`, and route-level code-splitting all produce it — for buildless CDN-first distribution it is the normal case). Keeping the vocabulary for "not yet" next to the discovery rule it qualifies is what makes a single answer possible.
 

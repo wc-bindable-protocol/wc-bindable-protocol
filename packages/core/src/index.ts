@@ -257,12 +257,47 @@ export interface BindOptions {
    *   upgraded yet"; without it both collapse into the same silent no-op
    *   cleanup. See SPEC.md § Deferring Discovery Until Definition.
    *
-   *   Note that `"define"` and `"connect"` do not compose: a deferred
-   *   `"define"` bind performs its initial sync at definition time, not at
-   *   connection time. A composite form (array / object `syncOn`) is a
-   *   possible future addition and would be purely additive.
+   * The two deferrals are independent and compose, so `syncOn` also
+   * accepts an **array** of modes:
+   *
+   * ```ts
+   * bind(el, onUpdate, { syncOn: ["define", "connect"] })
+   * ```
+   *
+   * waits for the definition, then — once the declaration is readable —
+   * still defers the initial-value read until the element is connected.
+   * That is the correct combination for an imperative binder whose caller
+   * hands it a detached element built from a definition that may not have
+   * loaded yet. Order within the array is irrelevant; discovery always
+   * precedes the initial sync. `"call"` in an array is inert (it names the
+   * absence of a deferral), and unrecognized entries are ignored the same
+   * way an unrecognized bare string is.
    */
-  syncOn?: "call" | "connect" | "define";
+  syncOn?: SyncOnMode | SyncOnMode[];
+}
+
+/** A single `BindOptions.syncOn` mode. See {@link BindOptions.syncOn}. */
+export type SyncOnMode = "call" | "connect" | "define";
+
+/**
+ * Does the caller's `syncOn` request `mode`?
+ *
+ * Accepts the bare-string and array forms, and — like every other input
+ * `bind()` takes — MUST NOT throw on a malformed value: an unrecognized
+ * string, an array holding unrecognized entries, a non-string non-array,
+ * and a `Proxy`-wrapped array whose index reads throw all resolve to
+ * "this mode was not requested", i.e. the `"call"` default. See SPEC.md
+ * § Deferring the Initial Sync Until Connection (unknown-value rule).
+ */
+function wantsSyncMode(options: BindOptions | undefined, mode: SyncOnMode): boolean {
+  const syncOn = options?.syncOn;
+  if (syncOn === mode) return true;
+  if (!Array.isArray(syncOn)) return false;
+  try {
+    return syncOn.includes(mode);
+  } catch {
+    return false;
+  }
 }
 
 // DOM globals are accessed through these locals so that the module
@@ -332,11 +367,12 @@ export function bind(
   const decl = getWcBindableDeclaration(target);
   if (decl !== undefined) return bindDeclared(target, decl, onUpdate, options);
 
-  // Discovery failed. Under the default `"call"` (and under `"connect"`,
-  // and under any unrecognized value per the unknown-syncOn fallback) that
-  // is terminal — return the historical no-op. Only `"define"` asks us to
-  // distinguish "not bindable" from "not upgraded yet".
-  if ((options?.syncOn ?? "call") !== "define") return () => {};
+  // Discovery failed. Under the default `"call"` (and under `"connect"`
+  // alone, and under any unrecognized value per the unknown-syncOn
+  // fallback) that is terminal — return the historical no-op. Only
+  // `"define"` asks us to distinguish "not bindable" from "not upgraded
+  // yet".
+  if (!wantsSyncMode(options, "define")) return () => {};
   const tag = pendingCustomElementTag(target);
   if (tag === undefined) return () => {};
   return bindWhenDefined(target, tag, onUpdate, options);
@@ -572,7 +608,6 @@ function bindDeclared(
     }
   };
 
-  const syncOn = options?.syncOn ?? "call";
   // A declaration with empty `properties` has nothing to initial-sync, so
   // there is no work the deferred path could meaningfully do — short-
   // circuiting here keeps the "empty properties returns a real no-op
@@ -580,8 +615,13 @@ function bindDeclared(
   // Without this, we would install a document-wide MutationObserver whose
   // callback only ever runs an empty loop, and the returned cleanup would
   // include the observer.disconnect() — i.e. NOT a no-op.
+  //
+  // Reached both from bind() directly and from the deferred-discovery path,
+  // which forwards the caller's original options — so `["define",
+  // "connect"]` still defers the initial sync here after the definition
+  // arrives.
   const canDefer =
-    syncOn === "connect" &&
+    wantsSyncMode(options, "connect") &&
     properties.length > 0 &&
     HTMLElementCtor !== undefined &&
     et instanceof HTMLElementCtor &&

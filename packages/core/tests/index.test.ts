@@ -1104,6 +1104,80 @@ describe("bind", () => {
       expect(onUpdate).not.toHaveBeenCalled();
     });
 
+    it("composes with connect: waits for the definition, then for connection", async () => {
+      const tag = uniqueTag("composed");
+      const el = document.createElement(tag);
+      const onUpdate = vi.fn();
+
+      const unbind = bind(el, onUpdate, { syncOn: ["define", "connect"] });
+
+      defineUpgrading(tag, lateBindableClass("at-definition"), el);
+      await customElements.whenDefined(tag);
+      await Promise.resolve();
+
+      // Defined, but still detached — the initial sync is deferred again.
+      expect(onUpdate).not.toHaveBeenCalled();
+
+      // The value moves between definition and connection; the deferred
+      // sync must read at connection time, per the "connect" ordering rule.
+      (el as unknown as Record<string, unknown>).value = "at-connection";
+      document.body.appendChild(el);
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(onUpdate).toHaveBeenCalledWith("value", "at-connection");
+
+      unbind();
+      document.body.removeChild(el);
+    });
+
+    it("composes in either order, and tolerates inert or unknown array entries", async () => {
+      const tag = uniqueTag("orderless");
+      const el = document.createElement(tag);
+      const onUpdate = vi.fn();
+
+      const unbind = bind(el, onUpdate, {
+        syncOn: ["call", "later", "connect", "define"] as unknown as ("call" | "connect" | "define")[],
+      });
+
+      defineUpgrading(tag, lateBindableClass("v"), el);
+      await customElements.whenDefined(tag);
+      await Promise.resolve();
+      expect(onUpdate).not.toHaveBeenCalled();  // "connect" still in effect
+
+      document.body.appendChild(el);
+      await new Promise((r) => setTimeout(r, 0));
+      expect(onUpdate).toHaveBeenCalledWith("value", "v");
+
+      unbind();
+      document.body.removeChild(el);
+    });
+
+    it("treats a malformed syncOn as the plain default", () => {
+      const el = createBindableElement(validDeclaration);
+      (el as unknown as Record<string, unknown>).value = "sync";
+
+      for (const syncOn of [[], ["nope"], 42, null, { define: true }, ["define", "define"]]) {
+        const onUpdate = vi.fn();
+        const unbind = bind(el, onUpdate, { syncOn } as never);
+        // The declaration is readable, so every one of these behaves as
+        // "call" — including the duplicate-entry array, which is simply
+        // "define" and therefore also "call" here.
+        expect(onUpdate).toHaveBeenCalledWith("value", "sync");
+        unbind();
+      }
+
+      // And a hostile array whose reads throw must not escape bind().
+      const hostile = new Proxy(["define"], {
+        get(t, p, r) {
+          if (p === "includes") return () => { throw new Error("hostile includes"); };
+          return Reflect.get(t, p, r);
+        },
+      });
+      const onUpdate = vi.fn();
+      expect(() => bind(el, onUpdate, { syncOn: hostile as never })()).not.toThrow();
+      expect(onUpdate).toHaveBeenCalledWith("value", "sync");
+    });
+
     it("leaves the default modes unchanged for an un-upgraded element", async () => {
       // The regression guard for "no default behavior change": under
       // "call", "connect", and an unrecognized value, an un-upgraded
