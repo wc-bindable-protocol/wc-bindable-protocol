@@ -42,6 +42,15 @@ describe("createCompositeTarget — discovery & declaration (T1)", () => {
     expect("async" in run).toBe(false); // AgentSource.run declares no async hint
   });
 
+  it("does not carry a source input's attribute hint into the declaration (C52, § 2)", () => {
+    // UploaderSource declares `{ name: "file", attribute: "file" }`; the hint
+    // names an attribute of the source element, which the shell's own element
+    // does not map, so advertising it on the shell would be dead markup.
+    const shell = createCompositeTarget({ sources: { s3: new UploaderSource() } });
+    const decl = getWcBindableDeclaration(shell)!;
+    expect(decl.inputs).toEqual([{ name: "s3.file" }]);
+  });
+
   it("freezes the synthesized declaration for immutability (§ 11)", () => {
     const shell = createCompositeTarget({ sources: { s3: new UploaderSource() } });
     const decl = getWcBindableDeclaration(shell)!;
@@ -196,6 +205,16 @@ describe("createCompositeTarget — local facade (T2)", () => {
     const shell = createCompositeTarget({ sources: { s3 } });
     shell["s3.file"] = "report.pdf";
     expect(s3.file).toBe("report.pdf");
+  });
+
+  it("relays undefined and null to the source unchanged (C51: a relaying applier)", () => {
+    const s3 = new UploaderSource();
+    const shell = createCompositeTarget({ sources: { s3 } });
+    shell["s3.file"] = "report.pdf";
+    shell["s3.file"] = undefined;
+    expect(s3.file).toBeUndefined();
+    shell["s3.file"] = null;
+    expect(s3.file).toBeNull();
   });
 
   it("delegates command invocation to the source method and preserves the return (§ 9)", async () => {
