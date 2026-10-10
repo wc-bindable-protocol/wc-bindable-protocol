@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>wc-bindable composite integration harness</title>
+  <script type="importmap">
+    {
+      "imports": {
+        "@wc-bindable/core": "/packages/core/dist/index.js",
+        "@wc-bindable/composite": "/packages/composite/dist/index.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="module">
+    // Every test drives the page through `page.evaluate`; the harness only
+    // makes the bare specifiers resolvable and exposes the entry points.
+    const { bind } = await import("@wc-bindable/core");
+    const { defineComposite, silentLogger } = await import("@wc-bindable/composite");
+    window.__wcb = { bind, defineComposite, silentLogger };
+    document.getElementById("root").textContent = "ready";
+  </script>
+</body>
+</html>

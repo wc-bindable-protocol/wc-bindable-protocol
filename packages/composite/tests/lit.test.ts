@@ -323,3 +323,18 @@ describe("CompositeController — Lit reactive controller", () => {
     el.remove();
   });
 });
+
+describe("CompositeLitElement — inputs assigned before connect (#33)", () => {
+  it("forwards an input written before the element connects", async () => {
+    const Base = await CompositeLitElement({ sources, logger: silentLogger });
+    class EarlyWorkbench extends Base {}
+    customElements.define("lit-composite-early", EarlyWorkbench);
+    const el = document.createElement("lit-composite-early") as HTMLElement & Record<string, unknown>;
+    el["ai.prompt"] = "written early";
+    document.body.appendChild(el);
+    const ai = el.shadowRoot!.querySelector("ai-agent") as AiAgentElement;
+    expect(ai.prompt).toBe("written early");
+    expect((el["ai.run"] as () => string)()).toBe("run:written early");
+    el.remove();
+  });
+});

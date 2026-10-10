@@ -241,6 +241,15 @@ The base owns its shadow root for the source instances and sets them up in
 creates (`[data-wc-source]`) — it never wipes other shadow content, so a subclass
 may render its own shadow DOM alongside the sources.
 
+Because the sources and the T2 facade only exist once the element connects, an
+input written earlier — after `createElement()` but before insertion, or even
+before the tag is defined — lands on the element as a plain property. The
+element takes those writes when it connects and forwards them to the sources in
+the order they were made (the last value per input wins), so the usual "create,
+set props, append" order works. A source setter that throws while an early write
+is forwarded is reported (`reportError`, else the logger); the remaining writes
+are still applied.
+
 ### Lit
 
 `@wc-bindable/composite/lit` builds on the same machinery for

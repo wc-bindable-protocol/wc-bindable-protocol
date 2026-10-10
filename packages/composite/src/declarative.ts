@@ -1,6 +1,6 @@
 import type { WcBindableDeclaration } from "@wc-bindable/core";
 import { CompositeEngine, planComposition, type CompositionPlan } from "./engine.js";
-import { consoleLogger, type Logger } from "./logger.js";
+import { consoleLogger, reportComposite, type Logger } from "./logger.js";
 import {
   COMPOSITE_PROFILE_VERSION,
   COMPOSITE_TIERS_SYMBOL,
@@ -102,6 +102,48 @@ function readSourceDeclaration(tag: string): WcBindableDeclaration {
 function removeOwnedSources(shadow: ShadowRoot): void {
   for (const stray of Array.from(shadow.querySelectorAll("[data-wc-source]"))) {
     stray.remove();
+  }
+}
+
+/**
+ * Take the values of composed inputs that were assigned to `element` before its
+ * facade was installed — while it was not connected yet, or not yet upgraded.
+ * Such a write lands as an own data property, which {@link installInstanceSurface}
+ * would replace with the input accessor, silently dropping the value. The
+ * properties are removed here and returned in the order they were written, so
+ * the caller can forward them once the engine is installed (the "lazy property"
+ * pattern: SPEC-extensions.md § Producer guidance for inputs, P4).
+ *
+ * Only inputs are taken, and only when the T2 facade is materialized: a T1
+ * element exposes no input members, so an own property there is just an own
+ * property, before and after connecting.
+ */
+function takeEarlyInputs(element: HTMLElement, plan: CompositionPlan): [string, unknown][] {
+  if (!plan.localFacade || plan.inputs.length === 0) return [];
+  const inputNames = new Set(plan.inputs.map((input) => input.composedName));
+  const early: [string, unknown][] = [];
+  // Object.keys: own enumerable string keys in insertion order — the order the
+  // caller wrote them (a re-assignment keeps the key's original position, and
+  // the value is the last one written).
+  for (const key of Object.keys(element)) {
+    if (!inputNames.has(key)) continue;
+    const descriptor = Object.getOwnPropertyDescriptor(element, key);
+    // A data property is an early write. An accessor here is our own facade
+    // from an earlier, rolled-back setup attempt; leave it to be redefined.
+    if (!descriptor || !("value" in descriptor) || !descriptor.configurable) continue;
+    early.push([key, descriptor.value]);
+    delete (element as unknown as Record<string, unknown>)[key];
+  }
+  return early;
+}
+
+/**
+ * Put early input writes back as own data properties after a failed setup, so a
+ * reconnect retry takes them again instead of losing them.
+ */
+function restoreEarlyInputs(element: HTMLElement, early: [string, unknown][]): void {
+  for (const [name, value] of early) {
+    Object.defineProperty(element, name, { value, writable: true, enumerable: true, configurable: true });
   }
 }
 
@@ -354,6 +396,9 @@ export function setupCompositeInstance(
   }
 
   const engine = new CompositeEngine(synth.plan, sources, host, synth.logger);
+  // Inputs written before the facade existed would be overwritten by it; take
+  // them first and forward them below.
+  const early = takeEarlyInputs(host, synth.plan);
   // The instance surface (defined with configurable members) is safe to
   // (re)apply on a retry. install() is the only fallible step here; if it
   // throws, roll the sources back so a reconnect can retry cleanly rather than
@@ -364,7 +409,20 @@ export function setupCompositeInstance(
   } catch (err) {
     engine.dispose();
     removeOwnedSources(shadow);
+    restoreEarlyInputs(host, early);
     throw err;
+  }
+  // Forward the early writes through the facade, in the order they were made,
+  // now that the engine observes the sources (so any output a source emits in
+  // response is re-dispatched normally). The caller that made the write is long
+  // gone, so a throwing source setter cannot propagate to it (§ 12): report it
+  // and keep applying the rest rather than leaving the element half set up.
+  for (const [name, value] of early) {
+    try {
+      engine.setInput(name, value);
+    } catch (err) {
+      reportComposite(err, synth.logger);
+    }
   }
   return engine;
 }
