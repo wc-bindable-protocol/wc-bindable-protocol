@@ -1,6 +1,6 @@
 {
   "name": "@wc-bindable/composite",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Composition profile for wc-bindable — expose many wc-bindable targets as one (Extension 4)",
   "type": "module",
   "main": "dist/index.js",
@@ -28,7 +28,7 @@
     "test:integration": "playwright test"
   },
   "dependencies": {
-    "@wc-bindable/core": "^0.9.0"
+    "@wc-bindable/core": "^0.10.0"
   },
   "peerDependencies": {
     "lit": ">=2"
