@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll } from "vitest";
+import { describe, it, expect, beforeAll, vi } from "vitest";
 import { bind, getWcBindableDeclaration } from "@wc-bindable/core";
 import {
   defineComposite,
@@ -420,5 +420,166 @@ describe("defineComposite — concurrency, idempotency & validation", () => {
     );
     expect(customElements.get("composite-self-decl")).toBeUndefined();
     container.remove();
+  });
+});
+
+describe("inputs assigned before the element connects (#33)", () => {
+  // A source that records every input it receives, in order, and echoes `file`
+  // back as an output so the shell's re-dispatch can be observed.
+  const log: [string, unknown][] = [];
+  class RecordingSource extends HTMLElement {
+    static wcBindable = {
+      protocol: "wc-bindable" as const,
+      version: 1,
+      properties: [{ name: "echo", event: "rec:echo" }],
+      inputs: [{ name: "file" }, { name: "name" }],
+    };
+    echo: unknown = "initial";
+    #file: unknown = "default";
+    get file(): unknown { return this.#file; }
+    set file(v: unknown) {
+      log.push(["file", v]);
+      this.#file = v;
+      this.echo = v;
+      this.dispatchEvent(new CustomEvent("rec:echo", { detail: v }));
+    }
+    get name(): unknown { return undefined; }
+    set name(v: unknown) {
+      log.push(["name", v]);
+      if (v === "boom") throw new Error("setter boom");
+    }
+  }
+
+  let tagCount = 0;
+  async function defineRecordingComposite(options: { localFacade?: boolean } = {}): Promise<string> {
+    const tagName = `composite-early-${++tagCount}`;
+    await defineComposite({ tagName, sources: [{ id: "r", tag: "rec-source" }], logger: silentLogger, ...options });
+    return tagName;
+  }
+
+  beforeAll(() => {
+    customElements.define("rec-source", RecordingSource);
+  });
+
+  it("forwards an input written after upgrade but before connect, and re-dispatches the source's output", async () => {
+    log.length = 0;
+    const el = document.createElement(await defineRecordingComposite()) as HTMLElement & Record<string, unknown>;
+    expect("r.file" in el).toBe(false); // the facade is not installed before connect
+    el["r.file"] = "early.pdf";
+    const updates: [string, unknown][] = [];
+    bind(el, (name, value) => updates.push([name, value]));
+
+    document.body.appendChild(el);
+
+    const source = el.shadowRoot!.querySelector("rec-source") as RecordingSource;
+    expect(source.file).toBe("early.pdf");
+    expect(log).toEqual([["file", "early.pdf"]]);
+    expect(updates).toContainEqual(["r.echo", "early.pdf"]);
+    // The early own data property was replaced by the facade accessor.
+    expect(typeof Object.getOwnPropertyDescriptor(el, "r.file")?.set).toBe("function");
+    // Writes after connect keep working through the facade.
+    el["r.file"] = "later.pdf";
+    expect(source.file).toBe("later.pdf");
+    el.remove();
+  });
+
+  it("forwards several early writes in the order they were made, with the last value per input", async () => {
+    log.length = 0;
+    const el = document.createElement(await defineRecordingComposite()) as HTMLElement & Record<string, unknown>;
+    el["r.name"] = "n1";
+    el["r.file"] = "a.pdf";
+    el["r.name"] = "n2"; // re-assignment: keeps its position, last value wins
+    document.body.appendChild(el);
+    expect(log).toEqual([["name", "n2"], ["file", "a.pdf"]]);
+    el.remove();
+  });
+
+  it("forwards an early undefined unchanged (a T2 shell is a relaying applier)", async () => {
+    log.length = 0;
+    const el = document.createElement(await defineRecordingComposite()) as HTMLElement & Record<string, unknown>;
+    el["r.file"] = undefined;
+    document.body.appendChild(el);
+    expect(log).toEqual([["file", undefined]]);
+    el.remove();
+  });
+
+  it("reports a throwing source setter and still applies the other early writes", async () => {
+    log.length = 0;
+    const reportError = vi.fn();
+    vi.stubGlobal("reportError", reportError);
+    try {
+      const el = document.createElement(await defineRecordingComposite()) as HTMLElement & Record<string, unknown>;
+      el["r.name"] = "boom";
+      el["r.file"] = "ok.pdf";
+      document.body.appendChild(el);
+      expect(reportError).toHaveBeenCalledWith(expect.objectContaining({ message: "setter boom" }));
+      const source = el.shadowRoot!.querySelector("rec-source") as RecordingSource;
+      expect(source.file).toBe("ok.pdf");
+      // The element is fully set up despite the failed early write.
+      const updates: [string, unknown][] = [];
+      bind(el, (name, value) => updates.push([name, value]));
+      expect(updates).toContainEqual(["r.echo", "ok.pdf"]);
+      el.remove();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("leaves an own property alone on a T1 element, which has no input facade", async () => {
+    log.length = 0;
+    const el = document.createElement(await defineRecordingComposite({ localFacade: false })) as HTMLElement & Record<string, unknown>;
+    el["r.file"] = "x.pdf";
+    document.body.appendChild(el);
+    expect(log).toEqual([]);
+    expect(Object.getOwnPropertyDescriptor(el, "r.file")?.value).toBe("x.pdf");
+    el.remove();
+  });
+
+  it("keeps early writes across a failed setup and forwards them on the retry", async () => {
+    let failNextInstall = true;
+    const received: unknown[] = [];
+    class FlakyInputSource extends HTMLElement {
+      static wcBindable = {
+        protocol: "wc-bindable" as const,
+        version: 1,
+        properties: [{ name: "o", event: "flaky-input:o" }],
+        inputs: [{ name: "v" }],
+      };
+      o = 0;
+      set v(x: unknown) { received.push(x); }
+      get v(): unknown { return undefined; }
+      addEventListener(
+        type: string,
+        listener: EventListenerOrEventListenerObject | null,
+        options?: boolean | AddEventListenerOptions,
+      ): void {
+        if (type === "flaky-input:o" && failNextInstall) {
+          failNextInstall = false;
+          throw new Error("install boom");
+        }
+        super.addEventListener(type, listener, options);
+      }
+    }
+    customElements.define("flaky-input-source", FlakyInputSource);
+    await defineComposite({
+      tagName: "composite-flaky-input",
+      sources: [{ id: "f", tag: "flaky-input-source" }],
+      logger: silentLogger,
+    });
+    const el = document.createElement("composite-flaky-input") as HTMLElement & Record<string, unknown>;
+    el["f.v"] = "early";
+
+    try {
+      document.body.appendChild(el); // install() throws; setup rolls back
+    } catch (err) {
+      expect((err as Error).message).toMatch(/install boom/);
+    }
+    expect(received).toEqual([]);
+    expect(Object.getOwnPropertyDescriptor(el, "f.v")).toMatchObject({ value: "early", writable: true });
+
+    el.remove();
+    document.body.appendChild(el); // retry succeeds and forwards the kept write
+    expect(received).toEqual(["early"]);
+    el.remove();
   });
 });
