@@ -1,3 +1,178 @@
+# v0.10.0
+
+Pre-1.0 minor release with one breaking package: **`@wc-bindable/remote` now
+enforces the `JsonValue` gate the wire spec has always required**
+([#30](https://github.com/wc-bindable-protocol/wc-bindable-protocol/issues/30)).
+
+Until now the consumer validated with `try { JSON.stringify }`, so non-JSON
+values were silently reshaped and the caller saw success:
+- a `Date` input arrived as an ISO string, `NaN` as `null`, and a `Map` as `{}`;
+- an `undefined` argument arrived as `null`;
+- a command returning a `Date` resolved with a string;
+- a command returning a `BigInt` left the caller waiting for its timeout.
+
+These values are now rejected with a coded error before anything is sent.
+
+The spec gains an **applier profile** in Extension 1 for code that applies
+inputs and commands to a live component. It answers three proposals about
+binders: `undefined` writes
+([#27](https://github.com/wc-bindable-protocol/wc-bindable-protocol/issues/27)),
+command arguments
+([#28](https://github.com/wc-bindable-protocol/wc-bindable-protocol/issues/28)),
+and attribute reflection
+([#29](https://github.com/wc-bindable-protocol/wc-bindable-protocol/issues/29)).
+`@wc-bindable/composite` gets two fixes. `core` and the framework adapters have
+no behavior change.
+
+## Breaking changes in `@wc-bindable/remote` — review before upgrading
+
+| Change | Migration |
+|---|---|
+| Non-`JsonValue` inputs and arguments are rejected with `WC_BINDABLE_INVALID_JSON_VALUE` instead of being coerced. This covers `Date`, `NaN`, `Map`, nested `undefined`, sparse arrays, class instances, and so on, and also reactive-library values that carry accessors or symbol keys. | Convert values before sending: MobX `toJS()`; Solid `unwrap()`, then `structuredClone` or a JSON round-trip; Vue `toRaw()`. |
+| `set(name, undefined)` and `proxy.x = undefined` throw. Previously the producer was assigned `undefined`. | Assign `null`, and have the Core treat `null` as reset. |
+| `proxy.x = <invalid value>` throws from the assignment expression. | Validate or convert before assigning. |
+| A command that returns a non-`JsonValue` rejects with `WC_BINDABLE_INVALID_RETURN_VALUE`. This happens even if only the producer is upgraded. | Return JSON values, for example `date.toISOString()`. |
+| A non-`JsonValue` property value is no longer sent. A `Date` output used to arrive as an ISO string; now the `update` is dropped, and in `sync` the property is absent. | Expose JSON values from the Core. |
+| Outbound values nested deeper than 256 are rejected as a resource limit. | Raise the new `maxDepth` option if needed. |
+| A thrown non-`Error` arrives as an `Error` named `NonErrorThrow`. | Throw `Error` instances. |
+| Values are copied before sending, so object identity is not preserved over a transport that does not serialize (such transports are already out of contract). | — |
+
+**Mixed versions.**
+- A 0.9 consumer talking to a 0.10 producer keeps working for
+  `set(name, undefined)`: the producer still applies the value-less `set` that
+  older consumers send. However, a 0.9 consumer still reshapes `NaN` / `Date`
+  before sending, and the producer cannot detect that.
+- A 0.10 consumer talking to a 0.9 producer rejects invalid values locally.
+
+## Remote
+
+- **New `jsonValue` module** (`isJsonValue`, `describeNonJsonValue`, `toJsonValue`
+  are exported). It implements the deep validator from SPEC-extensions.md
+  § Design invariants, invariant 3. Senders **validate and copy**, then
+  serialize the copy. As a result, a Proxy whose descriptors lie, a reachable
+  `toJSON`, or a value mutated while queued before `sync` cannot change what
+  crosses the wire.
+- **Consumer checks.** `set` / `setWithAck` / `invoke` validate at the call site
+  in the order name → disposed → terminal → value. A serialization failure at
+  send fails only that call; the transport stays up.
+- **Producer: inbound.** Inbound `set.value` / `cmd.args` are validated before
+  the Core is touched (for commands, before the method lookup).
+- **Producer: outbound.** Return values are validated and produce
+  `WC_BINDABLE_INVALID_RETURN_VALUE` on failure. Property values are validated
+  too: a failing value is dropped with a warning, and in `sync` the name is
+  listed in `getterFailures`.
+- **Error codes.** `err.code` now carries the producer's code.
+  - The shell replaces application codes in the `WC_BINDABLE_` namespace with
+    `WC_BINDABLE_REMOTE_THROW`.
+  - The consumer does the same for consumer-only codes (`DISPOSED`, `TIMEOUT`, …)
+    that arrive in a `throw` envelope, so a thrown object can no longer make an
+    adapter treat a live proxy as disposed.
+  - Non-Error throws are canonicalized (`NonErrorThrow`).
+  - Every error the shell synthesizes carries a code, including the
+    consumer-side `UNDECLARED_INPUT` / `UNDECLARED_COMMAND`, which the README
+    already documented.
+- **`maxDepth` option** on `createRemoteCoreProxy` and `RemoteShellProxy`
+  (default 256). It applies to values each side **sends**; inbound values are
+  not depth-limited, because the limit is not negotiated.
+- **Smaller fixes.**
+  - The proxy reports the wrapped declaration's `version` instead of a
+    hardcoded `1`.
+  - The consumer logs the warning that `getterFailures` requires.
+  - Messages with an empty or non-string `id` are dropped before any Core
+    access.
+
+## Composite
+
+- A composed shell no longer copies a source input's `attribute` hint into its
+  own declaration. The hint named an attribute of the source element that the
+  shell does not map
+  ([#32](https://github.com/wc-bindable-protocol/wc-bindable-protocol/pull/32)).
+- An input written to a declarative composite element before it connects is
+  now forwarded to the source when it connects. This covers a write after
+  `createElement()` but before insertion, and even one before the tag is
+  defined. Previously the facade overwrote the value silently, which broke the
+  usual "create, set props, append" order. Writes are forwarded in the order
+  they were made, with the last value per input winning. A source setter that
+  throws is reported, and the remaining writes are still applied
+  ([#33](https://github.com/wc-bindable-protocol/wc-bindable-protocol/issues/33)).
+
+## Spec & conformance
+
+- **Extension 1 § Applier profile** (claim shorthand `{applier}`).
+  - *Relaying appliers* MUST satisfy it: the producer-side shell (now part of
+    the Level 3 row), wire-less Extension-1 harnesses, and Extension 4 T2 shells
+    (and T3 shells for plain-local delegation kinds).
+  - *Binding appliers* (binders, template systems, framework integrations) MAY
+    claim it.
+  - **A1:** never write, rewrite or remove the attribute an input's `attribute`
+    hint names, and never fall back to it before upgrade.
+  - **A2:** relaying appliers forward `undefined` unchanged. A binding applier
+    skips an `undefined` that has no previous evaluation or follows another
+    `undefined`, and applies one that follows a value. This is what React 19
+    does for custom elements.
+  - **A3:** call commands with `this` set to the target and the arguments as
+    given, and propagate the completion.
+- **Extension 1 § Producer guidance for inputs (P1–P4).** Restore the initial
+  state on `undefined`, document `null`, own attribute reflection, and re-apply
+  early properties. These are listed in SPEC.md § Producer Obligations.
+- **Extension 2.**
+  - `undefined` never travels client → server, and a producer MAY accept the
+    legacy value-less `set`.
+  - Arrays must have `Array.prototype`.
+  - Producers validate inbound values before touching the Core.
+  - Return values are validated.
+  - Dropped property values are listed in `getterFailures`, whose definition
+    now covers "could not transmit".
+  - A consumer-only code arriving in a `throw` envelope is surfaced as
+    `WC_BINDABLE_REMOTE_THROW`.
+  - A declared but unimplemented command produces `WC_BINDABLE_REMOTE_THROW`.
+  - The `invoke` end-to-end diagram adopts thenables.
+- **Extension 4.** Composed shells do not carry source `attribute` hints (§ 2).
+  The T2 / T3 tiers reference the applier profile.
+- **CONFORMANCE.md.**
+  - Vector 7 is amended, and vector 30 gains sub-case (h).
+  - New vectors 40–43 are added to the Extension 2 minimum list.
+  - New applier-profile procedures AP1–AP3.
+  - New Extension 4 vectors C51–C53b.
+- No `version` bump: nothing is added to the declaration or wire schema.
+
+## Tests
+
+- `packages/remote` gains validator tests and tests for the behaviors behind
+  vectors 7, 30(h) and 40–43. These include queued-value mutation, deep-stack
+  serialization failure and hostile thrown values.
+- `packages/composite` gains a Playwright suite (`test:integration`) for the
+  cases that need real custom element upgrade: an element upgraded in place by
+  `define()`, and a detached element upgraded on insertion. Like the other
+  suites, it loads built `dist/`, so `npm run build` must run first.
+
+## Packages
+
+| Package | Version |
+|---------|---------|
+| `@wc-bindable/core` | 0.10.0 |
+| `@wc-bindable/react` | 0.10.0 |
+| `@wc-bindable/vue` | 0.10.0 |
+| `@wc-bindable/angular` | 0.10.0 |
+| `@wc-bindable/svelte` | 0.10.0 |
+| `@wc-bindable/alpine` | 0.10.0 |
+| `@wc-bindable/lit` | 0.10.0 |
+| `@wc-bindable/marko` | 0.10.0 |
+| `@wc-bindable/mithril` | 0.10.0 |
+| `@wc-bindable/preact` | 0.10.0 |
+| `@wc-bindable/qwik` | 0.10.0 |
+| `@wc-bindable/riot` | 0.10.0 |
+| `@wc-bindable/solid` | 0.10.0 |
+| `@wc-bindable/stencil` | 0.10.0 |
+| `@wc-bindable/vanjs` | 0.10.0 |
+| `@wc-bindable/mobx` | 0.10.0 |
+| `@wc-bindable/rxjs` | 0.10.0 |
+| `@wc-bindable/signals` | 0.10.0 |
+| `@wc-bindable/composite` | 0.10.0 |
+| `@wc-bindable/remote` | 0.10.0 |
+
+---
+
 # v0.9.0
 
 Pre-1.0 minor release built around a single defect: `bind()` could not tell
