@@ -61,7 +61,6 @@ interface PlanInput {
   composedName: string;
   sourceId: string;
   sourceName: string;
-  attribute?: string;
 }
 
 interface PlanCommand {
@@ -244,17 +243,11 @@ export function planComposition(
     };
   });
 
-  const inputs: PlanInput[] = rawInputs.map((raw) => {
-    const member = findMember(sourceDecls.get(raw.sourceId)!, "inputs", raw.sourceName)! as {
-      attribute?: string;
-    };
-    return {
-      composedName: raw.composedName,
-      sourceId: raw.sourceId,
-      sourceName: raw.sourceName,
-      attribute: member.attribute,
-    };
-  });
+  const inputs: PlanInput[] = rawInputs.map((raw) => ({
+    composedName: raw.composedName,
+    sourceId: raw.sourceId,
+    sourceName: raw.sourceName,
+  }));
 
   const commands: PlanCommand[] = rawCommands.map((raw) => {
     const member = findMember(sourceDecls.get(raw.sourceId)!, "commands", raw.sourceName)! as {
@@ -282,9 +275,10 @@ export function planComposition(
     })),
   };
   if (inputs.length > 0) {
-    declaration.inputs = inputs.map((i) =>
-      i.attribute !== undefined ? { name: i.composedName, attribute: i.attribute } : { name: i.composedName },
-    );
+    // A source input's `attribute` hint is NOT carried over: it names an
+    // attribute on the source element, and the shell maps no attribute of its
+    // own element to the composed input (SPEC-extensions.md Extension 4 § 2).
+    declaration.inputs = inputs.map((i) => ({ name: i.composedName }));
   }
   if (commands.length > 0) {
     declaration.commands = commands.map((c) =>
