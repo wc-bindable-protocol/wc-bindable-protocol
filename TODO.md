@@ -12,11 +12,13 @@
 - [ ] **SPEC-extensions.md:128 "producer-side proxy" → "producer-side shell"**
   同文書の他箇所（L401, L516, L633, L772）と § Naming: factory vs class の定義は一貫して producer 側 = Shell、consumer 側 = Proxy。L128 のみ用語不整合。
 
-- [ ] **SPEC-extensions.md § Methods — fire-and-forget `set` の JsonValue 検証必須条件を 1 箇所に集約**
+- [x] **SPEC-extensions.md § Methods — fire-and-forget `set` の JsonValue 検証必須条件を 1 箇所に集約**
   `set` 行は「Extension 2 採用時のみ JsonValue 検証」と読める一方、§ Pre-sync call state machine は「call site で MUST」と書く。Extension 1 単独実装で検証必須性が分岐。「Ext 2 採用時 MUST / Ext 1 単独時 SHOULD」など条件分岐を明示。
+  → 対応済み（#27–#30 の仕様改訂）: § Methods の表の直後に "Call-site `JsonValue` validation" 段落を新設。Ext 2 採用時は call site で MUST、wire のない Extension 1 surface は値をそのまま適用する（§ Applier profile A2）。
 
-- [ ] **SPEC-extensions.md § Design invariants invariant 3 に producer 側 `cmd.args[i]` 検証 MUST を明記**
+- [x] **SPEC-extensions.md § Design invariants invariant 3 に producer 側 `cmd.args[i]` 検証 MUST を明記**
   現状は `args` が配列であることまでしか書かず、各要素の検証必須性は `WC_BINDABLE_INVALID_JSON_VALUE` 行からの逆引きでしか確認できない。「producer は inbound `set.value` / `cmd.args[i]` の各要素を JsonValue で検証 MUST」を 1 行追加。
+  → 対応済み（#27–#30 の仕様改訂）: invariant 3 に "Producer-side (client → server traffic)" を新設。Core に触れる前（`cmd` はメソッド参照の前）に `set.value` と `cmd.args` の各要素を検証する MUST と、値なし `set` の legacy acceptance を追加。
 
 ### CONFORMANCE.md ベクトル補強（normative MUST 対応）
 
@@ -57,10 +59,12 @@
 
 ### CONFORMANCE.md 追補候補
 
-- [ ] vector: `WC_BINDABLE_INVALID_RETURN_VALUE`（producer が返値を `throw` に変換するパス）
+- [x] vector: `WC_BINDABLE_INVALID_RETURN_VALUE`（producer が返値を `throw` に変換するパス）
+  → 対応済み: vector 42（return-value validation）。
 - [ ] vector: Pre-aborted `AbortSignal`（wire 送信なしで即 reject MUST）
 - [ ] vector: Wire envelope unknown-fields rule の forward-compat MUST
-- [ ] vector: Application-throw `code` pass-through（`throw.error.code === "MYAPP_X"` がそのまま届く）
+- [x] vector: Application-throw `code` pass-through（`throw.error.code === "MYAPP_X"` がそのまま届く）
+  → 対応済み: vector 30 (h)。
 - [ ] vector: `reconnect()` on disposed proxy が同期 throw する分岐（vector 28 本文記述あり、Expected で未アサート）
 
 ### 編集・整合性
