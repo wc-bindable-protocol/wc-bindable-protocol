@@ -25,3 +25,5 @@ export {
   buildDeclarationFingerprint,
   declarationFingerprintsEqual,
 } from "./declarationFingerprint.js";
+export { isJsonValue, describeNonJsonValue, toJsonValue } from "./jsonValue.js";
+export type { JsonValue, JsonValueResult } from "./jsonValue.js";

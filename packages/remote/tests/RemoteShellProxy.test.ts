@@ -161,7 +161,7 @@ describe("RemoteShellProxy", () => {
     }));
   });
 
-  it("falls back when JSON.stringify does not return a string for a thrown cause", () => {
+  it("omits a thrown cause that is not a JsonValue", () => {
     class UndefinedJsonCauseCore extends EventTarget {
       static wcBindable: WcBindableDeclaration = {
         protocol: "wc-bindable",
@@ -189,15 +189,9 @@ describe("RemoteShellProxy", () => {
     expect(send).toHaveBeenCalledWith({
       type: "throw",
       id: "undefined-json-cause",
-      error: expect.objectContaining({
-        name: "Error",
-        message: "top",
-        cause: {
-          name: "RemoteShellProxyError",
-          message: "Error cause is not JSON-serializable",
-        },
-      }),
+      error: expect.objectContaining({ name: "Error", message: "top" }),
     });
+    expect(send.mock.calls[0][0].error).not.toHaveProperty("cause");
   });
 
   it("treats non-string JSON.stringify results as non-serializable throw payloads", () => {
@@ -229,8 +223,8 @@ describe("RemoteShellProxy", () => {
       type: "throw",
       id: "undefined-json-throw",
       error: {
-        name: "RemoteShellProxyError",
-        message: "Thrown value is not JSON-serializable",
+        name: "NonErrorThrow",
+        message: "[object Object]",
       },
     });
   });
@@ -267,6 +261,7 @@ describe("RemoteShellProxy", () => {
         error: {
           name: "RemoteShellProxyError",
           message: "Thrown value is not JSON-serializable",
+          code: "WC_BINDABLE_REMOTE_THROW",
         },
       });
     } finally {
@@ -493,7 +488,7 @@ describe("RemoteShellProxy", () => {
 
     expect(() => {
       new RemoteShellProxy(core, server);
-      core.dispatchEvent(new CustomEvent("test:value-changed", { detail: 1n }));
+      core.dispatchEvent(new CustomEvent("test:value-changed", { detail: 1 }));
     }).not.toThrow();
 
     expect(errorSpy).toHaveBeenCalledWith(
@@ -735,6 +730,7 @@ describe("RemoteShellProxy", () => {
       error: {
         name: "RemoteShellProxyError",
         message: 'Command "nonExistent" is not declared in wcBindable.commands',
+        code: "WC_BINDABLE_UNDECLARED_COMMAND",
       },
     });
   });
@@ -767,6 +763,7 @@ describe("RemoteShellProxy", () => {
       error: {
         name: "RemoteShellProxyError",
         message: 'Method "boom" not found on Core',
+        code: "WC_BINDABLE_REMOTE_THROW",
       },
     });
   });
@@ -816,6 +813,7 @@ describe("RemoteShellProxy", () => {
       error: {
         name: "RemoteShellProxyError",
         message: 'Input "missing" is not declared in wcBindable.inputs',
+        code: "WC_BINDABLE_UNDECLARED_INPUT",
       },
     });
   });
@@ -840,6 +838,7 @@ describe("RemoteShellProxy", () => {
       error: {
         name: "RemoteShellProxyError",
         message: 'Input "__proto__" is reserved and cannot be assigned remotely',
+        code: "WC_BINDABLE_RESERVED_NAME",
       },
     });
     expect(Object.prototype).not.toHaveProperty("polluted");
@@ -869,7 +868,7 @@ describe("RemoteShellProxy", () => {
     warnSpy.mockRestore();
   });
 
-  it("treats an empty string set id as an acknowledged request", () => {
+  it("logs and drops a set with an empty-string id without touching the Core", () => {
     const core = new TestCore();
     const send = vi.fn();
     let handler: ((msg: ClientMessage) => void) | null = null;
@@ -878,10 +877,13 @@ describe("RemoteShellProxy", () => {
       onMessage: (h) => { handler = h; },
     };
 
-    new RemoteShellProxy(core, server);
+    const warn = vi.fn();
+    new RemoteShellProxy(core, server, { logger: { warn, error: vi.fn() } });
     handler!({ type: "set", name: "url", value: "/empty-id", id: "" });
 
-    expect(send).toHaveBeenCalledWith({ type: "return", id: "", value: undefined });
+    expect(send).not.toHaveBeenCalled();
+    expect(core.url).not.toBe("/empty-id");
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("malformed id"));
   });
 
   it("isolates setter exceptions so the message handler survives", () => {
@@ -996,8 +998,8 @@ describe("RemoteShellProxy", () => {
       type: "throw",
       id: "set-bigint",
       error: {
-        name: "RemoteShellProxyError",
-        message: "Thrown value is not JSON-serializable",
+        name: "NonErrorThrow",
+        message: "1",
       },
     });
   });
@@ -1038,7 +1040,7 @@ describe("RemoteShellProxy", () => {
     });
   });
 
-  it("passes through non-Error async rejections", async () => {
+  it("canonicalizes non-Error async rejections", async () => {
     class StringRejectCore extends EventTarget {
       static wcBindable: WcBindableDeclaration = {
         protocol: "wc-bindable",
@@ -1068,7 +1070,7 @@ describe("RemoteShellProxy", () => {
     expect(send).toHaveBeenCalledWith({
       type: "throw",
       id: "string-async",
-      error: "plain failure",
+      error: { name: "NonErrorThrow", message: "plain failure", cause: "plain failure" },
     });
   });
 
@@ -1106,8 +1108,8 @@ describe("RemoteShellProxy", () => {
       type: "throw",
       id: "circular-async",
       error: {
-        name: "RemoteShellProxyError",
-        message: "Thrown value is not JSON-serializable",
+        name: "NonErrorThrow",
+        message: "[object Object]",
       },
     });
   });
@@ -1268,7 +1270,7 @@ describe("RemoteShellProxy", () => {
     });
   });
 
-  it("replaces cyclic Error causes with an explicit RemoteShellProxyError", () => {
+  it("omits a cause that cycles back to an Error being serialized", () => {
     class CyclicCauseCore extends EventTarget {
       static wcBindable: WcBindableDeclaration = {
         protocol: "wc-bindable",
@@ -1298,15 +1300,9 @@ describe("RemoteShellProxy", () => {
     expect(send).toHaveBeenCalledWith({
       type: "throw",
       id: "cyclic-cause",
-      error: expect.objectContaining({
-        name: "Error",
-        message: "cycle root",
-        cause: {
-          name: "RemoteShellProxyError",
-          message: "Error cause chain contains a cycle",
-        },
-      }),
+      error: expect.objectContaining({ name: "Error", message: "cycle root" }),
     });
+    expect(send.mock.calls[0][0].error).not.toHaveProperty("cause");
   });
 
   it("serializes errors even when stack is missing", () => {
@@ -1363,7 +1359,7 @@ describe("RemoteShellProxy", () => {
     expect(shell._safeSend({ type: "sync" }, "after dispose")).toBe(false);
   });
 
-  it("notifies when a nested Error cause is not JSON-serializable", () => {
+  it("omits a nested Error's cause that is not a JsonValue", () => {
     class ThrowCore extends EventTarget {
       static wcBindable: WcBindableDeclaration = {
         protocol: "wc-bindable",
@@ -1394,19 +1390,13 @@ describe("RemoteShellProxy", () => {
       error: expect.objectContaining({
         name: "Error",
         message: "top",
-        cause: expect.objectContaining({
-          name: "Error",
-          message: "nested",
-          cause: {
-            name: "RemoteShellProxyError",
-            message: "Error cause is not JSON-serializable",
-          },
-        }),
+        cause: expect.objectContaining({ name: "Error", message: "nested" }),
       }),
     });
+    expect(send.mock.calls[0][0].error.cause).not.toHaveProperty("cause");
   });
 
-  it("passes through non-Error sync throws", () => {
+  it("canonicalizes non-Error sync throws", () => {
     class StringThrowCore extends EventTarget {
       static wcBindable: WcBindableDeclaration = {
         protocol: "wc-bindable",
@@ -1434,7 +1424,7 @@ describe("RemoteShellProxy", () => {
     expect(send).toHaveBeenCalledWith({
       type: "throw",
       id: "string-sync",
-      error: "plain sync failure",
+      error: { name: "NonErrorThrow", message: "plain sync failure", cause: "plain sync failure" },
     });
   });
 

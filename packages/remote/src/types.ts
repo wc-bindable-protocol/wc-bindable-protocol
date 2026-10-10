@@ -3,7 +3,13 @@
  */
 export type ClientMessage =
   | { type: "sync" }
-  | { type: "set"; name: string; value: unknown; id?: string }
+  /**
+   * `value` is required on the wire. It is typed optional because the
+   * producer-side shell still accepts the legacy encoding of
+   * `set(name, undefined)` from consumers that predate the JsonValue gate (a
+   * `set` without `value`); the consumer-side proxy never sends one.
+   */
+  | { type: "set"; name: string; value?: unknown; id?: string }
   | { type: "cmd"; name: string; id: string; args: unknown[] };
 
 export interface RemoteCapabilities {
@@ -103,6 +109,12 @@ export interface RemoteSerializedError {
   message: string;
   stack?: string;
   cause?: unknown;
+  /**
+   * Machine-readable failure class (SPEC-extensions.md § Error envelope).
+   * Present on every error the producer-side shell synthesizes itself;
+   * optional on application throws.
+   */
+  code?: string;
 }
 
 export interface RemoteRequestOptions {

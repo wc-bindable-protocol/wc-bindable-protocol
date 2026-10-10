@@ -90,11 +90,12 @@ describe("end-to-end", () => {
     expect(onUpdate).toHaveBeenCalledWith("loading", false);
   });
 
-  it("round-trips undefined updates and undefined set through the real WebSocket wire", async () => {
+  it("round-trips undefined updates and rejects undefined set through the real WebSocket wire", async () => {
     // JSON.stringify drops `value: undefined`, so a live update that
-    // reverts a property to undefined and a `set(name, undefined)` call
-    // must both be understood as undefined on the receiving side. This
-    // test wires the real WebSocket transports so JSON.stringify /
+    // reverts a property to undefined must be understood as undefined on
+    // the receiving side (the absent-`value` encoding). An input value of
+    // `undefined` is not a JsonValue and is rejected before it is sent.
+    // This test wires the real WebSocket transports so JSON.stringify /
     // JSON.parse actually run — the mock pair used by other tests bypasses
     // serialization and would not have caught the drop.
     const { clientTransport, serverTransport } = createWebSocketPair();
@@ -137,12 +138,14 @@ describe("end-to-end", () => {
 
     expect(proxy.value).toBeUndefined();
 
-    // Client-side set(name, undefined) — JSON.stringify drops the field
-    // too, and the server must treat the absent `value` as undefined.
-    proxy.set("url", undefined);
+    // Client-side set(name, undefined) does not cross the wire: it throws
+    // locally and the Core keeps its value.
+    expect(() => proxy.set("url", undefined)).toThrow(
+      expect.objectContaining({ code: "WC_BINDABLE_INVALID_JSON_VALUE" }),
+    );
     await flush();
 
-    expect(core._url).toBeUndefined();
+    expect(core._url).toBe("start");
   });
 
   it("multiple sync requests return latest state", async () => {

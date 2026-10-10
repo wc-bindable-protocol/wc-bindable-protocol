@@ -538,7 +538,7 @@ describe("RemoteCoreProxy", () => {
     }
   });
 
-  it("rejects invoke() on throw message", async () => {
+  it("rejects invoke() with an Error when a throw envelope carries a non-Error value", async () => {
     let handler: ((msg: ServerMessage) => void) | null = null;
     const client: ClientTransport = {
       send: (msg) => {
@@ -551,7 +551,12 @@ describe("RemoteCoreProxy", () => {
 
     const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
     deliverSync(handler);
-    await expect(proxy.invoke("doFetch")).rejects.toBe("boom");
+    // SPEC-extensions.md § Error envelope: the proxy MUST reject with an
+    // Error instance whatever the producer sent (older producers forwarded raw
+    // non-Error throws); the canonical non-Error mapping applies.
+    const error = await proxy.invoke("doFetch").catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(Error);
+    expect(error).toMatchObject({ name: "NonErrorThrow", message: "boom", cause: "boom" });
   });
 
   it("revives serialized remote errors into Error instances", async () => {
@@ -896,7 +901,7 @@ describe("RemoteCoreProxy", () => {
     await expect(setPromise).rejects.toBeInstanceOf(RangeError);
   });
 
-  it("rejects only the pending setWithAck() when send() fails on a non-serializable payload", async () => {
+  it("rejects a non-JsonValue setWithAck() locally without sending or tearing down", async () => {
     const send = vi.fn((msg: ClientMessage) => {
       JSON.stringify(msg);
     });
@@ -911,8 +916,10 @@ describe("RemoteCoreProxy", () => {
     const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
     deliverSync(handler);
 
+    const sentBefore = send.mock.calls.length;
     const badPending = proxy.setWithAck("url", 1n);
-    await expect(badPending).rejects.toBeInstanceOf(TypeError);
+    await expect(badPending).rejects.toMatchObject({ code: "WC_BINDABLE_INVALID_JSON_VALUE" });
+    expect(send.mock.calls.length).toBe(sentBefore);
 
     const pending = Reflect.getOwnPropertyDescriptor(proxy, "_pending")?.value as Map<string, unknown>;
     expect(pending.size).toBe(0);
@@ -1252,7 +1259,7 @@ describe("RemoteCoreProxy", () => {
     }
   });
 
-  it("rejects only the pending invoke() when send() fails on a non-serializable payload", async () => {
+  it("rejects a non-JsonValue invoke() locally without sending or tearing down", async () => {
     const send = vi.fn((msg: ClientMessage) => {
       JSON.stringify(msg);
     });
@@ -1266,8 +1273,10 @@ describe("RemoteCoreProxy", () => {
 
     const proxy = createRemoteCoreProxy(TestCore.wcBindable, client);
 
+    const sentBefore = send.mock.calls.length;
     const badPending = proxy.invoke("doFetch", 1n);
-    await expect(badPending).rejects.toBeInstanceOf(TypeError);
+    await expect(badPending).rejects.toMatchObject({ code: "WC_BINDABLE_INVALID_JSON_VALUE" });
+    expect(send.mock.calls.length).toBe(sentBefore);
 
     const pending = Reflect.getOwnPropertyDescriptor(proxy, "_pending")?.value as Map<string, unknown>;
     expect(pending.size).toBe(0);
