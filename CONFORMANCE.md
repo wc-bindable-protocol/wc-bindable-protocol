@@ -24,6 +24,7 @@ Conformance is **facet-based, not monolithic** — an implementation does not ne
 | **`{3-consumer}`** | Remote consumer-side proxy — implements Extension 2's wire format and Extension 1's call methods (`set`, `setWithAck`, `invoke`) from the consumer side |
 | **`{3-producer}`** | Remote producer-side shell — accepts the wire format on the producer side, dispatches per-property updates, runs `getter` server-side |
 | **`{3-both}`** | Implementation that ships both sides (the reference `@wc-bindable/remote` is `{1O + 1P, 2, 3-both}` — it ships the consumer-side proxy `{1O}`, the producer-side shell `{1P}`, the Level 2 JS API, and both Level 3 sides) |
+| **`{applier}`** | The Extension 1 applier profile ([SPEC-extensions.md § Applier profile](SPEC-extensions.md#applier-profile)) — code that applies `set` / `invoke` to a live target. Required of every relaying applier: a producer-side shell (so every `{3-producer}` claim includes it), a wire-less Extension-1 surface such as a devtools or automation harness, an Extension 4 T2 shell, and a T3 shell for a plain-local delegation kind. A binding applier (application binder, template system, framework integration) MAY claim it. Tested by the procedures in [§ Extension 1 applier profile vectors](#extension-1-applier-profile-vectors) |
 
 Compound shorthand: `{1O, 2}` means "Level 1 observer facet + Level 2"; `{3-consumer}` is the consumer-side of an Extension 2 implementation; `{3-both}` ships both Level 3 sides. `{1O}` standalone means any 1O-claiming implementation regardless of higher levels. The full definitions live in [SPEC.md § Conformance Levels](SPEC.md#conformance-levels) — this legend is a navigation aid, not a re-definition.
 
@@ -35,7 +36,7 @@ Compound shorthand: `{1O, 2}` means "Level 1 observer facet + Level 2"; `{3-cons
 | 4 | Initial sync | `{1O}` (any 1O-claiming bind implementation, including `{1O, 2}` and `{3-consumer}` proxies that expose `bind()`-equivalent semantics to local consumers) | A property whose current value is `undefined` is still delivered as `onUpdate(name, undefined)` on initial sync | [SPEC.md § Initial Value Synchronization](SPEC.md#initial-value-synchronization) |
 | 5 | Remote sync | `{3-consumer}` and `{3-both}` | Before the `sync` response, `name in proxy === false` for declared `properties` names (the rule is properties-only; `inputs` / `commands` `in` behavior is implementation-defined — see the detail section) | [SPEC-extensions.md § Consumer-side proxy `has` trap contract](SPEC-extensions.md#consumer-side-proxy-has-trap-contract) |
 | 6 | Remote undefined | `{3-consumer}` and `{3-both}` | An `update` envelope with no `value` key produces `onUpdate(name, undefined)` — **not** `null` | [SPEC-extensions.md § Update envelope value field](SPEC-extensions.md#update-envelope-value-field) + [§ CustomEvent `detail` and undefined preservation](SPEC-extensions.md#customevent-detail-and-undefined-preservation) |
-| 7 | JsonValue | `{3-consumer}` and `{3-producer}` (and `{3-both}`) — every side that serializes payloads to the wire | Non-finite numbers, non-plain-prototype objects, sparse-hole arrays, accessor-property objects, non-enumerable objects, functions, and cyclic references are rejected by `JsonValue` validation. Symbol-keyed objects are rejected **by default**; an implementation MAY accept them only by documenting the opt-out and silently dropping the symbol keys at serialization (see the detail section) | [SPEC-extensions.md § Design invariants → invariant 3](SPEC-extensions.md#extension-2--wire-format-remote-proxying) |
+| 7 | JsonValue | `{3-consumer}` and `{3-producer}` (and `{3-both}`) — every side that serializes payloads to the wire | Non-finite numbers, non-plain-prototype objects, `Array` subclass instances, sparse-hole arrays, accessor-property objects, non-enumerable objects, functions, `BigInt`, cyclic references, and `undefined` at any position (top level, object property, array element) are rejected by `JsonValue` validation — for `set` / `setWithAck` values and for `invoke` arguments alike. Symbol-keyed objects are rejected **by default**; an implementation MAY accept them only by documenting the opt-out and silently dropping the symbol keys at serialization (see the detail section) | [SPEC-extensions.md § Design invariants → invariant 3](SPEC-extensions.md#extension-2--wire-format-remote-proxying) |
 | 8 | Teardown | `{1O, 2}` (and any other 1O implementation that hands a cleanup function back to the caller) | If `addEventListener` throws on the Nth listener install, the previous N-1 listeners MUST be removed before the throw propagates | [SPEC.md § Teardown Contract](SPEC.md#teardown-contract) |
 | 9 | setWithAck | `{3-both}` end-to-end; producer-side semantics tested on `{3-producer}`, consumer-side semantics tested on `{3-consumer}` | The returned `Promise` MUST NOT resolve before the JS-level assignment `target[name] = value` has executed on the producer side | [SPEC-extensions.md § Methods](SPEC-extensions.md#methods) (the `setWithAck` row) + [§ setWithAck end-to-end](SPEC-extensions.md#setwithack-end-to-end) |
 | 10 | setWithAck legacy | `{3-consumer}` and `{3-both}` (the consumer-side rejection rule is what is tested; producer side participates only as a stub that omits `setAck`) | If the producer's `sync` response omits / sets-false `capabilities.setAck`, `setWithAck` MUST return an already-rejected `Promise` whose `error.code === "WC_BINDABLE_SET_ACK_UNSUPPORTED"` and MUST NOT send an id-bearing `set` on the wire. The pinned code is what makes consumer recovery (typical pattern: fall back to fire-and-forget `set`) robust against `error.message` localization / runtime differences | [SPEC-extensions.md § Message types — server → client](SPEC-extensions.md#message-types--server--client) (setAck capability bullets) + [§ Pre-sync call state machine](SPEC-extensions.md#pre-sync-call-state-machine) + [§ Error envelope](SPEC-extensions.md#error-envelope) (`WC_BINDABLE_SET_ACK_UNSUPPORTED` row) |
@@ -58,7 +59,7 @@ Compound shorthand: `{1O, 2}` means "Level 1 observer facet + Level 2"; `{3-cons
 | 27 | `dispose()` rejects pending in caller order; late envelopes dropped | `{3-consumer}` and `{3-both}` | `dispose()` MUST reject every pending `setWithAck` / `setWithAckOptions` / `invoke` / `invokeWithOptions` entry in **caller order** (FIFO across the pending table) before returning. Each rejection MUST carry `error.code === "WC_BINDABLE_DISPOSED"` per [§ Error envelope](SPEC-extensions.md#error-envelope) (the locally-synthesized-error MUST applies). Any subsequent inbound `return` / `throw` envelope referencing one of the already-rejected `id`s MUST be silently dropped (SHOULD warn-log) — the consumer `Promise` MUST NOT re-settle. `set()` after `dispose()` MUST throw synchronously with the same `WC_BINDABLE_DISPOSED` code on the thrown Error; `setWithAck` / `setWithAckOptions` / `invoke` / `invokeWithOptions` after `dispose()` MUST return an already-rejected `Promise` with the same code. `dispose()` itself MUST be idempotent (safely re-callable as a no-op) | [SPEC-extensions.md § Lifecycle methods](SPEC-extensions.md#lifecycle-methods) + [§ Pending-call lifecycle](SPEC-extensions.md#pending-call-lifecycle-setwithack--setwithackoptions--invoke--invokewithoptions) + [§ AckOptions](SPEC-extensions.md#ackoptions) + [§ Error envelope](SPEC-extensions.md#error-envelope) (`WC_BINDABLE_DISPOSED` row) |
 | 28 | `reconnect()` after TerminalFailure: fresh `sync`; old pending NOT replayed | `{3-consumer}` and `{3-both}` that ship `reconnect()` (OPTIONAL per [§ Lifecycle methods](SPEC-extensions.md#lifecycle-methods); implementations that omit `reconnect` are conformant and this vector is N/A) | After the channel enters TerminalFailure, every pending entry MUST have been rejected (per vector 27's drain rule applied to TerminalFailure). On `reconnect(transport)` with a fresh transport, the proxy MUST send a new `{ "type": "sync" }` envelope and MUST NOT replay any of the previously-rejected pending messages on the new transport. `reconnect()` MUST throw synchronously when the proxy is already disposed OR when the existing transport is still active (re-attaching to a healthy connection is a programmer error) | [SPEC-extensions.md § Lifecycle methods](SPEC-extensions.md#lifecycle-methods) (reconnect row) + [§ Remote proxy lifecycle](SPEC-extensions.md#remote-proxy-lifecycle) (TerminalFailure → Reconnecting → PreSync) |
 | 29 | Cache validity across TerminalFailure / Reconnecting | `{3-consumer}` and `{3-both}` | During TransientFailure, TerminalFailure, and Reconnecting (before the next `sync` response arrives), the per-property cache MUST be preserved as last-known-value: `proxy.<N>` reads the same value it returned before the lifecycle transition, and `N in proxy` stays `true` for `N` that was cached before the transition. The proxy MUST NOT zero / clear / mark-stale the cache merely because the transport state changed. The new `sync` response (after reconnect) re-applies the [§ Consumer-side sync-response handling](SPEC-extensions.md#consumer-side-sync-response-handling--reference-pseudocode) rules diff-style: `N` now present in `values` / `undefinedProperties` updates the cache and re-fires `onUpdate`; `N` now omitted from both (and not in `getterFailures`) removes the cache entry and flips `has` back to `false` without dispatching a synthetic removal event | [SPEC-extensions.md § Cache validity across transport lifecycle](SPEC-extensions.md#cache-validity-across-transport-lifecycle) |
-| 30 | Locally-synthesized errors MUST carry `code` | `{3-consumer}` and `{3-both}` (consumer-side synthetic errors); `{3-producer}` and `{3-both}` (producer-side `throw` envelope emission for locally-synthesized failures) | Every locally-synthesized protocol error reaching the consumer's `catch` MUST carry `error.code` drawn from the registry in [SPEC-extensions.md § Error envelope → Machine-readable code field](SPEC-extensions.md#error-envelope). Concretely test: (a) `setWithAckOptions(name, value, { timeoutMs: 1 })` against an unresponsive producer rejects with `error.code === "WC_BINDABLE_TIMEOUT"`; (b) `invokeWithOptions(name, args, { signal })` aborted after send rejects with `error.code === "WC_BINDABLE_ABORTED"`; (c) `setWithAck(name, new Date())` (or any non-`JsonValue`) rejects with `error.code === "WC_BINDABLE_INVALID_JSON_VALUE"`; (d) malformed inbound `sync` (per vector 23) drains pending with `error.code === "WC_BINDABLE_PROTOCOL_ERROR"`; (e) `proxy.dispose()` with one or more pending calls drains them with `error.code === "WC_BINDABLE_DISPOSED"` (per vector 27); (f) transport-induced TerminalFailure drains pending with `error.code === "WC_BINDABLE_TERMINAL_FAILURE"` (per vector 28); (g) `setWithAckOptions(name, value, { timeoutMs: -1 })` (or any negative / non-finite / non-numeric `timeoutMs`) rejects with `error.code === "WC_BINDABLE_INVALID_ACK_OPTIONS"` AND `error.name === "RangeError"` (the RangeError-shaped minimum requirement per [SPEC-extensions.md § AckOptions](SPEC-extensions.md#ackoptions)). The spec additionally requires the returned Promise to be **synchronously** already-rejected (not microtask-deferred), but this vector's `try / await / catch` shape verifies the observable error shape only — synchrony timing is tracked as future-work, see "[Synchrony of `setWithAckOptions` / `invokeWithOptions` invalid-`timeoutMs` rejection](#what-this-list-does-not-cover)". Application throws from the producer's command / setter (canonical example: `target.fetch()` throws a `RangeError`) MAY omit `code` or carry `WC_BINDABLE_REMOTE_THROW` — application throws MUST NOT repurpose any other registered `WC_BINDABLE_*` code | [SPEC-extensions.md § Error envelope → Code-emission rule for locally-synthesized errors](SPEC-extensions.md#error-envelope) (origin-conditional MUST / MAY, both emission sites) |
+| 30 | Locally-synthesized errors MUST carry `code` | `{3-consumer}` and `{3-both}` (consumer-side synthetic errors); `{3-producer}` and `{3-both}` (producer-side `throw` envelope emission for locally-synthesized failures); sub-case (h) end-to-end on `{3-both}` (consumer pass-through on `{3-consumer}`, producer code handling on `{3-producer}`) | Every locally-synthesized protocol error reaching the consumer's `catch` MUST carry `error.code` drawn from the registry in [SPEC-extensions.md § Error envelope → Machine-readable code field](SPEC-extensions.md#error-envelope). Concretely test: (a) `setWithAckOptions(name, value, { timeoutMs: 1 })` against an unresponsive producer rejects with `error.code === "WC_BINDABLE_TIMEOUT"`; (b) `invokeWithOptions(name, args, { signal })` aborted after send rejects with `error.code === "WC_BINDABLE_ABORTED"`; (c) `setWithAck(name, new Date())` (or any non-`JsonValue`) rejects with `error.code === "WC_BINDABLE_INVALID_JSON_VALUE"`; (d) malformed inbound `sync` (per vector 23) drains pending with `error.code === "WC_BINDABLE_PROTOCOL_ERROR"`; (e) `proxy.dispose()` with one or more pending calls drains them with `error.code === "WC_BINDABLE_DISPOSED"` (per vector 27); (f) transport-induced TerminalFailure drains pending with `error.code === "WC_BINDABLE_TERMINAL_FAILURE"` (per vector 28); (g) `setWithAckOptions(name, value, { timeoutMs: -1 })` (or any negative / non-finite / non-numeric `timeoutMs`) rejects with `error.code === "WC_BINDABLE_INVALID_ACK_OPTIONS"` AND `error.name === "RangeError"` (the RangeError-shaped minimum requirement per [SPEC-extensions.md § AckOptions](SPEC-extensions.md#ackoptions)). The spec additionally requires the returned Promise to be **synchronously** already-rejected (not microtask-deferred), but this vector's `try / await / catch` shape verifies the observable error shape only — synchrony timing is tracked as future-work, see "[Synchrony of `setWithAckOptions` / `invokeWithOptions` invalid-`timeoutMs` rejection](#what-this-list-does-not-cover)". Application throws from the producer's command / setter (canonical example: `target.fetch()` throws a `RangeError`) MAY omit `code` or carry `WC_BINDABLE_REMOTE_THROW` — application throws MUST NOT repurpose any other registered `WC_BINDABLE_*` code. (h) Application-error codes end to end: a `code` on an inbound `throw` reaches `err.code` unchanged; an application-supplied `WC_BINDABLE_*` code — on an `Error` or on a thrown plain object — never reaches the consumer as the protocol code it names (it arrives as `WC_BINDABLE_REMOTE_THROW`, or absent); a consumer-only code (`WC_BINDABLE_DISPOSED`, `WC_BINDABLE_TIMEOUT`, …) arriving in a `throw` envelope is surfaced as `WC_BINDABLE_REMOTE_THROW`; a non-`Error` throw rejects with an `Error` named `"NonErrorThrow"` | [SPEC-extensions.md § Error envelope → Code-emission rule for locally-synthesized errors](SPEC-extensions.md#error-envelope) (origin-conditional MUST / MAY, both emission sites) |
 | 31 | `getterFailures` does NOT touch cache; subsequent `update` recovers | `{3-consumer}` and `{3-both}` | Setup: producer's first `sync` response includes `values: { v: 42 }` and `capabilities: { setAck: true, getterFailures: true }`. After consumer caches `v === 42`, force a re-sync (via reconnect or a producer-issued fresh `sync`) whose response carries `values: {}` and `getterFailures: ["v"]`. Expected: (a) `proxy.v === 42` is preserved (cache NOT reverted to `undefined`); (b) no `onUpdate` event is dispatched for `v` as part of the failed-getter sync; (c) the consumer logger receives a warn-level message naming `v`; (d) a subsequent `{ type: "update", name: "v", value: 99 }` from the producer normally updates the cache to `99` and dispatches `onUpdate("v", 99)` — the getter failure does NOT permanently taint the property | [SPEC-extensions.md § `getterFailures` semantics](SPEC-extensions.md#getterfailures-semantics) + [§ Consumer-side sync-response handling](SPEC-extensions.md#consumer-side-sync-response-handling--reference-pseudocode) |
 | 32 | Malformed `update` drops + warns; transport stays open; next valid `update` processed | `{3-consumer}` and `{3-both}` | Inject a malformed `update` envelope (missing `name`, non-string `name`, or present `value` that fails `JsonValue` deep validation). Expected: (a) the proxy does NOT throw, does NOT close the transport, and does NOT write the cache for the property whose `name` was malformed (if any); (b) the consumer's `bind()` callback receives NO event for the malformed envelope; (c) the proxy logger receives a warn-level entry naming the field that failed; (d) a subsequent well-formed `{ type: "update", name: "value", value: "ok" }` envelope is processed normally — the cache updates, `onUpdate("value", "ok")` fires. This is the asymmetry from vector 23: malformed `sync` escalates to TerminalFailure, malformed `update` degrades gracefully | [SPEC-extensions.md § Consumer-side malformed message handling](SPEC-extensions.md#consumer-side-malformed-message-handling) (malformed `update` row) |
 | 33 | Deferred initial-sync throw — `unbind()` is a literal no-op afterward | `{1O}` for general-purpose browser JS implementations that support `syncOn: "connect"` (skip applies under the same conditions as vector 13) | A `syncOn: "connect"` bind where the deferred initial-sync throws (e.g. a property getter throws on read inside the `MutationObserver` microtask). Expected: (a) the adapter's installed cleanups (listeners + the `MutationObserver`) MUST be torn down before the throw escapes the microtask; (b) the throw surfaces as an uncaught error on the dispatching microtask (`window.onerror` / `reportError` / `process.on('uncaughtException')`), NOT as a synchronous throw from the original `bind()` call frame; (c) the `unbind` function the caller received at `bind()` time MUST still be safe to invoke after the throw — calling `unbind()` MUST be a literal no-op (the closure-level `disposed` re-entry guard was set by the cleanup-on-throw path); (d) the `unbind()` call MUST NOT re-walk the cleanup list, MUST NOT throw, MUST NOT trigger any further uncaught error | [SPEC.md § Teardown Contract](SPEC.md#teardown-contract) (the "If a deferred initial-sync (`syncOn: \"connect\"`) throws" paragraph) + [§ bind() state machine summary](SPEC.md#bind-state-machine-summary) (InitialSyncing → Disposed via deferred throw) |
@@ -68,6 +69,10 @@ Compound shorthand: `{1O, 2}` means "Level 1 observer facet + Level 2"; `{3-cons
 | 37 | Non-`protocol` fingerprint mismatch — warn+continue (default mode), TerminalFailure (strict mode) | `{3-consumer}` and `{3-both}`. The strict-mode branch is conditional on implementations that ship a `strictFingerprint` (or equivalent) option; implementations that do not ship strict mode satisfy only the default-mode sub-case | Setup: proxy constructed with a local declaration that agrees with the producer on `protocol` but differs on at least one of `version` / `properties` / `inputs` / `commands` (e.g. local declares `commands: ["fetch"]`, producer's fingerprint carries `commands: ["fetch", "abort"]`). Two sub-cases: **Default mode** — (a) the proxy does NOT transition to TerminalFailure; (b) the consumer logger receives a warn-level entry identifying which field(s) differ; (c) pending queue entries are NOT rejected on the basis of the mismatch (subsequent per-message rejections — e.g. an `invoke("abort")` against a consumer that doesn't know `"abort"` — still fire per their own rules); (d) the proxy proceeds to Active. **Strict mode** (`strictFingerprint: true` or implementation-equivalent) — (a) every queued pending entry rejects in caller order with `error.code === "WC_BINDABLE_PROTOCOL_ERROR"` (the trigger code); (b) the proxy transitions to TerminalFailure; (c) **after** the transition, subsequent `set` throws synchronously with `error.code === "WC_BINDABLE_TERMINAL_FAILURE"`, and subsequent `setWithAck` / `invoke` return already-rejected promises with the same `WC_BINDABLE_TERMINAL_FAILURE` code (per vector 34's terminal-path rule — distinct from the drain code, same separation as vector 35); (d) **no wire reply is emitted**; (e) the transport is signaled to dispose. The split — `protocol` always terminal (vector 35), non-`protocol` opt-in terminal — is the canonical asymmetry between the two compatibility tiers | [SPEC-extensions.md § Declaration fingerprint](SPEC-extensions.md#declaration-fingerprint) (`Non-protocol mismatch` bullet + `Strict-mode opt-in` paragraph) |
 | 38 | Deferred discovery — a late `customElements.define()` completes the bind | `{1O}` for general-purpose browser JS implementations. MAY be skipped **only** under the spec-defined fallback conditions: a runtime without `customElements`, or an explicitly scoped profile documenting non-support of deferred discovery. Ignoring `syncOn: "define"` while claiming general-purpose `{1O}` is a documentation gap, not a skip reason — see body | Binding an un-upgraded custom element with `syncOn: "define"` installs nothing up front; once the tag is defined, the implementation upgrades the target, re-runs discovery, and registers on `syncOn: "call"` terms — delivering both the initial property read and every subsequent event. A cleanup invoked while the wait is pending registers nothing even after a later `define()` and MUST release the target rather than merely flagging the work dead; concurrent waits on the same element are independent and one waiter's throw does not stop its siblings; an `onUpdate` that calls its own `unbind()` during the deferred initial sync leaves no listener attached | [SPEC.md § Deferring Discovery Until Definition](SPEC.md#deferring-discovery-until-definition) |
 | 39 | Deferred discovery — the non-deferral matrix | `{1O}`, same scope and skip conditions as vector 38 (the headless row is REQUIRED even for implementations that skip the rest) | Under `syncOn: "define"`: an already-readable declaration is indistinguishable from `syncOn: "call"` (same synchronous frame, `whenDefined()` never consulted); a dashless element, a non-element target, and a runtime without `customElements` do not wait at all; a tag that is defined but not wc-bindable registers nothing after the single re-run; a reserved hyphenated name (`font-face`, …) produces no unhandled rejection; and `"call"` / `"connect"` / unrecognized values keep the historical silent no-op for an un-upgraded element. Also covers the array form: `["define", "connect"]` gates discovery *and* the initial read independently, order is insignificant, `"call"` entries are inert, duplicates are idempotent, and every malformed shape falls back to `"call"` without throwing | [SPEC.md § Deferring Discovery Until Definition](SPEC.md#deferring-discovery-until-definition) + [§ Composing `syncOn` modes](SPEC.md#composing-syncon-modes) + [§ Teardown Contract](SPEC.md#teardown-contract) |
+| 40 | `undefined` input | `{3-consumer}` and `{3-both}` | `set(name, undefined)` throws, and `setWithAck` / `setWithAckOptions(name, undefined)` return an already-rejected `Promise`, each with `error.code === "WC_BINDABLE_INVALID_JSON_VALUE"`, before and after the `sync` response, and no frame is sent — not even when the pre-sync queue drains. An `undefined` `invoke` argument rejects the same way. Where the implementation exposes an assignable input facade, `proxy.x = undefined` throws the same error. Precedence among simultaneous failures is recorded informationally (reference order: name → disposed → terminal → value) | [SPEC-extensions.md § Methods](SPEC-extensions.md#methods) (call-site `JsonValue` validation) + [§ Design invariants](SPEC-extensions.md#design-invariants) invariant 3 |
+| 41 | Producer inbound validation | `{3-producer}` and `{3-both}` | Inbound `set.value` / `cmd.args[i]` that fail `JsonValue` are rejected before the Core is touched — for `cmd`, before the method is even looked up (an instrumented accessor for the command is never read): a `throw` coded `WC_BINDABLE_INVALID_JSON_VALUE` against a well-formed `id`, log + drop otherwise. A message whose `id` is `""` or not a string is dropped at entry. A value-less `set` is applied as `undefined` by a producer that accepts the legacy form, and treated as malformed (`WC_BINDABLE_PROTOCOL_ERROR`) by one that does not | [SPEC-extensions.md § Design invariants](SPEC-extensions.md#design-invariants) invariant 3 (producer-side client → server traffic, legacy acceptance) + [§ Message types — client → server](SPEC-extensions.md#message-types--client--server) |
+| 42 | Producer-side applier: commands | `{3-producer}` and `{3-both}` (the `cmd.args` wire check is `{3-consumer}`) | The producer-side shell calls `core[name](...args)` with `this === core` and exactly the arguments carried in `cmd.args` — count and order kept, no wrapping, padding or truncation — whatever the method's declared parameter count. A thenable return value is adopted and any other value resolves; `undefined` and `null` returns stay distinct; the `async` hint changes nothing. A `Date` / `1n` / cyclic return value (directly, or as a thenable's resolution) produces a `throw` coded `WC_BINDABLE_INVALID_RETURN_VALUE`, never a timeout. A declared command the Core does not implement produces a `throw` coded `WC_BINDABLE_REMOTE_THROW` | [SPEC-extensions.md § Applier profile](SPEC-extensions.md#applier-profile) A3 + [§ `invoke` end-to-end](SPEC-extensions.md#invoke-end-to-end) + [§ Return envelope value field](SPEC-extensions.md#return-envelope-value-field) |
+| 43 | Non-`JsonValue` property values | `{3-producer}` and `{3-both}` | A property value that fails `JsonValue` validation is dropped, never converted: on a change event no `update` is sent and a warn-log names the property; in a `sync` response the name is absent from `values` and `undefinedProperties` and listed in `getterFailures`. End to end, the consumer keeps its cached value, `name in proxy` does not change, and no `onUpdate` fires | [SPEC-extensions.md § Design invariants](SPEC-extensions.md#design-invariants) invariant 3 (producer-side server → client traffic) + [§ `getterFailures` semantics](SPEC-extensions.md#getterfailures-semantics) |
 
 ---
 
@@ -239,7 +244,7 @@ The same vector applies to the initial-sync path via `undefinedProperties` — a
 
 ### 7. JsonValue — invalid JSON shapes are rejected; symbol-keyed objects are implementation-defined
 
-**Setup.** Two buckets — `NEEDS_REJECT` is unconditional (every conformant implementation MUST reject these); `IMPLEMENTATION_DEFINED` is the symbol-keyed-object opt-out per [SPEC-extensions.md § Implementation-defined behavior](SPEC-extensions.md#implementation-defined-behavior-interop-variability-flag). Test each value with the producer's `isJsonValue(v)` predicate (or the equivalent the implementation exposes) and with `proxy.setWithAck("name", v)` against any declared input named `"name"`:
+**Setup.** Two buckets — `NEEDS_REJECT` is unconditional (every conformant implementation MUST reject these); `IMPLEMENTATION_DEFINED` is the symbol-keyed-object opt-out per [SPEC-extensions.md § Implementation-defined behavior](SPEC-extensions.md#implementation-defined-behavior-interop-variability-flag). Test each value with the producer's `isJsonValue(v)` predicate (or the equivalent the implementation exposes), with `proxy.setWithAck("name", v)` against any declared input named `"name"`, and with `proxy.invoke("name", v)` against a declared command of the same name (core permits one name in both `inputs` and `commands`):
 
 ```javascript
 // Bucket 1 — always rejected, regardless of implementation choice.
@@ -261,6 +266,11 @@ const NEEDS_REJECT = [
   Symbol("x"),                                               // symbol primitive used as a value
   () => {},                                                  // function
   (() => { const o = {}; o.self = o; return o; })(),         // cyclic
+  undefined,                                                 // top-level undefined (crosses the wire only out of band, server → client)
+  { a: undefined },                                          // undefined as an object property value
+  [undefined],                                               // undefined as an array element (a present element, not a hole)
+  1n,                                                        // BigInt
+  (() => { class MyArray extends Array {} return MyArray.from([1, 2]); })(), // Array subclass instance — prototype is not Array.prototype
 ];
 
 // Bucket 2 — symbol-keyed object: a plain object whose OWN keys include a symbol.
@@ -277,10 +287,12 @@ const IMPLEMENTATION_DEFINED = [
 **Action.** For each value `v` in either bucket:
 - `isJsonValue(v)` (or equivalent) is called
 - `proxy.setWithAck("name", v)` is called (assuming `"name"` is in the declaration's `inputs`)
+- `proxy.invoke("name", v)` is called (assuming `"name"` is also in the declaration's `commands`)
 
 **Expected — `NEEDS_REJECT`.** Every entry:
 - `isJsonValue(v) === false`
-- `proxy.setWithAck("name", v)` returns an already-rejected `Promise` (per [SPEC-extensions.md § Design invariants invariant 3](SPEC-extensions.md#extension-2--wire-format-remote-proxying)); no wire message is sent
+- `proxy.setWithAck("name", v)` returns an already-rejected `Promise` with `error.code === "WC_BINDABLE_INVALID_JSON_VALUE"` (per [SPEC-extensions.md § Design invariants invariant 3](SPEC-extensions.md#extension-2--wire-format-remote-proxying)); no wire message is sent
+- `proxy.invoke("name", v)` returns an already-rejected `Promise` with `error.code === "WC_BINDABLE_INVALID_JSON_VALUE"`; no `cmd` frame is sent (every element of `cmd.args` must be a `JsonValue` — an `undefined` argument cannot be encoded as absent)
 - `proxy.set("name", v)` (fire-and-forget) MUST throw synchronously **at the `set()` call site** (no silent drop, and crucially: even if the implementation is queueing fire-and-forget `set` calls before `sync` per [SPEC-extensions.md § Pre-sync call state machine](SPEC-extensions.md#pre-sync-call-state-machine), validation MUST happen at the call site, not at send time — `set()` returns `void` and deferring validation past the call site removes the caller's only signal that anything went wrong)
 
 **Expected — `IMPLEMENTATION_DEFINED`.** For each entry, the **default normative behavior is rejection** (the implementation behaves identically to a `NEEDS_REJECT` entry). An implementation MAY accept the value, but only if **all** of the following hold:
@@ -291,9 +303,10 @@ const IMPLEMENTATION_DEFINED = [
 For an opt-out implementation, the acceptance MUST be uniform across the call surface:
 - `proxy.setWithAck("name", v)` MUST resolve normally (no `JsonValue`-validation rejection) and the on-wire `setWithAck` frame MUST omit the symbol key
 - `proxy.set("name", v)` (fire-and-forget) MUST NOT throw and the on-wire fire-and-forget frame MUST likewise omit the symbol key
+- `proxy.invoke("name", v)` MUST NOT reject on `JsonValue` grounds and the on-wire `cmd` frame MUST likewise omit the symbol key
 - `isJsonValue(v)` MUST return `true` (otherwise the predicate disagrees with the call-surface behavior, which is itself non-conformant)
 
-Cross-implementation tests targeting symbol-key handling MUST therefore branch on the implementation's documented stance: a strict-rejecting implementation (the default and the reference implementation's choice) treats `IMPLEMENTATION_DEFINED` exactly like `NEEDS_REJECT` on all three call sites; an opt-out implementation accepts on all three and verifies the symbol key did not cross the wire on either of the two `set`-family frames.
+Cross-implementation tests targeting symbol-key handling MUST therefore branch on the implementation's documented stance: a strict-rejecting implementation (the default and the reference implementation's choice) treats `IMPLEMENTATION_DEFINED` exactly like `NEEDS_REJECT` on all four call sites; an opt-out implementation accepts on all four and verifies the symbol key did not cross the wire on any of the three frames.
 
 A `try { JSON.stringify(v) }` based predicate fails this vector against `NaN`, `Infinity`, and any value containing them — `JSON.stringify` silently coerces them to `null` rather than throwing. See the "JSON.stringify is NOT sufficient validation" paragraph in invariant 3.
 
@@ -1341,7 +1354,7 @@ const labelInAfterResync = "label" in proxy;
 
 ### 30. Locally-synthesized errors MUST carry `code`
 
-**Setup.** A remote proxy in Active state with a mock producer that lets the test force each of the four canonical locally-synthesized failure modes.
+**Setup.** A remote proxy in Active state with a mock producer that lets the test force each of the canonical locally-synthesized failure modes (a)–(g); sub-case (h) adds the application-error code checks.
 
 **Action.** Trigger each failure mode and inspect `error.code` on the rejection:
 
@@ -1422,6 +1435,43 @@ async function testInvalidAckOptions() {
   return { code: err.code, name: err.name };
   // expected: { code: "WC_BINDABLE_INVALID_ACK_OPTIONS", name: "RangeError" }
 }
+
+// (h) Application-error codes. Consumer half: a hand-built inbound `throw`
+// carrying an application code.
+async function testCodePassThrough() {
+  const t = new RecordingTransport();
+  const p = createRemoteCoreProxy(declaration, t);
+  t.emitInbound({ type: "sync", values: {}, capabilities: { setAck: true } });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const pending = p.invoke("fetch").catch((e) => e);
+  const { id } = t.sentMessages.at(-1);
+  t.emitInbound({ type: "throw", id, error: { name: "Error", message: "denied", code: "MYAPP_DENIED" } });
+  return (await pending).code; // expected: "MYAPP_DENIED"
+}
+
+// (h) End to end: a real producer-side shell and consumer-side proxy over an
+// in-process transport pair, so the producer's handling of `code` is exercised.
+class Thrower extends EventTarget {
+  static wcBindable = {
+    protocol: "wc-bindable",
+    version: 1,
+    properties: [],
+    commands: [{ name: "app" }, { name: "spoofError" }, { name: "spoofPlain" }, { name: "nonError" }],
+  };
+  app()        { throw Object.assign(new Error("app"), { code: "MYAPP_DENIED" }); }
+  spoofError() { throw Object.assign(new Error("spoof"), { code: "WC_BINDABLE_DISPOSED" }); }
+  spoofPlain() { throw { code: "WC_BINDABLE_TIMEOUT" }; }   // a plain object, not an Error
+  nonError()   { throw "oops"; }
+}
+async function testApplicationCodes(proxy /* bound to a RemoteShellProxy over new Thrower() */) {
+  const settle = (p) => p.then(() => null, (e) => e);
+  return {
+    app:        await settle(proxy.invoke("app")),
+    spoofError: await settle(proxy.invoke("spoofError")),
+    spoofPlain: await settle(proxy.invoke("spoofPlain")),
+    nonError:   await settle(proxy.invoke("nonError")),
+  };
+}
 ```
 
 **Expected.**
@@ -1434,6 +1484,12 @@ async function testInvalidAckOptions() {
 - `testInvalidAckOptions()` resolves to `{ code: "WC_BINDABLE_INVALID_ACK_OPTIONS", name: "RangeError" }`. The `code` value MUST NOT be `WC_BINDABLE_PROTOCOL_ERROR` — nothing on the wire is malformed; this is a call-site argument validation failure, symmetric with `WC_BINDABLE_INVALID_JSON_VALUE` for the `value` / `args` validation gate. The `name` value MUST be exactly `"RangeError"` per the RangeError-shaped definition in [SPEC-extensions.md § AckOptions](SPEC-extensions.md#ackoptions) — the spec's minimum requirement is `error.name === "RangeError"` regardless of whether the implementation actually constructs the rejection with `new RangeError(...)` (cross-realm / non-JS implementations are not required to preserve `instanceof RangeError`, so the test asserts on `name` rather than prototype identity).
 
   > **Vector scope: error-shape only, not synchrony.** The spec ALSO requires the returned `Promise` to be **synchronously** already-rejected (not microtask-deferred) per [SPEC-extensions.md § AckOptions](SPEC-extensions.md#ackoptions), but this vector's `try / await / catch` shape cannot distinguish the two — both produce identical observable behavior under `await`. The "did not throw synchronously" half of the spec rule IS exercised here (a synchronous throw would skip the `catch` branch and fail the test), but "the returned Promise was already in rejected state at function return" is not. Tightening that check requires a different observation pattern (`Promise.race` against a sentinel, inspecting Promise state via host introspection, etc.) and is tracked as future-work — see "[Synchrony of `setWithAckOptions` / `invokeWithOptions` invalid-`timeoutMs` rejection](#what-this-list-does-not-cover)". An implementation that passes vector 30 (g) is conformant on the error-shape rule; conformance on the synchrony rule rests on the spec text alone until the future-work vector lands.
+- `testCodePassThrough()` resolves to `"MYAPP_DENIED"`: the consumer surfaces the producer's wire `code` faithfully and MUST NOT inject a code of its own for an application-origin throw (emission site B, pass-through row).
+- Repeat `testCodePassThrough()` with `code: "WC_BINDABLE_DISPOSED"` (and with `"WC_BINDABLE_TIMEOUT"`, `"WC_BINDABLE_TERMINAL_FAILURE"`) in the hand-built `throw`: it resolves to `"WC_BINDABLE_REMOTE_THROW"`. These codes are reserved for consumer-side synthesis, so the pass-through row's exception applies — a producer never sends them, and surfacing one would let an application value impersonate a lifecycle state.
+- `testApplicationCodes()`:
+  - `app` is an `Error`. A producer that forwards application codes (the reference implementation does) delivers `code === "MYAPP_DENIED"`; one that does not delivers `"WC_BINDABLE_REMOTE_THROW"` or no `code`. All three are conformant.
+  - `spoofError.code` is NOT `"WC_BINDABLE_DISPOSED"` and `spoofPlain.code` is NOT `"WC_BINDABLE_TIMEOUT"` — an application throw MUST NOT reach the consumer carrying a registered protocol code, whether it was thrown as an `Error` or as a plain object. A producer that forwards application codes replaces such a code with `"WC_BINDABLE_REMOTE_THROW"`; omitting `code` is also conformant. (The reference implementation replaces every top-level string `code` beginning with `WC_BINDABLE_` that its shell did not synthesize itself.) Without this rule an application could make a consumer's recovery branch treat a live proxy as disposed.
+  - `nonError` is an `Error` instance (the consumer MUST reject with an `Error` regardless of what was thrown), and `nonError.name === "NonErrorThrow"`, `nonError.message === "oops"`. The producer MUST put `"NonErrorThrow"` on the wire ([SPEC-extensions.md § Canonical mapping for non-Error throws](SPEC-extensions.md#canonical-mapping-for-non-error-throws)); the consumer SHOULD preserve `name` and `message`.
 
 **Why the three transport-side codes are distinct.** `WC_BINDABLE_DISPOSED` is a consumer-intentional teardown (the proxy is, by contract, never reusable; `reconnect()` MUST throw on it). `WC_BINDABLE_TERMINAL_FAILURE` is a transport-level outage (the proxy stays alive for `reconnect()` if the implementation supports it). `WC_BINDABLE_PROTOCOL_ERROR` is a wire bug (malformed envelope, unexpected wire state — investigate the producer / consumer / transport adapter version mismatch). Conflating any two of them into the same code prevents the consumer from making the right recovery decision (reconstruct vs reconnect vs file a bug).
 
@@ -2061,9 +2117,389 @@ Also required of the array form: **order is not significant** (`["connect", "def
 
 ---
 
+### 40. `undefined` input — rejected at the call site like any other non-`JsonValue`; nothing is sent
+
+**Setup.** A consumer-side proxy over a recording transport, with one declared input and one declared command:
+
+```javascript
+const declaration = {
+  protocol: "wc-bindable",
+  version: 1,
+  properties: [],
+  inputs: [{ name: "x" }],
+  commands: [{ name: "run" }],
+};
+const t = new RecordingTransport();
+const proxy = createRemoteCoreProxy(declaration, t);
+// t.sentMessages holds only the initial { type: "sync" }.
+```
+
+**Action — before the `sync` response.**
+
+```javascript
+let thrown;
+try { proxy.set("x", undefined); } catch (e) { thrown = e; }
+
+const settled = [];
+const pending = [
+  proxy.setWithAck("x", undefined),
+  proxy.setWithAckOptions("x", undefined, { timeoutMs: 0 }),
+  proxy.invoke("run", undefined),
+  proxy.invoke("run", 1, undefined),
+].map((p, i) => p.catch((e) => { settled[i] = e; }));
+await new Promise((resolve) => setTimeout(resolve, 0));   // still no sync response
+
+const settledBeforeSync = settled.filter(Boolean).length;
+t.emitInbound({ type: "sync", values: {}, capabilities: { setAck: true } });
+await Promise.all(pending);
+```
+
+**Expected — before the `sync` response.**
+- `thrown.code === "WC_BINDABLE_INVALID_JSON_VALUE"`. `set()` throws at the call site even under a queueing profile, as for any other invalid value (vector 17).
+- `settledBeforeSync === 4`, and every entry of `settled` carries `code === "WC_BINDABLE_INVALID_JSON_VALUE"`. The calls were rejected at the call site, not queued and rejected later at drain.
+- After the drain, `t.sentMessages` still holds only the initial `{ type: "sync" }`: no `set` frame (with or without `value`) and no `cmd` frame.
+
+**Action — after the `sync` response.** Repeat every call above on the now-Active proxy.
+
+**Expected — after the `sync` response.** The same: `set` throws synchronously, the other calls return already-rejected `Promise`s, every error carries `code === "WC_BINDABLE_INVALID_JSON_VALUE"`, and no frame is sent.
+
+**Control.** `proxy.set("x", null)` sends `{ type: "set", name: "x", value: null }`. `null` is an ordinary `JsonValue`, and it is how a remote input is reset ([SPEC-extensions.md § Producer guidance for inputs](SPEC-extensions.md#producer-guidance-for-inputs), P2).
+
+**Facade sub-case (conditional).** Whether `proxy.x` exists for a declared input is implementation-defined ([SPEC-extensions.md § Consumer-side proxy `has` trap contract](SPEC-extensions.md#consumer-side-proxy-has-trap-contract), "Scope: inputs and commands"). An implementation whose input facade routes assignment to `set()` (the reference implementation does) therefore throws from the assignment expression: `proxy.x = undefined` throws `WC_BINDABLE_INVALID_JSON_VALUE` and sends nothing. Implementations without an assignable facade skip this sub-case.
+
+**Precedence (informational).** When more than one check fails at once, the spec does not pin which code wins. The reference implementation checks name → disposed → terminal → value: `set("nope", undefined)` throws `WC_BINDABLE_UNDECLARED_INPUT`, `set("x", undefined)` on a disposed proxy throws `WC_BINDABLE_DISPOSED`, and on a terminally failed one `WC_BINDABLE_TERMINAL_FAILURE`. Record the observed order; a different order is not a conformance failure. Each single failure still MUST carry its own registered code (vector 30).
+
+**Spec reference.** [SPEC-extensions.md § Methods](SPEC-extensions.md#methods) (the call-site `JsonValue` validation paragraph, the `set` / `invoke` rows) + [§ Design invariants](SPEC-extensions.md#design-invariants) invariant 3 (the `undefined` paragraph, consumer-side client → server traffic) + [§ Pre-sync call state machine](SPEC-extensions.md#pre-sync-call-state-machine).
+
+---
+
+### 41. Producer-side inbound validation runs before the Core is touched; the legacy value-less `set`
+
+**Setup.** A producer-side shell over a recording transport that hands envelope objects to the shell **by reference** (no serialization), so the harness can inject values JSON could never carry. The Core records every setter call and every lookup of its command:
+
+```javascript
+const log = { setter: [], lookups: 0, calls: 0 };
+class Core extends EventTarget {
+  static wcBindable = {
+    protocol: "wc-bindable",
+    version: 1,
+    properties: [],
+    inputs: [{ name: "x" }],
+    commands: [{ name: "run" }],
+  };
+  set x(v) { log.setter.push(v); }
+  get x() { return log.setter.at(-1); }
+  get run() {                       // reading core.run IS the method lookup
+    log.lookups++;
+    return () => { log.calls++; };
+  }
+}
+const t = new RecordingTransport();
+const shell = new RemoteShellProxy(new Core(), t);
+log.lookups = 0;                    // ignore any construction-time inspection
+```
+
+**Action — invalid values.**
+
+```javascript
+t.emitInbound({ type: "cmd", name: "run", id: "c1", args: [NaN] });
+t.emitInbound({ type: "cmd", name: "run", id: "c2", args: [1, new Date()] });
+t.emitInbound({ type: "set", name: "x", value: { a: undefined }, id: "s1" });
+t.emitInbound({ type: "set", name: "x", value: 1n });           // fire-and-forget
+```
+
+**Expected — invalid values.**
+- `t.sentMessages` contains a `throw` for each of `c1`, `c2` and `s1`, each with `error.code === "WC_BINDABLE_INVALID_JSON_VALUE"`.
+- The fire-and-forget `set` produces no envelope (it has no `id` to answer); the producer logs a warning and drops it.
+- `log.lookups === 0`, `log.calls === 0` and `log.setter.length === 0`. Validation ran before the setter, and for `cmd` before the method was even looked up.
+
+**Action — malformed `id`.**
+
+```javascript
+t.emitInbound({ type: "cmd", name: "run", id: "", args: [NaN] });
+t.emitInbound({ type: "set", name: "x", value: NaN, id: 7 });
+```
+
+**Expected — malformed `id`.** No envelope at all — not even an `INVALID_JSON_VALUE` `throw` — and the Core is untouched. A message whose `id` is `""` or not a string is dropped at entry as malformed (vector 22), whatever its payload.
+
+**Action — value-less `set`.**
+
+```javascript
+t.emitInbound({ type: "set", name: "x", id: "s2" });                   // no `value` key
+t.emitInbound({ type: "set", name: "x" });                             // fire-and-forget, no `value` key
+t.emitInbound({ type: "set", name: "x", value: undefined, id: "s3" }); // by reference: present and undefined
+```
+
+**Expected — value-less `set`.** Branch on whether the producer accepts the legacy form:
+- **Accepts (the reference implementation does).** `log.setter` receives `undefined` three times, and `t.sentMessages` gains a `return` for `s2` and for `s3`, each without a `value` key. The value is applied as `undefined` — never as `null`, `""` or a default.
+- **Does not accept.** `t.sentMessages` gains a `throw` for `s2` and for `s3`, each with `error.code === "WC_BINDABLE_PROTOCOL_ERROR"`; the fire-and-forget message is logged and dropped; `log.setter` stays empty.
+
+On a serializing transport the `s3` shape cannot occur: JSON drops a key whose value is `undefined`, so it arrives as the `s2` shape. A conformant consumer-side proxy never sends either shape (vector 40); legacy acceptance exists only for consumers that predate that rule.
+
+**Spec reference.** [SPEC-extensions.md § Design invariants](SPEC-extensions.md#design-invariants) invariant 3 (producer-side client → server traffic, including legacy acceptance; producer-side handling of malformed inbound messages) + [§ Message types — client → server](SPEC-extensions.md#message-types--client--server) (id constraints) + [§ Error envelope](SPEC-extensions.md#error-envelope) (emission site A).
+
+---
+
+### 42. The producer-side shell as a relaying applier — arguments pass through, completion propagates, return values are validated
+
+**Setup.** A producer-side shell and a consumer-side proxy over an in-process transport pair that serializes at the boundary. The Core records how each command is called:
+
+```javascript
+const seen = [];
+const RETURNS = {
+  undef:    () => undefined,
+  nul:      () => null,
+  thenable: () => ({ then(resolve) { resolve(7); } }),    // a thenable that is not a Promise
+  rejects:  () => Promise.reject(new Error("no")),
+  throws:   () => { throw new Error("sync no"); },
+  date:     () => new Date(),
+  big:      () => 1n,
+  cyclic:   () => { const o = {}; o.self = o; return o; },
+  lateDate: () => Promise.resolve(new Date()),
+};
+class Core extends EventTarget {
+  static wcBindable = {
+    protocol: "wc-bindable",
+    version: 1,
+    properties: [],
+    commands: [
+      { name: "none" },                  // declares no parameters
+      { name: "three" },                 // declares three
+      { name: "ret" },
+      { name: "later", async: false },   // returns a Promise despite the hint
+      { name: "now", async: true },      // returns a plain value despite the hint
+      { name: "missing" },               // declared, not implemented
+    ],
+  };
+  none()        { seen.push({ self: this, args: [...arguments] }); }
+  three(a, b, c) { seen.push({ self: this, args: [...arguments] }); }
+  ret(kind)     { return RETURNS[kind](); }
+  later()       { return Promise.resolve("late"); }
+  now()         { return "now"; }
+}
+const core = new Core();
+// shell = new RemoteShellProxy(core, serverTransport);
+// proxy = createRemoteCoreProxy(Core.wcBindable, clientTransport); await the sync response.
+```
+
+**Action and Expected — arguments.**
+
+| Call | Expected at the Core |
+|---|---|
+| `proxy.invoke("none", 1, 2, 3)` | `self === core`; `args` deep-equals `[1, 2, 3]` — extra arguments are not truncated |
+| `proxy.invoke("three", "a")` | `args` deep-equals `["a"]` (`arguments.length === 1`) — not padded with `undefined` |
+| `proxy.invoke("three")` | `args` deep-equals `[]` — a call with no arguments |
+| `proxy.invoke("none", { k: [1, 2] }, null)` | `args` deep-equals `[{ k: [1, 2] }, null]` — two positional arguments, not wrapped into one object; `null` stays `null` |
+
+On the wire, each `cmd.args` deep-equals the arguments passed to `invoke`, in order. Object identity is not observable across Extension 2: "unchanged" means the values the shell reconstructs from `cmd.args`. AP3 covers identity for appliers without a wire.
+
+**Action and Expected — completion.**
+
+| Call | Expected |
+|---|---|
+| `proxy.invoke("ret", "undef")` | Resolves with `undefined`; the `return` frame has no `value` key |
+| `proxy.invoke("ret", "nul")` | Resolves with `null`; the `return` frame carries `value: null` |
+| `proxy.invoke("ret", "thenable")` | Resolves with `7` — a thenable that is not a `Promise` is still adopted |
+| `proxy.invoke("ret", "rejects")` / `proxy.invoke("ret", "throws")` | Rejects; the producer emits a `throw` (an application error, so its `code` is `WC_BINDABLE_REMOTE_THROW` or absent) |
+| `proxy.invoke("later")` | Resolves with `"late"` — the result is awaited although the descriptor says `async: false` |
+| `proxy.invoke("now")` | Resolves with `"now"` — `async: true` does not require the method to return a `Promise` |
+
+**Action and Expected — return-value validation.** For each of `"date"`, `"big"`, `"cyclic"` and `"lateDate"`, call `proxy.invokeWithOptions("ret", [kind], { timeoutMs: 2000 })`. Each MUST reject promptly with `error.code === "WC_BINDABLE_INVALID_RETURN_VALUE"`. It MUST NOT reject with `WC_BINDABLE_TIMEOUT` (the producer replies with a `throw`; it does not leave the call pending), and it MUST NOT resolve with a converted value such as an ISO date string or `{}`.
+
+**Action and Expected — declared but not implemented.** `proxy.invoke("missing")` rejects with `error.code === "WC_BINDABLE_REMOTE_THROW"`, not `WC_BINDABLE_UNDECLARED_COMMAND` (the name is declared) and not `WC_BINDABLE_PROTOCOL_ERROR` (the envelope is well-formed).
+
+**Spec reference.** [SPEC-extensions.md § Applier profile](SPEC-extensions.md#applier-profile) A3 + [§ `invoke` end-to-end](SPEC-extensions.md#invoke-end-to-end) + [§ Return envelope value field](SPEC-extensions.md#return-envelope-value-field) + [§ Design invariants](SPEC-extensions.md#design-invariants) invariant 3 (producer-side server → client traffic; consumer-side `cmd.args`).
+
+---
+
+### 43. Non-`JsonValue` property values are dropped, never converted
+
+**Setup.** A producer-side shell and a consumer-side proxy over an in-process transport pair that serializes at the boundary, with loggers captured on both sides and a recording tap on the server-side transport:
+
+```javascript
+class Core extends EventTarget {
+  static wcBindable = {
+    protocol: "wc-bindable",
+    version: 1,
+    properties: [{ name: "when", event: "core:when" }],
+  };
+  #when = "2026-01-01";
+  get when() { return this.#when; }
+  setWhen(v) {
+    this.#when = v;
+    this.dispatchEvent(new CustomEvent("core:when", { detail: v }));
+  }
+}
+const core = new Core();
+// shell = new RemoteShellProxy(core, serverTransport);
+// proxy = createRemoteCoreProxy(Core.wcBindable, clientTransport); await the sync response.
+const calls = [];
+bind(proxy, (name, value) => calls.push([name, value]));
+calls.length = 0;   // discard the initial sync
+```
+
+**Action 1 — `update` path.** `core.setWhen(new Date())`.
+
+**Expected 1.**
+- The server-side transport sends no `update` for `when`, and the producer logs a warning naming `when`.
+- `proxy.when === "2026-01-01"` and `calls.length === 0`: the consumer keeps its last value.
+- A following `core.setWhen("2026-02-02")` is sent as a normal `update`, and `calls` receives `["when", "2026-02-02"]`. The failure does not taint the property.
+
+**Action 2 — `sync` path.** Leave the Core holding a `Date` (`core.setWhen(new Date())`), then force a re-sync, for example by reconnecting the proxy over a fresh transport pair.
+
+**Expected 2.**
+- The `sync` response omits `when` from `values` and from `undefinedProperties`, lists it in `getterFailures`, and advertises `capabilities.getterFailures: true`.
+- On the consumer, `proxy.when` still holds the last transmitted value, `"when" in proxy` is still `true`, no `onUpdate` fires for `when`, and the consumer logs a warning naming `when` (vector 31).
+
+**First-sync sub-case.** A fresh proxy whose first `sync` response lists `when` in `getterFailures` reports `"when" in proxy === false` and delivers no initial `onUpdate` for it; the property has never been transmitted. A later valid `update` makes it present.
+
+**Across all paths.** The value never arrives converted — not as an ISO date string, not as `{}`, not as `null`. Repeat with `NaN` and `new Map()` in place of the `Date`.
+
+**Spec reference.** [SPEC-extensions.md § Design invariants](SPEC-extensions.md#design-invariants) invariant 3 (producer-side server → client traffic) + [§ `getterFailures` semantics](SPEC-extensions.md#getterfailures-semantics) + [§ Cache validity across transport lifecycle](SPEC-extensions.md#cache-validity-across-transport-lifecycle).
+
+---
+
+## Extension 1 applier profile vectors
+
+These vectors test the **applier profile** ([SPEC-extensions.md § Applier profile](SPEC-extensions.md#applier-profile)), claim shorthand `{applier}`. They are written as **procedures**, not as code against one API, because an applier can be a producer-side shell (driven by inbound `set` / `cmd` envelopes), an Extension 4 shell (driven by `shell[N] = v` / `shell[N](...)` or by `set` / `invoke`), an Extension-1 surface without a wire, or a binding applier (driven by changing the value of a bound source expression). "Apply `v`" below means "cause the applier, through its own surface, to apply `v` to the target's input"; "invoke with `a, b`" means the same for a command. Each claimant maps these steps onto its surface.
+
+| Vector | Applies to |
+|---|---|
+| AP1 | Every `{applier}` claimant whose targets are DOM elements (A1 applies to DOM targets only) |
+| AP2 | Relaying appliers: the relay row. Binding appliers that claim the profile: every row |
+| AP3 | Every `{applier}` claimant that applies commands |
+
+Relaying appliers do not opt in: a producer-side shell (`{3-producer}`), an Extension 4 T2 shell, and a T3 shell for a plain-local delegation kind run these procedures as part of their own conformance. Vectors 42 and C51–C53b are the wire-level and composite-level restatements.
+
+### AP1. Inputs are applied through the property, never the hinted attribute
+
+**Setup.** Two element classes that declare one input with an `attribute` hint:
+
+```javascript
+const declaration = {
+  protocol: "wc-bindable",
+  version: 1,
+  properties: [],
+  inputs: [{ name: "open", attribute: "open" }],
+};
+
+// (a) A target that does not reflect the property to the attribute.
+class Plain extends HTMLElement {
+  static wcBindable = declaration;
+  received = [];
+  set open(v) { this.received.push(v); }
+  get open() { return this.received.at(-1); }
+}
+
+// (b) A target that reflects in its own encoding: "on" / "off".
+class OnOff extends HTMLElement {
+  static wcBindable = declaration;
+  #open = false;
+  set open(v) {
+    this.#open = Boolean(v);
+    this.setAttribute("open", this.#open ? "on" : "off");
+  }
+  get open() { return this.#open; }
+}
+```
+
+**Procedure.** For each target, apply `false`, `true`, `{ a: 1 }` and `null` in turn, and read the `open` attribute after each step.
+
+**Expected.**
+- (a) `hasAttribute("open") === false` after every step, and `received` deep-equals the applied values in order: the applier went through the property.
+- (a′) Repeat (a) on an element whose markup carries an authored attribute (`<x-plain open="authored">`). After every step `getAttribute("open") === "authored"`: the applier neither rewrote nor removed it.
+- (b) After every step `getAttribute("open")` is `"on"` or `"off"` — the target's encoding — and never `"true"`, `"false"`, `""`, `"null"` or `"[object Object]"`.
+
+**Sub-case (c) — an element that has not been upgraded.** Create an element for a tag that is not defined yet, apply `"x"`, then define the tag with a variant of `Plain` that follows P4 (it re-applies an own `open` property when it is upgraded), and let the element upgrade.
+- The `open` attribute is never present, before or after the upgrade: the applier did not fall back to the hinted attribute.
+- After the upgrade, `received` ends with `"x"`. Either the applier assigned the property before the upgrade and the target re-applied it (P4), or the applier deferred and applied after the upgrade. A deferring applier MUST NOT apply before the upgrade, and MAY additionally wait until the element is connected.
+
+> **Harness note.** Sub-case (c) needs real custom element upgrade, which `happy-dom` 20.x does not implement (see the harness note in vector 38). Run it in a real browser — in this repository, a Playwright integration suite of the kind under `packages/core/tests/integration/`. Sub-cases (a), (a′) and (b) need no upgrade and run anywhere.
+
+**Spec reference.** [SPEC-extensions.md § Applier profile](SPEC-extensions.md#applier-profile) A1 + [§ The `attribute` hint](SPEC-extensions.md#the-attribute-hint) + [§ Producer guidance for inputs](SPEC-extensions.md#producer-guidance-for-inputs) (P3, P4).
+
+### AP2. `undefined` — relays pass it through; binding appliers decide from the previous evaluation
+
+**Setup.** A target whose input setter records every value it receives:
+
+```javascript
+class Rec extends HTMLElement {          // or EventTarget, for appliers without DOM targets
+  static wcBindable = {
+    protocol: "wc-bindable",
+    version: 1,
+    properties: [],
+    inputs: [{ name: "v" }],
+  };
+  calls = [];
+  set v(x) { this.calls.push(x); }
+}
+```
+
+A relaying applier is handed `undefined` once. A binding applier binds input `v` to a source expression whose successive evaluations are given per row.
+
+**Procedure and Expected.** Assert only on setter calls that receive `undefined`, and on the absence of substitutes. A binding applier MAY skip assigning a non-`undefined` value the target already holds, so do not assert on those calls.
+
+| Evaluations of the bound expression | Setter calls receiving `undefined` |
+|---|---|
+| Relaying applier handed `undefined` | Exactly one |
+| `[undefined]` (first evaluation) | None |
+| A source key that does not exist (first evaluation) | None — it evaluates to `undefined` |
+| `[undefined, undefined]` | None |
+| `["a", undefined]` | One, after the call receiving `"a"` |
+| `["a", undefined, undefined]` | Exactly one |
+| `"a"` taken over from server-rendered markup during hydration (not assigned), then `undefined` | One |
+| `"a"` skipped because the target already held it, then `undefined` | One |
+| `[null]` / `["a", null]` | None; the setter receives `null` as `null` |
+| The binding is removed after `"a"` | One — SHOULD-level; record informationally |
+
+Across all rows, the setter never receives `""`, `false`, `0`, `null`, a default value or the string `"undefined"` in place of an `undefined` evaluation. The hydration row applies only to appliers that hydrate.
+
+**Spec reference.** [SPEC-extensions.md § Applier profile](SPEC-extensions.md#applier-profile) A2 + [§ Producer guidance for inputs](SPEC-extensions.md#producer-guidance-for-inputs) (P1).
+
+### AP3. Commands — arguments pass through unchanged; completion is propagated
+
+**Setup.** A target whose commands record how they were called:
+
+```javascript
+const passed = { k: 1 };
+class Cmd extends EventTarget {
+  static wcBindable = {
+    protocol: "wc-bindable",
+    version: 1,
+    properties: [],
+    commands: [{ name: "f" }, { name: "g", async: true }],
+  };
+  f(a, b) { this.last = { self: this, args: [...arguments] }; return this.result?.(); }
+  g()     { return "plain"; }       // declared async, returns a plain value
+}
+```
+
+**Procedure and Expected — arguments (MUST).**
+
+| Invoke `f` with | Expected at the method |
+|---|---|
+| No arguments | `last.args.length === 0` |
+| `1` (the method declares two parameters) | `last.args` deep-equals `[1]` — not padded |
+| `1, 2, 3` | `last.args` deep-equals `[1, 2, 3]` — not truncated |
+| `passed, undefined` | `last.args.length === 2`, `last.args[0] === passed` (the same object — not cloned, wrapped or coerced), `last.args[1] === undefined` |
+| Anything | `last.self === target` |
+
+Across Extension 2, object identity and `undefined` arguments do not apply: arguments are the values reconstructed from `cmd.args`, and `cmd.args` cannot carry `undefined` (vectors 40 and 42).
+
+**Procedure and Expected — completion (MUST).** Set `target.result` in turn to a function that throws, one that returns a rejected `Promise`, one that returns a non-`Promise` thenable resolving to `7`, and one that returns `"v"`.
+- **Direct method-call applier** (an Extension 4 T2 shell): a synchronous throw reaches the caller as a synchronous throw; a rejected `Promise` reaches it as a rejected `Promise`, with no synchronous throw; other return values are returned.
+- **Promise-returning surface** (`invoke` / `invokeWithOptions`, an Extension 4 T3 shell, a producer-side shell's `return` / `throw` envelope): the call rejects for the throw and the rejection, resolves with `7` for the thenable (adopted), and resolves with `"v"`.
+- Invoking `g` yields `"plain"` on either kind of surface: the `async` hint does not decide whether a result is awaited, propagated or discarded.
+
+**Return identity (SHOULD, informational).** For a direct method-call applier, set `target.result` to return a fixed `Promise` `p` and record whether the applier's return value `=== p`. Returning a wrapper is not a conformance failure.
+
+**Spec reference.** [SPEC-extensions.md § Applier profile](SPEC-extensions.md#applier-profile) A3 + [Extension 4 § 12](SPEC-extensions.md#12-delegation-and-error-propagation).
+
+---
+
 ## Extension 4 — Composition vectors
 
-These vectors test the **Composition profile** ([SPEC-extensions.md § Extension 4 — Composition](SPEC-extensions.md#extension-4--composition)). They map 1:1 to the draft vectors in [COMPOSITE.md § Draft conformance vectors](COMPOSITE.md) and are now normative against Extension 4 (which is authoritative; where a vector below disagrees with Extension 4, the spec section wins).
+These vectors test the **Composition profile** ([SPEC-extensions.md § Extension 4 — Composition](SPEC-extensions.md#extension-4--composition)). C1–C50 map 1:1 to the draft vectors in [COMPOSITE.md § Draft conformance vectors](COMPOSITE.md); C51–C53b were added with the Extension 1 applier profile and have no draft counterpart. All are normative against Extension 4 (which is authoritative; where a vector below disagrees with Extension 4, the spec section wins).
 
 **Composite-tier scoping.** The "Applies to" column uses the **composite profile tiers** (distinct from the SPEC.md `{1O/1P/2/3}` facets above), as read from the tier-claim object `Symbol.for("wc-bindable.composite.tiers")`:
 
@@ -2127,6 +2563,10 @@ A shell claiming "T1 + T3 only" runs the `[T1]` and `[T3]` vectors and MAY skip 
 | C48 | `[T1]` | Alias-transparent fan-out: if the same underlying source-event **occurrence** is exposed through multiple aliases / source ids, the affected composed properties still behave as one § 6 three-phase cycle — a listener on `a.x` reading `shell["b.y"]` after the shared commit point observes `b.y`'s committed value, not an implementation-defined interleaving | [§ 3](SPEC-extensions.md#3-name-mapping) + [§ 6](SPEC-extensions.md#6-event-rewriting) |
 | C49 | `[T1]` | Source subscription ownership belongs to the shell, not downstream `bind(shell, …)` consumers: a shell with no current consumers continues its § 10 source-listener lifecycle, and a later consumer observes state derived from that shell-owned tracking rather than a fresh consumer-triggered subscription | [§ 10](SPEC-extensions.md#10-lifecycle-and-teardown) |
 | C50 | `[T3]` | A composed shell that claims T3 and is used as a source for a parent composite SHOULD advertise a matching `Symbol.for("wc-bindable.extension1")` marker so the parent's `auto` classification accepts it without an explicit override; if both the marker and the tier claim are present, they agree on whether the child is Extension-1-capable | [§ 8](SPEC-extensions.md#8-inputs) |
+| C51 | `[T2]` | The facade relays `undefined` and `null` unchanged: `shell["s.x"] = undefined` calls the source setter once with `undefined` (not skipped, not replaced by `null` or a default), and `shell["s.x"] = null` calls it with `null` — a T2 shell is a relaying applier | [§ 8](SPEC-extensions.md#8-inputs) + [§ Applier profile](SPEC-extensions.md#applier-profile) A2 |
+| C52 | `[T1]` | The synthesized declaration carries no `attribute` hint on a composed input unless the shell itself maps that attribute, on its own element, to the composed input: a source input declared `{ name: "open", attribute: "open" }` and exposed without such a mapping appears in the shell's `inputs` without `attribute` | [§ 2](SPEC-extensions.md#2-declaration-shape) + [§ The `attribute` hint](SPEC-extensions.md#the-attribute-hint) |
+| C53a | `[T2]` | Command pass-through on the facade: `shell["s.run"](a, b)` calls the source method with `this === source` and the same arguments — same count, same order, the same objects, no padding or truncation — and `shell["s.run"]()` passes none; the completion shape is preserved (MUST: a synchronous throw stays synchronous, a rejected `Promise` stays a rejection); returning the very value the source returned (the same `Promise` object) is SHOULD and is recorded informationally | [§ 9](SPEC-extensions.md#9-commands) + [§ 12](SPEC-extensions.md#12-delegation-and-error-propagation) + [§ Applier profile](SPEC-extensions.md#applier-profile) A3 |
+| C53b | `[T3]` *(conditional — only for a command kind classified plain-local)* | `shell.invoke("s.run", a, b)` calls `source.run(a, b)` with `this === source` and the arguments unchanged; the returned `Promise` settles with the method's outcome — a thenable return value is adopted, any other value resolves — and a synchronous throw from the source method becomes a rejection, never a synchronous throw from `invoke` | [§ 9](SPEC-extensions.md#9-commands) + [§ 12](SPEC-extensions.md#12-delegation-and-error-propagation) + [§ Applier profile](SPEC-extensions.md#applier-profile) A3 |
 
 ---
 

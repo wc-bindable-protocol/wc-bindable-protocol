@@ -6,9 +6,10 @@ export interface WcBindableProperty {
 
 export interface WcBindableInput {
   name: string;
-  // `attribute` is a declarative hint consumed by extension specs (tooling,
-  // attribute reflection, remote proxying). The core protocol ignores it.
-  // See SPEC-extensions.md.
+  // `attribute` is a declarative hint naming the input's HTML attribute, for
+  // tooling, documentation and markup authoring. The core protocol ignores it,
+  // and it is not an instruction to write the attribute (SPEC-extensions.md
+  // § The `attribute` hint, § Applier profile A1).
   attribute?: string;
 }
 
