@@ -13,6 +13,7 @@ import {
   buildDeclarationFingerprint,
   declarationFingerprintsEqual,
 } from "./declarationFingerprint.js";
+import { type JsonValueResult, normalizeMaxDepth, toJsonArguments, toJsonValue } from "./jsonValue.js";
 
 const DEFAULT_PENDING_TIMEOUT_MS = 30_000;
 
@@ -75,6 +76,15 @@ export interface RemoteCoreProxyOptions {
    * `console.error`. Inject a structured logger in production.
    */
   logger?: Logger;
+  /**
+   * Nesting-depth resource limit for the values this proxy SENDS — `set.value`
+   * and each `cmd.args[i]` (SPEC-extensions.md § Design invariants,
+   * invariant 3 → "Resource limits during validation"). Deeper values risk
+   * exceeding `JSON.stringify`'s stack. A deeper value is rejected with
+   * `WC_BINDABLE_INVALID_JSON_VALUE` and a message that names the resource
+   * limit. Defaults to 256. A positive integer, or `Infinity` to disable.
+   */
+  maxDepth?: number;
 }
 
 function normalizePendingLimit(value: number | undefined): number {
@@ -126,6 +136,53 @@ function createCodedError(code: string, message: string): Error {
   return error;
 }
 
+/**
+ * Consumer-side `JsonValue` gate per SPEC-extensions.md § Design invariants,
+ * invariant 3 → "Consumer-side (client → server traffic)".
+ */
+function createInvalidJsonValueError(
+  context: string,
+  value: unknown,
+  result: Extract<JsonValueResult, { ok: false }>,
+): Error {
+  let message: string;
+  if (result.resourceLimit) {
+    message = `RemoteCoreProxy: ${context} was rejected by a resource limit: ${result.reason}`;
+  } else if (value === undefined) {
+    // `undefined` does not cross the wire (SPEC-extensions.md § Design
+    // invariants, invariant 3); the conventional reset across Extension 2 is
+    // `null` (§ Producer guidance for inputs, P2).
+    message = `RemoteCoreProxy: ${context} is undefined, which cannot be sent; assign null to reset the input`;
+  } else {
+    message = `RemoteCoreProxy: ${context} is not a JsonValue: ${result.reason}`;
+  }
+  return createCodedError("WC_BINDABLE_INVALID_JSON_VALUE", message);
+}
+
+/**
+ * Last-resort guard for a message that validated but still could not be
+ * serialized (e.g. `JSON.stringify` ran out of stack because the caller was
+ * already deep in its own stack). Only that call fails; the transport stays up.
+ */
+function canSerializeClientMessage(message: ClientMessage): boolean {
+  try {
+    JSON.stringify(message);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function createUnserializableError(context: string, err: unknown): Error {
+  const error = createCodedError(
+    "WC_BINDABLE_INVALID_JSON_VALUE",
+    `RemoteCoreProxy: ${context} could not be serialized in this runtime (resource limit): ` +
+      (err instanceof Error ? err.message : String(err)),
+  ) as Error & { cause?: unknown };
+  error.cause = err;
+  return error;
+}
+
 function normalizeTimeoutMs(options?: RemoteRequestOptions): number | null {
   const timeoutMs = options?.timeoutMs;
   if (timeoutMs === undefined) {
@@ -140,15 +197,6 @@ function normalizeTimeoutMs(options?: RemoteRequestOptions): number | null {
     );
   }
   return timeoutMs;
-}
-
-function canSerializeClientMessage(message: ClientMessage): boolean {
-  try {
-    JSON.stringify(message);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 function createCommandId(getFallbackId: () => number): string {
@@ -182,7 +230,7 @@ function isRemoteSerializedError(value: unknown): value is RemoteSerializedError
 type PreSyncQueueEntry = {
   kind: "set-ack" | "invoke";
   name: string;
-  /** Present for `set-ack` entries. */
+  /** Present for `set-ack` entries: the validated copy made at the call site. */
   value?: unknown;
   /** Present for `invoke` entries. */
   args?: unknown[];
@@ -197,28 +245,68 @@ type PreSyncQueueEntry = {
   cleanup: () => void;
 };
 
-function reviveThrownError(value: unknown): unknown {
+/**
+ * Codes the registry defines only for errors the consumer-side proxy builds
+ * itself (SPEC-extensions.md § Error envelope, emission site B). A producer
+ * never legitimately sends one, so a `throw` envelope carrying it is an
+ * application value — surfacing it would let a thrown object impersonate,
+ * say, `WC_BINDABLE_DISPOSED` and switch off an adapter's reconnect logic.
+ */
+const CONSUMER_ONLY_CODES: ReadonlySet<string> = new Set([
+  "WC_BINDABLE_TIMEOUT",
+  "WC_BINDABLE_ABORTED",
+  "WC_BINDABLE_DISPOSED",
+  "WC_BINDABLE_TERMINAL_FAILURE",
+  "WC_BINDABLE_PRE_SYNC_QUEUE_FULL",
+  "WC_BINDABLE_INVALID_ACK_OPTIONS",
+  "WC_BINDABLE_SET_ACK_UNSUPPORTED",
+]);
+
+function safeStringFrom(read: () => unknown, fallback: string): string {
+  try {
+    const s = String(read());
+    return s || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function defineCause(error: Error & { cause?: unknown }, cause: unknown): void {
+  try {
+    Object.defineProperty(error, "cause", {
+      value: cause,
+      configurable: true,
+      writable: true,
+    });
+  } catch {
+    error.cause = cause;
+  }
+}
+
+function reviveThrownError(value: unknown): Error {
+  // SPEC-extensions.md § Error envelope: the proxy MUST reject with an Error
+  // instance whatever arrived. A producer that forwarded a raw non-Error
+  // throw (older producers did) gets the canonical non-Error mapping here.
   if (!isRemoteSerializedError(value)) {
-    return value;
+    const error = new Error(safeStringFrom(() => value, "<unstringifiable thrown value>"));
+    error.name = "NonErrorThrow";
+    defineCause(error, value);
+    return error;
   }
 
-  const error = new Error(value.message) as Error & { cause?: unknown };
+  const error = new Error(value.message) as Error & { cause?: unknown; code?: string };
   error.name = value.name;
+  // Emission site B, pass-through row: surface the producer's `code` — except
+  // a consumer-only code, which no producer may send (see above).
+  if (typeof value.code === "string") {
+    error.code = CONSUMER_ONLY_CODES.has(value.code) ? "WC_BINDABLE_REMOTE_THROW" : value.code;
+  }
 
   if (typeof value.stack === "string") {
     error.stack = value.stack;
   }
 
-  try {
-    Object.defineProperty(error, "cause", {
-      value,
-      configurable: true,
-      writable: true,
-    });
-  } catch {
-    error.cause = value;
-  }
-
+  defineCause(error, value);
   return error;
 }
 
@@ -250,6 +338,7 @@ export class RemoteCoreProxy extends EventTarget {
   private _disposedError: Error | null = null;
   private _transportGeneration = 0;
   private _setAckSupported: boolean | null = null;
+  private _maxDepth: number;
   private _maxPendingInvocations: number;
   private _maxPreSyncQueue: number;
   /**
@@ -294,6 +383,7 @@ export class RemoteCoreProxy extends EventTarget {
     this._commands = new Set((declaration.commands ?? []).map((command) => command.name));
     this._maxPendingInvocations = normalizePendingLimit(options.maxPendingInvocations);
     this._maxPreSyncQueue = normalizePreSyncQueueLimit(options.maxPreSyncQueue);
+    this._maxDepth = normalizeMaxDepth(options.maxDepth, "RemoteCoreProxy");
     // Default is "eager" in 0.7.x for backward compatibility with the 0.6.x
     // optimistic-send behavior; the planned 0.8.0 release flips this to
     // "queue" to match the SPEC-extensions.md § Pre-sync call state machine MUST.
@@ -307,11 +397,22 @@ export class RemoteCoreProxy extends EventTarget {
 
   /** Set an input property on the remote Core. */
   set(name: string, value: unknown): void {
+    // Check order (shared with setWithAck): name → disposed → terminal → value.
     this._validateInputName(name);
     const transport = this._requireTransport();
+    // Validate-and-copy: what is serialized is exactly what was validated.
+    // `undefined` is rejected like any other non-JsonValue.
+    const checked = toJsonValue(value, "value", this._maxDepth);
+    if (!checked.ok) {
+      throw createInvalidJsonValueError(`set("${name}") value`, value, checked);
+    }
+    const message: ClientMessage = { type: "set", name, value: checked.value };
     try {
-      transport.send({ type: "set", name, value });
+      transport.send(message);
     } catch (err) {
+      if (!canSerializeClientMessage(message)) {
+        throw createUnserializableError(`set("${name}") value`, err);
+      }
       throw this._handleSendFailure(transport, err);
     }
   }
@@ -328,9 +429,21 @@ export class RemoteCoreProxy extends EventTarget {
     } catch (err) {
       return Promise.reject(err);
     }
+    // Check order (shared with set): name → disposed → terminal → value.
     if (this._disposedError) {
       return Promise.reject(this._disposedError);
     }
+    const transport = this._transport;
+    if (!transport) {
+      /* v8 ignore next -- reaching transport=null without a recorded connection error requires mutating private state */
+      return Promise.reject(this._connectionError ?? new Error("Transport closed"));
+    }
+    const context = `setWithAck("${name}")`;
+    const checked = toJsonValue(value, "value", this._maxDepth);
+    if (!checked.ok) {
+      return Promise.reject(createInvalidJsonValueError(`${context} value`, value, checked));
+    }
+    const wireValue = checked.value;
     // setAck capability is known only after the first `sync` response.
     // Per SPEC-extensions.md § Pre-sync call state machine MUST, pre-sync
     // `setWithAck` MUST queue instead of fast-rejecting on a capability we
@@ -338,7 +451,7 @@ export class RemoteCoreProxy extends EventTarget {
     // `preSyncBehavior: "queue"` (the planned 0.8.0 default). The 0.7.x
     // default `"eager"` preserves the legacy optimistic-send behavior.
     if (this._isPreSync && this._preSyncBehavior === "queue") {
-      return this._enqueuePreSync<void>("set-ack", name, value, undefined, options, `setWithAck("${name}")`);
+      return this._enqueuePreSync<void>("set-ack", name, wireValue, undefined, options, context);
     }
     if (this._setAckSupported === false) {
       return Promise.reject(createCodedError(
@@ -347,11 +460,6 @@ export class RemoteCoreProxy extends EventTarget {
       ));
     }
 
-    const transport = this._transport;
-    if (!transport) {
-      /* v8 ignore next -- reaching transport=null without a recorded connection error requires mutating private state */
-      return Promise.reject(this._connectionError ?? new Error("Transport closed"));
-    }
     const signal = options.signal;
     if (signal?.aborted) {
       return Promise.reject(createAbortError(signal));
@@ -360,22 +468,30 @@ export class RemoteCoreProxy extends EventTarget {
     return this._createPendingRequest<void>(
       "set-ack",
       options,
-      `setWithAck(\"${name}\")`,
+      context,
       (id) => {
-        const message: ClientMessage = { type: "set", name, value, id };
-        try {
-          transport.send(message);
-        } catch (err) {
-          if (!canSerializeClientMessage(message)) {
-            this._rejectPendingRequest(id, err);
-            return;
-          }
-          // _handleSendFailure rejects all pending (including this id) and
-          // clears the transport so reconnect() can attach a new one.
-          this._handleSendFailure(transport, err);
-        }
+        this._sendPending(transport, { type: "set", name, value: wireValue, id }, id, context);
       },
     );
+  }
+
+  /**
+   * Send an id-bearing message. A serialization failure (the validated copy
+   * still could not be stringified, e.g. under stack pressure) rejects only
+   * this call; any other send failure is a transport failure.
+   */
+  private _sendPending(transport: ClientTransport, message: ClientMessage, id: string, context: string): void {
+    try {
+      transport.send(message);
+    } catch (err) {
+      if (!canSerializeClientMessage(message)) {
+        this._rejectPendingRequest(id, createUnserializableError(context, err));
+        return;
+      }
+      // _handleSendFailure rejects all pending (including this id) and
+      // clears the transport so reconnect() can attach a new one.
+      this._handleSendFailure(transport, err);
+    }
   }
 
   /** Invoke a command on the remote Core and return its result. */
@@ -416,19 +532,28 @@ export class RemoteCoreProxy extends EventTarget {
 
   private _invoke(name: string, args: unknown[], options?: RemoteRequestOptions): Promise<unknown> {
     if (!this._commands.has(name)) {
-      return Promise.reject(
-        new Error(`RemoteCoreProxy: command "${name}" is not declared in wcBindable.commands`),
-      );
+      return Promise.reject(createCodedError(
+        "WC_BINDABLE_UNDECLARED_COMMAND",
+        `RemoteCoreProxy: command "${name}" is not declared in wcBindable.commands`,
+      ));
     }
     if (this._disposedError) {
       return Promise.reject(this._disposedError);
     }
+    // Validate-and-copy the arguments; an `undefined` argument cannot be
+    // encoded in `cmd.args` and is rejected like any other non-JsonValue.
+    // Each argument gets the full depth budget.
+    const checked = toJsonArguments(args, this._maxDepth);
+    if (!checked.ok) {
+      return Promise.reject(createInvalidJsonValueError(`invoke("${name}") args`, args, checked));
+    }
+    const wireArgs = checked.value as unknown[];
     // Per SPEC-extensions.md § Pre-sync call state machine MUST, pre-sync
     // `invoke` MUST queue alongside `setWithAck` so caller-order FIFO is
     // preserved across mixed traffic. Gated behind `preSyncBehavior: "queue"`
     // (planned 0.8.0 default); 0.7.x defaults to `"eager"` legacy behavior.
     if (this._isPreSync && this._preSyncBehavior === "queue") {
-      return this._enqueuePreSync<unknown>("invoke", name, undefined, args, options, `invoke("${name}")`);
+      return this._enqueuePreSync<unknown>("invoke", name, undefined, wireArgs, options, `invoke("${name}")`);
     }
     const transport = this._transport;
     if (!transport) {
@@ -444,18 +569,7 @@ export class RemoteCoreProxy extends EventTarget {
       options,
       `invoke(\"${name}\")`,
       (id) => {
-        const message: ClientMessage = { type: "cmd", name, id, args };
-        try {
-          transport.send(message);
-        } catch (err) {
-          if (!canSerializeClientMessage(message)) {
-            this._rejectPendingRequest(id, err);
-            return;
-          }
-          // _handleSendFailure rejects all pending (including this id) and
-          // clears the transport so reconnect() can attach a new one.
-          this._handleSendFailure(transport, err);
-        }
+        this._sendPending(transport, { type: "cmd", name, id, args: wireArgs }, id, `invoke("${name}")`);
       },
     );
   }
@@ -678,19 +792,13 @@ export class RemoteCoreProxy extends EventTarget {
       entry.reject(this._connectionError ?? this._disposedError ?? new Error("Transport closed"));
       return;
     }
+    // Queue entries hold the validated copy made at the call site, so a
+    // caller mutating its own value while queued cannot reach the wire.
     const dispatcher = (id: string) => {
-      const message: ClientMessage = entry.kind === "set-ack"
-        ? { type: "set", name: entry.name, value: entry.value, id }
-        : { type: "cmd", name: entry.name, id, args: entry.args ?? [] };
-      try {
-        transport.send(message);
-      } catch (err) {
-        if (!canSerializeClientMessage(message)) {
-          this._rejectPendingRequest(id, err);
-          return;
-        }
-        this._handleSendFailure(transport, err);
-      }
+      const message: ClientMessage = entry.kind === "invoke"
+        ? { type: "cmd", name: entry.name, id, args: entry.args ?? [] }
+        : { type: "set", name: entry.name, value: entry.value, id };
+      this._sendPending(transport, message, id, entry.timeoutContext);
     };
     const pending = this._createPendingRequest<unknown>(
       entry.kind,
@@ -816,7 +924,10 @@ export class RemoteCoreProxy extends EventTarget {
     // disposed — otherwise diagnosing client-side bugs on a stale proxy is
     // harder (see README "Error handling").
     if (!this._inputs.has(name)) {
-      throw new Error(`RemoteCoreProxy: input "${name}" is not declared in wcBindable.inputs`);
+      throw createCodedError(
+        "WC_BINDABLE_UNDECLARED_INPUT",
+        `RemoteCoreProxy: input "${name}" is not declared in wcBindable.inputs`,
+      );
     }
   }
 
@@ -990,6 +1101,14 @@ export class RemoteCoreProxy extends EventTarget {
         }
         const getterFailures = new Set(msg.getterFailures ?? []);
         const undefinedProperties = new Set(msg.undefinedProperties ?? []);
+        // SPEC-extensions.md § getterFailures semantics: the producer could not
+        // read (or could not transmit) these values. The cache keeps whatever it
+        // had, and the consumer MUST say so.
+        for (const name of getterFailures) {
+          this._logger.warn(
+            `RemoteCoreProxy: the producer could not read or transmit property "${name}" during sync; keeping the last known value`,
+          );
+        }
         // Populate cache and dispatch events for each initial value.
         for (const [name, value] of Object.entries(msg.values)) {
           const eventName = this._eventsByName.get(name);
@@ -1266,7 +1385,10 @@ export function createRemoteCoreProxy(
 
   const proxyDeclaration: WcBindableDeclaration = {
     protocol: "wc-bindable",
-    version: 1,
+    // SPEC.md § Discovery Contract: a wrapper MUST report the wrapped
+    // declaration's `version`. It also feeds the local fingerprint, which the
+    // producer's fingerprint is compared against.
+    version: declaration.version,
     properties: proxyProperties,
     inputs: declaration.inputs,
     commands: declaration.commands,
